@@ -1,0 +1,25 @@
+{
+  "name": "meetless-cli",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Meetless CLI (mla): extracted, self-contained codebase intended for open source. Seeded from the dogfood agent stack; single source of truth post-cutover.",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run build && pnpm -r run test",
+    "typecheck": "pnpm -r run typecheck",
+    "plugin:sync": "pnpm --filter @meetless/mla build && node scripts/sync-plugin.mjs",
+    "plugin:check": "pnpm --filter @meetless/mla build && node scripts/sync-plugin.mjs --check",
+    "plugin:validate": "pnpm plugin:check && node scripts/validate-plugin.mjs"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "packageManager": "pnpm@10.28.1",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}

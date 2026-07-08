@@ -1,0 +1,49 @@
+#!/bin/sh
+# resolve-mla: locate the installed `mla` binary and exec it with the forwarded
+# arguments. Bundled in the Meetless Claude Code plugin so the `meetless` MCP
+# server can boot `mla mcp` regardless of where mla was installed (brew, npm,
+# install.sh) and regardless of whether a GUI-launched Claude Code inherited the
+# shell PATH. Pure POSIX sh; the exec path relies only on shell builtins so it
+# still works under a stripped PATH (env -i), where external tools are absent.
+set -u
+
+self="$0"
+selfreal="$self"
+if command -v realpath >/dev/null 2>&1; then
+  selfreal="$(realpath "$self" 2>/dev/null || printf '%s' "$self")"
+fi
+
+# §5 candidate order. MEETLESS_MLA_PATH is the operator override; then the
+# install.sh default; then Homebrew (Apple silicon and Intel); then Linuxbrew.
+for cand in \
+  "${MEETLESS_MLA_PATH:-}" \
+  "${HOME:-}/.meetless/bin/mla" \
+  "/opt/homebrew/bin/mla" \
+  "/usr/local/bin/mla" \
+  "/home/linuxbrew/.linuxbrew/bin/mla"
+do
+  [ -n "$cand" ] || continue
+  [ "$cand" = "$self" ] && continue
+  if command -v realpath >/dev/null 2>&1; then
+    candreal="$(realpath "$cand" 2>/dev/null || printf '%s' "$cand")"
+    [ "$candreal" = "$selfreal" ] && continue
+  fi
+  [ -x "$cand" ] || continue
+  exec "$cand" "$@"
+done
+
+# Last resort: mla on PATH, but never this very script (guards an infinite
+# re-exec if resolve-mla were ever itself named mla on PATH).
+if command -v mla >/dev/null 2>&1; then
+  onpath="$(command -v mla)"
+  onpathreal="$onpath"
+  if command -v realpath >/dev/null 2>&1; then
+    onpathreal="$(realpath "$onpath" 2>/dev/null || printf '%s' "$onpath")"
+  fi
+  if [ "$onpath" != "$self" ] && [ "$onpathreal" != "$selfreal" ]; then
+    exec "$onpath" "$@"
+  fi
+fi
+
+printf 'resolve-mla: could not find the `mla` binary. Install it (https://meetless.ai/install.sh) or set MEETLESS_MLA_PATH.\n' >&2
+exit 127

@@ -1,0 +1,7 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Pinned shape only. R0 is observe-only and never emits this. A later slice fills in the reason from the rule verdict."
+  }
+}

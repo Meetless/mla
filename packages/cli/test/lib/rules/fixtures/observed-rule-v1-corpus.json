@@ -1,0 +1,66 @@
+{
+  "domain": "observed-rule-v1",
+  "note": "Golden vectors for the observed-rule-v1 hash domain (proposal P0.36/P0.53). Digest = SHA-256(domainTag || 0x00 || JCS(payload)), lowercase hex. PROVISIONAL FIELD SET: the payload is exactly the R0 evaluator-consumed ObservedRuleSpec (text, applicability, effect, forbiddenRootRelativePath). When the schema/identity contract freezes the fuller observed-rule-v1 field family, these vectors rotate. The domain-separation machinery is final; the field set is not.",
+  "vectors": [
+    {
+      "label": "notes-pilot-action-glob",
+      "spec": {
+        "text": "Notes and design docs MUST go in the standalone vault, never the repo notes directory.",
+        "applicability": {
+          "mode": "action",
+          "tools": [
+            "Write",
+            "Edit"
+          ],
+          "matcher": {
+            "field": "file_path",
+            "glob": "*.md"
+          }
+        },
+        "effect": "PROHIBIT",
+        "forbiddenRootRelativePath": "notes"
+      },
+      "jcs": "{\"applicability\":{\"matcher\":{\"field\":\"file_path\",\"glob\":\"*.md\"},\"mode\":\"action\",\"tools\":[\"Edit\",\"Write\"]},\"effect\":\"PROHIBIT\",\"forbiddenRootRelativePath\":\"notes\",\"text\":\"Notes and design docs MUST go in the standalone vault, never the repo notes directory.\"}",
+      "hash": "422f495d8b2f37fb4f34a17ea5ce126552e1c884a15c508bb6506790e1fa565d"
+    },
+    {
+      "label": "matcher-without-glob-omits-absent",
+      "spec": {
+        "text": "Some prose rule.",
+        "applicability": {
+          "mode": "action",
+          "tools": [
+            "Write"
+          ],
+          "matcher": {
+            "field": "file_path"
+          }
+        },
+        "effect": "PROHIBIT",
+        "forbiddenRootRelativePath": "secrets"
+      },
+      "jcs": "{\"applicability\":{\"matcher\":{\"field\":\"file_path\"},\"mode\":\"action\",\"tools\":[\"Write\"]},\"effect\":\"PROHIBIT\",\"forbiddenRootRelativePath\":\"secrets\",\"text\":\"Some prose rule.\"}",
+      "hash": "79286616ed22b8a21384960a482ff50638903085e15a3ea7a20790c326a983cb"
+    },
+    {
+      "label": "prose-nfc-folding",
+      "spec": {
+        "text": "Notes go in café vault.",
+        "applicability": {
+          "mode": "action",
+          "tools": [
+            "Write"
+          ],
+          "matcher": {
+            "field": "file_path",
+            "glob": "*.md"
+          }
+        },
+        "effect": "PROHIBIT",
+        "forbiddenRootRelativePath": "notes"
+      },
+      "jcs": "{\"applicability\":{\"matcher\":{\"field\":\"file_path\",\"glob\":\"*.md\"},\"mode\":\"action\",\"tools\":[\"Write\"]},\"effect\":\"PROHIBIT\",\"forbiddenRootRelativePath\":\"notes\",\"text\":\"Notes go in café vault.\"}",
+      "hash": "cfdebdf11749fd2baefcb9b1e7376cf9411cf182c7e93182904a49de0fbf435d"
+    }
+  ]
+}

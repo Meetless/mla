@@ -1,0 +1,18 @@
+{
+  "name": "mla",
+  "version": "0.2.1",
+  "description": "The Meetless agent CLI (mla): capture hooks, the governed-memory MCP server, and the /mla:cli and /mla:onboard skills for Claude Code.",
+  "author": {
+    "name": "Meetless"
+  },
+  "homepage": "https://meetless.ai",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "meetless": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-mla",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

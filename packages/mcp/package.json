@@ -1,0 +1,36 @@
+{
+  "name": "@meetless/mcp",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "description": "Canonical knowledge substrate for the Meetless product. Use for concepts, architecture, decisions, flows, privacy/ACL, anything beyond pure code shape (grep handles code).",
+  "type": "module",
+  "private": false,
+  "main": "dist/server.js",
+  "exports": {
+    ".": "./dist/server.js"
+  },
+  "bin": {
+    "meetless-mcp": "dist/server.js",
+    "meetless-ws-doctor": "ws-doctor.mjs"
+  },
+  "files": [
+    "dist",
+    "ws-doctor.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "esbuild server.js --bundle --platform=node --format=esm --packages=external --outfile=dist/server.js && chmod +x dist/server.js",
+    "start": "node server.js",
+    "ws:doctor": "node ws-doctor.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "meetless",
+  "description": "Meetless plugins for Claude Code. Ships mla: capture hooks, the governed-memory MCP server, and the /mla:cli and /mla:onboard skills.",
+  "owner": {
+    "name": "Meetless"
+  },
+  "plugins": [
+    {
+      "name": "mla",
+      "source": "./plugin",
+      "description": "The Meetless agent CLI (mla): capture hooks, the governed-memory MCP server, and the /mla:cli and /mla:onboard skills for Claude Code."
+    }
+  ]
+}

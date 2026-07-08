@@ -1,0 +1,12 @@
+{
+  "session_id": "ses_pinned_fixture_write",
+  "transcript_path": "/Users/dev/.claude/projects/example/transcript.jsonl",
+  "cwd": "/Users/dev/projects/example",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/Users/dev/projects/example/notes/scratch.md",
+    "content": "# scratch\n"
+  }
+}

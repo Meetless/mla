@@ -1,0 +1,27 @@
+{
+  "name": "@meetless/ask-core",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "description": "Shared, env-free ask implementation (intel /v1/ask mode routing + INDEX.md canonical matcher + status-fallback rule). Imported by both front-ends: @meetless/mcp (MCP transport) and @meetless/mla (the `mla` CLI). One ask implementation, two front-ends; intel remains the execution backend.",
+  "type": "module",
+  "private": true,
+  "main": "./ask_modes.js",
+  "types": "./index.d.ts",
+  "exports": {
+    "./ask_modes.js": "./ask_modes.js",
+    "./status_fallback.js": "./status_fallback.js",
+    "./match_canonical.js": "./match_canonical.js"
+  },
+  "files": [
+    "ask_modes.js",
+    "status_fallback.js",
+    "match_canonical.js",
+    "index.d.ts"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  }
+}

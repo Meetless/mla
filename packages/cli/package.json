@@ -1,0 +1,76 @@
+{
+  "name": "@meetless/mla",
+  "version": "0.2.4",
+  "license": "Apache-2.0",
+  "private": false,
+  "description": "Meetless CLI (mla): governed change-control and knowledge for AI coding agents.",
+  "keywords": [
+    "meetless",
+    "mla",
+    "cli",
+    "ai",
+    "coding-agent",
+    "claude-code",
+    "mcp",
+    "governance",
+    "knowledge-base"
+  ],
+  "homepage": "https://meetless.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Meetless/mla.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Meetless/mla/issues"
+  },
+  "author": "Meetless",
+  "type": "commonjs",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "mla": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.js && node scripts/gen-build-info.js && node scripts/bundle-esm.js && chmod +x dist/cli.js dist/pretool-entry.js",
+    "dev": "ts-node src/cli.ts",
+    "start": "node dist/cli.js",
+    "test": "jest --config jest.config.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "node scripts/check-publish-gate.js"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "pkg": {
+    "assets": [
+      "dist/hooks-template/**/*",
+      "dist/build-info.json"
+    ],
+    "scripts": [
+      "dist/**/*.js"
+    ]
+  },
+  "dependencies": {
+    "@sentry/node": "^10.39.0",
+    "better-sqlite3": "^11.8.0"
+  },
+  "devDependencies": {
+    "@meetless/ask-core": "workspace:*",
+    "@meetless/mcp": "workspace:*",
+    "@meetless/trace-core": "workspace:*",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.30",
+    "@yao-pkg/pkg": "^6.3.0",
+    "esbuild": "^0.28.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}

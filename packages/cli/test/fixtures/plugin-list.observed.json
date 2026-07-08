@@ -1,0 +1,90 @@
+[
+  {
+    "id": "claude-md-management@claude-plugins-official",
+    "version": "1.0.0",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/claude-plugins-official/claude-md-management/1.0.0",
+    "installedAt": "2026-04-14T21:02:36.260Z",
+    "lastUpdated": "2026-04-14T21:02:36.260Z"
+  },
+  {
+    "id": "claude-mem@thedotmack",
+    "version": "12.1.0",
+    "scope": "user",
+    "enabled": false,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/thedotmack/claude-mem/12.1.0",
+    "installedAt": "2026-04-14T11:46:28.613Z",
+    "lastUpdated": "2026-04-14T11:46:28.613Z",
+    "mcpServers": {
+      "mcp-search": {
+        "type": "stdio",
+        "command": "${CLAUDE_PLUGIN_ROOT}/scripts/mcp-server.cjs",
+        "args": []
+      }
+    }
+  },
+  {
+    "id": "code-review@claude-plugins-official",
+    "version": "unknown",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/claude-plugins-official/code-review/unknown",
+    "installedAt": "2026-04-14T11:49:43.517Z",
+    "lastUpdated": "2026-07-05T02:04:46.421Z"
+  },
+  {
+    "id": "code-simplifier@claude-plugins-official",
+    "version": "1.0.0",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/claude-plugins-official/code-simplifier/1.0.0",
+    "installedAt": "2026-04-14T21:03:15.408Z",
+    "lastUpdated": "2026-04-14T21:03:15.408Z"
+  },
+  {
+    "id": "context7@claude-plugins-official",
+    "version": "unknown",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/claude-plugins-official/context7/unknown",
+    "installedAt": "2026-04-14T11:49:28.307Z",
+    "lastUpdated": "2026-07-05T02:04:46.420Z",
+    "mcpServers": {
+      "context7": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@upstash/context7-mcp"
+        ]
+      }
+    }
+  },
+  {
+    "id": "frontend-design@claude-plugins-official",
+    "version": "unknown",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/claude-plugins-official/frontend-design/unknown",
+    "installedAt": "2026-04-14T11:48:56.454Z",
+    "lastUpdated": "2026-07-05T02:04:46.421Z"
+  },
+  {
+    "id": "ralph-loop@claude-plugins-official",
+    "version": "1.0.0",
+    "scope": "user",
+    "enabled": false,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/claude-plugins-official/ralph-loop/1.0.0",
+    "installedAt": "2026-04-14T21:02:49.597Z",
+    "lastUpdated": "2026-04-14T21:02:49.597Z"
+  },
+  {
+    "id": "superpowers@claude-plugins-official",
+    "version": "6.1.1",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/Users/REDACTED/.claude/plugins/cache/claude-plugins-official/superpowers/6.1.1",
+    "installedAt": "2026-04-14T11:49:15.234Z",
+    "lastUpdated": "2026-07-03T17:24:07.803Z"
+  }
+]

@@ -1,0 +1,92 @@
+{
+  "tool_use_id": "toolu_01KG96HLwsRri14JnaKPN33i",
+  "providerSessionId": "4a53ce6d-de7d-47ab-9b26-d17beb2cad6f",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "What does \"write the mcp\" mean here — extend what exists, or start fresh?",
+        "header": "MCP scope",
+        "multiSelect": false,
+        "options": [
+          {
+            "label": "Verify existing MCP works",
+            "description": "tools/meetless-mcp/ already routes to intel /v1/ask. Run reingest, then test the existing tools (query, relationship_verdict) against fresh data. Fix anything broken."
+          },
+          {
+            "label": "Extend existing MCP",
+            "description": "Existing MCP stays; add new tools/modes for the new pipeline's outputs (e.g., raw chunk retrieval, claim/relation browsing, ingestion status)."
+          },
+          {
+            "label": "Write a new MCP",
+            "description": "The existing one queries the old surface. Build a separate MCP that talks directly to the new ingestion pipeline's data (Postgres + Weaviate) for low-level inspection."
+          }
+        ]
+      },
+      {
+        "question": "Which workspace + intel instance for the reingest?",
+        "header": "Target env",
+        "multiSelect": false,
+        "options": [
+          {
+            "label": "Local intel + dogfood ws",
+            "description": "Local intel at 127.0.0.1:8100, workspace ws_dogfood_v1 (or current dogfood workspace ID). I'll start intel if it's not running."
+          },
+          {
+            "label": "Staging intel",
+            "description": "Point at connector-staging / intel-staging. I'll need the workspace ID + base URL."
+          },
+          {
+            "label": "Tell me what to use",
+            "description": "I'll specify the workspace ID and intel URL in my reply."
+          }
+        ]
+      }
+    ]
+  },
+  "tool_response": {
+    "questions": [
+      {
+        "question": "What does \"write the mcp\" mean here — extend what exists, or start fresh?",
+        "header": "MCP scope",
+        "options": [
+          {
+            "label": "Verify existing MCP works",
+            "description": "tools/meetless-mcp/ already routes to intel /v1/ask. Run reingest, then test the existing tools (query, relationship_verdict) against fresh data. Fix anything broken."
+          },
+          {
+            "label": "Extend existing MCP",
+            "description": "Existing MCP stays; add new tools/modes for the new pipeline's outputs (e.g., raw chunk retrieval, claim/relation browsing, ingestion status)."
+          },
+          {
+            "label": "Write a new MCP",
+            "description": "The existing one queries the old surface. Build a separate MCP that talks directly to the new ingestion pipeline's data (Postgres + Weaviate) for low-level inspection."
+          }
+        ],
+        "multiSelect": false
+      },
+      {
+        "question": "Which workspace + intel instance for the reingest?",
+        "header": "Target env",
+        "options": [
+          {
+            "label": "Local intel + dogfood ws",
+            "description": "Local intel at 127.0.0.1:8100, workspace ws_dogfood_v1 (or current dogfood workspace ID). I'll start intel if it's not running."
+          },
+          {
+            "label": "Staging intel",
+            "description": "Point at connector-staging / intel-staging. I'll need the workspace ID + base URL."
+          },
+          {
+            "label": "Tell me what to use",
+            "description": "I'll specify the workspace ID and intel URL in my reply."
+          }
+        ],
+        "multiSelect": false
+      }
+    ],
+    "answers": {
+      "What does \"write the mcp\" mean here — extend what exists, or start fresh?": "Verify existing MCP works",
+      "Which workspace + intel instance for the reingest?": "local envs. Make sure you can reuse the current dogfood workspace first, to ensure it deoesn't interfere with the evaluation. "
+    }
+  }
+}

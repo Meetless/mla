@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "categories": [
+    "schema_or_migration",
+    "auth_or_permission",
+    "external_integration",
+    "llm_prompt",
+    "outbox_or_handler",
+    "api_contract",
+    "cli_or_tooling",
+    "docs",
+    "unknown"
+  ],
+  "cases": [
+    { "path": "prisma/schema.prisma",            "category": "schema_or_migration" },
+    { "path": "db/migrations/0001_init.sql",     "category": "schema_or_migration" },
+    { "path": "src/auth/session.ts",             "category": "auth_or_permission" },
+    { "path": "src/authz/policy.ts",             "category": "auth_or_permission" },
+    { "path": "src/webhooks/github.ts",          "category": "external_integration" },
+    { "path": "src/integrations/stripe.ts",      "category": "external_integration" },
+    { "path": "prompts/code-review.yaml",        "category": "llm_prompt" },
+    { "path": "src/outbox/dispatcher.ts",        "category": "outbox_or_handler" },
+    { "path": "src/handlers/user-created.ts",    "category": "outbox_or_handler" },
+    { "path": "src/api/users.controller.ts",     "category": "api_contract" },
+    { "path": "src/users/user.dto.ts",           "category": "api_contract" },
+    { "path": "tools/seed.ts",                   "category": "cli_or_tooling" },
+    { "path": "scripts/deploy.sh",               "category": "cli_or_tooling" },
+    { "path": "docs/architecture.md",            "category": "docs" },
+    { "path": "README.md",                       "category": "docs" },
+    { "path": "src/services/user.service.ts",    "category": "unknown" },
+    { "path": "../outside/file.ts",              "category": "unknown" },
+    { "path": "./src/webhooks/github.ts",        "category": "external_integration" },
+    { "path": "/src/webhooks/github.ts",         "category": "external_integration" },
+    { "path": "src\\webhooks\\github.ts",        "category": "external_integration" }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "_comment": "S1-a shared cross-language fixture for the canonical Claude agent-session UUID parser. The SAME fixture drives the TS twin (canonicalizeSessionId in observability.ts), the Bash twin (canonicalize_agent_session_id in common.sh), and the Python twin (canonicalize_agent_session_id in intel app/observability/langfuse_session.py). It is duplicated byte-for-byte into intel/tests/fixtures/. If any twin drifts from this grammar, the same Claude session id canonicalizes to two strings and splits the Langfuse Session; this fixture catches that drift in all three languages. expected null means the parser drops the value (no agent session). The None input (raw is None / null / unset) is asserted separately per language since JSON cannot distinguish an absent key from a null string here. The SOH case carries a real U+0001 byte via the JSON \\u0001 escape so every parser decodes it identically.",
+  "cases": [
+    {
+      "name": "canonical lowercase dashed uuid passes unchanged",
+      "input": "e1b29b04-7467-412d-bdd6-80ee8de19de0",
+      "expected": "e1b29b04-7467-412d-bdd6-80ee8de19de0"
+    },
+    {
+      "name": "uppercase canonical uuid is lowercased",
+      "input": "E1B29B04-7467-412D-BDD6-80EE8DE19DE0",
+      "expected": "e1b29b04-7467-412d-bdd6-80ee8de19de0"
+    },
+    {
+      "name": "mixed-case canonical uuid is lowercased",
+      "input": "E1b29B04-7467-412d-BDD6-80ee8DE19de0",
+      "expected": "e1b29b04-7467-412d-bdd6-80ee8de19de0"
+    },
+    {
+      "name": "surrounding spaces and tabs are trimmed then lowercased",
+      "input": "  \t E1B29B04-7467-412D-BDD6-80EE8DE19DE0 \t ",
+      "expected": "e1b29b04-7467-412d-bdd6-80ee8de19de0"
+    },
+    {
+      "name": "trailing newline alone is trimmed (accepted)",
+      "input": "e1b29b04-7467-412d-bdd6-80ee8de19de0\n",
+      "expected": "e1b29b04-7467-412d-bdd6-80ee8de19de0"
+    },
+    {
+      "name": "braces wrapper is rejected",
+      "input": "{e1b29b04-7467-412d-bdd6-80ee8de19de0}",
+      "expected": null
+    },
+    {
+      "name": "urn:uuid prefix is rejected",
+      "input": "urn:uuid:e1b29b04-7467-412d-bdd6-80ee8de19de0",
+      "expected": null
+    },
+    {
+      "name": "un-dashed 32-hex is rejected",
+      "input": "e1b29b047467412dbdd680ee8de19de0",
+      "expected": null
+    },
+    {
+      "name": "too-short hex run is rejected",
+      "input": "e1b29b04-7467-412d-bdd6-80ee8de19de",
+      "expected": null
+    },
+    {
+      "name": "non-hex character is rejected",
+      "input": "g1b29b04-7467-412d-bdd6-80ee8de19de0",
+      "expected": null
+    },
+    {
+      "name": "trailing control char (SOH) is rejected (not whitespace, not trimmed)",
+      "input": "e1b29b04-7467-412d-bdd6-80ee8de19de0\u0001",
+      "expected": null
+    },
+    {
+      "name": "whitespace-only is rejected",
+      "input": "   ",
+      "expected": null
+    },
+    {
+      "name": "empty string is rejected",
+      "input": "",
+      "expected": null
+    },
+    {
+      "name": "newline-bearing header-injection attempt is rejected",
+      "input": "e1b29b04-7467-412d-bdd6-80ee8de19de0\nX-Evil: 1",
+      "expected": null
+    },
+    {
+      "name": "interior space is rejected",
+      "input": "e1b29b04-7467-412d-bdd6-80ee8 de19de0",
+      "expected": null
+    }
+  ]
+}

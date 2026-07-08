@@ -1,0 +1,28 @@
+# Dependencies
+node_modules
+
+# Build output (rebuilt by `pnpm build`; never committed -- see Phase 4.6)
+dist
+.turbo
+*.tsbuildinfo
+
+# Release artifacts (pkg binaries + checksums from scripts/build-release.sh; CI
+# uploads them, they are never committed)
+release
+
+# Test / coverage output
+coverage
+.nyc_output
+
+# Package tarballs (`pnpm pack` / `npm pack` dry-run output)
+*.tgz
+
+# Secrets / local config
+.env*
+.sentryclirc
+*.local
+
+# Logs / OS cruft
+*.log
+pnpm-debug.log*
+.DS_Store

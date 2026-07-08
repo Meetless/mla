@@ -1,0 +1,53 @@
+{
+  "domain": "evaluation-input-v1",
+  "note": "Golden vectors for the evaluation-input-v1 hash domain (proposal §10.1 step 2, decision 4). Digest = SHA-256(domainTag || 0x00 || JCS(payload)), lowercase hex. The payload is the action-side replay basis persisted as tool_attempt.evaluation_input_snapshot: the post-canonicalization compliance-replay input, NOT a rule hash. target is the discriminated three-arm union (RUNTIME_RELATIVE carries a runtime-root-relative path; OUTSIDE_RUNTIME_SCOPE carries no path; UNKNOWN carries reasonCode CANONICALIZATION_FAILED). The version strings are representative: this corpus pins the ENCODING, while the runtime contract-version values are wired by the durable-observation slice. Every value in the pilot is ASCII, so the universal-NFC caveat (see evaluation-input-hash.ts header) is byte-identical here.",
+  "vectors": [
+    {
+      "label": "runtime-relative-write",
+      "input": {
+        "toolName": "Write",
+        "target": {
+          "kind": "RUNTIME_RELATIVE",
+          "path": "src/app/main.ts"
+        },
+        "forbiddenRootRelativePath": "notes",
+        "evaluatorContractVersion": "four-state-evaluator-v1",
+        "matcherSchemaVersion": "action-applicability-v1",
+        "pathCanonicalizerVersion": "notes-path-v1"
+      },
+      "jcs": "{\"evaluatorContractVersion\":\"four-state-evaluator-v1\",\"forbiddenRootRelativePath\":\"notes\",\"matcherSchemaVersion\":\"action-applicability-v1\",\"pathCanonicalizerVersion\":\"notes-path-v1\",\"target\":{\"kind\":\"RUNTIME_RELATIVE\",\"path\":\"src/app/main.ts\"},\"toolName\":\"Write\"}",
+      "hash": "cf51283b9b0cb4307424ff9b22efdba4a2ff4c3ba1c58dd718081a4fdaed5856"
+    },
+    {
+      "label": "outside-scope-edit",
+      "input": {
+        "toolName": "Edit",
+        "target": {
+          "kind": "OUTSIDE_RUNTIME_SCOPE"
+        },
+        "forbiddenRootRelativePath": "notes",
+        "evaluatorContractVersion": "four-state-evaluator-v1",
+        "matcherSchemaVersion": "action-applicability-v1",
+        "pathCanonicalizerVersion": "notes-path-v1"
+      },
+      "jcs": "{\"evaluatorContractVersion\":\"four-state-evaluator-v1\",\"forbiddenRootRelativePath\":\"notes\",\"matcherSchemaVersion\":\"action-applicability-v1\",\"pathCanonicalizerVersion\":\"notes-path-v1\",\"target\":{\"kind\":\"OUTSIDE_RUNTIME_SCOPE\"},\"toolName\":\"Edit\"}",
+      "hash": "22eee3e5af418d3af363ba4f89883e6baaef83c1501a42a3d6358c45e19ba68f"
+    },
+    {
+      "label": "unknown-canonicalization-failed",
+      "input": {
+        "toolName": "Write",
+        "target": {
+          "kind": "UNKNOWN",
+          "reasonCode": "CANONICALIZATION_FAILED"
+        },
+        "forbiddenRootRelativePath": "notes",
+        "evaluatorContractVersion": "four-state-evaluator-v1",
+        "matcherSchemaVersion": "action-applicability-v1",
+        "pathCanonicalizerVersion": "notes-path-v1"
+      },
+      "jcs": "{\"evaluatorContractVersion\":\"four-state-evaluator-v1\",\"forbiddenRootRelativePath\":\"notes\",\"matcherSchemaVersion\":\"action-applicability-v1\",\"pathCanonicalizerVersion\":\"notes-path-v1\",\"target\":{\"kind\":\"UNKNOWN\",\"reasonCode\":\"CANONICALIZATION_FAILED\"},\"toolName\":\"Write\"}",
+      "hash": "31fdcbd5f6f0c8d4b7924ace1dd200ec9ed4d83fa2ee0e911903154f0fcb831b"
+    }
+  ]
+}

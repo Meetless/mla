@@ -1,0 +1,21 @@
+{
+  "_comment": "Cross-language Langfuse trace-URL contract (OBS-9 / spec gap 6.3). The CLI's langfuseTraceUrl(projectId, traceId) and intel's langfuse_trace_url(project_id, trace_id) MUST both produce the `url` below for the given (projectId, traceId) on the Langfuse Cloud host. This file is duplicated byte-for-byte in meetless-cli/packages/cli/test/fixtures/langfuse-url-fixtures.json and intel/tests/fixtures/langfuse-url-fixtures.json. Keep them identical; if a builder drifts, its own language's suite fails against these rows.",
+  "host": "https://cloud.langfuse.com",
+  "cases": [
+    {
+      "projectId": "p_abc",
+      "traceId": "0123456789abcdef0123456789abcdef",
+      "url": "https://cloud.langfuse.com/project/p_abc/traces/0123456789abcdef0123456789abcdef"
+    },
+    {
+      "projectId": "cmpzughg20174kvzao5gh6x6y",
+      "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "url": "https://cloud.langfuse.com/project/cmpzughg20174kvzao5gh6x6y/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "projectId": "proj-123-xyz",
+      "traceId": "deadbeefdeadbeefdeadbeefdeadbeef",
+      "url": "https://cloud.langfuse.com/project/proj-123-xyz/traces/deadbeefdeadbeefdeadbeefdeadbeef"
+    }
+  ]
+}

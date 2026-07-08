@@ -1,0 +1,415 @@
+{
+  "extractionVectors": [
+    {
+      "label": "decide-about-soft-gate",
+      "prompt": "What did we decide about the soft gate enforcement?",
+      "derived": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "soft"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      }
+    },
+    {
+      "label": "why-choose",
+      "prompt": "Why did we choose Postgres over Dynamo for the event store",
+      "derived": {
+        "subjectId": "subj:6d2b7e906277791d5f44e35b109c7db00c67d71f35d3523fcefe1cc50634c44c",
+        "normalizedTerms": [
+          "dynamo",
+          "event",
+          "postgres",
+          "store"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "6d2b7e906277791d5f44e35b109c7db00c67d71f35d3523fcefe1cc50634c44c"
+      }
+    },
+    {
+      "label": "still-doing",
+      "prompt": "Are we still doing the email digest",
+      "derived": {
+        "subjectId": "subj:5a27b8ad23373dadf3a5299ea88e6c9af78bcc453d475bae6a3cb2e748e74822",
+        "normalizedTerms": [
+          "digest",
+          "email"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "5a27b8ad23373dadf3a5299ea88e6c9af78bcc453d475bae6a3cb2e748e74822"
+      }
+    },
+    {
+      "label": "who-owns",
+      "prompt": "Who owns the rate limiter rollout and the ACL policy",
+      "derived": {
+        "subjectId": "subj:7c0e5dad1665a831b692e96902c53fefb3835a531c0027c86fe17ceff6702bf5",
+        "normalizedTerms": [
+          "acl",
+          "limiter",
+          "policy",
+          "rate",
+          "rollout"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "7c0e5dad1665a831b692e96902c53fefb3835a531c0027c86fe17ceff6702bf5"
+      }
+    },
+    {
+      "label": "our-canonical",
+      "prompt": "our canonical ingestion model",
+      "derived": {
+        "subjectId": "subj:3e18930f821c848111da353dea5189f97f4ed40715163028fea50f56ab725b2a",
+        "normalizedTerms": [
+          "canonical",
+          "ingestion",
+          "model"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "3e18930f821c848111da353dea5189f97f4ed40715163028fea50f56ab725b2a"
+      }
+    },
+    {
+      "label": "all-scaffolding-empty",
+      "prompt": "what is the",
+      "derived": {
+        "subjectId": "subj:73dd99e99f365f898a5b417b31d21e0de17761f45d2a880e10292098aafe23ff",
+        "normalizedTerms": [],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "73dd99e99f365f898a5b417b31d21e0de17761f45d2a880e10292098aafe23ff"
+      }
+    },
+    {
+      "label": "empty-prompt",
+      "prompt": "",
+      "derived": {
+        "subjectId": "subj:73dd99e99f365f898a5b417b31d21e0de17761f45d2a880e10292098aafe23ff",
+        "normalizedTerms": [],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "73dd99e99f365f898a5b417b31d21e0de17761f45d2a880e10292098aafe23ff"
+      }
+    },
+    {
+      "label": "dedup-terms",
+      "prompt": "gate gate enforcement gate",
+      "derived": {
+        "subjectId": "subj:3930cf292d1db9ac056b7d5a3d05987a6f2a7e0e9467237c0ed68fa0a8b7c85e",
+        "normalizedTerms": [
+          "enforcement",
+          "gate"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "3930cf292d1db9ac056b7d5a3d05987a6f2a7e0e9467237c0ed68fa0a8b7c85e"
+      }
+    },
+    {
+      "label": "resolved-ids-sorted-deduped",
+      "prompt": "rollout plan",
+      "resolved": {
+        "entityIds": [
+          "E2",
+          "E1",
+          "E2"
+        ],
+        "decisionIds": [
+          "DD:9"
+        ],
+        "conceptIds": [
+          "C3",
+          "C1"
+        ]
+      },
+      "derived": {
+        "subjectId": "subj:e56a45d0d55492cfc16329db6df4711cba8e0bd6bd9c6a8435ebf84d4aabced5",
+        "normalizedTerms": [
+          "plan",
+          "rollout"
+        ],
+        "entityIds": [
+          "E1",
+          "E2"
+        ],
+        "decisionIds": [
+          "DD:9"
+        ],
+        "conceptIds": [
+          "C1",
+          "C3"
+        ],
+        "fingerprint": "e56a45d0d55492cfc16329db6df4711cba8e0bd6bd9c6a8435ebf84d4aabced5"
+      }
+    },
+    {
+      "label": "paraphrase-same-identity",
+      "prompt": "enforcement of the SOFT gate",
+      "derived": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "soft"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      }
+    }
+  ],
+  "matchVectors": [
+    {
+      "label": "full-by-entity-id",
+      "required": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "soft"
+        ],
+        "entityIds": [
+          "E1"
+        ],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "consultation": {
+        "subjectId": "subj:27dae62e6ad37ad1795a6e67b12e50ac9a14d538d262e4f6513c489d3d4b6bbd",
+        "normalizedTerms": [
+          "completely",
+          "different",
+          "here",
+          "topic"
+        ],
+        "entityIds": [
+          "E1",
+          "E9"
+        ],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "27dae62e6ad37ad1795a6e67b12e50ac9a14d538d262e4f6513c489d3d4b6bbd"
+      },
+      "coverage": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "result": "FULL",
+        "candidateMatch": true
+      }
+    },
+    {
+      "label": "full-by-decision-id",
+      "required": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "soft"
+        ],
+        "entityIds": [],
+        "decisionIds": [
+          "DD:1"
+        ],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "consultation": {
+        "subjectId": "subj:27dae62e6ad37ad1795a6e67b12e50ac9a14d538d262e4f6513c489d3d4b6bbd",
+        "normalizedTerms": [
+          "completely",
+          "different",
+          "here",
+          "topic"
+        ],
+        "entityIds": [],
+        "decisionIds": [
+          "DD:1",
+          "DD:7"
+        ],
+        "conceptIds": [],
+        "fingerprint": "27dae62e6ad37ad1795a6e67b12e50ac9a14d538d262e4f6513c489d3d4b6bbd"
+      },
+      "coverage": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "result": "FULL",
+        "candidateMatch": true
+      }
+    },
+    {
+      "label": "full-by-term-containment",
+      "required": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "soft"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "consultation": {
+        "subjectId": "subj:3e71f5ba23e6fd863a489409f481478893f74c2935d1d08fc6f2970c8d78d5e1",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "plan",
+          "rollout",
+          "soft"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "3e71f5ba23e6fd863a489409f481478893f74c2935d1d08fc6f2970c8d78d5e1"
+      },
+      "coverage": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "result": "FULL",
+        "candidateMatch": true
+      }
+    },
+    {
+      "label": "full-at-exact-threshold",
+      "required": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "alpha",
+          "beta"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "consultation": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "beta",
+          "gamma"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "coverage": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "result": "FULL",
+        "candidateMatch": true
+      }
+    },
+    {
+      "label": "unknown-below-threshold",
+      "required": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "a1",
+          "b2",
+          "c3",
+          "d4"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "consultation": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "a1",
+          "z9"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "coverage": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "result": "UNKNOWN",
+        "candidateMatch": false
+      }
+    },
+    {
+      "label": "unknown-disjoint",
+      "required": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "soft"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "consultation": {
+        "subjectId": "subj:27dae62e6ad37ad1795a6e67b12e50ac9a14d538d262e4f6513c489d3d4b6bbd",
+        "normalizedTerms": [
+          "completely",
+          "different",
+          "here",
+          "topic"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "27dae62e6ad37ad1795a6e67b12e50ac9a14d538d262e4f6513c489d3d4b6bbd"
+      },
+      "coverage": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "result": "UNKNOWN",
+        "candidateMatch": false
+      }
+    },
+    {
+      "label": "unknown-degenerate-required",
+      "required": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "normalizedTerms": [],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b"
+      },
+      "consultation": {
+        "subjectId": "subj:3e71f5ba23e6fd863a489409f481478893f74c2935d1d08fc6f2970c8d78d5e1",
+        "normalizedTerms": [
+          "enforcement",
+          "gate",
+          "plan",
+          "rollout",
+          "soft"
+        ],
+        "entityIds": [],
+        "decisionIds": [],
+        "conceptIds": [],
+        "fingerprint": "3e71f5ba23e6fd863a489409f481478893f74c2935d1d08fc6f2970c8d78d5e1"
+      },
+      "coverage": {
+        "subjectId": "subj:e0a9890cdd58624a050c1f17f788aa2720fef29aa95f52d593e949de56cbc89b",
+        "result": "UNKNOWN",
+        "candidateMatch": false
+      }
+    }
+  ]
+}
