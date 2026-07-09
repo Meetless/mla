@@ -8,17 +8,34 @@
 #   mla-<triple>.tar.gz          (executable `mla` at the archive root)
 #   mla-<triple>.tar.gz.sha256   (<hex>  <filename>, the format install.sh reads)
 #
-# macOS targets are ad-hoc signed (codesign -s -) and the signature is verified,
-# because pkg invalidates the donor Node binary's signature and arm64 will not
-# execute unsigned. Windows is intentionally unsupported here (not ratified).
+# macOS signing has two modes (BUG-1: a quarantined, un-notarized binary is
+# SIGKILLed with exit 137 on Apple Silicon):
+#   * Developer-ID (MLA_APPLE_SIGN_IDENTITY set): sign with a real Developer ID
+#     Application cert + hardened runtime + secure timestamp, then (if the notary
+#     trio is set) notarize via notarytool so Gatekeeper admits a quarantined
+#     download. This is the durable fix.
+#   * ad-hoc (identity unset, the default): codesign -s - . pkg invalidates the
+#     donor Node binary's signature and arm64 refuses to run UNSIGNED, so an
+#     ad-hoc signature is the floor that lets a NON-quarantined copy run; it is
+#     not notarizable and a quarantined copy is still gated. This keeps local/dev
+#     and the pre-secret CI green until the MLA_APPLE_* credentials are provisioned.
+# Windows is intentionally unsupported here (not ratified).
 #
-# Env overrides (the matrix CI sets none of these; they exist for tests/local):
+# Env overrides (the matrix CI sets none of the first group; they exist for tests/local):
 #   MLA_CLI_DIR     path to packages/cli      (default: <repo>/packages/cli)
 #   MLA_RELEASE_DIR output dir                (default: <repo>/release)
 #   MLA_SKIP_BUILD  skip `pnpm build`         (default: unset -> build runs)
 #   MLA_PKG_BIN     pkg executable            (default: local node_modules/.bin/pkg)
 #   MLA_CODESIGN    codesign executable       (default: codesign)
+#   MLA_XCRUN       xcrun executable          (default: xcrun; used for notarytool/stapler)
 #   MLA_SMOKE       run --version/--help gate (default: unset; CI sets 1)
+#
+# Apple Developer-ID signing + notarization (all optional; absent -> ad-hoc):
+#   MLA_APPLE_SIGN_IDENTITY        Developer ID Application identity (name or SHA-1).
+#                                  Presence flips macOS signing to Developer-ID.
+#   MLA_APPLE_NOTARY_KEY_ID        App Store Connect API key id       ) all three
+#   MLA_APPLE_NOTARY_ISSUER_ID     App Store Connect issuer uuid       > required
+#   MLA_APPLE_NOTARY_KEY_P8_BASE64 base64 of the AuthKey_XXXX.p8 file ) to notarize
 #
 # NOTE: pin/verify the @yao-pkg/pkg version and that its node22 base binaries
 # exist for every target before a real release; pkg-fetch downloads them once.
@@ -81,11 +98,65 @@ say "compiling $KEY -> $PKG_TARGET"
 [ -f "$STAGE/$EXE" ] || err "pkg did not produce $STAGE/$EXE"
 chmod +x "$STAGE/$EXE"
 
-# 4. macOS: ad-hoc sign, then verify the signature is present.
+# 4. macOS signing. Developer-ID when MLA_APPLE_SIGN_IDENTITY is set (the durable
+#    BUG-1 fix), else ad-hoc (the floor, kept for local/dev + pre-secret CI).
 if [ "$SIGN" = "1" ]; then
-  say "ad-hoc signing $EXE"
-  "$CODESIGN" -s - --force "$STAGE/$EXE"
-  "$CODESIGN" -dv "$STAGE/$EXE" || err "ad-hoc signature verification failed"
+  SIGN_IDENTITY="${MLA_APPLE_SIGN_IDENTITY:-}"
+  if [ -n "$SIGN_IDENTITY" ]; then
+    say "Developer-ID signing $EXE (hardened runtime + secure timestamp) as: $SIGN_IDENTITY"
+    # --options runtime is REQUIRED for notarization; --timestamp gets a secure
+    # Apple timestamp so the signature keeps validating after the cert expires.
+    "$CODESIGN" --sign "$SIGN_IDENTITY" --options runtime --timestamp \
+      --force "$STAGE/$EXE"
+    # --strict: reject an ad-hoc or malformed signature; a real Developer-ID sig
+    # must pass before we bother notarizing.
+    "$CODESIGN" --verify --strict --verbose=2 "$STAGE/$EXE" \
+      || err "Developer-ID signature verification failed"
+  else
+    say "ad-hoc signing $EXE (no MLA_APPLE_SIGN_IDENTITY; not notarizable)"
+    "$CODESIGN" -s - --force "$STAGE/$EXE"
+    "$CODESIGN" -dv "$STAGE/$EXE" || err "ad-hoc signature verification failed"
+  fi
+fi
+
+# 4b. Notarization (macOS, Developer-ID only). Submits the signed binary to
+#     Apple's notary service, which registers its code-directory hash so a
+#     QUARANTINED download passes Gatekeeper instead of being SIGKILLed (BUG-1).
+#     Gated on the App Store Connect API-key trio; when the identity is set but
+#     the trio is absent we sign-only and WARN. notarytool needs a container, so
+#     we zip the exec with ditto (preserves the embedded signature).
+#     A BARE Mach-O executable cannot hold a stapled ticket (`stapler` only
+#     staples .app/.pkg/.dmg), so stapling is best-effort: on the expected
+#     failure we rely on Gatekeeper's ONLINE notarization check plus install.sh's
+#     quarantine strip, rather than failing the release.
+if [ "$SIGN" = "1" ] && [ -n "${MLA_APPLE_SIGN_IDENTITY:-}" ]; then
+  XCRUN="${MLA_XCRUN:-xcrun}"
+  NKEY_ID="${MLA_APPLE_NOTARY_KEY_ID:-}"
+  NISSUER="${MLA_APPLE_NOTARY_ISSUER_ID:-}"
+  NKEY_B64="${MLA_APPLE_NOTARY_KEY_P8_BASE64:-}"
+  if [ -n "$NKEY_ID" ] && [ -n "$NISSUER" ] && [ -n "$NKEY_B64" ]; then
+    say "notarizing $EXE via notarytool (key-id $NKEY_ID)"
+    NZIP="$STAGE/${EXE}-notarize.zip"
+    P8="$STAGE/notary-key.p8"
+    # Materialize the private key from base64 inside the auto-cleaned STAGE tmpdir
+    # so it never lands in the release dir or the archive.
+    printf '%s' "$NKEY_B64" | base64 -d > "$P8" \
+      || err "could not decode MLA_APPLE_NOTARY_KEY_P8_BASE64"
+    ( cd "$STAGE" && ditto -c -k "$EXE" "$NZIP" ) \
+      || err "could not zip $EXE for notarization"
+    "$XCRUN" notarytool submit "$NZIP" \
+      --key "$P8" --key-id "$NKEY_ID" --issuer "$NISSUER" \
+      --wait --timeout 20m \
+      || err "notarization was rejected (see the notarytool log above)"
+    rm -f "$P8" "$NZIP"
+    if "$XCRUN" stapler staple "$STAGE/$EXE" 2>/dev/null; then
+      say "stapled the notarization ticket to $EXE"
+    else
+      say "note: a bare executable cannot be stapled (expected); relying on online notarization + install-time de-quarantine"
+    fi
+  else
+    say "WARNING: Developer-ID signed but NOT notarized. Set MLA_APPLE_NOTARY_KEY_ID + MLA_APPLE_NOTARY_ISSUER_ID + MLA_APPLE_NOTARY_KEY_P8_BASE64 to notarize; a quarantined download may still be gated."
+  fi
 fi
 
 # 5. optional smoke gate (CI runs this on the native runner before upload).

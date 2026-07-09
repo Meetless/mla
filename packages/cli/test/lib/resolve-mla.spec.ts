@@ -15,6 +15,40 @@ function makeFakeMla(dir: string, marker: string): string {
   return p;
 }
 
+// Render the resolver with its three baked-in absolute install paths
+// (/opt/homebrew/bin/mla, /usr/local/bin/mla, /home/linuxbrew/.linuxbrew/bin/mla)
+// repointed into an absent sandbox path, so "nothing installed on this machine"
+// is genuinely reachable even on a dev box where /opt/homebrew/bin/mla is a live
+// symlink to the dogfood CLI. The drift guard fails loudly if a candidate is ever
+// renamed, rather than silently regressing to a coincidental pass.
+function renderScriptWithoutSystemCandidates(absent: string): string {
+  let script = renderResolverScript();
+  for (const hard of [
+    "/opt/homebrew/bin/mla",
+    "/usr/local/bin/mla",
+    "/home/linuxbrew/.linuxbrew/bin/mla",
+  ]) {
+    const before = script;
+    script = script.split(hard).join(absent);
+    expect(script).not.toBe(before);
+  }
+  return script;
+}
+
+// A fake installer, served to the resolver over a file:// URL, that drops a fake
+// mla (printing `BOOTSTRAPPED:<args>`) into the canonical ~/.meetless/bin location
+// the resolver execs after bootstrap. Returns the installer path.
+function makeFakeInstaller(root: string, name: string): string {
+  const premade = makeFakeMla(path.join(root, `${name}-src`), "BOOTSTRAPPED");
+  const installer = path.join(root, `${name}.sh`);
+  fs.writeFileSync(
+    installer,
+    `#!/bin/sh\nmkdir -p "$HOME/.meetless/bin"\ncp '${premade}' "$HOME/.meetless/bin/mla"\nchmod +x "$HOME/.meetless/bin/mla"\n`,
+  );
+  fs.chmodSync(installer, 0o755);
+  return installer;
+}
+
 describe("resolve-mla (generated script)", () => {
   let root: string;
   let resolver: string;
@@ -62,39 +96,25 @@ describe("resolve-mla (generated script)", () => {
     expect(out.trim()).toBe("HOME:mcp");
   });
 
-  it("hits its own exit 127 with the not-found message when no mla exists", () => {
-    // The §5 list includes hardcoded absolute install paths (/opt/homebrew/bin/mla,
-    // /usr/local/bin/mla, /home/linuxbrew/.linuxbrew/bin/mla) that a hermetic test
-    // cannot delete from the real filesystem: on a dev machine /opt/homebrew/bin/mla
-    // is a live symlink to the dogfood CLI. Left intact, the resolver would exec THAT
-    // real binary and 127 would come from its `env node` shebang failing under the
-    // stripped PATH, not from the resolver exhausting its candidates. On a box where
-    // node is on the base PATH it would instead launch the real `mla mcp` server and
-    // hang. So repoint exactly those three baked-in paths into an empty sandbox dir,
-    // making "nothing found" genuinely reachable, then prove the resolver's OWN
-    // exit-127 branch fired by asserting its bespoke stderr message.
-    let script = renderResolverScript();
+  it("hits its own exit 127 with the not-found message when no mla exists (bootstrap opted out)", () => {
+    // With every candidate absent the resolver would otherwise try its network
+    // self-heal, so MEETLESS_MLA_NO_BOOTSTRAP=1 isolates the pure candidate-
+    // exhaustion path and proves the resolver reached its OWN exit-127 branch
+    // (asserted via the bespoke stderr message), not a stray exec of a real binary.
     const absent = path.join(root, "no-candidates", "mla");
-    for (const hard of [
-      "/opt/homebrew/bin/mla",
-      "/usr/local/bin/mla",
-      "/home/linuxbrew/.linuxbrew/bin/mla",
-    ]) {
-      const before = script;
-      script = script.split(hard).join(absent);
-      // Drift guard: if a future resolver renames a candidate, fail loudly here rather
-      // than silently regress to the coincidental-pass this test exists to kill.
-      expect(script).not.toBe(before);
-    }
     const hermetic = path.join(root, "resolver-127");
-    fs.writeFileSync(hermetic, script);
+    fs.writeFileSync(hermetic, renderScriptWithoutSystemCandidates(absent));
     fs.chmodSync(hermetic, 0o755);
 
     let code = 0;
     let stderr = "";
     try {
       execFileSync("sh", [hermetic, "mcp"], {
-        env: { PATH: "/usr/bin:/bin", HOME: path.join(root, "empty-home") },
+        env: {
+          PATH: "/usr/bin:/bin",
+          HOME: path.join(root, "empty-home"),
+          MEETLESS_MLA_NO_BOOTSTRAP: "1",
+        },
         encoding: "utf8",
       });
     } catch (e: any) {
@@ -104,6 +124,62 @@ describe("resolve-mla (generated script)", () => {
     expect(code).toBe(127);
     // Not a stray exec of a real binary: the resolver reached its own last line.
     expect(stderr).toContain("could not find");
+  });
+
+  it("bootstraps the binary from MEETLESS_INSTALL_URL when none is installed, then execs it", () => {
+    // Plugin-first install: `claude plugin install mla@meetless` with no binary yet.
+    // The resolver must fetch the installer (here a local file:// URL, so the test is
+    // hermetic and offline), which drops the binary at ~/.meetless/bin/mla, then exec
+    // it with the forwarded args. stdout carrying the fake binary's marker proves the
+    // exec happened; the persisted file proves the install location is correct.
+    const installer = makeFakeInstaller(root, "installer");
+    const absent = path.join(root, "no-candidates", "mla");
+    const hermetic = path.join(root, "resolver-bootstrap");
+    fs.writeFileSync(hermetic, renderScriptWithoutSystemCandidates(absent));
+    fs.chmodSync(hermetic, 0o755);
+
+    const home = path.join(root, "boot-home"); // fresh: no ~/.meetless/bin/mla yet
+    const out = execFileSync("sh", [hermetic, "mcp"], {
+      env: {
+        PATH: "/usr/bin:/bin",
+        HOME: home,
+        MEETLESS_INSTALL_URL: `file://${installer}`,
+      },
+      encoding: "utf8",
+    });
+    expect(out.trim()).toBe("BOOTSTRAPPED:mcp");
+    expect(fs.existsSync(path.join(home, ".meetless", "bin", "mla"))).toBe(true);
+  });
+
+  it("does NOT bootstrap when MEETLESS_MLA_NO_BOOTSTRAP=1, even with a working installer URL", () => {
+    // The kill switch wins over an otherwise-fetchable installer: no network, no
+    // binary written, straight to the 127 hint.
+    const installer = makeFakeInstaller(root, "optout-installer");
+    const absent = path.join(root, "no-candidates", "mla");
+    const hermetic = path.join(root, "resolver-optout");
+    fs.writeFileSync(hermetic, renderScriptWithoutSystemCandidates(absent));
+    fs.chmodSync(hermetic, 0o755);
+
+    const home = path.join(root, "optout-home");
+    let code = 0;
+    let stderr = "";
+    try {
+      execFileSync("sh", [hermetic, "mcp"], {
+        env: {
+          PATH: "/usr/bin:/bin",
+          HOME: home,
+          MEETLESS_INSTALL_URL: `file://${installer}`,
+          MEETLESS_MLA_NO_BOOTSTRAP: "1",
+        },
+        encoding: "utf8",
+      });
+    } catch (e: any) {
+      code = e.status;
+      stderr = String(e.stderr ?? "");
+    }
+    expect(code).toBe(127);
+    expect(stderr).toContain("could not find");
+    expect(fs.existsSync(path.join(home, ".meetless", "bin", "mla"))).toBe(false);
   });
 
   it("does not abort under `set -u` when HOME is unset (stripped GUI env)", () => {

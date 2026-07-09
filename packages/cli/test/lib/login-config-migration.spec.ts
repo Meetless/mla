@@ -97,7 +97,7 @@ describe("config auth compat shim (§6.4, T29)", () => {
       sessionId: "sess_1",
       authMode: "user-token",
       actorUserId: "u_should_be_ignored",
-      user: { id: "u_real", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+      user: { id: "u_real", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
       mlaPath: "/usr/local/bin/mla",
     });
     const { readConfig } = loadConfig();
@@ -185,12 +185,12 @@ describe("config auth compat shim (§6.4, T29)", () => {
         accessExpiresAt: ACCESS_FUTURE,
         refreshExpiresAt: FUTURE,
         sessionId: "sess_x",
-        user: { id: "u_1", displayName: "An Pham", email: null, role: "OWNER" },
+        user: { id: "u_1", displayName: "Ada Lovelace", email: null, role: "OWNER" },
       },
     });
     const { readConfig } = loadConfig();
     process.env.MEETLESS_CONTROL_TOKEN = "sk_env";
-    expect(() => readConfig()).toThrow(/MEETLESS_CONTROL_TOKEN is set but you are logged in as An Pham/);
+    expect(() => readConfig()).toThrow(/MEETLESS_CONTROL_TOKEN is set but you are logged in as Ada Lovelace/);
   });
 
   it("MEETLESS_CONTROL_TOKEN under none overrides to shared-key (documented CI path)", () => {
@@ -252,6 +252,34 @@ describe("config auth compat shim (§6.4, T29)", () => {
     });
     const { readConfig } = loadConfig();
     expect(() => readConfig()).toThrow(/unrecognized auth\.mode/);
+  });
+
+  it("writeConfig re-asserts 0600 even when the file already exists loose (overwrite ignores the mode option)", () => {
+    // The token file holds a live refresh token; it must be owner-only. The
+    // `{ mode: 0o600 }` on writeFileSync is honored ONLY on create, so a config
+    // that ever landed loose (older CLI, permissive umask) would stay loose
+    // across every refresh/re-login overwrite. Simulate that: seed a valid
+    // config, force it world-readable, then writeConfig and assert the explicit
+    // chmodSync tightened it back to 0600. POSIX-only; skip elsewhere.
+    if (process.platform === "win32") return;
+    seed({
+      controlUrl: "http://127.0.0.1:3006",
+      mlaPath: "/usr/local/bin/mla",
+      auth: {
+        mode: "user-token",
+        accessToken: "at_1",
+        refreshToken: "rt_secret",
+        accessExpiresAt: ACCESS_FUTURE,
+        refreshExpiresAt: FUTURE,
+        sessionId: "sess_x",
+        user: { id: "u_1", displayName: "An", email: null, role: "OWNER" },
+      },
+    });
+    fs.chmodSync(cfgPath, 0o644);
+    expect(fs.statSync(cfgPath).mode & 0o777).toBe(0o644);
+    const { readConfig, writeConfig } = loadConfig();
+    writeConfig(readConfig());
+    expect(fs.statSync(cfgPath).mode & 0o777).toBe(0o600);
   });
 
   it("malformed cli-config.json throws ConfigError (operator-fixable), not a bare SyntaxError", () => {

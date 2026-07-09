@@ -52,6 +52,14 @@ interface ReportFlags {
   messageFile?: string;
   /** Skip the interactive y/N confirm and send. Required non-interactively. */
   yes: boolean;
+  /**
+   * `--workspace <id>` admin escape hatch (BUG-2 I). By default the report is
+   * filed against the workspace bound to the current directory's .meetless.json
+   * marker. When the operator runs from an unbound directory, or belongs to a
+   * DIFFERENT workspace than the marker points at, this overrides marker
+   * resolution so `mla bug report` never dead-ends on "not activated" / a 403.
+   */
+  workspace?: string;
 }
 
 // Wire shapes (control/apps/control/src/bug-report). Dates serialize to ISO
@@ -93,6 +101,34 @@ function errText(e: unknown): string {
   return String(e);
 }
 
+// BUG-2 I: the marker-model workspace guard (control) answers a non-member with
+// a 403 whose body carries code WORKSPACE_ACCESS_DENIED. buildError (lib/http.ts)
+// puts the status on `.status` and inlines the body into the message, so a
+// substring match on the code is stable across get/post/patch.
+export function isWorkspaceAccessDenied(e: unknown): boolean {
+  const status = (e as { status?: number } | null)?.status;
+  const msg = e instanceof Error ? e.message : String(e);
+  return status === 403 && msg.includes("WORKSPACE_ACCESS_DENIED");
+}
+
+// Turn a WORKSPACE_ACCESS_DENIED 403 into actionable guidance instead of the raw
+// `POST ... -> HTTP 403: {...}` wire error. We deliberately do NOT silently
+// redirect to some "home" workspace (there is no server support for resolving
+// one, and a silent tenant switch would file the report against the wrong
+// workspace); the operator must name a workspace they belong to.
+export function workspaceAccessDeniedGuidance(
+  workspaceId: string,
+  usedOverride: boolean,
+): string {
+  const head = `You are not a member of workspace '${workspaceId}', so this bug report was not filed.`;
+  const fix = usedOverride
+    ? `Pass --workspace <id> for a workspace you belong to, or ask an admin to add you to '${workspaceId}'.`
+    : `This directory is bound to that workspace by its .meetless.json marker. ` +
+      `Ask a workspace admin to add you, or file against a workspace you belong to:\n` +
+      `  mla bug report --workspace <id> --message "..."`;
+  return `${head}\n${fix}`;
+}
+
 // A value-bearing flag must be followed by a real value, never the next flag,
 // or an operator's "drop the value" typo silently changes intent.
 function takeValue(argv: string[], i: number, flag: string): string {
@@ -115,9 +151,11 @@ const KNOWN_REPORT_FLAGS = new Set([
   "--message-file",
   "--yes",
   "-y",
+  "--workspace",
+  "-w",
 ]);
 
-function parseReportArgs(argv: string[]): ReportFlags {
+export function parseReportArgs(argv: string[]): ReportFlags {
   const out: ReportFlags = { last: false, yes: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -148,6 +186,11 @@ function parseReportArgs(argv: string[]): ReportFlags {
       case "--yes":
       case "-y":
         out.yes = true;
+        break;
+      case "--workspace":
+      case "-w":
+        out.workspace = takeValue(argv, i, a);
+        i += 1;
         break;
       default:
         if (a.startsWith("-") && !KNOWN_REPORT_FLAGS.has(a)) {
@@ -366,7 +409,7 @@ async function runReport(rest: string[], deps: RunBugDeps): Promise<number> {
 
   let cfg: WorkspaceCliConfig;
   try {
-    cfg = loadWorkspaceConfig();
+    cfg = loadWorkspaceConfig(flags.workspace);
   } catch (e) {
     console.error(errText(e));
     return 2;
@@ -457,7 +500,11 @@ async function runReport(rest: string[], deps: RunBugDeps): Promise<number> {
     // A failed submission is a normal, expected error (network, rate limit,
     // rejected bundle); it must NOT trip the top-level "file a bug report"
     // footer. Print a clean message and exit non-zero via return (not throw).
-    console.error(errText(e));
+    if (isWorkspaceAccessDenied(e)) {
+      console.error(workspaceAccessDeniedGuidance(cfg.workspaceId, Boolean(flags.workspace)));
+    } else {
+      console.error(errText(e));
+    }
     return 1;
   } finally {
     try {
@@ -468,22 +515,58 @@ async function runReport(rest: string[], deps: RunBugDeps): Promise<number> {
   }
 }
 
-async function runList(rest: string[]): Promise<number> {
-  if (rest.length) {
-    console.error(`Unexpected argument: ${rest[0]}. Usage: mla bug list`);
-    return 2;
+// Pull a `--workspace <id>` / `-w <id>` admin override out of an otherwise
+// positional argv (BUG-2 I). list/status take no value flags of their own, so a
+// tiny extractor keeps their strict "unexpected argument" checks intact while
+// still honoring the escape hatch. Returns the override (if any) and the argv
+// with it removed; throws on a missing value so a "-w" typo never silently drops.
+export function extractWorkspaceOverride(rest: string[]): { workspace?: string; rest: string[] } {
+  const out: string[] = [];
+  let workspace: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--workspace" || a === "-w") {
+      workspace = takeValue(rest, i, a);
+      i += 1;
+      continue;
+    }
+    out.push(a);
   }
-  let cfg: WorkspaceCliConfig;
+  return { workspace, rest: out };
+}
+
+async function runList(rest: string[]): Promise<number> {
+  let workspace: string | undefined;
   try {
-    cfg = loadWorkspaceConfig();
+    ({ workspace, rest } = extractWorkspaceOverride(rest));
   } catch (e) {
     console.error(errText(e));
     return 2;
   }
-  const reports = await get<ReporterView[]>(
-    cfg,
-    `/internal/v1/bug-reports?workspaceId=${encodeURIComponent(cfg.workspaceId)}`,
-  );
+  if (rest.length) {
+    console.error(`Unexpected argument: ${rest[0]}. Usage: mla bug list [--workspace <id>]`);
+    return 2;
+  }
+  let cfg: WorkspaceCliConfig;
+  try {
+    cfg = loadWorkspaceConfig(workspace);
+  } catch (e) {
+    console.error(errText(e));
+    return 2;
+  }
+  let reports: ReporterView[];
+  try {
+    reports = await get<ReporterView[]>(
+      cfg,
+      `/internal/v1/bug-reports?workspaceId=${encodeURIComponent(cfg.workspaceId)}`,
+    );
+  } catch (e) {
+    if (isWorkspaceAccessDenied(e)) {
+      console.error(workspaceAccessDeniedGuidance(cfg.workspaceId, Boolean(workspace)));
+      return 1;
+    }
+    throw e;
+  }
   if (!reports.length) {
     console.log('No bug reports filed yet. File one with: mla bug report --message "..."');
     return 0;
@@ -496,26 +579,42 @@ async function runList(rest: string[]): Promise<number> {
 }
 
 async function runStatus(rest: string[]): Promise<number> {
-  const ref = rest[0];
-  if (!ref) {
-    console.error("Usage: mla bug status <BUG-ref>");
-    return 2;
-  }
-  if (rest.length > 1) {
-    console.error(`Unexpected argument: ${rest[1]}. Usage: mla bug status <BUG-ref>`);
-    return 2;
-  }
-  let cfg: WorkspaceCliConfig;
+  let workspace: string | undefined;
   try {
-    cfg = loadWorkspaceConfig();
+    ({ workspace, rest } = extractWorkspaceOverride(rest));
   } catch (e) {
     console.error(errText(e));
     return 2;
   }
-  const r = await get<ReporterView>(
-    cfg,
-    `/internal/v1/bug-reports/${encodeURIComponent(ref)}?workspaceId=${encodeURIComponent(cfg.workspaceId)}`,
-  );
+  const ref = rest[0];
+  if (!ref) {
+    console.error("Usage: mla bug status <BUG-ref> [--workspace <id>]");
+    return 2;
+  }
+  if (rest.length > 1) {
+    console.error(`Unexpected argument: ${rest[1]}. Usage: mla bug status <BUG-ref> [--workspace <id>]`);
+    return 2;
+  }
+  let cfg: WorkspaceCliConfig;
+  try {
+    cfg = loadWorkspaceConfig(workspace);
+  } catch (e) {
+    console.error(errText(e));
+    return 2;
+  }
+  let r: ReporterView;
+  try {
+    r = await get<ReporterView>(
+      cfg,
+      `/internal/v1/bug-reports/${encodeURIComponent(ref)}?workspaceId=${encodeURIComponent(cfg.workspaceId)}`,
+    );
+  } catch (e) {
+    if (isWorkspaceAccessDenied(e)) {
+      console.error(workspaceAccessDeniedGuidance(cfg.workspaceId, Boolean(workspace)));
+      return 1;
+    }
+    throw e;
+  }
   console.log(`${r.handle}  ${r.status}`);
   console.log(`  Title:      ${r.title}`);
   console.log(`  Filed:      ${r.createdAt}`);
@@ -545,8 +644,9 @@ export async function runBug(
         `Unknown bug subcommand: ${sub ?? "(none)"}. Usage:\n` +
           "  mla bug report [--trace-id <id> | --session <sid> | --last]\n" +
           "                 [--title <t>] [--message <m> | --message-file <f>] [--yes]\n" +
-          "  mla bug list\n" +
-          "  mla bug status <BUG-ref>",
+          "                 [--workspace <id>]\n" +
+          "  mla bug list [--workspace <id>]\n" +
+          "  mla bug status <BUG-ref> [--workspace <id>]",
       );
       return 2;
   }

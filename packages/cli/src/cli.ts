@@ -35,7 +35,7 @@ import {
 } from "./lib/analytics/command-event";
 import { get as controlGet } from "./lib/http";
 import type { CliConfig } from "./lib/config";
-import { readConfig } from "./lib/config";
+import { readConfig, HOME } from "./lib/config";
 import { tryResolveWorkspaceId } from "./lib/workspace";
 import type { Tracer } from "@meetless/trace-core";
 import { runInit } from "./commands/init";
@@ -45,7 +45,7 @@ import { runUninstall } from "./commands/uninstall";
 import { runWhoami } from "./commands/whoami";
 import { runRewire } from "./commands/rewire";
 import { runActivate, runDeactivate, runMute, runUnmute } from "./commands/activate";
-import { runReview, runReviewById } from "./commands/review";
+import { runReview, runReviewById, reviewUsage } from "./commands/review";
 import { runEnforcement } from "./commands/enforcement";
 import { runConflicts } from "./commands/conflicts";
 import { runFlush } from "./commands/flush";
@@ -587,6 +587,18 @@ export async function dispatch(argv: string[]): Promise<number> {
       // `mla review <id>`          -> deep-link emission, exactly one positional.
       // Old `latest` / `by-session` are intentionally removed; surface a clear
       // pointer instead of silently routing the operator to the wrong path.
+      //
+      // `--help`/`-h` is intercepted here, BEFORE either runReview's or
+      // runReviewById's strict parser runs. Both parsers throw on any unknown
+      // `--`/`-` token by design (to name stray flags), but help is not stray --
+      // throwing "Unknown flag: --help" reads as the tool being broken. Match it
+      // anywhere in the review args so `mla review -h`, `mla review <id> --help`,
+      // and `mla review --plain --help` all print usage and exit 0.
+      const reviewArgs = argv.slice(1);
+      if (reviewArgs.includes("--help") || reviewArgs.includes("-h")) {
+        console.log(reviewUsage());
+        return 0;
+      }
       if (sub === undefined || sub.startsWith("--")) {
         return runReview(argv.slice(1));
       }
@@ -809,6 +821,23 @@ async function prefetchWorkspaceConfig(
   }
 }
 
+// Teardown commands delete the local ~/.meetless footprint as their whole
+// purpose (BUG-1 D). `uninstall` is the only one today; `unwire` keeps HOME
+// (it only strips settings.json hooks), so it is deliberately NOT here.
+export function isTeardownCommand(cmdName: string): boolean {
+  return cmdName === "uninstall";
+}
+
+// True only when a teardown command has ACTUALLY removed HOME. The homeExists
+// probe is lazy (a thunk) so the existsSync never runs on the hot path of a
+// normal command -- it is evaluated solely for `uninstall`. A dry-run or
+// cancelled uninstall leaves HOME in place, so this returns false and the
+// post-command telemetry runs as usual; a real uninstall returns true and every
+// disk-writing teardown bows out rather than mkdir the directory back to life.
+export function homeWasTornDown(cmdName: string, homeExists: () => boolean): boolean {
+  return isTeardownCommand(cmdName) && !homeExists();
+}
+
 // Testable orchestration: mints trace_id, hydrates workspace config, opens the
 // root span, runs dispatch, captures non-zero / throw signals, ends the root,
 // flushes the trace, prints the Langfuse deep link only when the trace likely
@@ -871,6 +900,14 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   const cmdName = cmd ?? "(none)";
   const subName = sub ?? null;
 
+  // Teardown command (BUG-1 D): `mla uninstall` deletes ~/.meetless as its whole
+  // point. Every post-command telemetry writer below routes through ensureHome(),
+  // which mkdir's ~/.meetless straight back into existence, so a "clean" uninstall
+  // was silently resurrecting the directory (events.jsonl + a trace deadletter).
+  // Flag the command here so both the pre-dispatch detached background check and
+  // the post-dispatch disk writers can bow out once HOME is actually gone.
+  const teardown = isTeardownCommand(cmdName);
+
   const cfg = tryReadConfig();
   // Folder = workspace (T1.1): the trace workspace comes from the nearest
   // `.meetless.json` marker, never cli-config. This bootstrap runs for EVERY
@@ -888,7 +925,12 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   // BEFORE dispatch so it overlaps the command and the parent never waits. The
   // nag itself is printed at the end of the run from whatever the LAST completed
   // check cached. Both halves are best-effort and can never change the exit code.
-  maybeSpawnBackgroundCheck({ command: cmdName, env: process.env, now: startedAtMs });
+  // Skipped for a teardown command (BUG-1 D): the detached child writes the update
+  // state under ~/.meetless and could land AFTER uninstall removes HOME, silently
+  // recreating the directory we were asked to delete.
+  if (!teardown) {
+    maybeSpawnBackgroundCheck({ command: cmdName, env: process.env, now: startedAtMs });
+  }
 
   // Content sub-kill: a null flushFn yields a no-op tracer (createRunTracer), so
   // when trace upload is off the trace plane never POSTs a span batch to control.
@@ -965,7 +1007,18 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
       : { status: code === 0 ? "ok" : "error", output: { exitCode: code } },
   );
   tracer.root.setAttribute("exit_code", code);
-  await boundedTraceFlush(tracer);
+  // homeRemoved (BUG-1 D): true only when this run was an uninstall that actually
+  // deleted ~/.meetless. A dry-run or cancelled uninstall leaves HOME in place, so
+  // this stays false and telemetry runs normally; a real uninstall skips every
+  // disk-writing teardown below so nothing mkdir's the directory back. The
+  // existsSync is short-circuited behind the command check so it only runs for
+  // uninstall, never on the hot path of every command.
+  const homeRemoved = homeWasTornDown(cmdName, () => fs.existsSync(HOME));
+  // The trace flush deadletters a failed upload under ~/.meetless; skip it once
+  // HOME is gone so a 403/5xx on the uninstall's own trace cannot resurrect it.
+  if (!homeRemoved) {
+    await boundedTraceFlush(tracer);
+  }
   setRunTracer(null);
 
   // mla_command journey event (spec section 6.2, section 11.4). Recorded after the
@@ -973,21 +1026,25 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   // the closed-enum outcome, the run's sequence fields, and timing. Local-first and
   // fully best-effort: captureCommandEvent swallows every failure so analytics can
   // never change the exit code below. sessionId is the ambient Claude Code session
-  // the same way `mla review`/`mla summary` bind it.
-  await captureCommandEvent({
-    argv,
-    exitCode: code,
-    threw,
-    thrown,
-    workspaceId,
-    sessionId: (process.env.CLAUDE_CODE_SESSION_ID || "").trim() || null,
-    actorUserId: cfg?.actorUserId ?? null,
-    mlaVersion: buildInfo.version,
-    gitSha: buildInfo.sha,
-    startedAtMs,
-    nowMs: Date.now(),
-    cfg: cfg ?? null,
-  });
+  // the same way `mla review`/`mla summary` bind it. Skipped once HOME is gone
+  // (BUG-1 D): the local jsonl append calls ensureHome() and would recreate the
+  // very directory an uninstall just removed.
+  if (!homeRemoved) {
+    await captureCommandEvent({
+      argv,
+      exitCode: code,
+      threw,
+      thrown,
+      workspaceId,
+      sessionId: (process.env.CLAUDE_CODE_SESSION_ID || "").trim() || null,
+      actorUserId: cfg?.actorUserId ?? null,
+      mlaVersion: buildInfo.version,
+      gitSha: buildInfo.sha,
+      startedAtMs,
+      nowMs: Date.now(),
+      cfg: cfg ?? null,
+    });
+  }
 
   // Deep link: print iff tracing.enabled === true AND langfuseProjectId set
   // AND (flush succeeded OR intel echoed the inbound X-Trace-ID). The gate is

@@ -46,25 +46,56 @@ chmod +x "$out"
 EOF
   chmod +x "$STUB/pkg"
 
-  # stub codesign: -dv reports adhoc; signing run drops a marker
+  # stub codesign: record every invocation's args; -dv reports adhoc; a signing
+  # or verify run drops a marker. Developer-ID mode calls `--sign ... ` then
+  # `--verify --strict ...`; both land in the marker branch and succeed.
   cat > "$STUB/codesign" <<EOF
 #!/bin/sh
+printf '%s\n' "\$*" >> "$SBX/codesign.args"
 if [ "\$1" = "-dv" ]; then echo "Signature=adhoc" >&2; exit 0; fi
 echo "signed" >> "$SBX/codesign.calls"
 exit 0
 EOF
   chmod +x "$STUB/codesign"
+
+  # stub xcrun: notarytool submit succeeds; stapler FAILS (a bare Mach-O cannot
+  # be stapled -- the real-world case), so the script must treat that as non-fatal.
+  cat > "$STUB/xcrun" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$SBX/xcrun.args"
+case "\$1" in
+  notarytool) echo "notarize: \${STUB_NOTARY_STATUS:-Accepted}"; exit "\${STUB_NOTARY_RC:-0}" ;;
+  stapler)    exit "\${STUB_STAPLER_RC:-1}" ;;
+esac
+exit 0
+EOF
+  chmod +x "$STUB/xcrun"
+
+  # stub ditto: the notary path zips the exec with `ditto -c -k <src> <dest>`;
+  # just create the dest so the flow proceeds (ditto is macOS-only, unavailable
+  # on a linux CI runner). Last positional arg is the destination zip.
+  cat > "$STUB/ditto" <<'EOF'
+#!/bin/sh
+dest=""
+for a in "$@"; do dest="$a"; done
+: > "$dest"
+EOF
+  chmod +x "$STUB/ditto"
 }
 
 run_build() {  # $1=platform-key ; extra env via remaining args
   key="$1"; shift
   OUT="$SBX/out.txt"
+  # Prepend STUB to PATH so the notary path's `ditto` resolves to the stub
+  # (ditto is macOS-only); xcrun is passed explicitly via MLA_XCRUN.
   env \
+    PATH="$STUB:$PATH" \
     MLA_CLI_DIR="$CLI" \
     MLA_RELEASE_DIR="$REL" \
     MLA_SKIP_BUILD=1 \
     MLA_PKG_BIN="$STUB/pkg" \
     MLA_CODESIGN="$STUB/codesign" \
+    MLA_XCRUN="$STUB/xcrun" \
     "$@" \
     bash "$SCRIPT" "$key" > "$OUT" 2>&1
   RC=$?
@@ -141,6 +172,60 @@ if [ "$RC" -eq 0 ] && [ "$entries" = "1" ]; then
   ok "archive root holds exactly the executable, no nested dir (DIST-P0-2)"
 else
   bad "single-entry archive" "rc=$RC entries=$entries"
+fi
+cleanup
+
+# --- Developer-ID identity set, no notary trio: real-sign + WARN, no notarize -
+new_sandbox
+run_build macos-arm64 MLA_APPLE_SIGN_IDENTITY="Developer ID Application: Test (T3AMID)"
+A="$REL/mla-aarch64-apple-darwin.tar.gz"
+if [ "$RC" -eq 0 ] && [ -f "$A" ] && checksum_valid "$A" \
+   && grep -Fq -- '--sign Developer ID Application: Test (T3AMID) --options runtime --timestamp' "$SBX/codesign.args" \
+   && grep -Fq -- '--verify --strict' "$SBX/codesign.args" \
+   && ! grep -Fq -- '-s -' "$SBX/codesign.args" \
+   && grep -Fq 'NOT notarized' "$OUT" \
+   && [ ! -f "$SBX/xcrun.args" ]; then
+  ok "Developer-ID identity signs with hardened runtime + timestamp; warns when not notarized"
+else
+  bad "dev-id sign-only" "rc=$RC out=$(cat "$OUT")"
+fi
+cleanup
+
+# --- Developer-ID + full notary trio: signs, notarizes, staple-fail non-fatal -
+new_sandbox
+run_build macos-arm64 \
+  MLA_APPLE_SIGN_IDENTITY="Developer ID Application: Test (T3AMID)" \
+  MLA_APPLE_NOTARY_KEY_ID="KEY123" \
+  MLA_APPLE_NOTARY_ISSUER_ID="issuer-uuid" \
+  MLA_APPLE_NOTARY_KEY_P8_BASE64="$(printf 'fake-p8-key' | base64)"
+A="$REL/mla-aarch64-apple-darwin.tar.gz"
+if [ "$RC" -eq 0 ] && [ -f "$A" ] && checksum_valid "$A" \
+   && grep -Fq -- '--sign Developer ID Application: Test (T3AMID)' "$SBX/codesign.args" \
+   && grep -Fq 'notarytool submit' "$SBX/xcrun.args" \
+   && grep -Fq -- '--key-id KEY123 --issuer issuer-uuid' "$SBX/xcrun.args" \
+   && grep -Fq 'stapler staple' "$SBX/xcrun.args" \
+   && grep -Fq 'cannot be stapled' "$OUT"; then
+  ok "Developer-ID + notary trio notarizes; bare-binary staple failure is non-fatal"
+else
+  bad "dev-id notarize" "rc=$RC out=$(cat "$OUT") xcrun=$(cat "$SBX/xcrun.args" 2>&1)"
+fi
+cleanup
+
+# --- notarization rejection IS fatal (a rejected submit must fail the release) -
+new_sandbox
+# STUB_NOTARY_RC makes the notarytool stub fail; the release must abort with no
+# archive, so a binary that Apple rejected is never shipped.
+run_build macos-arm64 \
+  STUB_NOTARY_RC=1 STUB_NOTARY_STATUS="Invalid" \
+  MLA_APPLE_SIGN_IDENTITY="Developer ID Application: Test (T3AMID)" \
+  MLA_APPLE_NOTARY_KEY_ID="KEY123" \
+  MLA_APPLE_NOTARY_ISSUER_ID="issuer-uuid" \
+  MLA_APPLE_NOTARY_KEY_P8_BASE64="$(printf 'fake-p8-key' | base64)"
+A="$REL/mla-aarch64-apple-darwin.tar.gz"
+if [ "$RC" -ne 0 ] && [ ! -f "$A" ] && grep -Fq 'notarization was rejected' "$OUT"; then
+  ok "a rejected notarization aborts the release (no un-notarized archive shipped)"
+else
+  bad "notary rejection fatal" "rc=$RC archive=$([ -f "$A" ] && echo yes || echo no) out=$(cat "$OUT")"
 fi
 cleanup
 

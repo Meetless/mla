@@ -1374,7 +1374,7 @@ describe("push interception hook: Part 3 reactive refresh-on-401", () => {
     refreshToken: "rt_initial",
     accessExpiresAt: "2999-01-01T00:00:00.000Z",
     sessionId: "sess_1",
-    user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+    user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
   };
 
   afterEach(() => {

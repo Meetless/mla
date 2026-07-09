@@ -20,6 +20,30 @@ SESSION_ID="${1:?session id required}"
 QUEUE_FILE="$QUEUE_DIR/$SESSION_ID.jsonl"
 LOCK="$QUEUE_DIR/$SESSION_ID.lock"
 
+# ---------------------------------------------------------------------------
+# Honest per-session flush outcome (BUG-1 E / BUG-2 H). flush.sh ALWAYS exits 0
+# (capture must never break a session), and `mla flush` used to key its
+# "[flush] ok" line purely on that exit code -- so a 401/403/404 that silently
+# re-spooled every event still printed "ok", making a wholly-down capture
+# pipeline look healthy. We now emit ONE machine-readable marker line to stdout
+# on EVERY exit path (via an EXIT trap, so no early return can skip it) and the
+# TS runFlushScript parses it to report the truth. log() writes only to logfiles
+# + TTY-stderr, so stdout is otherwise clean; the parser substring-matches this
+# exact prefix (finalize-session at Pass 3 inherits stdout, so it must NOT assume
+# last-line). The marker is inert on the nohup-detached hook path (stdout goes
+# nowhere) and is consumed only by the interactive `mla flush` orchestrator. The
+# EXIT trap fires exactly once at real exit and never inside `$(...)` command
+# substitutions (verified), so there is exactly one marker per invocation.
+FLUSH_STATUS="unknown"   # unknown -> a crash / unclassified early-exit
+DELIVERED=0              # events PATCHed to control this drain (Pass 2)
+RESPOOLED=0              # event / finalize lines kept for a later retry
+LAST_AUTH_CODE=""        # last 401/403/404 from a capture write, if any
+emit_flush_result() {
+  printf 'MLA_FLUSH_RESULT status=%s delivered=%s respooled=%s authcode=%s\n' \
+    "${FLUSH_STATUS:-unknown}" "${DELIVERED:-0}" "${RESPOOLED:-0}" "${LAST_AUTH_CODE:-}"
+}
+trap emit_flush_result EXIT
+
 CONTROL_URL="$(jq -r '.controlUrl' "$CFG")"
 # Bearer for control. cli-config is now nested-auth-only on disk (the top-level
 # controlToken is a read-time projection the TS layer adds, never persisted), so
@@ -63,6 +87,7 @@ fi
 if [[ -z "${WORKSPACE_ID:-}" ]]; then
   # No workspace resolved (no marker sidecar): nothing safe to POST. Leave queue
   # intact for a future flush (mla doctor will warn the user).
+  FLUSH_STATUS="noworkspace"
   exit 0
 fi
 
@@ -71,7 +96,7 @@ fi
 # flush). Orphan recovery happens INSIDE the lock, BEFORE detach, so a crash
 # mid-POST in a previous flush cannot strand events forever.
 exec 9>"$LOCK"
-flock -n 9 || { log "skip: another flush already holds the session lock"; exit 0; }
+flock -n 9 || { FLUSH_STATUS="locked"; log "skip: another flush already holds the session lock"; exit 0; }
 
 # Correction 11: recover orphaned *.draining.* snapshots from prior interrupted
 # flushes (laptop sleep, terminal close, SIGKILL, mid-POST crash). Concat back
@@ -111,6 +136,7 @@ fi
 
 # After recovery: if nothing to drain, exit cleanly.
 if [[ ! -s "$QUEUE_FILE" ]]; then
+  FLUSH_STATUS="empty"
   log "nothing to flush (queue empty after orphan recovery)"
   rm -f "$QUEUE_FILE"
   exec 9>&-
@@ -288,10 +314,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     log "Pass 1: created/updated agent run (POST /internal/v1/agent-runs)"
   else
     case "$HTTP_CODE" in
-      401|403|404) warn_capture_auth "$SESSION_ID" "$HTTP_CODE" "POST /internal/v1/agent-runs" ;;
+      401|403|404) warn_capture_auth "$SESSION_ID" "$HTTP_CODE" "POST /internal/v1/agent-runs"; LAST_AUTH_CODE="$HTTP_CODE" ;;
     esac
     log "Pass 1: POST /internal/v1/agent-runs FAILED (HTTP $HTTP_CODE; control unreachable or 4xx/5xx); re-spooled session_started for retry"
     spool_append "$SESSION_ID" "$LINE"
+    RESPOOLED=$((RESPOOLED + 1))
     continue
   fi
 done < "$TMP"
@@ -354,12 +381,13 @@ if [[ "${EVENT_COUNT:-0}" -gt 0 ]]; then
   rm -f "$PATCH_BODY_FILE"
   if [[ "$CURL_RC" -eq 0 ]]; then
     log "Pass 2: PATCHed $EVENT_COUNT event(s) -> /by-session/$SESSION_ID/events"
+    DELIVERED=$((DELIVERED + EVENT_COUNT))
   else
     # Non-2xx (control down, transient network, HTTP 4xx/5xx). Server dedupes on
     # eventKey, so the re-spool block below replays the lot. 401/403/404 also fire
     # a throttled local warning (fail soft); other codes just re-spool silently.
     case "$HTTP_CODE" in
-      401|403|404) warn_capture_auth "$SESSION_ID" "$HTTP_CODE" "PATCH /internal/v1/agent-runs/by-session/$SESSION_ID/events" ;;
+      401|403|404) warn_capture_auth "$SESSION_ID" "$HTTP_CODE" "PATCH /internal/v1/agent-runs/by-session/$SESSION_ID/events"; LAST_AUTH_CODE="$HTTP_CODE" ;;
     esac
     EVENTS_OK=0
     log "Pass 2: PATCH events FAILED (HTTP $HTTP_CODE; control unreachable or 4xx/5xx); will re-spool $EVENT_COUNT event(s)"
@@ -388,6 +416,7 @@ if [[ "$EVENTS_OK" == "0" ]]; then
     case "$EVT" in
       prompt_submitted|tool_used_bash|tool_used_file|session_stopped|agent_decision_captured|injection_trace|assistant_message)
         spool_append "$SESSION_ID" "$LINE"
+        RESPOOLED=$((RESPOOLED + 1))
         ;;
     esac
   done < "$TMP"
@@ -407,6 +436,7 @@ if grep -q '"event":"finalize_requested"' "$TMP" 2>/dev/null; then
     FALLBACK_KEY="$(gen_event_key)"
     spool_append "$SESSION_ID" "$(jq -c -n --arg sessionId "$SESSION_ID" --arg key "$FALLBACK_KEY" \
       '{event:"finalize_requested", eventKey:$key, sessionId:$sessionId, payload:{}}')"
+    RESPOOLED=$((RESPOOLED + 1))
   else
     HAS_FINALIZE=1
   fi
@@ -434,6 +464,7 @@ if [[ "$HAS_FINALIZE" == "1" ]]; then
     FALLBACK_KEY="$(gen_event_key)"
     spool_append "$SESSION_ID" "$(jq -c -n --arg sessionId "$SESSION_ID" --arg key "$FALLBACK_KEY" \
         '{event:"finalize_requested", eventKey:$key, sessionId:$sessionId, payload:{}}')"
+    RESPOOLED=$((RESPOOLED + 1))
   else
     log "Pass 3: finalizing session (mla _internal finalize-session) -> triggers review packet pipeline"
     if "$MLA_PATH" _internal finalize-session "$SESSION_ID"; then
@@ -453,10 +484,24 @@ if [[ "$HAS_FINALIZE" == "1" ]]; then
       FALLBACK_KEY="$(gen_event_key)"
       spool_append "$SESSION_ID" "$(jq -c -n --arg sessionId "$SESSION_ID" --arg key "$FALLBACK_KEY" \
         '{event:"finalize_requested", eventKey:$key, sessionId:$sessionId, payload:{}}')"
+      RESPOOLED=$((RESPOOLED + 1))
     fi
   fi
 fi
 
+# Classify the drain for the honest `mla flush` line (BUG-1 E / BUG-2 H). Auth
+# rejections win: a 401/403/404 on any pass means capture is DOWN (logged out,
+# not a workspace member, or a route the edge does not allow) and that is the
+# single most important thing to surface -- everything got re-spooled. Any other
+# re-spool (control 5xx, a missing filter, a deferred finalize) is a transient
+# "deferred, will retry next flush". Otherwise the queue drained clean.
+if [[ -n "$LAST_AUTH_CODE" ]]; then
+  FLUSH_STATUS="blocked"
+elif [[ "$EVENTS_OK" == "0" || "$RESPOOLED" -gt 0 ]]; then
+  FLUSH_STATUS="deferred"
+else
+  FLUSH_STATUS="ok"
+fi
 log "flush complete"
 rm -f "$TMP"
 

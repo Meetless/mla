@@ -42,8 +42,8 @@ function sampleBundle(): TokenBundle {
     refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
     user: {
       id: "u_1",
-      displayName: "An Pham",
-      email: "an@x.com",
+      displayName: "Ada Lovelace",
+      email: "ada@example.com",
       avatarUrl: null,
       role: "OWNER",
       roleVersion: 1,

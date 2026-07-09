@@ -244,12 +244,20 @@ export function removeMeetlessAgents(agentsDir: string): { changed: boolean } {
 }
 
 // Map (binPath, realPath) to the human removal instruction. Classifies by the
-// realpath shape, no shelling out:
-//   - realpath under node_modules/@meetless/mla  -> a package-manager global
-//     (pnpm if the path mentions pnpm, else npm)
-//   - otherwise a dev symlink into a source checkout -> rm the launcher, and
-//     name the repo root (the segment before /packages/cli/) so the operator
-//     can delete the clone too.
+// realpath shape, no shelling out. Four distinct install shapes, four distinct
+// instructions -- the previous version collapsed the last three into a single
+// "a dev symlink" line, which was wrong for the two most common install paths
+// (Homebrew cask, curl one-liner) and sent those users hunting for a source
+// checkout that does not exist:
+//   1. realpath under node_modules/@meetless/mla  -> package-manager global
+//      (pnpm if the path mentions pnpm, else npm); uninstall, never rm.
+//   2. realpath (or launcher) under a Homebrew Caskroom -> a cask; uninstall via
+//      brew. rm-ing the symlink leaves brew thinking mla is installed and a
+//      `brew upgrade` would resurrect it, so the launcher rm is actively wrong.
+//   3. realpath resolves into the monorepo at packages/cli -> a genuine dev
+//      symlink; rm the launcher and name the repo root so the clone can go too.
+//   4. anything else -> a real binary the curl one-liner copied (a Mach-O, not a
+//      symlink) or a manual drop-in; rm is correct, but it is NOT a dev symlink.
 export function detectBinaryRemovalHint(
   binPath: string | null,
   realPath: string | null,
@@ -258,6 +266,8 @@ export function detectBinaryRemovalHint(
     return ["Could not find `mla` on your PATH. If a copy remains, remove it manually."];
   }
   const probe = realPath ?? "";
+
+  // 1. Package-manager global.
   const pkgMarker = `${path.sep}node_modules${path.sep}@meetless${path.sep}mla`;
   if (probe.includes(pkgMarker)) {
     const isPnpm = /pnpm/.test(probe) || /pnpm/.test(binPath);
@@ -266,13 +276,29 @@ export function detectBinaryRemovalHint(
       isPnpm ? "  pnpm rm -g @meetless/mla" : "  npm uninstall -g @meetless/mla",
     ];
   }
-  const lines = ["Remove the `mla` launcher (a dev symlink):", `  rm ${binPath}`];
-  if (realPath) {
-    const marker = `${path.sep}packages${path.sep}cli${path.sep}`;
-    const idx = realPath.indexOf(marker);
+
+  // 2. Homebrew cask. brew stages the binary under <prefix>/Caskroom/mla/... and
+  //    symlinks it onto PATH from <prefix>/bin. Match on either the symlink
+  //    target (the usual signal) or the launcher path itself.
+  const caskMarker = `${path.sep}Caskroom${path.sep}`;
+  if (probe.includes(caskMarker) || binPath.includes(caskMarker)) {
+    return [
+      "Remove the Homebrew cask (do NOT `rm` the launcher -- brew would resurrect it):",
+      "  brew uninstall --cask mla",
+    ];
+  }
+
+  // 3. Dev symlink into a source checkout.
+  const devMarker = `${path.sep}packages${path.sep}cli${path.sep}`;
+  if (realPath && realPath.includes(devMarker)) {
+    const lines = ["Remove the `mla` launcher (a dev symlink):", `  rm ${binPath}`];
+    const idx = realPath.indexOf(devMarker);
     if (idx > 0) {
       lines.push(`If you no longer need the source, delete the checkout at ${realPath.slice(0, idx)}`);
     }
+    return lines;
   }
-  return lines;
+
+  // 4. Real installed binary (curl one-liner copy or manual drop-in).
+  return ["Remove the `mla` binary:", `  rm ${binPath}`];
 }

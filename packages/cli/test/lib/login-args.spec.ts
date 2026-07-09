@@ -89,8 +89,8 @@ describe("runLogin early-return gates", () => {
     refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
     user: {
       id: "u_1",
-      displayName: "An Pham",
-      email: "an@x.com",
+      displayName: "Ada Lovelace",
+      email: "ada@example.com",
       avatarUrl: null,
       role: "OWNER",
       roleVersion: 1,
@@ -137,7 +137,7 @@ describe("runLogin early-return gates", () => {
     // Bootstrap does NOT short-circuit: it falls through to the browser flow,
     // which writes the user-token and logs success.
     expect(browserLogin).toHaveBeenCalledTimes(1);
-    expect(logs.join("\n")).toMatch(/Logged in as An Pham/);
+    expect(logs.join("\n")).toMatch(/Logged in as Ada Lovelace/);
     expect(JSON.parse(fs.readFileSync(cfgPath, "utf8")).auth.mode).toBe("user-token");
   });
 
@@ -155,7 +155,7 @@ describe("runLogin early-return gates", () => {
           accessExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
           refreshExpiresAt: farFuture,
           sessionId: "sess_1",
-          user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+          user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
         },
       }),
     );
@@ -166,7 +166,7 @@ describe("runLogin early-return gates", () => {
     const verifySession = jest.fn(async () => {});
     expect(await runLogin([], { verifySession })).toBe(0);
     expect(verifySession).toHaveBeenCalledTimes(1);
-    expect(logs.join("\n")).toMatch(/Already logged in as An Pham/);
+    expect(logs.join("\n")).toMatch(/Already logged in as Ada Lovelace/);
     // Never echoes a token.
     expect(logs.join("\n")).not.toMatch(/at_1|rt_1/);
   });
@@ -198,8 +198,8 @@ describe("runLogin dead-session self-heal", () => {
     refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
     user: {
       id: "u_1",
-      displayName: "An Pham",
-      email: "an@x.com",
+      displayName: "Ada Lovelace",
+      email: "ada@example.com",
       avatarUrl: null,
       role: "OWNER",
       roleVersion: 1,
@@ -223,7 +223,7 @@ describe("runLogin dead-session self-heal", () => {
           accessExpiresAt: new Date(Date.now() - 60_000).toISOString(),
           refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
           sessionId: "sess_old",
-          user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+          user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
         },
       }),
     );
@@ -284,7 +284,7 @@ describe("runLogin dead-session self-heal", () => {
     expect(verifySession).toHaveBeenCalledTimes(1);
     expect(browserLogin).toHaveBeenCalledTimes(1);
     expect(logs.join("\n")).toMatch(/Re-authenticating/i);
-    expect(logs.join("\n")).toMatch(/Logged in as An Pham/);
+    expect(logs.join("\n")).toMatch(/Logged in as Ada Lovelace/);
     // The dead tokens were replaced on disk with the freshly-minted ones.
     const written = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
     expect(written.auth.accessToken).toBe("at_new");
@@ -314,7 +314,7 @@ describe("runLogin dead-session self-heal", () => {
           accessExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
           refreshExpiresAt: farFuture,
           sessionId: "sess_old",
-          user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+          user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
         },
       }),
     );
@@ -331,7 +331,7 @@ describe("runLogin dead-session self-heal", () => {
     expect(verifySession).toHaveBeenCalledTimes(1);
     expect(browserLogin).toHaveBeenCalledTimes(1);
     expect(logs.join("\n")).toMatch(/Re-authenticating/i);
-    expect(logs.join("\n")).toMatch(/Logged in as An Pham/);
+    expect(logs.join("\n")).toMatch(/Logged in as Ada Lovelace/);
   });
 
   it("no-ops when the access token is expired but control confirms the session is still live", async () => {
@@ -345,7 +345,7 @@ describe("runLogin dead-session self-heal", () => {
     expect(await runLogin([], { verifySession, browserLogin })).toBe(0);
     expect(verifySession).toHaveBeenCalledTimes(1);
     expect(browserLogin).not.toHaveBeenCalled();
-    expect(logs.join("\n")).toMatch(/Already logged in as An Pham/);
+    expect(logs.join("\n")).toMatch(/Already logged in as Ada Lovelace/);
   });
 
   it("keeps the cached session (no doomed browser flow) when control is unreachable", async () => {
@@ -360,7 +360,7 @@ describe("runLogin dead-session self-heal", () => {
     expect(await runLogin([], { verifySession, browserLogin })).toBe(0);
     expect(verifySession).toHaveBeenCalledTimes(1);
     expect(browserLogin).not.toHaveBeenCalled();
-    expect(logs.join("\n")).toMatch(/Already logged in as An Pham/);
+    expect(logs.join("\n")).toMatch(/Already logged in as Ada Lovelace/);
     expect(logs.join("\n")).toMatch(/could not verify/i);
   });
 
@@ -378,7 +378,7 @@ describe("runLogin dead-session self-heal", () => {
           accessExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
           refreshExpiresAt: farFuture,
           sessionId: "sess_old",
-          user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+          user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
         },
       }),
     );
@@ -391,6 +391,6 @@ describe("runLogin dead-session self-heal", () => {
     expect(await runLogin(["--force"], { verifySession, browserLogin })).toBe(0);
     expect(verifySession).not.toHaveBeenCalled();
     expect(browserLogin).toHaveBeenCalledTimes(1);
-    expect(logs.join("\n")).toMatch(/Logged in as An Pham/);
+    expect(logs.join("\n")).toMatch(/Logged in as Ada Lovelace/);
   });
 });

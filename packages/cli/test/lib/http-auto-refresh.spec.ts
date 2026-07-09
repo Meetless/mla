@@ -139,7 +139,7 @@ describe("doFetch auth policy (§6.4/§6.5)", () => {
           accessExpiresAt,
           refreshExpiresAt: FAR(),
           sessionId: "sess_1",
-          user: { id: "u_1", displayName: "An Pham", email: null, role: "OWNER" },
+          user: { id: "u_1", displayName: "Ada Lovelace", email: null, role: "OWNER" },
         },
       }),
     );

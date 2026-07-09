@@ -112,7 +112,7 @@ describe("runLogout", () => {
         accessExpiresAt,
         refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
         sessionId: "sess_1",
-        user: { id: "u_1", displayName: "An Pham", email: null, role: "OWNER" },
+        user: { id: "u_1", displayName: "Ada Lovelace", email: null, role: "OWNER" },
       },
     };
   }
@@ -136,7 +136,7 @@ describe("runLogout", () => {
     expect(d.auth).toEqual({ mode: "none" });
     expect(d).not.toHaveProperty("controlToken");
     expect(d).not.toHaveProperty("actorUserId");
-    expect(logs.join("\n")).toMatch(/Logged out An Pham/);
+    expect(logs.join("\n")).toMatch(/Logged out Ada Lovelace/);
   });
 
   it("succeeds even when the access token already expired (refresh token is the proof)", async () => {

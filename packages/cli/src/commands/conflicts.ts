@@ -25,7 +25,7 @@
 //                                    positive).
 //
 // Both write verbs hit the SAME control endpoint the console Conflict Detail page
-// drives (POST /internal/v1/cases/:caseId/resolve-session-conflict), so a terminal
+// drives (POST /internal/v1/session-conflicts/:caseId/resolve), so a terminal
 // resolve is byte-for-byte the console resolve: it closes the case on the mapped
 // resolution, writes the SESSION_CONFLICT_RESOLVED audit row under the operator's
 // identity, and (for the outcomes that need it) broadcasts a steer to the loser
@@ -156,9 +156,10 @@ function defaultFetchConflicts(
   );
 }
 
-// POST one verdict to the same endpoint the console Conflict Detail page drives.
-// The body carries workspaceId + outcome + rationale; the actor is derived
-// server-side from the cli-session token (INV-AUTH-1), never sent from here.
+// POST one verdict to /internal/v1/session-conflicts/:caseId/resolve, the same
+// endpoint the console Conflict Detail page drives. The body carries workspaceId +
+// outcome + rationale; the actor is derived server-side from the cli-session token
+// (INV-AUTH-1), never sent from here.
 function defaultResolveConflict(
   cfg: WorkspaceCliConfig,
   caseId: string,
@@ -167,7 +168,7 @@ function defaultResolveConflict(
 ): Promise<ResolveConflictResult> {
   return post<ResolveConflictResult>(
     cfg,
-    `/internal/v1/cases/${encodeURIComponent(caseId)}/resolve-session-conflict`,
+    `/internal/v1/session-conflicts/${encodeURIComponent(caseId)}/resolve`,
     { workspaceId: cfg.workspaceId, outcome, rationale },
     RESOLVE_TIMEOUT_MS,
   );

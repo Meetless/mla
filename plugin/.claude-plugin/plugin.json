@@ -1,6 +1,6 @@
 {
   "name": "mla",
-  "version": "0.2.1",
+  "version": "0.2.7",
   "description": "The Meetless agent CLI (mla): capture hooks, the governed-memory MCP server, and the /mla:cli and /mla:onboard skills for Claude Code.",
   "author": {
     "name": "Meetless"

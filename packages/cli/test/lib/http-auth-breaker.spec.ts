@@ -135,7 +135,7 @@ describe("doFetch dead-auth circuit breaker", () => {
           accessExpiresAt,
           refreshExpiresAt: FAR(),
           sessionId: "sess_1",
-          user: { id: "u_1", displayName: "An Pham", email: null, role: "OWNER" },
+          user: { id: "u_1", displayName: "Ada Lovelace", email: null, role: "OWNER" },
         },
       }),
     );

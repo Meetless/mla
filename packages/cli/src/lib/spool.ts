@@ -414,11 +414,101 @@ export function executeQueuePrune(
   return result;
 }
 
-export function runFlushScript(sessionId: string, hookDir: string): { ok: boolean; stderr: string } {
+// Honest per-session flush outcome (BUG-1 E / BUG-2 H). flush.sh ALWAYS exits 0
+// -- capture must never break a session -- so the process exit code carries no
+// signal. The real outcome rides on a single machine-readable marker the flush's
+// EXIT trap prints to stdout: `MLA_FLUSH_RESULT status=... delivered=N
+// respooled=N authcode=...`. Statuses:
+//   ok          drain delivered clean (events PATCHed, or session_started only)
+//   empty       nothing was queued to send
+//   locked      another flush already held the session lock (benign, retry later)
+//   noworkspace no marker workspace bound; queue left intact
+//   deferred    a transient failure (control 5xx / missing filter) re-spooled; retry
+//   blocked     an auth rejection (401/403/404) re-spooled EVERYTHING; capture is down
+//   unknown     marker absent (pre-BUG-1-E hook) or the flush crashed before the trap
+export type FlushStatus =
+  | "ok"
+  | "empty"
+  | "locked"
+  | "noworkspace"
+  | "deferred"
+  | "blocked"
+  | "unknown";
+
+export interface FlushScriptResult {
+  ok: boolean; // true only for a clean/empty drain (nothing left behind)
+  status: FlushStatus;
+  delivered: number; // events PATCHed to control this drain
+  respooled: number; // event/finalize lines kept for a later retry
+  authCode: string; // the 401/403/404 that blocked capture, or "" if none
+  stderr: string;
+}
+
+const FLUSH_RESULT_RE =
+  /^MLA_FLUSH_RESULT status=(\S+) delivered=(\d+) respooled=(\d+) authcode=(\S*)\s*$/;
+
+function normalizeFlushStatus(raw: string): FlushStatus {
+  switch (raw) {
+    case "ok":
+    case "empty":
+    case "locked":
+    case "noworkspace":
+    case "deferred":
+    case "blocked":
+      return raw;
+    default:
+      return "unknown";
+  }
+}
+
+// Parse the flush marker out of the script's stdout. The EXIT trap prints exactly
+// one marker at the real script exit, so it is the LAST matching line;
+// finalize-session (Pass 3) inherits stdout but never emits this prefix, so a
+// line scan is safe. Returns null when no marker is present (older hook, or a
+// bash that died before the trap fired).
+export function parseFlushResult(stdout: string): Omit<FlushScriptResult, "stderr"> | null {
+  const lines = stdout.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = FLUSH_RESULT_RE.exec(lines[i].trim());
+    if (!m) continue;
+    const status = normalizeFlushStatus(m[1]);
+    return {
+      ok: status === "ok" || status === "empty",
+      status,
+      delivered: Number(m[2]) || 0,
+      respooled: Number(m[3]) || 0,
+      authCode: m[4] || "",
+    };
+  }
+  return null;
+}
+
+export function runFlushScript(sessionId: string, hookDir: string): FlushScriptResult {
   const flush = path.join(hookDir, "flush.sh");
   if (!fs.existsSync(flush)) {
-    return { ok: false, stderr: `flush.sh not found at ${flush}` };
+    return {
+      ok: false,
+      status: "unknown",
+      delivered: 0,
+      respooled: 0,
+      authCode: "",
+      stderr: `flush.sh not found at ${flush}`,
+    };
   }
   const r = spawnSync("bash", [flush, sessionId], { encoding: "utf8" });
-  return { ok: r.status === 0, stderr: r.stderr || "" };
+  const parsed = parseFlushResult(r.stdout || "");
+  if (!parsed) {
+    // No marker: an older hook that predates BUG-1 E, or a flush that died before
+    // its EXIT trap ran. Fall back to the (always-0) exit code so behaviour never
+    // regresses for a stale hook -- worst case it reports the pre-fix "ok".
+    return {
+      ok: r.status === 0,
+      status: "unknown",
+      delivered: 0,
+      respooled: 0,
+      authCode: "",
+      stderr: r.stderr || "",
+    };
+  }
+  return { ...parsed, stderr: r.stderr || "" };
 }

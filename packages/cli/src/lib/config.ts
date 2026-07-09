@@ -453,6 +453,12 @@ export function writeConfig(cfg: CliConfig): void {
   };
 
   fs.writeFileSync(CFG_PATH, JSON.stringify(onDisk, null, 2) + "\n", { mode: 0o600 });
+  // The `mode` option above is honored ONLY when writeFileSync CREATES the file;
+  // on an overwrite (every token refresh / re-login / workspace switch) it is a
+  // no-op, so a config that was ever created loose (older CLI, permissive umask)
+  // would stay loose forever. Re-assert 0600 explicitly on every write so the
+  // token file is always owner-only, regardless of how it first landed.
+  fs.chmodSync(CFG_PATH, 0o600);
 }
 
 export function configExists(): boolean {

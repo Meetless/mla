@@ -23,6 +23,35 @@ describe("detectBinaryRemovalHint", () => {
     expect(hint).toContain("rm /opt/homebrew/bin/mla");
     expect(hint).toContain("/Users/x/code/mla");
     expect(hint).not.toContain("npm uninstall");
+    expect(hint).not.toContain("brew uninstall");
+  });
+
+  it("Homebrew cask (symlink resolves into Caskroom) -> brew uninstall --cask, never rm", () => {
+    const real = "/opt/homebrew/Caskroom/mla/0.2.4/mla";
+    const hint = detectBinaryRemovalHint("/opt/homebrew/bin/mla", real).join("\n");
+    expect(hint).toContain("brew uninstall --cask mla");
+    // The launcher rm is actively wrong for a cask: brew would resurrect it.
+    expect(hint).not.toContain("rm /opt/homebrew/bin/mla");
+    expect(hint).not.toContain("dev symlink");
+  });
+
+  it("curl-installed real Mach-O binary -> rm the binary, NOT labeled a dev symlink", () => {
+    // curl copies a real binary onto PATH; there is no symlink and no source
+    // checkout. realPath === binPath (a real file). rm is right; the old code
+    // mislabeled this "a dev symlink" and pointed at a non-existent checkout.
+    const bin = "/usr/local/bin/mla";
+    const hint = detectBinaryRemovalHint(bin, bin).join("\n");
+    expect(hint).toContain("rm /usr/local/bin/mla");
+    expect(hint).not.toContain("dev symlink");
+    expect(hint).not.toContain("delete the checkout");
+    expect(hint).not.toContain("brew uninstall");
+    expect(hint).not.toContain("npm uninstall");
+  });
+
+  it("curl-installed binary with no resolvable realpath -> rm the binary", () => {
+    const hint = detectBinaryRemovalHint("/usr/local/bin/mla", null).join("\n");
+    expect(hint).toContain("rm /usr/local/bin/mla");
+    expect(hint).not.toContain("dev symlink");
   });
 
   it("not found on PATH -> manual guidance, no command", () => {

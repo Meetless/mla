@@ -74,7 +74,7 @@ describe("runWhoami", () => {
         accessExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
         refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
         sessionId: "sess_1",
-        user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+        user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
       },
     };
   }
@@ -108,7 +108,7 @@ describe("runWhoami", () => {
     seed(userTokenConfig());
     const getMeFn = jest.fn(async () => ({
       mode: "cli-session" as const,
-      user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+      user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
       workspace: { id: "ws_1", name: "Acme", slug: "acme" },
       sessionId: "sess_1",
       accessExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
@@ -119,7 +119,7 @@ describe("runWhoami", () => {
     expect(code).toBe(0);
     expect(getMeFn).toHaveBeenCalledTimes(1);
     const out = logs.join("\n");
-    expect(out).toMatch(/Logged in as An Pham <an@x.com>/);
+    expect(out).toMatch(/Logged in as Ada Lovelace <ada@example.com>/);
     expect(out).toMatch(/Workspace: Acme \(acme\)/);
     expect(out).not.toMatch(/at_1|rt_1/);
   });
@@ -144,7 +144,7 @@ describe("runWhoami", () => {
     const code = await runWhoami([], { log: collect, getMeFn });
     expect(code).toBe(1);
     expect(errs.join("\n")).toMatch(/Could not reach control/);
-    expect(logs.join("\n")).toMatch(/Cached identity: An Pham <an@x.com>.*unverified/);
+    expect(logs.join("\n")).toMatch(/Cached identity: Ada Lovelace <ada@example.com>.*unverified/);
   });
 
   it("rejects stray arguments with exit 2", async () => {

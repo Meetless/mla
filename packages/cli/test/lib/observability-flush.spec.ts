@@ -207,6 +207,29 @@ describe("boundedTraceFlush failure path (P1.T5)", () => {
     expect(matches).toHaveLength(1);
     expect(didTraceFlushSucceed()).toBe(false);
   });
+
+  // BUG-1 (G): the marker-model membership denial. When the folder marker names
+  // a workspace the logged-in user is not a member of, control answers the trace
+  // relay with 403 WORKSPACE_ACCESS_DENIED on EVERY command for the whole
+  // session. That is a stable, expected, non-retryable condition -- not a
+  // failure -- so it must be silenced exactly like the §9 policy refusal, not
+  // nagged once per command. (A token-auth 403 above still warns; only these two
+  // codes are swallowed.)
+  it("stays SILENT on a marker-model WORKSPACE_ACCESS_DENIED 403", async () => {
+    const tracer = stubTracer(async () => {
+      const e = new Error(
+        "POST .../agent-traces/ingest -> HTTP 403: " +
+          '{"code":"WORKSPACE_ACCESS_DENIED","message":"You are not a member of workspace \'cmq9l2xom002n5ueiwjuoy9bb\'."}',
+      ) as Error & { status?: number };
+      e.status = 403;
+      throw e;
+    });
+
+    await boundedTraceFlush(tracer);
+
+    expect(stderrBuf).toBe("");
+    expect(didTraceFlushSucceed()).toBe(false);
+  });
 });
 
 // F8 (telemetry-upload-failed) wiring. On a real, non-policy flush failure

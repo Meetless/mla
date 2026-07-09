@@ -1,5 +1,48 @@
-import { listActiveSessions, runFlushScript, reapQueue } from "../lib/spool";
+import { listActiveSessions, runFlushScript, reapQueue, FlushScriptResult } from "../lib/spool";
 import { HOOKS_DIR } from "../lib/config";
+
+// Turn a parsed flush outcome into an honest one-line report (BUG-1 E / BUG-2 H).
+// The old loop keyed everything on flush.sh's exit code, which is ALWAYS 0, so a
+// 403 that silently re-spooled every event still printed "[flush] <sid> ok". Now
+// each status maps to a distinct line, and only genuinely-lost/blocked drains
+// (`blocked`, `unknown`-with-nonzero-exit) count toward the non-zero exit code.
+// `deferred` is a transient retry, not a failure -- surfaced but not counted.
+export function describeFlush(
+  sid: string,
+  r: FlushScriptResult,
+): { text: string; bad: boolean } {
+  switch (r.status) {
+    case "ok":
+      return { text: `[flush] ${sid} ok (delivered ${r.delivered})`, bad: false };
+    case "empty":
+      return { text: `[flush] ${sid} nothing to flush`, bad: false };
+    case "locked":
+      return { text: `[flush] ${sid} busy (another flush is running)`, bad: false };
+    case "noworkspace":
+      return {
+        text: `[flush] ${sid} skipped: no workspace bound to this session (queue kept). Run 'mla doctor'.`,
+        bad: false,
+      };
+    case "deferred":
+      return {
+        text: `[flush] ${sid} deferred: re-spooled ${r.respooled} (control unreachable or events not yet persisted); will retry next flush`,
+        bad: false,
+      };
+    case "blocked":
+      return {
+        text:
+          `[flush] ${sid} capture BLOCKED (HTTP ${r.authCode || "4xx"}); re-spooled ${r.respooled}. ` +
+          `You are logged out or not a member of this workspace -- run 'mla doctor' / 'mla login'.`,
+        bad: true,
+      };
+    default:
+      // "unknown": marker absent. runFlushScript set ok from the (always-0) exit
+      // code, so trust that -- a stale pre-BUG-1-E hook reports its old "ok".
+      return r.ok
+        ? { text: `[flush] ${sid} ok`, bad: false }
+        : { text: `[flush] ${sid} FAILED: ${r.stderr.slice(0, 200)}`, bad: true };
+  }
+}
 
 // `mla flush` (§3 hour 6 + Acceptance A11)
 //
@@ -185,11 +228,12 @@ export async function runFlush(
     } else {
       for (const sid of sessions) {
         const r = runFlushScript(sid, hookDir);
-        if (!r.ok) {
+        const line = describeFlush(sid, r);
+        if (line.bad) {
           bad += 1;
-          if (!quiet) console.error(`[flush] ${sid} FAILED: ${r.stderr.slice(0, 200)}`);
+          if (!quiet) console.error(line.text);
         } else if (!quiet) {
-          console.log(`[flush] ${sid} ok`);
+          console.log(line.text);
         }
       }
     }

@@ -17,7 +17,7 @@ function userToken(
     accessExpiresAt,
     refreshExpiresAt,
     sessionId: "sess_1",
-    user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+    user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
   };
 }
 
@@ -38,7 +38,7 @@ describe("describeAuthMode", () => {
     const out = describeAuthMode(
       userToken(new Date(Date.now() + 3 * 3600_000 + 30 * 60_000).toISOString()),
     );
-    expect(out).toBe("user-token (An Pham; access expires ~3h)");
+    expect(out).toBe("user-token (Ada Lovelace; access expires ~3h)");
   });
 
   it("shows days of runway at or beyond 48h", () => {
@@ -46,7 +46,7 @@ describe("describeAuthMode", () => {
     const out = describeAuthMode(
       userToken(new Date(Date.now() + 5 * 86_400_000 + 12 * 3600_000).toISOString()),
     );
-    expect(out).toBe("user-token (An Pham; access expires ~5d)");
+    expect(out).toBe("user-token (Ada Lovelace; access expires ~5d)");
   });
 
   it("flags an expired access token as conditionally refreshable, NOT a guaranteed refresh", () => {
@@ -55,7 +55,7 @@ describe("describeAuthMode", () => {
     // must point at `mla login` as the fallback and never promise a refresh that
     // could fail (the old "(will auto-refresh)" lie trapped operators).
     const out = describeAuthMode(userToken(new Date(Date.now() - 3600_000).toISOString()));
-    expect(out).toBe("user-token (An Pham; access token expired (auto-refresh, else `mla login`))");
+    expect(out).toBe("user-token (Ada Lovelace; access token expired (auto-refresh, else `mla login`))");
     expect(out).not.toMatch(/will auto-refresh/);
   });
 
@@ -66,12 +66,12 @@ describe("describeAuthMode", () => {
         new Date(Date.now() - 86_400_000).toISOString(),
       ),
     );
-    expect(out).toBe("user-token (An Pham; session expired; run `mla login`)");
+    expect(out).toBe("user-token (Ada Lovelace; session expired; run `mla login`)");
   });
 
   it("tolerates an unparseable expiry without crashing", () => {
     const out = describeAuthMode(userToken("not-a-date"));
-    expect(out).toBe("user-token (An Pham; expiry unknown)");
+    expect(out).toBe("user-token (Ada Lovelace; expiry unknown)");
   });
 
   it("falls back to the user id when the display name is empty, and never prints a token", () => {

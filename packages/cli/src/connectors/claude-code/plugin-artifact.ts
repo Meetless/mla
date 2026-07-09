@@ -148,6 +148,42 @@ if command -v mla >/dev/null 2>&1; then
   fi
 fi
 
+# No binary on any candidate path. resolve-mla runs only as the \`meetless\` MCP
+# server command, so this is the MCP boot. Self-heal ONCE: fetch the
+# tool-agnostic binary from the same installer the website serves so
+# \`claude plugin install mla@meetless\` works even when the plugin was installed
+# before the binary. Opt out with MEETLESS_MLA_NO_BOOTSTRAP=1; override the
+# installer source with MEETLESS_INSTALL_URL (enterprise mirror / tests). Every
+# line here writes to stderr: stdout is the MCP JSON-RPC channel and must stay clean.
+bootstrap_target="\${HOME:-}/.meetless/bin/mla"
+if [ "\${MEETLESS_MLA_NO_BOOTSTRAP:-}" != "1" ] && [ -n "\${HOME:-}" ]; then
+  install_url="\${MEETLESS_INSTALL_URL:-https://meetless.ai/install.sh}"
+  if command -v curl >/dev/null 2>&1; then
+    fetch="curl -fsSL --max-time 180"
+  elif command -v wget >/dev/null 2>&1; then
+    fetch="wget -qO- --timeout=180"
+  else
+    fetch=""
+  fi
+  if [ -n "\$fetch" ]; then
+    mkdir -p "\${HOME}/.meetless" 2>/dev/null || true
+    lock="\${HOME}/.meetless/.mla-bootstrap.lock"
+    # Atomic single-runner guard: if two Claude Code sessions cold-boot the MCP
+    # at once, only the lock holder installs; the other falls through to the hint
+    # and boots clean on its next restart once the binary lands.
+    if mkdir "\$lock" 2>/dev/null; then
+      trap 'rmdir "\$lock" 2>/dev/null' EXIT INT TERM
+      printf 'resolve-mla: mla binary not found; bootstrapping once from %s (MEETLESS_MLA_NO_BOOTSTRAP=1 to skip)...\\n' "\$install_url" >&2
+      # MLA_NO_WIRE=1: the plugin IS the Claude Code wiring; the installer must
+      # not hand-wire ~/.claude too, or the two would double-wire.
+      \$fetch "\$install_url" 2>/dev/null | MLA_NO_WIRE=1 sh >&2 || true
+      rmdir "\$lock" 2>/dev/null || true
+      trap - EXIT INT TERM
+      [ -x "\$bootstrap_target" ] && exec "\$bootstrap_target" "\$@"
+    fi
+  fi
+fi
+
 printf 'resolve-mla: could not find the \`mla\` binary. Install it (https://meetless.ai/install.sh) or set MEETLESS_MLA_PATH.\\n' >&2
 exit 127
 `;

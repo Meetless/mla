@@ -87,7 +87,7 @@ describe("mla _internal refresh", () => {
             opts?.accessExpiresAt ?? new Date(Date.now() + 3600_000).toISOString(),
           refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
           sessionId: "sess_1",
-          user: { id: "u_1", displayName: "An Pham", email: "an@x.com", role: "OWNER" },
+          user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
         },
       }),
     );

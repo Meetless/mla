@@ -273,6 +273,30 @@ async function triggerOnDemandReview(
   }
 }
 
+// `mla review --help` / `-h`. The strict parsers above THROW on any `--`/`-`
+// token (that strictness is deliberate for stray flags), but `--help` is not a
+// stray flag -- it is the one universally-expected request, and throwing
+// "Unknown flag: --help" on it reads as the tool being broken. So the
+// dispatcher intercepts help BEFORE either parser runs and prints this instead.
+export function reviewUsage(): string {
+  return [
+    "Usage: mla review [--plain] [--no-flush]",
+    "       mla review <id>",
+    "",
+    "Show the current Claude Code session's review packet, or emit a console",
+    "deep link for a specific relationship-candidate / case id.",
+    "",
+    "Flags (no-arg form only):",
+    "  --plain      Strip ANSI colour from the rendered packet.",
+    "  --no-flush   Skip draining the spool queues before polling.",
+    "  -h, --help   Show this help and exit.",
+    "",
+    "With no id and no CLAUDE_CODE_SESSION_ID set, prints the console review",
+    "queue URLs. `mla review <id>` resolves the id to /relationships/<id> or",
+    "/cases/<id>.",
+  ].join("\n");
+}
+
 // `mla review` (no args). Resolves the current session from
 // CLAUDE_CODE_SESSION_ID and polls the by-session packet endpoint. The poll
 // shape is exactly the previous `mla review by-session <sid>` path; the only

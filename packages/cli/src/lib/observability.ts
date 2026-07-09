@@ -655,11 +655,25 @@ export function makeHttpFlush(opts: {
 // drift on the literal.
 const TRACING_DISABLED_CODE = "TRACING_NOT_ENABLED_FOR_WORKSPACE";
 
-// True when a flush error is the §9 tracing-policy refusal: either tagged by
-// makeHttpFlush, or (defense in depth, if the tag is ever lost in transit) a
-// 403 whose message carries the policy code. Such a refusal is expected and
-// must NOT surface a "trace upload failed" warning.
-function isTracingPolicyDisabled(err: unknown): boolean {
+// Control's marker-model 403 code (apps/control api-exception.ts
+// workspaceAccessDenied): the folder `.meetless.json` marker named a workspace
+// the logged-in user is not a member of. On the trace-relay path the marker is
+// fixed for the whole run, so this fires on EVERY command for the entire session
+// -- exactly the "warn: trace upload failed (HTTP 403) on every single command"
+// noise BUG-1 flagged. It is not transient and not fixable by retry (you simply
+// cannot relay traces for a workspace you are not in), so it is a silent skip,
+// the same class as the §9 policy refusal.
+const WORKSPACE_ACCESS_DENIED_CODE = "WORKSPACE_ACCESS_DENIED";
+
+// True when a flush error is one of the two control refusals we deliberately
+// swallow instead of warning on: the §9 tracing-policy refusal, or the
+// marker-model workspace-access denial. Both are stable, per-session, expected
+// conditions under normal multi-workspace / non-member operation, so a
+// per-command "trace upload failed" line is pure noise. Every OTHER failure --
+// a token/auth 403, any 5xx, a connection refusal, a timeout -- still warns
+// loudly. Recognized by the makeHttpFlush tag (policy only) or, defense in
+// depth, the body-borne code carried in the error message.
+function isSilencedTraceFlushError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const e = err as {
     tracingDisabledByPolicy?: boolean;
@@ -667,10 +681,10 @@ function isTracingPolicyDisabled(err: unknown): boolean {
     message?: string;
   };
   if (e.tracingDisabledByPolicy === true) return true;
+  if (e.status !== 403 || typeof e.message !== "string") return false;
   return (
-    e.status === 403 &&
-    typeof e.message === "string" &&
-    e.message.includes(TRACING_DISABLED_CODE)
+    e.message.includes(TRACING_DISABLED_CODE) ||
+    e.message.includes(WORKSPACE_ACCESS_DENIED_CODE)
   );
 }
 
@@ -845,9 +859,10 @@ export async function boundedTraceFlush(
     // Not relayed either way, so no trace URL to advertise (cli.ts gates on
     // didTraceFlushSucceed()).
     traceFlushSucceeded = false;
-    // A §9 tracing-policy refusal is expected, not a failure: stay silent.
-    // Every real failure (auth, 5xx, connection refused, timeout) still warns.
-    if (!isTracingPolicyDisabled(flushErr)) {
+    // A §9 tracing-policy refusal or a marker-model workspace-access denial is
+    // expected, not a failure: stay silent (both fire on every command). Every
+    // real failure (token/auth 403, 5xx, connection refused, timeout) still warns.
+    if (!isSilencedTraceFlushError(flushErr)) {
       process.stderr.write(
         `warn: trace upload failed (${describeFlushErr(flushErr)}); ` +
           `Sentry event still carries trace_id\n`,
