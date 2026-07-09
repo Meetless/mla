@@ -77,6 +77,17 @@ EOF
 CASK_CAVEATS=$(cat <<'EOF'
   binary "mla"
 
+  # The release binary is ad-hoc signed; Developer-ID notarization is not wired
+  # yet. Homebrew stamps com.apple.quarantine on cask artifacts, and on Apple
+  # Silicon a quarantined + un-notarized binary is SIGKILLed by Gatekeeper
+  # (exit 137) with a scary "move to Trash" popup. Strip the quarantine xattr so
+  # `mla` runs. This is the stopgap; delete it once the binary is notarized +
+  # stapled (build-release.sh MLA_APPLE_* path), which fixes it at the source.
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", staged_path]
+  end
+
   caveats <<~CAVEATS
     The mla command is now on your PATH via Homebrew.
     Get started:  mla --help

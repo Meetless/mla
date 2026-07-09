@@ -15,6 +15,7 @@ VERSION="${VERSION#v}"                          # accept 0.4.2 or v0.4.2; normal
 # release pipeline can publish either way unchanged.
 DOWNLOAD_BASE="${MLA_DOWNLOAD_URL:-https://storage.googleapis.com/meetless-public/cli/releases}"
 NO_MODIFY_PATH="${MLA_NO_MODIFY_PATH:-0}"
+NO_WIRE="${MLA_NO_WIRE:-0}"                     # skip wiring mla into Claude Code (CI/headless/paranoid)
 ALLOW_UNVERIFIED="${MLA_ALLOW_UNVERIFIED:-0}"   # dev/test ONLY; never documented on the install page
 
 main() {
@@ -45,14 +46,49 @@ main() {
   [ -f "$tmp/$APP" ] || err "archive did not contain '$APP' at its root (release-layout bug)"
   mkdir -p "$INSTALL_DIR" || err "could not create $INSTALL_DIR"
   install_bin "$tmp/$APP" "$INSTALL_DIR/$APP"
+  strip_quarantine "$INSTALL_DIR/$APP"
 
   write_env "$INSTALL_DIR"        # always written, so the success message never lies
   configure_path "$INSTALL_DIR"   # rc mutation only; skipped under MLA_NO_MODIFY_PATH=1
+
+  wire_claude_code "$INSTALL_DIR"
+
   say ""
   say "  mla is installed at $INSTALL_DIR/$APP"
   say "  Restart your shell, or run:  . \"$INSTALL_DIR/env\""
-  say "  Then run:  mla login"
   say ""
+  say "  Next, two steps:"
+  say "    mla login       sign in (opens your browser)"
+  say "    mla activate    bind a repo to a workspace (run inside the repo)"
+  say ""
+}
+
+# Wire mla into Claude Code (hooks, /mla skill, MCP server) so capture is live the
+# moment the user opens a session, instead of a wired-but-invisible binary. We run
+# `mla init --no-project-rules`:
+#   - init is idempotent AND upgrade-safe: a re-run preserves a live login, refreshes
+#     the bundled hook scripts, and re-registers wiring, so this one command covers
+#     both fresh installs and upgrades with no branch on "is this an upgrade".
+#   - --no-project-rules is NON-NEGOTIABLE here: a bare `mla init` would stamp a
+#     Meetless block into whatever CLAUDE.md the cwd happens to sit in (curl | sh runs
+#     from the user's current directory, often ~/ or an unrelated repo). Project-rules
+#     writing is onboarding hygiene that belongs to an explicit `mla init`/`mla
+#     activate` the user runs inside a repo they chose, never a drive-by install.
+# Exit-tolerant: init returns nonzero when `flock` is not ready (a non-fatal hook-
+# pipeline warning), and flock auto-install can fail on a bare machine. A successful
+# binary install must never abort over that, so we warn and carry on. Opt out entirely
+# with MLA_NO_WIRE=1 (CI/headless), mirroring MLA_NO_MODIFY_PATH.
+wire_claude_code() {
+  _dir="$1"
+  if [ "$NO_WIRE" = "1" ]; then
+    say ""
+    say "  Skipping Claude Code wiring (MLA_NO_WIRE=1). Run 'mla init' later to wire capture."
+    return 0
+  fi
+  say ""
+  say "Wiring mla into Claude Code..."
+  "$_dir/$APP" init --no-project-rules \
+    || say "  (wiring reported a warning; run 'mla doctor' later)"
 }
 
 detect_target() {
@@ -110,6 +146,17 @@ install_bin() {
   src="$1"; dst="$2"
   if command -v install >/dev/null 2>&1; then install -m 0755 "$src" "$dst" || err "install to $dst failed"
   else cp "$src" "$dst" && chmod 0755 "$dst" || err "install to $dst failed"; fi
+}
+
+# macOS Gatekeeper (BUG-1): a binary carrying com.apple.quarantine (set when a
+# browser or Homebrew stages the download) can be SIGKILLed on first run. Clearing
+# the attribute lets Gatekeeper's ONLINE notarization check admit the binary. This
+# is belt-and-suspenders: a Terminal `curl` download is usually NOT quarantined, so
+# the attr is often absent -- hence best-effort. Darwin-only; never fatal.
+strip_quarantine() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  command -v xattr >/dev/null 2>&1 || return 0
+  xattr -d com.apple.quarantine "$1" >/dev/null 2>&1 || true
 }
 
 write_env() {

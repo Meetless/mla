@@ -6,6 +6,7 @@
 import {
   classifyOutcome,
   classifyScope,
+  isReportableFault,
   normalizeCommand,
 } from "../../src/lib/analytics/command-event";
 
@@ -189,6 +190,37 @@ describe("classifyOutcome", () => {
     });
   });
 
+  it("maps app-level user-actionable errors by their type name (never system_error)", () => {
+    // These are thrown at their sites (http.ts, workspace.ts) with a stable
+    // `name`; the classifier must not let them fall through to system_error,
+    // which would fire the bug-report nudge for a "run mla login / activate" case.
+    expect(classifyOutcome(1, true, { name: "ConfigError" })).toMatchObject({
+      outcome: "user_error",
+      error_class: "config_error",
+      retryable: false,
+    });
+    expect(classifyOutcome(1, true, { name: "NotLoggedInError" })).toMatchObject({
+      outcome: "auth_error",
+      error_class: "not_logged_in",
+      retryable: false,
+    });
+    expect(classifyOutcome(1, true, { name: "NotActivatedError" })).toMatchObject({
+      outcome: "user_error",
+      error_class: "not_activated",
+    });
+    expect(
+      classifyOutcome(1, true, { name: "MarkerMissingWorkspaceIdError" }),
+    ).toMatchObject({
+      outcome: "user_error",
+      error_class: "marker_missing_workspace_id",
+    });
+    expect(classifyOutcome(1, true, { name: "RefreshBusyError" })).toMatchObject({
+      outcome: "timeout",
+      error_class: "refresh_busy",
+      retryable: true,
+    });
+  });
+
   it("error_class for an unknown throw is the class NAME, never a message", () => {
     const res = classifyOutcome(1, true, new RangeError("an@meetless.ai exploded at /secret/path"));
     expect(res.outcome).toBe("system_error");
@@ -196,5 +228,50 @@ describe("classifyOutcome", () => {
     // The message (which could carry PII) is not surfaced.
     expect(JSON.stringify(res)).not.toContain("meetless.ai");
     expect(JSON.stringify(res)).not.toContain("/secret/path");
+  });
+});
+
+describe("isReportableFault (bug-report nudge policy)", () => {
+  // Behavioral contract for the failure-footer nudge: it fires ONLY on a genuine
+  // fault on our side (a 5xx from a reachable backend, or an unhandled in-process
+  // crash), never on a user-actionable or transient failure. Each row is a real
+  // thrown-error shape run through the full classify -> predicate path, mirroring
+  // exactly what the cli.ts catch does.
+  const cases: Array<{ label: string; thrown: unknown; nudge: boolean }> = [
+    // Our faults -> nudge.
+    { label: "HTTP 500", thrown: { status: 500 }, nudge: true },
+    { label: "HTTP 502", thrown: { status: 502 }, nudge: true },
+    { label: "HTTP 503", thrown: { status: 503 }, nudge: true },
+    { label: "unhandled in-process crash", thrown: new RangeError("boom"), nudge: true },
+    // User-actionable / transient -> quiet.
+    { label: "HTTP 401 (auth)", thrown: { status: 401 }, nudge: false },
+    { label: "HTTP 403 (permission)", thrown: { status: 403 }, nudge: false },
+    { label: "HTTP 400 (validation)", thrown: { status: 400 }, nudge: false },
+    { label: "HTTP 404 (bad ref)", thrown: { status: 404 }, nudge: false },
+    { label: "HTTP 429 (rate limit)", thrown: { status: 429 }, nudge: false },
+    { label: "config missing / corrupt (run mla init)", thrown: { name: "ConfigError" }, nudge: false },
+    { label: "not logged in", thrown: { name: "NotLoggedInError" }, nudge: false },
+    { label: "repo not activated", thrown: { name: "NotActivatedError" }, nudge: false },
+    {
+      label: "marker missing workspaceId",
+      thrown: { name: "MarkerMissingWorkspaceIdError" },
+      nudge: false,
+    },
+    { label: "refresh busy", thrown: { name: "RefreshBusyError" }, nudge: false },
+    { label: "backend unreachable (ECONNREFUSED)", thrown: { code: "ECONNREFUSED" }, nudge: false },
+    { label: "fetch failed (TypeError)", thrown: { name: "TypeError" }, nudge: false },
+    { label: "aborted / timeout", thrown: { name: "AbortError" }, nudge: false },
+  ];
+
+  it.each(cases)("$label -> nudge=$nudge", ({ thrown, nudge }) => {
+    expect(isReportableFault(classifyOutcome(1, true, thrown))).toBe(nudge);
+  });
+
+  it("a bare 429 classification is system_error but excluded from the nudge", () => {
+    // Guards the one special-case: 429 is analytics-bucketed as system_error yet
+    // must stay quiet (client-side throttle, not a bug).
+    const c = classifyOutcome(1, true, { status: 429 });
+    expect(c.outcome).toBe("system_error");
+    expect(isReportableFault(c)).toBe(false);
   });
 });

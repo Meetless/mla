@@ -253,4 +253,25 @@ describe("config auth compat shim (§6.4, T29)", () => {
     const { readConfig } = loadConfig();
     expect(() => readConfig()).toThrow(/unrecognized auth\.mode/);
   });
+
+  it("malformed cli-config.json throws ConfigError (operator-fixable), not a bare SyntaxError", () => {
+    // The bug-report nudge classifier is message-blind and keys on the error
+    // NAME. A raw JSON.parse SyntaxError would fall through to system_error and
+    // wrongly scream "file a bug report" for a file the operator can just fix or
+    // re-init. readConfig wraps it as ConfigError so it stays quiet, same as
+    // every other config-load failure. Assert the NAME (not instanceof, which is
+    // unstable across jest.resetModules) since that is exactly what the
+    // classifier inspects.
+    fs.writeFileSync(cfgPath, "{ definitely not: valid json ]");
+    const { readConfig } = loadConfig();
+    let thrown: unknown;
+    try {
+      readConfig();
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).name).toBe("ConfigError");
+    expect((thrown as Error).message).toMatch(/not valid JSON/);
+  });
 });

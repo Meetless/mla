@@ -29,6 +29,10 @@ import {
 import { computeRepoFingerprint } from "./lib/git";
 import { traceUploadEnabled } from "./lib/analytics/consent";
 import { captureCommandEvent } from "./lib/analytics/capture";
+import {
+  classifyOutcome,
+  isReportableFault,
+} from "./lib/analytics/command-event";
 import { get as controlGet } from "./lib/http";
 import type { CliConfig } from "./lib/config";
 import { readConfig } from "./lib/config";
@@ -936,15 +940,16 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
     } else {
       console.error(e.message || String(err));
     }
-    // Failure footer (proposal §3.6): a genuine internal fault points the user
-    // straight at filing a redacted diagnostic report for THIS run. Suppress it
-    // for 4xx (ordinary client-side errors like a bad ref, missing auth, or a
-    // rate limit are the user's to fix, not ours to debug). A 5xx or a non-HTTP
-    // crash (no status) shows it.
-    const status = e.status;
-    const isClientError =
-      typeof status === "number" && status >= 400 && status < 500;
-    if (!isClientError) {
+    // Failure footer (proposal §3.6): the nudge to file a redacted diagnostic
+    // report must fire ONLY on a genuine fault on our side (a 5xx from a reachable
+    // backend, or an unhandled in-process crash), never on a user-actionable
+    // failure (not logged in, repo not activated, offline, a bad ref, a rate
+    // limit). classifyOutcome + isReportableFault is the single source of truth
+    // for that decision (shared with the analytics journey event below), so the
+    // nudge and the recorded outcome can never disagree. A user's own codebase
+    // errors never traverse this catch, so the nudge is structurally scoped to
+    // mla's own faults.
+    if (isReportableFault(classifyOutcome(1, true, err))) {
       console.error(
         "\nMLA hit an internal error. Send us a redacted diagnostic report:\n" +
           `  mla bug report --trace-id ${traceId}`,

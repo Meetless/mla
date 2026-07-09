@@ -258,6 +258,10 @@ function notLoggedInError(): HttpError {
   const e = new Error(
     "Not logged in. Run `mla login` (or `mla init --control-token <T>`).",
   ) as HttpError;
+  // A stable, PII-safe type token so the (message-blind) outcome classifier can
+  // recognize this as a user-actionable auth failure, not an internal fault:
+  // it must NOT trigger the "file a bug report" nudge (classifyOutcome).
+  e.name = "NotLoggedInError";
   e.body = "";
   return e;
 }
@@ -274,6 +278,9 @@ function refreshBusyError(): HttpError {
   const e = new Error(
     "Another mla process is refreshing the login. Retry in a moment.",
   ) as HttpError;
+  // Transient contention, not a bug: named so classifyOutcome maps it to a
+  // retryable outcome instead of system_error (no bug-report nudge).
+  e.name = "RefreshBusyError";
   e.body = "";
   return e;
 }

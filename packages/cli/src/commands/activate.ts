@@ -19,6 +19,7 @@ import {
   SESSION_GATE_DIR,
 } from "../lib/config";
 import { backfillSessionPrompts } from "../lib/transcript-prompts";
+import { runLogin } from "./login";
 import { get, HttpError, post } from "../lib/http";
 import { renderActivationCard, renderBootstrapSummary } from "../lib/scanner/bootstrap-summary";
 import { renderManualScoutMission, renderAgenticInvitation } from "../lib/scanner/scout-mission";
@@ -401,6 +402,13 @@ export async function runActivate(argv: string[]): Promise<number> {
   }
 
   const cwd = process.cwd();
+
+  // Fold the browser login into activate when the machine is wired but logged
+  // out, so a fresh user does not have to discover `mla login` separately. Runs
+  // before every real-work branch below (repair/bind/provision all hit the
+  // backend and need a token). Strictly best-effort and TTY-gated inside the
+  // helper; a decline or failure never blocks activate.
+  await maybeOfferLogin();
 
   // `--repair` re-checks an existing binding's membership/connectivity ONLY. It
   // never mints a new id (An, 2026-06-04): re-creation is an explicit
@@ -928,17 +936,83 @@ function readMarkerWorkspaceId(markerPath: string): string | undefined {
   }
 }
 
-// Interactive y/N prompt. Only reached on a real TTY (the non-interactive path
-// refuses before calling this), so reading stdin can never hang a script.
-function promptYesNo(question: string): Promise<boolean> {
+// Interactive y/N prompt. Only reached on a real TTY (every caller TTY-gates
+// before calling this), so reading stdin can never hang a script. `defaultYes`
+// picks the answer for a bare Enter: false = `[y/N]` (deactivate, the safe
+// default for a destructive action), true = `[Y/n]` (the login offer, where the
+// happy path is "yes, log me in").
+function promptYesNo(question: string, defaultYes = false): Promise<boolean> {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     rl.question(question, (answer) => {
       rl.close();
       const a = answer.trim().toLowerCase();
+      if (a === "") return resolve(defaultYes);
       resolve(a === "y" || a === "yes");
     });
   });
+}
+
+// `mla activate` is the first command a user runs that genuinely needs the backend
+// (provision POSTs a new workspace; bind's capture/review lean on it too), and it
+// is the moment they have committed to the product on a repo. So when the machine
+// is wired but logged out, we fold the browser login into activate inline, exactly
+// as Claude Code folds auth into first-run. Best-effort and strictly gated:
+//   - config must exist AND be readable (a missing config takes activate's existing
+//     "run `mla init` first" path; an unreadable/Gate-4-conflicted config is left
+//     for the downstream reader to surface verbatim);
+//   - only when auth.mode === 'none' (already signed in via user-token OR shared-key
+//     is left untouched);
+//   - only on a real TTY (headless/hook contexts never prompt; the printed
+//     `mla login` nudges cover them);
+//   - a decline or a failed login NEVER blocks activate: we continue, and any
+//     backend call that then needs auth surfaces its own clear 401 guidance.
+//
+// `deps` exists only to make the two genuinely-external seams testable: the stdin
+// prompt (`confirm`) and the browser login (`login`). The gating (configExists /
+// readConfig / isTTY) is driven for real in tests via MEETLESS_HOME + an isTTY
+// spy, so the guard logic is exercised against the real config loader, not a mock.
+export interface OfferLoginDeps {
+  confirm?: (question: string, defaultYes: boolean) => Promise<boolean>;
+  login?: (argv: string[]) => Promise<number>;
+}
+
+export async function maybeOfferLogin(deps: OfferLoginDeps = {}): Promise<void> {
+  if (!configExists()) return;
+  let cfg: CliConfig;
+  try {
+    cfg = readConfig();
+  } catch {
+    return;
+  }
+  if (cfg.auth.mode !== "none") return;
+  if (!process.stdin.isTTY) return;
+
+  const confirm = deps.confirm ?? promptYesNo;
+  const login = deps.login ?? runLogin;
+
+  console.log("You're not signed in to Meetless.");
+  const yes = await confirm("Open the browser to log in now? [Y/n] ", true);
+  if (!yes) {
+    console.log(
+      "Skipping login. Run `mla login` when you're ready; activate continues.",
+    );
+    console.log("");
+    return;
+  }
+  // login reads/writes the same HOME-level cli-config.json, so the fresh
+  // user-token lands on disk before the provision/bind path below re-reads it.
+  // It returns a nonzero code on failure rather than throwing, and we intentionally
+  // do not gate activate on its result: a failed login just means the next backend
+  // call prints its own actionable error. The try/catch is belt-and-suspenders for
+  // a pathological throw (e.g. the post-auth config write failing) so the offer can
+  // NEVER turn a wired activate into a crash.
+  try {
+    await login([]);
+  } catch {
+    console.log("Login did not complete; activate continues.");
+  }
+  console.log("");
 }
 
 // `mla deactivate` (workspace-binding removal, folder = workspace T2.2).

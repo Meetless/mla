@@ -3,6 +3,20 @@ import * as os from "os";
 import * as path from "path";
 import { resolveWorkspaceId } from "./workspace";
 
+// Every config/auth-load failure is the operator's to fix (run `mla init`,
+// `mla login`, unset an env var, populate a field), NEVER an internal mla fault.
+// A stable, PII-safe `name` lets the message-blind outcome classifier
+// (analytics/command-event.classifyOutcome) bucket these as `user_error` and,
+// critically, keep the "file a bug report" nudge (isReportableFault) silent for
+// them. config.ts is the single chokepoint for config/auth loading, so stamping
+// the marker here covers the whole surface at its source rather than per command.
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
+
 // Credential state of the CLI, as a single nested discriminated union (§6.4,
 // §0.01 clause 3). This REPLACES the old habit of piling credential fields onto
 // the top level of CliConfig. New auth modes land as new variants here, never as
@@ -208,7 +222,7 @@ function normalizeUserToken(src: {
 }): Extract<CliAuth, { mode: "user-token" }> {
   const accessToken = asString(src.accessToken);
   if (!accessToken) {
-    throw new Error(
+    throw new ConfigError(
       `cli-config.json at ${CFG_PATH} has auth.mode 'user-token' but no access token. ` +
         "The login is corrupt. Run `mla logout` then `mla login`, or " +
         "`mla init --control-token <T>` to fall back to shared-key.",
@@ -252,7 +266,7 @@ function normalizeAuthFromDisk(cfg: RawDiskConfig): CliAuth {
       );
     }
     // Unknown mode: fail loud rather than guess a credential path.
-    throw new Error(
+    throw new ConfigError(
       `cli-config.json at ${CFG_PATH} has an unrecognized auth.mode. ` +
         "Run `mla logout` then `mla login`, or `mla init --control-token <T>`.",
     );
@@ -271,12 +285,23 @@ function normalizeAuthFromDisk(cfg: RawDiskConfig): CliAuth {
 
 export function readConfig(): CliConfig {
   if (!fs.existsSync(CFG_PATH)) {
-    throw new Error(
+    throw new ConfigError(
       `cli-config.json not found at ${CFG_PATH}. Run 'mla init' first.`,
     );
   }
   const raw = fs.readFileSync(CFG_PATH, "utf8");
-  const cfg = JSON.parse(raw) as RawDiskConfig;
+  let cfg: RawDiskConfig;
+  try {
+    cfg = JSON.parse(raw) as RawDiskConfig;
+  } catch {
+    // A malformed cli-config.json is the operator's to fix (re-init or edit),
+    // not an internal fault. Wrap the raw SyntaxError so it stays out of the
+    // bug-report nudge, same as every other config-load failure.
+    throw new ConfigError(
+      `cli-config.json at ${CFG_PATH} is not valid JSON. ` +
+        "Fix it, or run `mla init --control-token <T>` / `mla login` to rewrite it.",
+    );
+  }
 
   // Non-credential env aliases select WHICH control plane, not WHO you are, so
   // they are honored in every auth mode (CI / containers). MEETLESS_INTEL_ROOT
@@ -294,7 +319,7 @@ export function readConfig(): CliConfig {
   const envSharedKey = process.env.MEETLESS_CONTROL_TOKEN;
   let auth: CliAuth;
   if (diskAuth.mode === "user-token" && envSharedKey) {
-    throw new Error(
+    throw new ConfigError(
       `MEETLESS_CONTROL_TOKEN is set but you are logged in as ${diskAuth.user.displayName}.\n` +
         "Unset it (`unset MEETLESS_CONTROL_TOKEN`) or run `mla logout` first.",
     );
@@ -376,7 +401,7 @@ export function readKbConfig(override?: string): KbCliConfig {
   const cfg = loadWorkspaceConfig(override);
   const actor = (cfg.actorUserId || "").trim();
   if (!actor) {
-    throw new Error(
+    throw new ConfigError(
       `cli-config.json is missing required field 'actorUserId'. ` +
         `KB curation commands stamp this onto every outbox event so the ` +
         `audit trail records who acted. Re-run 'mla init --actor <id>' ` +

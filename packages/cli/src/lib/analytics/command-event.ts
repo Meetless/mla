@@ -265,11 +265,37 @@ export function classifyOutcome(
     return { outcome: "user_error", error_class: `http_${status}`, retryable: false };
   }
 
-  // No HTTP status: a network-layer or programmatic error. fetch() rejects with a
-  // TypeError ("fetch failed") wrapping a cause; AbortController aborts surface as
-  // an AbortError; node socket errors carry an errno code.
+  // No HTTP status: an app-level, network-layer, or programmatic error. fetch()
+  // rejects with a TypeError ("fetch failed") wrapping a cause; AbortController
+  // aborts surface as an AbortError; node socket errors carry an errno code.
   const code = (err?.code || "").toUpperCase();
   const name = err?.name || "";
+
+  // App-level, user-actionable failures carry a stable type name (set at their
+  // throw sites: config.ts, http.ts, workspace.ts). They are the user's to act on
+  // (fix config, log in, activate, retry), never an internal fault, so they must
+  // NOT fall through to system_error and fire the "file a bug report" nudge
+  // (isReportableFault).
+  if (name === "ConfigError") {
+    // Any config/auth-load failure (config.ts): missing/corrupt cli-config,
+    // unrecognized auth.mode, MEETLESS_CONTROL_TOKEN-while-logged-in, missing
+    // actorUserId. All are "fix your setup" (run `mla init` / `mla login` /
+    // unset an env var), never an internal fault.
+    return { outcome: "user_error", error_class: "config_error", retryable: false };
+  }
+  if (name === "NotLoggedInError") {
+    return { outcome: "auth_error", error_class: "not_logged_in", retryable: false };
+  }
+  if (name === "NotActivatedError") {
+    return { outcome: "user_error", error_class: "not_activated", retryable: false };
+  }
+  if (name === "MarkerMissingWorkspaceIdError") {
+    return { outcome: "user_error", error_class: "marker_missing_workspace_id", retryable: false };
+  }
+  if (name === "RefreshBusyError") {
+    return { outcome: "timeout", error_class: "refresh_busy", retryable: true };
+  }
+
   if (code === "ETIMEDOUT" || name === "AbortError" || name === "TimeoutError") {
     return { outcome: "timeout", error_class: "timeout", retryable: true };
   }
@@ -286,4 +312,18 @@ export function classifyOutcome(
 
   // Unknown thrown error: a class name is PII-safe (it is a type, not a message).
   return { outcome: "system_error", error_class: name || "Error", retryable: false };
+}
+
+// True when a run's classification is a genuinely unexpected fault on OUR side,
+// and so should surface the "file a bug report" nudge: a 5xx from a reachable
+// backend, or an unhandled in-process crash. A 429 is bucketed as system_error
+// for analytics but is a client-side throttle (back off, not a bug), so it is
+// excluded. Everything else (auth, permission, validation, user error,
+// offline/timeout/network) is the user's to act on and stays quiet. This is the
+// single source of truth for the nudge policy so the analytics outcome and the
+// user-facing nudge can never disagree.
+export function isReportableFault(c: OutcomeClassification): boolean {
+  if (c.outcome !== "system_error") return false;
+  if (c.error_class === "http_429") return false;
+  return true;
 }
