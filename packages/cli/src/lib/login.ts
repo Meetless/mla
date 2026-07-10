@@ -131,11 +131,23 @@ export interface LoopbackServer {
   callbackPromise: Promise<{ code: string }>;
 }
 
+// Callback page. The login is already complete by the time this renders (the
+// grant code has been captured), so the copy says "done", not "finishing up" —
+// the old wording made users sit and wait on an already-finished flow.
+//
+// We also fire a best-effort window.close(). It works ONLY in the minority of
+// cases where the browser permits it (a script can close only script-opened
+// windows; this tab was opened by the OS, so Chrome/Safari/most Firefox will
+// ignore it). That is why the visible fallback message must stand on its own:
+// when the auto-close is blocked, the page still clearly reads "closed / return
+// to terminal". No CLI tool (gcloud, gh, vercel) can force this close either.
 const CLOSE_TAB_HTML =
-  "<!doctype html><html><head><meta charset=utf-8><title>mla login</title></head>" +
-  "<body style=\"font-family:system-ui;margin:3rem;text-align:center\">" +
-  "<h2>You can close this tab.</h2>" +
-  "<p>Return to your terminal; <code>mla login</code> is finishing up.</p>" +
+  "<!doctype html><html><head><meta charset=utf-8><title>mla login ✓</title>" +
+  "<script>try{window.close();setTimeout(function(){window.close();},250);}catch(e){}</script>" +
+  "</head>" +
+  "<body style=\"font-family:system-ui;margin:3rem;text-align:center;color:#111\">" +
+  "<h2 style=\"color:#16a34a\">✓ Login complete</h2>" +
+  "<p>You can close this tab and return to your terminal.</p>" +
   "</body></html>";
 
 export function openLoopbackServer(opts: {

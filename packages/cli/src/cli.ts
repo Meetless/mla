@@ -34,6 +34,10 @@ import {
   isReportableFault,
 } from "./lib/analytics/command-event";
 import { get as controlGet } from "./lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "./lib/workspace-access";
 import type { CliConfig } from "./lib/config";
 import { readConfig, HOME } from "./lib/config";
 import { tryResolveWorkspaceId } from "./lib/workspace";
@@ -199,6 +203,13 @@ usage:
                      does not touch .meetless.json)
   mla workspace [show]
                     (print the workspace bound to this folder + its health)
+  mla workspace invite <email> [--json] [--workspace <id>]
+                    (add a teammate's email as a MEMBER so they can share this
+                     workspace's governed memory, cases, and conflicts; owner/admin)
+  mla workspace members [--json] [--workspace <id>]
+                    (list the workspace's active members)
+  mla workspace remove <email> [--json] [--workspace <id>]
+                    (revoke a MEMBER's access by email; owner/admin)
   mla review [--plain] [--no-flush]
   mla review <id>
   mla enforcement [--all] [--json]
@@ -990,7 +1001,17 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
     threw = true;
     thrown = err;
     const e = err as Error & { status?: number; body?: string };
-    if (e.status) {
+    // A workspace-membership 403 (the folder marker, or an explicit --workspace,
+    // names a workspace this human is not in) is the single most common way a
+    // read command reaches this catch. Route it through the ONE canonical handler
+    // (BUG-5) so it reads "You are not a member of workspace 'X'..." instead of a
+    // raw `HTTP 403: GET https://.../internal/... -> ...` dump that leaks the
+    // internal URL and buries the actual cause. This is the backstop for commands
+    // that let the 403 propagate (review --plain, session show); commands that
+    // catch locally handle it at their own call site.
+    if (isWorkspaceAccessDenied(e)) {
+      console.error(workspaceAccessDeniedMessage(e));
+    } else if (e.status) {
       console.error(`HTTP ${e.status}: ${e.message}`);
     } else {
       console.error(e.message || String(err));

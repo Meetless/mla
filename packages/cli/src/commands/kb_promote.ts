@@ -25,6 +25,10 @@ import * as path from "path";
 
 import { KbCliConfig, readKbConfig, HOME } from "../lib/config";
 import { intelPatch, HttpError, DEFAULT_INTEL_URL } from "../lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
 
 export interface KbPromoteResult {
   rejected: boolean;
@@ -125,8 +129,13 @@ function explainPromoteError(err: HttpError, intelUrl: string): string {
   if (err.status === 404) {
     return `intel returned 404 for the posture route. Document not found, or this intel does not expose the KB posture endpoint.`;
   }
+  // Membership 403 (folder marker / --workspace names a workspace you are not
+  // in) is not a token problem; route it to the shared canonical line (BUG-5).
+  if (isWorkspaceAccessDenied(err)) {
+    return workspaceAccessDeniedMessage(err);
+  }
   if (err.status === 401 || err.status === 403) {
-    return `intel rejected the token (HTTP ${err.status}). Check controlToken in cli-config.json.`;
+    return `intel rejected the token (HTTP ${err.status}). Run \`mla doctor\` to check your login and workspace access.`;
   }
   if (err.status === undefined) {
     return `intel not reachable at ${intelUrl}. Is it running? Try \`mla doctor\`.`;

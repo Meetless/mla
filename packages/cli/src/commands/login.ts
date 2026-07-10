@@ -168,8 +168,45 @@ function printAlreadyLoggedIn(auth: Extract<CliAuth, { mode: "user-token" }>): v
   const runway = formatRemaining(auth.refreshExpiresAt);
   console.log(`Already logged in as ${who}${email}.`);
   console.log(
-    `  Session expires ${runway ?? "soon"} (run \`mla logout && mla login\` to re-login).`,
+    `  Session expires ${runway ?? "soon"} (run \`mla login --force\` to re-login).`,
   );
+}
+
+// What a failed liveness probe means for `mla login`'s no-op short-circuit.
+//   "keep"   -> we could not reach control for a verdict; keep the cached
+//               session and do NOT open a browser (offline, or control up but
+//               erroring on a concrete non-auth status).
+//   "reauth" -> the session may be invalid, or a transient/contended check
+//               prevented confirmation; open a real browser login rather than
+//               declaring "already logged in".
+export type ProbeVerdict = "keep" | "reauth";
+
+// Classify why `GET /internal/v1/auth/me` failed during the login no-op probe.
+//
+// The critical case is RefreshBusyError (see lib/http.ts): `get()` funnels EVERY
+// transient refresh failure into it. A sibling mla process (hook / MCP worker)
+// holding the single-use refresh lock, the server's dead-session 429 rate limit,
+// and a transient 5xx/network blip on the refresh POST all surface as a
+// RefreshBusyError that carries NO HTTP `.status`. The old code lumped that into
+// the "no status -> offline, keep cached" branch, so `mla login` would print
+// "already logged in (could not verify)" and exit WITHOUT opening the browser,
+// exactly the intermittent "didn't open the browser" report. None of those
+// signals prove the session is live, so we re-authenticate instead of no-op'ing.
+//
+// A genuinely dead session is distinguishable: its refresh is REJECTED (401/410)
+// and surfaces here as a 401 (authExpiredError), which we also route to reauth.
+export function classifyProbeFailure(err: HttpError): ProbeVerdict {
+  // Session rejected server-side: definitely re-authenticate.
+  if (err.status === 401 || err.status === 403) return "reauth";
+  // Refresh contention / throttle / transient refresh failure (no HTTP status).
+  // Not proof of a live session -> re-authenticate rather than suppress the browser.
+  if (err.name === "RefreshBusyError") return "reauth";
+  // A concrete non-auth HTTP status (control reachable but erroring): keep the
+  // cached session; an OAuth exchange would hit the same broken control.
+  if (typeof err.status === "number") return "keep";
+  // No status, not a known contention signal: the client never reached control
+  // (offline / DNS / connection refused). Keep the cached session.
+  return "keep";
 }
 
 export async function runLogin(argv: string[], deps: LoginDeps = {}): Promise<number> {
@@ -278,23 +315,27 @@ export async function runLogin(argv: string[], deps: LoginDeps = {}): Promise<nu
         printAlreadyLoggedIn(auth);
         return 0;
       } catch (e) {
-        const status = (e as HttpError).status;
-        if (status === 401 || status === 403) {
-          // Session is dead server-side. Self-heal: drop through to a real browser
-          // login instead of the old no-op dead end.
-          console.log(
-            "Cached session is no longer valid server-side. Re-authenticating...",
-          );
-        } else {
-          // No HTTP status -> never reached the server (control down / offline).
-          // Keep the cached session; do not open a browser flow that cannot reach
-          // control anyway.
+        if (classifyProbeFailure(e as HttpError) === "keep") {
+          // We could not reach control for a verdict: either the client is truly
+          // offline (network error / DNS / connection refused) or control is up
+          // but erroring on a concrete non-auth status (e.g. 500 on /auth/me).
+          // Keep the cached session; opening a browser flow whose token exchange
+          // would hit the same wall helps no one.
           printAlreadyLoggedIn(auth);
           console.log(
             "  (could not verify with control; keeping cached session for now.)",
           );
           return 0;
         }
+        // verdict === "reauth": the session is dead server-side (401/403), OR a
+        // sibling mla process held the refresh lock / the server throttled us
+        // (429) / a transient refresh error occurred. None of those prove the
+        // session is live, so do NOT silently no-op and suppress the browser
+        // (the reported "mla login didn't open the browser" bug). Self-heal by
+        // dropping through to a real browser login below.
+        console.log(
+          "Could not confirm your cached session; re-authenticating...",
+        );
       }
     }
   }

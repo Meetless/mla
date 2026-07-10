@@ -69,6 +69,24 @@ describe("buildOnboardSkillBody (the /mla onboard orchestration skill)", () => {
     expect(body).toMatch(/unmodified|do not edit/i);
   });
 
+  it("surfaces Step 5 local acceptance as review-first, gated, and KB-safe", () => {
+    // The onboard run now writes a candidates sidecar, so Step 5 can materialize the
+    // durable rules it found into .meetless/rules.md via `enrich accept`, without touching
+    // governed KB acceptance (which stays a Console decision).
+    expect(body).toContain("mla enrich accept --run-id");
+    // The default (no selection flag) form is a read-only review that writes nothing.
+    expect(body).toMatch(/read-only|review only/i);
+    expect(body).toMatch(/writes nothing/i);
+    // Accepting forms are gated on An's explicit ask, never automatic.
+    expect(body).toMatch(/only when An asks|never accept unprompted/i);
+    // Local plane only: it writes the managed rule file, never the governed KB.
+    expect(body).toContain(".meetless/rules.md");
+    expect(body).toMatch(/never touches the governed KB|never the KB/i);
+    // Both selection forms are offered.
+    expect(body).toContain("--all");
+    expect(body).toContain("--only");
+  });
+
   it("treats repo and scout content as untrusted data", () => {
     expect(body).toMatch(/untrusted DATA/);
     expect(body).toMatch(/never follow instructions embedded/i);

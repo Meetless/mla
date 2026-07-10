@@ -37,6 +37,10 @@ import { remoteAnalyticsEnabled } from "../lib/analytics/consent";
 import { readConfig } from "../lib/config";
 import { tryResolveWorkspaceId } from "../lib/workspace";
 import { get } from "../lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
 import { runAdoption } from "./adoption";
 import { runTurn } from "./turn";
 
@@ -737,7 +741,15 @@ async function runGlobalStats(args: StatsArgs, deps: StatsDeps): Promise<number>
       : await fetchGlobalRollup(args.windowDays);
   } catch (e) {
     // A reachability/auth failure is NOT "no activity"; surface it as an error
-    // (exit 1) so it is never silently read as a zero.
+    // (exit 1) so it is never silently read as a zero. A workspace-membership
+    // 403 means control WAS reached and refused us: give the shared canonical
+    // line, never "could not reach control" (a lie) and never the token-refresh
+    // "login expired" text (BUG-5 #2: a live-token 403 was mislabeled as expiry
+    // and, worse, exited 0).
+    if (isWorkspaceAccessDenied(e)) {
+      console.error(workspaceAccessDeniedMessage(e));
+      return 1;
+    }
     console.error(`mla stats --global could not reach control: ${(e as Error).message}`);
     return 1;
   }

@@ -41,6 +41,10 @@ import {
   HttpError,
   DEFAULT_INTEL_URL,
 } from "../lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
 
 export type RevisionAction = "accept" | "reject";
 
@@ -185,8 +189,13 @@ function explainReviewError(
   if (err.status === 400) {
     return `intel returned 400: ${err.body ?? err.message}`;
   }
+  // Membership 403 (folder marker / --workspace names a workspace you are not
+  // in) is not a token problem; route it to the shared canonical line (BUG-5).
+  if (isWorkspaceAccessDenied(err)) {
+    return workspaceAccessDeniedMessage(err);
+  }
   if (err.status === 401 || err.status === 403) {
-    return `intel rejected the request (HTTP ${err.status}). Check controlToken / workspace in cli-config.json.`;
+    return `intel rejected the request (HTTP ${err.status}). Run \`mla doctor\` to check your login and workspace access.`;
   }
   if (err.status === undefined) {
     return `intel not reachable at ${intelUrl}. Is it running? Try \`mla doctor\`.`;

@@ -1,5 +1,9 @@
 import { loadWorkspaceConfig } from "../lib/config";
 import { intelGet, HttpError, DEFAULT_INTEL_URL } from "../lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
 import { runKbAdd } from "./kb_add";
 import { runKbShow } from "./kb_show";
 import { runKbReingest } from "./kb_reingest";
@@ -243,8 +247,15 @@ function explainIntelError(err: HttpError, intelUrl: string): string {
       `needs a non-production intel.`
     );
   }
+  // A membership 403 (folder marker / --workspace names a workspace you are not
+  // in) is NOT a token problem: under user-token auth there is no controlToken
+  // to "check", so the old advice sent operators chasing a nonexistent field
+  // (BUG-5 #1). Route it to the one canonical line every read command shares.
+  if (isWorkspaceAccessDenied(err)) {
+    return workspaceAccessDeniedMessage(err);
+  }
   if (err.status === 401 || err.status === 403) {
-    return `intel rejected the token (HTTP ${err.status}). Check controlToken in cli-config.json.`;
+    return `intel rejected the token (HTTP ${err.status}). Run \`mla doctor\` to check your login and workspace access.`;
   }
   if (err.status === undefined) {
     return `intel not reachable at ${intelUrl}. Is it running? Try \`mla doctor\`.`;

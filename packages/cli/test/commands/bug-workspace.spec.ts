@@ -3,6 +3,7 @@ import {
   extractWorkspaceOverride,
   isWorkspaceAccessDenied,
   workspaceAccessDeniedGuidance,
+  workspaceAccessDeniedReadGuidance,
 } from "../../src/commands/bug";
 
 // BUG-2 I: `mla bug report|list|status` must accept a `--workspace <id>` admin
@@ -97,6 +98,44 @@ describe("workspaceAccessDeniedGuidance", () => {
   it("override path: does not blame the marker, tells them to pick a workspace they belong to", () => {
     const g = workspaceAccessDeniedGuidance("ws_override", true);
     expect(g).toContain("ws_override");
+    expect(g).not.toContain(".meetless.json");
+    expect(g).toContain("--workspace <id>");
+  });
+});
+
+describe("workspaceAccessDeniedReadGuidance (BUG-7: list/status is a lookup, not a filing)", () => {
+  // A 403 body carrying the canonical server message; the read path leads with it.
+  const deniedErr = Object.assign(
+    new Error(
+      'GET /internal/v1/bug-reports -> HTTP 403: {"code":"WORKSPACE_ACCESS_DENIED",' +
+        '"message":"You are not a member of workspace \'ws_marker\'. Ask a workspace admin to add you to it."}',
+    ),
+    {
+      status: 403,
+      body:
+        '{"code":"WORKSPACE_ACCESS_DENIED",' +
+        '"message":"You are not a member of workspace \'ws_marker\'. Ask a workspace admin to add you to it.",' +
+        '"details":{"requestedWorkspaceId":"ws_marker"}}',
+    },
+  );
+
+  it("leads with the canonical membership line, never the filing lie 'was not filed'", () => {
+    const g = workspaceAccessDeniedReadGuidance(deniedErr, "ws_marker", false);
+    expect(g).toContain("You are not a member of workspace 'ws_marker'.");
+    // The read path must NOT claim the report was not filed: it is a lookup, and
+    // the report may well exist in the workspace being read.
+    expect(g).not.toContain("was not filed");
+  });
+
+  it("marker path: names the bound workspace + the .meetless.json marker + the --workspace escape hatch", () => {
+    const g = workspaceAccessDeniedReadGuidance(deniedErr, "ws_marker", false);
+    expect(g).toContain(".meetless.json");
+    expect(g).toContain("ws_marker");
+    expect(g).toContain("--workspace <id>");
+  });
+
+  it("override path: does not blame the marker", () => {
+    const g = workspaceAccessDeniedReadGuidance(deniedErr, "ws_override", true);
     expect(g).not.toContain(".meetless.json");
     expect(g).toContain("--workspace <id>");
   });

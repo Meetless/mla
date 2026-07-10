@@ -5,6 +5,10 @@ import * as path from "path";
 import { MANAGED_RULES_PATH, parseManagedRules } from "../lib/scanner/managed-rules";
 import { loadWorkspaceConfig, type WorkspaceCliConfig } from "../lib/config";
 import { post } from "../lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
 import { openCe0Store, closeCe0Store, type Ce0Store } from "../lib/rules/ce0-store";
 import {
   listAllLocalRuleVersionsInScope,
@@ -222,7 +226,13 @@ async function publishLiveRulesForScope(
     const result = await publish(cfg, body);
     return { kind: "synced", sent: rules.length, workspaceId: cfg.workspaceId, result };
   } catch (e) {
-    return { kind: "failed", reason: (e as Error).message };
+    // A workspace-membership 403 is not a wire fault; surface the canonical line
+    // (BUG-5) as the reason instead of a raw `POST .../rules -> HTTP 403: {...}`
+    // dump. The caller keeps its "failed to publish" prefix for operation context.
+    const reason = isWorkspaceAccessDenied(e)
+      ? workspaceAccessDeniedMessage(e)
+      : (e as Error).message;
+    return { kind: "failed", reason };
   }
 }
 
@@ -408,7 +418,12 @@ export async function runRulesImport(argv: string[], deps: RulesImportDeps = {})
   try {
     result = await importFn(cfg, { workspaceId: cfg.workspaceId, rules });
   } catch (e) {
-    err(`failed to import rules to control: ${(e as Error).message}`);
+    // Membership 403 -> canonical line (BUG-5), keeping the operation prefix for
+    // context; anything else keeps its raw message.
+    const reason = isWorkspaceAccessDenied(e)
+      ? workspaceAccessDeniedMessage(e)
+      : (e as Error).message;
+    err(`failed to import rules to control: ${reason}`);
     return 1;
   }
 

@@ -130,7 +130,7 @@ function endHttpSpan(
 // "call doFetchOnce again with the rotated token" rather than re-entrant.
 async function doFetchOnce(
   cfg: CliConfig,
-  method: "GET" | "POST" | "PATCH",
+  method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   body?: unknown,
   timeoutMs = 10000,
@@ -189,7 +189,7 @@ interface DoFetchOpts {
 //     shared key out of band; they must re-run `mla init --control-token <NEW>`).
 async function doFetch(
   cfg: CliConfig,
-  method: "GET" | "POST" | "PATCH",
+  method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   body?: unknown,
   timeoutMs = 10000,
@@ -566,6 +566,17 @@ export async function patch<T = unknown>(
   timeoutMs?: number,
 ): Promise<T> {
   return (await doFetch(cfg, "PATCH", path, body, timeoutMs)) as T;
+}
+
+// DELETE carries no body: the target is named in the query string
+// (?email=...&workspaceId=...) so the Express bodyParser Content-Type trap on
+// bodiless requests never applies. Used by the membership revoke path.
+export async function del<T = unknown>(
+  cfg: CliConfig,
+  path: string,
+  timeoutMs?: number,
+): Promise<T> {
+  return (await doFetch(cfg, "DELETE", path, undefined, timeoutMs)) as T;
 }
 
 // Intel reads (KB inspector, T18). Intel is a SEPARATE base URL from control

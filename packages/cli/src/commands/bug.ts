@@ -8,6 +8,10 @@ import { HOME, getConsoleUrl, loadWorkspaceConfig } from "../lib/config";
 import type { WorkspaceCliConfig } from "../lib/config";
 import { get, post } from "../lib/http";
 import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
+import {
   canonicalizeSessionId,
   getRunSessionId,
   getRunTraceId,
@@ -101,21 +105,20 @@ function errText(e: unknown): string {
   return String(e);
 }
 
-// BUG-2 I: the marker-model workspace guard (control) answers a non-member with
-// a 403 whose body carries code WORKSPACE_ACCESS_DENIED. buildError (lib/http.ts)
-// puts the status on `.status` and inlines the body into the message, so a
-// substring match on the code is stable across get/post/patch.
-export function isWorkspaceAccessDenied(e: unknown): boolean {
-  const status = (e as { status?: number } | null)?.status;
-  const msg = e instanceof Error ? e.message : String(e);
-  return status === 403 && msg.includes("WORKSPACE_ACCESS_DENIED");
-}
+// The marker-model workspace guard (control) answers a non-member with a 403
+// whose body carries code WORKSPACE_ACCESS_DENIED. Detection + the canonical
+// remediation line now live in lib/workspace-access.ts, shared with every other
+// read/lookup command (BUG-5). Re-exported here so the historical import path
+// (test/commands/bug-workspace.spec.ts) and this file's own call sites stay put.
+export { isWorkspaceAccessDenied };
 
-// Turn a WORKSPACE_ACCESS_DENIED 403 into actionable guidance instead of the raw
-// `POST ... -> HTTP 403: {...}` wire error. We deliberately do NOT silently
-// redirect to some "home" workspace (there is no server support for resolving
-// one, and a silent tenant switch would file the report against the wrong
-// workspace); the operator must name a workspace they belong to.
+// FILING path (mla bug report). Turn a WORKSPACE_ACCESS_DENIED 403 into
+// actionable guidance instead of the raw `POST ... -> HTTP 403: {...}` wire
+// error. We deliberately do NOT silently redirect to some "home" workspace
+// (there is no server support for resolving one, and a silent tenant switch
+// would file the report against the wrong workspace); the operator must name a
+// workspace they belong to. "was not filed" is TRUE here (the POST was
+// rejected) -- contrast workspaceAccessDeniedReadGuidance below.
 export function workspaceAccessDeniedGuidance(
   workspaceId: string,
   usedOverride: boolean,
@@ -127,6 +130,26 @@ export function workspaceAccessDeniedGuidance(
       `Ask a workspace admin to add you, or file against a workspace you belong to:\n` +
       `  mla bug report --workspace <id> --message "..."`;
   return `${head}\n${fix}`;
+}
+
+// READ path (mla bug list / status). A lookup, not a write: the report may well
+// exist and was filed successfully (BUG-7: "BUG-5 WAS filed") -- the caller
+// simply is not a member of the workspace being read, so the filing path's "was
+// not filed" is a factual lie here. Lead with the canonical membership line
+// (identical to every other read command, BUG-5), then point at the
+// --workspace escape hatch these commands honor so a report filed against
+// another workspace stays reachable from the CLI.
+export function workspaceAccessDeniedReadGuidance(
+  e: unknown,
+  workspaceId: string,
+  usedOverride: boolean,
+): string {
+  const head = workspaceAccessDeniedMessage(e, workspaceId);
+  const hint = usedOverride
+    ? `Pass --workspace <id> for a workspace you belong to.`
+    : `This directory is bound to workspace '${workspaceId}' by its .meetless.json marker; ` +
+      `pass --workspace <id> to read from a workspace you belong to.`;
+  return `${head}\n${hint}`;
 }
 
 // A value-bearing flag must be followed by a real value, never the next flag,
@@ -562,7 +585,7 @@ async function runList(rest: string[]): Promise<number> {
     );
   } catch (e) {
     if (isWorkspaceAccessDenied(e)) {
-      console.error(workspaceAccessDeniedGuidance(cfg.workspaceId, Boolean(workspace)));
+      console.error(workspaceAccessDeniedReadGuidance(e, cfg.workspaceId, Boolean(workspace)));
       return 1;
     }
     throw e;
@@ -610,7 +633,7 @@ async function runStatus(rest: string[]): Promise<number> {
     );
   } catch (e) {
     if (isWorkspaceAccessDenied(e)) {
-      console.error(workspaceAccessDeniedGuidance(cfg.workspaceId, Boolean(workspace)));
+      console.error(workspaceAccessDeniedReadGuidance(e, cfg.workspaceId, Boolean(workspace)));
       return 1;
     }
     throw e;

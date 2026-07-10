@@ -29,7 +29,12 @@ import {
   onboardingLockPath,
   ONBOARDING_LOCK_GRACE_MS,
 } from "../lib/enrichment/lock";
-import { ingestRun, findCompletedRunWithDigest, type Persister } from "../lib/enrichment/ingest";
+import {
+  ingestRun,
+  findCompletedRunWithDigest,
+  loadCandidatesSidecar,
+  type Persister,
+} from "../lib/enrichment/ingest";
 import { buildScoutPrompt } from "../lib/enrichment/scout-brief";
 import {
   PROTOCOL_VERSION,
@@ -39,12 +44,14 @@ import {
   type ScoutName,
   type ScoutIngestOutcome,
   type EnrichmentCandidate,
+  type OnboardingCandidateRecord,
   type CandidateValidationError,
   type OnboardingRun,
 } from "../lib/enrichment/protocol";
 import { MANAGED_RULES_PATH } from "../lib/scanner/managed-rules";
 import {
   MATERIALIZE_SHARE_MESSAGE,
+  isDurableRuleKind,
   materializeRules,
   type MaterializeResult,
 } from "../lib/enrichment/materialize-rules";
@@ -80,7 +87,19 @@ const USAGE = `mla enrich: agent-orchestrated onboarding enrichment.
       or from stdin (a bare array, or an object with an \`accepted\` array). Decisions and
       deprecations are reported as skipped, never written. Local only: no commit, no push
       (prints "Effective locally. Commit and push to share with teammates."). --dry-run
-      reports the change without writing. Exit: 0 done (or nothing to do), 2 bad input.`;
+      reports the change without writing. Exit: 0 done (or nothing to do), 2 bad input.
+
+  mla enrich accept --run-id <id> [--all | --only <id-prefixes>] [--dry-run] [--json] [--workspace <id>]
+      Materialize the durable rules an onboarding run found into the mla-managed local rule
+      file (.meetless/rules.md), read from the run's candidates sidecar (written by \`enrich
+      ingest\`). With neither --all nor --only it is a read-only review: it prints the durable
+      rules plus the governed-knowledge candidates and writes nothing, so a human sees the
+      candidates before any file changes. --all accepts every durable rule this run found;
+      --only accepts just the candidates whose id starts with one of the comma-separated
+      prefixes (>= 6 hex chars each, fail-closed on no/ambiguous match). Decisions and
+      deprecations are governed knowledge, reported as skipped, never written. Local only:
+      no commit, no push. --dry-run previews without writing. Exit: 0 done (or nothing to
+      do), 2 bad input (unknown run, bad/ambiguous prefix).`;
 
 // Mirror kb_add's ingest timeout heuristic (it is module-private there). Generous,
 // scales with document count: the kb-add route runs the full atomic-claim pipeline.
@@ -961,6 +980,262 @@ async function runEnrichMaterialize(argv: string[]): Promise<number> {
   return 0;
 }
 
+// --- enrich accept: materialize a run's accepted candidates from the sidecar --------
+//
+// The onboarding-native ACCEPT half. `enrich ingest` parks a run's merged candidates in the
+// governed KB born PENDING AND writes a local candidates sidecar (the structured post-merge
+// records). This command reads that sidecar by run id and materializes the DURABLE ones
+// (constraint / convention / boundary) into .meetless/rules.md through the same materializeRules
+// bridge `enrich materialize` uses; decisions + deprecations are governed knowledge, reported as
+// skipped, never written (INV-AUTH-2).
+//
+// It exists so onboarding has a first-class "accept the rules this run found" step without the
+// operator hand-assembling an accepted-candidates JSON for `enrich materialize`. With no selection
+// flag it is a READ-ONLY review: it prints what the run found and writes nothing, so a human always
+// sees the candidates before any file changes. --all accepts every durable rule; --only <id-prefixes>
+// accepts just the named ones. Local only: the managed file lives at the run's repository root
+// (recorded in the sidecar), so no workspace/auth is needed to write it and mla never commits or
+// pushes (it prints MATERIALIZE_SHARE_MESSAGE so sharing stays an explicit human git step).
+interface AcceptFlags {
+  runId?: string;
+  all: boolean;
+  only?: string[];
+  dryRun: boolean;
+  json: boolean;
+  workspace?: string;
+}
+
+export function parseAcceptArgs(argv: string[]): AcceptFlags {
+  const flags: AcceptFlags = { all: false, dryRun: false, json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--run-id") {
+      flags.runId = argv[++i];
+      if (!flags.runId) throw new Error("--run-id requires a value");
+    } else if (a === "--all") {
+      flags.all = true;
+    } else if (a === "--only") {
+      const v = argv[++i];
+      if (!v) throw new Error("--only requires a comma-separated list of candidate id prefixes");
+      const prefixes = v
+        .split(",")
+        .map((p) => p.trim().toLowerCase())
+        .filter((p) => p.length > 0);
+      if (prefixes.length === 0) throw new Error("--only requires at least one candidate id prefix");
+      for (const p of prefixes) {
+        if (!/^[0-9a-f]{6,}$/.test(p)) {
+          throw new Error(`--only prefix "${p}" must be at least 6 hex characters of a candidate id`);
+        }
+      }
+      flags.only = prefixes;
+    } else if (a === "--dry-run") {
+      flags.dryRun = true;
+    } else if (a === "--json") {
+      flags.json = true;
+    } else if (a === "--workspace") {
+      flags.workspace = argv[++i];
+      if (!flags.workspace) throw new Error("--workspace requires a workspace id");
+    } else {
+      throw new Error(`Unknown flag for \`mla enrich accept\`: ${a}`);
+    }
+  }
+  if (!flags.runId) throw new Error("--run-id is required (the id printed by `mla enrich plan`)");
+  if (flags.all && flags.only) {
+    throw new Error("--all and --only are mutually exclusive (choose one way to pick which candidates to accept)");
+  }
+  return flags;
+}
+
+// Reconstruct the wire candidate materializeRules consumes. It reads only kind/statement/evidence
+// (candidateToManagedRule derives sources from evidence); sourceScout is required by the type, so
+// we take the first producing scout (a record always carries at least one). rationale is carried
+// through for fidelity though the managed file does not render it today.
+function recordToCandidate(r: OnboardingCandidateRecord): EnrichmentCandidate {
+  return {
+    kind: r.kind,
+    statement: r.statement,
+    evidence: r.evidence,
+    sourceScout: r.sourceScouts[0],
+    rationale: r.rationale,
+    rationaleSource: r.rationaleSource,
+  };
+}
+
+// How many chars of the sha256 candidate id to show in the review (enough to be readable and to
+// paste back into --only, which requires >= 6).
+const CANDIDATE_ID_DISPLAY_LEN = 12;
+
+// The read-only review a bare `mla enrich accept --run-id <id>` prints: the durable rules this run
+// found (materializable) and the governed-knowledge candidates it will NOT materialize, so a human
+// sees everything before choosing --all or --only. Pure (no fs) and exported so a test pins the
+// wording. Nothing is written in this mode.
+export function renderAcceptReview(
+  durable: readonly OnboardingCandidateRecord[],
+  knowledgeOnly: readonly OnboardingCandidateRecord[],
+): string {
+  const lines: string[] = [];
+  const byStatement = (a: OnboardingCandidateRecord, b: OnboardingCandidateRecord) =>
+    a.statement.localeCompare(b.statement);
+  const row = (c: OnboardingCandidateRecord) =>
+    `  ${c.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN)}  [${c.kind}]  ${c.statement}`;
+
+  if (durable.length > 0) {
+    lines.push(
+      `${durable.length} durable rule${durable.length === 1 ? "" : "s"} this run found ` +
+        `(accept to materialize into ${MANAGED_RULES_PATH}):`,
+    );
+    for (const c of [...durable].sort(byStatement)) lines.push(row(c));
+  } else {
+    lines.push(`This run found no durable rules to materialize into ${MANAGED_RULES_PATH}.`);
+  }
+
+  if (knowledgeOnly.length > 0) {
+    lines.push("");
+    lines.push(
+      `${knowledgeOnly.length} governed-knowledge candidate${knowledgeOnly.length === 1 ? "" : "s"} ` +
+        "(NOT materialized; governed in the Console KB):",
+    );
+    for (const c of [...knowledgeOnly].sort(byStatement)) lines.push(row(c));
+  }
+
+  if (durable.length > 0) {
+    lines.push("");
+    lines.push("Accept all durable rules:  mla enrich accept --run-id <id> --all");
+    lines.push("Accept specific ones:      mla enrich accept --run-id <id> --only <id-prefix>[,<id-prefix>...]");
+    lines.push("Preview without writing:   add --dry-run");
+  }
+  return lines.join("\n");
+}
+
+// Resolve the --only prefixes to concrete records, fail-closed. Each prefix must match exactly one
+// candidate id: zero matches or an ambiguous prefix is an error, not a silent skip, so the operator
+// never mistakes a typo'd id for "accepted nothing".
+type OnlyResolution =
+  | { ok: true; selected: OnboardingCandidateRecord[] }
+  | { ok: false; error: string };
+
+function resolveOnly(
+  prefixes: readonly string[],
+  candidates: readonly OnboardingCandidateRecord[],
+): OnlyResolution {
+  const selected = new Map<string, OnboardingCandidateRecord>();
+  for (const p of prefixes) {
+    const matches = candidates.filter((c) => c.candidateId.toLowerCase().startsWith(p));
+    if (matches.length === 0) {
+      return { ok: false, error: `no candidate id starts with "${p}" in this run` };
+    }
+    if (matches.length > 1) {
+      return {
+        ok: false,
+        error: `candidate id prefix "${p}" is ambiguous (matches ${matches.length}); use more characters`,
+      };
+    }
+    selected.set(matches[0].candidateId, matches[0]);
+  }
+  return { ok: true, selected: [...selected.values()] };
+}
+
+async function runEnrichAccept(argv: string[]): Promise<number> {
+  let flags: AcceptFlags;
+  try {
+    flags = parseAcceptArgs(argv);
+  } catch (e) {
+    console.error((e as Error).message);
+    return 2;
+  }
+
+  // The sidecar is keyed by workspace + runId. readKbConfig resolves the workspace the run was
+  // ingested under (the sidecar lives under that workspace's local onboarding-runs dir).
+  let cfg: KbCliConfig;
+  try {
+    cfg = readKbConfig(flags.workspace);
+  } catch (e) {
+    console.error((e as Error).message);
+    return 2;
+  }
+
+  const sidecar = loadCandidatesSidecar(HOME, cfg.workspaceId, flags.runId!);
+  if (!sidecar) {
+    console.error(
+      `no candidates sidecar for run ${flags.runId} in workspace ${cfg.workspaceId}. ` +
+        "Run `mla enrich ingest` first, from the same workspace.",
+    );
+    return 2;
+  }
+
+  const durable = sidecar.candidates.filter((c) => isDurableRuleKind(c.kind));
+  const knowledgeOnly = sidecar.candidates.filter((c) => !isDurableRuleKind(c.kind));
+
+  // No selection flag: read-only review. Print what the run found, write nothing.
+  if (!flags.all && !flags.only) {
+    if (flags.json) {
+      console.log(
+        JSON.stringify(
+          {
+            runId: sidecar.runId,
+            repositoryRoot: sidecar.repositoryRoot,
+            durable: durable.map((c) => ({ candidateId: c.candidateId, kind: c.kind, statement: c.statement })),
+            knowledgeOnly: knowledgeOnly.map((c) => ({
+              candidateId: c.candidateId,
+              kind: c.kind,
+              statement: c.statement,
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(renderAcceptReview(durable, knowledgeOnly));
+    }
+    return 0;
+  }
+
+  // Selection: which records to hand to materializeRules. --all forwards every candidate (the
+  // bridge itself skips + reports the non-durable ones); --only resolves the named prefixes.
+  let selectedRecords: OnboardingCandidateRecord[];
+  if (flags.all) {
+    selectedRecords = sidecar.candidates;
+  } else {
+    const res = resolveOnly(flags.only!, sidecar.candidates);
+    if (!res.ok) {
+      console.error(`refusing to accept: ${res.error}`);
+      return 2;
+    }
+    selectedRecords = res.selected;
+  }
+
+  const managedPath = join(sidecar.repositoryRoot, MANAGED_RULES_PATH);
+  const existing = readManagedFile(managedPath);
+  const result = materializeRules(existing, selectedRecords.map(recordToCandidate));
+
+  if (result.changed && !flags.dryRun) {
+    writeManagedFile(managedPath, result.text);
+  }
+
+  if (flags.json) {
+    console.log(
+      JSON.stringify(
+        {
+          runId: sidecar.runId,
+          path: MANAGED_RULES_PATH,
+          repositoryRoot: sidecar.repositoryRoot,
+          changed: result.changed,
+          wrote: result.changed && !flags.dryRun,
+          dryRun: flags.dryRun,
+          materialized: result.materialized.map((r) => ({ id: r.id, statement: r.statement, strength: r.strength })),
+          skipped: result.skipped,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.log(renderMaterializeSummary(result, MANAGED_RULES_PATH, flags.dryRun));
+  }
+  return 0;
+}
+
 export async function runEnrich(argv: string[]): Promise<number> {
   const sub = argv[0];
   const rest = argv.slice(1);
@@ -977,6 +1252,8 @@ export async function runEnrich(argv: string[]): Promise<number> {
       return runEnrichIngest(rest);
     case "materialize":
       return runEnrichMaterialize(rest);
+    case "accept":
+      return runEnrichAccept(rest);
     default:
       console.error(`unknown \`mla enrich\` subcommand: ${sub}\n`);
       console.error(USAGE);

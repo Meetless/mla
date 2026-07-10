@@ -44,6 +44,10 @@ import {
   WorkspaceCliConfig,
 } from "../lib/config";
 import { get, post, HttpError } from "../lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
 import { resolveScopeSession, SessionScopeError } from "../lib/session-scope";
 
 // One side of a conflict, mirroring control's WorkspaceConflictSide. `sessionId`
@@ -467,6 +471,12 @@ export async function runConflicts(
 }
 
 function reportFetchError(e: unknown, err: (l: string) => void): number {
+  // A workspace-membership 403 means you ARE logged in; re-login will not help.
+  // Give the shared canonical line instead of "Run `mla login`" (BUG-5 #3).
+  if (isWorkspaceAccessDenied(e)) {
+    err(workspaceAccessDeniedMessage(e));
+    return 1;
+  }
   const status = (e as HttpError | undefined)?.status;
   if (status === 401 || status === 403) {
     err("Not authorized. Run `mla login` to read conflicts as yourself.");
@@ -485,6 +495,12 @@ function reportResolveError(
   caseId: string,
   err: (l: string) => void,
 ): number {
+  // A workspace-membership 403 means you ARE logged in; re-login will not help.
+  // Give the shared canonical line instead of "Run `mla login`" (BUG-5 #3).
+  if (isWorkspaceAccessDenied(e)) {
+    err(workspaceAccessDeniedMessage(e));
+    return 1;
+  }
   const status = (e as HttpError | undefined)?.status;
   if (status === 404) {
     err(

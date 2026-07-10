@@ -44,6 +44,10 @@ import * as path from "path";
 import { loadWorkspaceConfig, readConfig, type WorkspaceCliConfig } from "../lib/config";
 import type { HttpError } from "../lib/http";
 import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
+import {
   editRule,
   getRule,
   listRules,
@@ -300,6 +304,26 @@ function renderRuleLine(node: RuleNodeView): string {
   );
 }
 
+// Surface a rules-backend HTTP failure. A workspace-membership 403 (an explicit
+// --workspace, or the folder marker, names a workspace this human is not in) is
+// NOT a token/config problem, so it is routed to the ONE canonical line (BUG-5):
+// "You are not a member of workspace 'X'..." instead of a raw
+// `PATCH https://.../internal/... -> HTTP 403: {...}` dump that leaks the internal
+// URL. Every other error keeps its verb-specific prefix. Call this from the
+// non-offline branch of each verb's catch so all rules verbs share one handler.
+function reportRulesBackendError(
+  e: unknown,
+  verbFailedPrefix: string,
+  err: (line: string) => void,
+): number {
+  if (isWorkspaceAccessDenied(e)) {
+    err(workspaceAccessDeniedMessage(e));
+    return 1;
+  }
+  err(`${verbFailedPrefix}: ${(e as Error).message}`);
+  return 1;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // list
 // ───────────────────────────────────────────────────────────────────────────
@@ -361,8 +385,7 @@ export async function runRulesListBackend(argv: string[], deps: RulesListBackend
     return 0;
   } catch (e) {
     if (!isOffline(e)) {
-      err(`rules list failed: ${(e as Error).message}`);
-      return 1;
+      return reportRulesBackendError(e, "rules list failed", err);
     }
     // Offline: fall back to the principal bundle cache so the operator still sees the
     // last-good set, clearly labelled with its revision + age (acceptance 16).
@@ -521,8 +544,7 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
       err("rules add failed: backend unreachable; the rule was NOT minted (the backend is the source of truth)");
       return 1;
     }
-    err(`rules add failed: ${(e as Error).message}`);
-    return 1;
+    return reportRulesBackendError(e, "rules add failed", err);
   }
 }
 
@@ -608,8 +630,7 @@ export async function runRulesEditBackend(argv: string[], deps: RulesEditBackend
       err("rules edit failed: backend unreachable; nothing changed");
       return 1;
     }
-    err(`rules edit failed: ${(e as Error).message}`);
-    return 1;
+    return reportRulesBackendError(e, "rules edit failed", err);
   }
   if (lifecycleOf(node) === "REVOKED") {
     err(`rule ${nodeId} is revoked; revive it by minting a new rule, not editing a revoked one`);
@@ -664,8 +685,7 @@ export async function runRulesEditBackend(argv: string[], deps: RulesEditBackend
       err("rules edit failed: backend unreachable; nothing changed");
       return 1;
     }
-    err(`rules edit failed: ${(e as Error).message}`);
-    return 1;
+    return reportRulesBackendError(e, "rules edit failed", err);
   }
 }
 
@@ -734,8 +754,7 @@ export async function runRulesRevokeBackend(argv: string[], deps: RulesRevokeBac
       err("rules revoke failed: backend unreachable; nothing changed");
       return 1;
     }
-    err(`rules revoke failed: ${(e as Error).message}`);
-    return 1;
+    return reportRulesBackendError(e, "rules revoke failed", err);
   }
   if (lifecycleOf(node) === "REVOKED") {
     out(`already revoked: rule ${nodeId}; no-op`);
@@ -781,8 +800,7 @@ export async function runRulesRevokeBackend(argv: string[], deps: RulesRevokeBac
       err("rules revoke failed: backend unreachable; nothing changed");
       return 1;
     }
-    err(`rules revoke failed: ${(e as Error).message}`);
-    return 1;
+    return reportRulesBackendError(e, "rules revoke failed", err);
   }
 }
 
@@ -1005,8 +1023,7 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
       err("rules attest failed: backend unreachable; the rule was NOT minted");
       return 1;
     }
-    err(`rules attest failed: ${(e as Error).message}`);
-    return 1;
+    return reportRulesBackendError(e, "rules attest failed", err);
   }
 }
 
@@ -1087,8 +1104,7 @@ export async function runRulesDemoteBackend(argv: string[], deps: RulesDemoteBac
       err("rules demote failed: backend unreachable; nothing changed");
       return 1;
     }
-    err(`rules demote failed: ${(e as Error).message}`);
-    return 1;
+    return reportRulesBackendError(e, "rules demote failed", err);
   }
 
   if (lifecycleOf(node) === "REVOKED") {
@@ -1153,6 +1169,13 @@ export async function runRulesDemoteBackend(argv: string[], deps: RulesDemoteBac
       deps.http,
     );
   } catch (e) {
+    // A membership 403 at the mint step means the copy was never created, so the
+    // TEAM rule is still untouched: route to the canonical line (BUG-5) but keep
+    // that reassurance instead of a raw wire dump.
+    if (isWorkspaceAccessDenied(e)) {
+      err(`${workspaceAccessDeniedMessage(e)} (the team rule is untouched)`);
+      return 1;
+    }
     if (isOffline(e)) {
       err("rules demote failed: backend unreachable; nothing changed (the team rule is untouched)");
       return 1;

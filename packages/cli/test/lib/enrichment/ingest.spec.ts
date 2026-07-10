@@ -8,6 +8,9 @@ import {
   CANDIDATE_DOC_SCHEMA_VERSION,
   verifyCandidate,
   defaultProbe,
+  loadCandidatesSidecar,
+  upsertCandidatesSidecar,
+  candidatesSidecarPath,
   type FsProbe,
   type Persister,
   type PersistDocument,
@@ -22,6 +25,8 @@ import {
   type EnrichmentLimits,
   type MergedCandidate,
   type PreparedGitEvidence,
+  type OnboardingCandidateRecord,
+  type OnboardingCandidatesSidecar,
 } from "../../../src/lib/enrichment/protocol";
 
 const NOW = "2026-06-26T12:00:00.000Z";
@@ -841,5 +846,139 @@ describe("defaultProbe (real fs + injected git)", () => {
     expect(probe.isTracked("nope.xyz")).toBe(false);
     const abs = join(probe.repoRealpath, "package.json");
     expect(probe.lineCount(abs)).toBeGreaterThan(0);
+  });
+});
+
+// The per-run candidates sidecar is the bridge that lets `enrich accept` materialize a run's
+// durable rules after ingest. These pin the two behaviors that make it safe to read later:
+// upsert MERGES by candidateId (a resuming scout appends, never clobbers the first scout's
+// candidates), and load is fail-closed (a corrupt / foreign / stale-schema sidecar reads as
+// "no candidates", never as another run's rules).
+describe("candidates sidecar IO", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "mla-sidecar-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const record = (over: Partial<OnboardingCandidateRecord> = {}): OnboardingCandidateRecord => ({
+    candidateId: "a".repeat(64),
+    kind: "constraint",
+    statement: "Use 127.0.0.1, not localhost, on macOS.",
+    evidence: [{ type: "file", path: "CLAUDE.md", startLine: 1, endLine: 2 }],
+    sourceScouts: ["documentation"],
+    rationale: null,
+    rationaleSource: null,
+    relPath: "onboarding/x.md",
+    landed: "ingested",
+    ...over,
+  });
+
+  const sidecar = (over: Partial<OnboardingCandidatesSidecar> = {}): OnboardingCandidatesSidecar => ({
+    schemaVersion: 1,
+    workspaceId: "ws_1",
+    runId: "run-1",
+    repositoryRoot: "/repo",
+    updatedAt: NOW,
+    candidates: [record()],
+    ...over,
+  });
+
+  it("returns null when the sidecar file does not exist", () => {
+    expect(loadCandidatesSidecar(home, "ws_1", "run-1")).toBeNull();
+  });
+
+  it("round-trips a written sidecar", () => {
+    upsertCandidatesSidecar(home, sidecar());
+    const loaded = loadCandidatesSidecar(home, "ws_1", "run-1");
+    expect(loaded?.candidates).toHaveLength(1);
+    expect(loaded?.candidates[0].statement).toBe("Use 127.0.0.1, not localhost, on macOS.");
+    expect(loaded?.repositoryRoot).toBe("/repo");
+  });
+
+  it("MERGES by candidateId across calls: a resuming scout appends, never clobbers", () => {
+    // First scout's candidate.
+    upsertCandidatesSidecar(home, sidecar({ candidates: [record({ candidateId: "a".repeat(64) })] }));
+    // Second scout resumes in a LATER call with the first already persisted; a blind overwrite
+    // would drop scout A. The merge keeps both.
+    upsertCandidatesSidecar(
+      home,
+      sidecar({
+        candidates: [record({ candidateId: "b".repeat(64), statement: "Never git add -A here." })],
+      }),
+    );
+    const loaded = loadCandidatesSidecar(home, "ws_1", "run-1");
+    expect(loaded?.candidates).toHaveLength(2);
+    expect(loaded?.candidates.map((c) => c.candidateId).sort()).toEqual(["a".repeat(64), "b".repeat(64)]);
+  });
+
+  it("overwrites a repeated candidateId in place so the latest landed outcome wins", () => {
+    upsertCandidatesSidecar(home, sidecar({ candidates: [record({ candidateId: "a".repeat(64), landed: "failed" })] }));
+    upsertCandidatesSidecar(home, sidecar({ candidates: [record({ candidateId: "a".repeat(64), landed: "ingested" })] }));
+    const loaded = loadCandidatesSidecar(home, "ws_1", "run-1");
+    expect(loaded?.candidates).toHaveLength(1);
+    expect(loaded?.candidates[0].landed).toBe("ingested");
+  });
+
+  it("reads null on a schemaVersion mismatch (never materializes an unknown-shape sidecar)", () => {
+    upsertCandidatesSidecar(home, sidecar());
+    const path = candidatesSidecarPath(home, "ws_1", "run-1");
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    onDisk.schemaVersion = 2;
+    writeFileSync(path, JSON.stringify(onDisk), "utf8");
+    expect(loadCandidatesSidecar(home, "ws_1", "run-1")).toBeNull();
+  });
+
+  it("reads null when the stored runId drifted from the path (corruption / hand-edit)", () => {
+    upsertCandidatesSidecar(home, sidecar());
+    const path = candidatesSidecarPath(home, "ws_1", "run-1");
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    onDisk.runId = "run-999";
+    writeFileSync(path, JSON.stringify(onDisk), "utf8");
+    expect(loadCandidatesSidecar(home, "ws_1", "run-1")).toBeNull();
+  });
+
+  it("reads null when candidates is not an array", () => {
+    upsertCandidatesSidecar(home, sidecar());
+    const path = candidatesSidecarPath(home, "ws_1", "run-1");
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    onDisk.candidates = { not: "an array" };
+    writeFileSync(path, JSON.stringify(onDisk), "utf8");
+    expect(loadCandidatesSidecar(home, "ws_1", "run-1")).toBeNull();
+  });
+
+  it("reads null on malformed JSON rather than throwing", () => {
+    upsertCandidatesSidecar(home, sidecar());
+    writeFileSync(candidatesSidecarPath(home, "ws_1", "run-1"), "{ not json", "utf8");
+    expect(loadCandidatesSidecar(home, "ws_1", "run-1")).toBeNull();
+  });
+});
+
+// The wiring that makes accept reachable at all: a successful ingest must leave a sidecar the
+// accept command can later read. Without this, ingested rule-looking candidates would land in
+// the governed KB with no local path to `.meetless/rules.md` (the bug this whole change fixes).
+describe("ingestRun writes the candidates sidecar", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "mla-ingest-sidecar-"));
+    seedRun(home);
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const completeDoc = (candidates: unknown[]) => [{ scout: "documentation", status: "complete", candidates }];
+
+  it("parks the persisted candidate in a sidecar keyed by workspace + runId", async () => {
+    const res = await ingestRun(ingestArgs(home, "run-1", completeDoc([docCandidate({ kind: "constraint" })])));
+    expect(res.ok).toBe(true);
+    const loaded = loadCandidatesSidecar(home, "ws_1", "run-1");
+    expect(loaded).not.toBeNull();
+    expect(loaded?.candidates).toHaveLength(1);
+    expect(loaded?.candidates[0].kind).toBe("constraint");
+    expect(loaded?.candidates[0].statement).toBe("Use 127.0.0.1 not localhost on macOS.");
+    expect(loaded?.repositoryRoot).toBe("/repo");
   });
 });
