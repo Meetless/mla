@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { HOOKS_DIR } from "./config";
+import { isPackagedBinary } from "./packaged";
 import { BuildInfo, loadBuildInfo } from "./observability";
 import { DEFAULT_CONFLICT_GATE_MODE, type ConflictGateMode } from "./active-conflict-cache";
 import { SCOUT_NAMES, type ScoutName } from "./enrichment/protocol";
@@ -299,17 +300,63 @@ export function ensureFlock(noInstall: boolean): { ok: boolean; detail: string }
 }
 
 // Resolve a fully canonical, executable mla path so hooks invoke the same
-// binary that ran `init`/`rewire`. process.argv[1] is the dispatcher entry;
-// realpathSync follows any symlink chain (pnpm link, npm i -g, manual
-// symlinks under ~/.local/bin) so the path stored in cli-config.json
-// survives package upgrades.
+// binary that ran `init`/`rewire`, and so the ~/.claude.json MCP `command`
+// points at a file that actually exists on disk. realpathSync follows any
+// symlink chain (pnpm link, npm i -g, manual symlinks under ~/.local/bin) so
+// the path stored in cli-config.json survives package upgrades.
+//
+// The seam is which entry to canonicalize. In a source/npm install process.argv[1]
+// IS the dispatcher script on a real Node, so use it. But in a @yao-pkg/pkg binary
+// (the Homebrew + curl|sh installs, i.e. most operators) process.argv[1] is the
+// snapshot-internal entry `/snapshot/.../cli.js` -- a V8-VFS path that does NOT
+// exist on the real filesystem. Baking THAT into the MCP `command` makes Claude
+// Code spawn a nonexistent file (ENOENT), so the Meetless MCP silently never loads;
+// the same path lands in cli-config.mlaPath and only survives in the hooks because
+// they guard with `-x` + a `command -v mla` PATH fallback. In a pkg binary the real
+// on-disk executable is process.execPath (pkg points it at the binary itself, e.g.
+// /opt/homebrew/bin/mla), so canonicalize that instead.
 export function resolveMlaPath(): string {
-  const entry = process.argv[1] || "";
+  const entry =
+    (isPackagedBinary() ? process.execPath : process.argv[1]) || "";
   const abs = path.resolve(entry);
   try {
     return fs.realpathSync(abs);
   } catch {
     return abs;
+  }
+}
+
+// Whether a Claude Code MCP `command` (from ~/.claude.json mcpServers.meetless)
+// is one Claude Code can actually spawn. Claude Code execs the command directly
+// with NO PATH fallback, so a stale absolute path leaves the meetless__* tools
+// silently absent while a presence-only check stays green. An absolute command
+// must therefore be executable on disk; a bare name (resolved via PATH at spawn
+// time) cannot be cheaply proven here, so it is accepted as present. Shared by
+// `mla doctor`'s health check and the bootstrap auto-heal (maybeHealMcpCommand);
+// it lives here next to resolveMlaPath and ensureClaudeMcpServer so both can use
+// it without a wire<->doctor import cycle.
+//
+// @yao-pkg/pkg mounts its read-only VFS at `/snapshot` (POSIX) or `<drive>:\snapshot`
+// (Windows). A command under that mount exists ONLY inside a pkg process's patched
+// fs; any EXTERNAL spawner (Claude Code) gets ENOENT. That is the exact shape an older
+// binary baked into the MCP command. The trap: when this code itself runs FROM a pkg
+// binary, `fs.accessSync("/snapshot/.../cli.js", X_OK)` resolves against the embedded
+// VFS and SUCCEEDS, so a plain executability probe stays falsely green for precisely the
+// poison it is meant to catch. A snapshot path is therefore never a valid external
+// command; reject it by prefix, before touching the (patched) fs.
+export function isPkgSnapshotPath(command: string): boolean {
+  const unix = command.replace(/\\/g, "/");
+  return unix.startsWith("/snapshot/") || /^[a-zA-Z]:\/snapshot\//.test(unix);
+}
+
+export function mcpCommandExecutable(command: string): boolean {
+  if (isPkgSnapshotPath(command)) return false;
+  if (!path.isAbsolute(command)) return true;
+  try {
+    fs.accessSync(command, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -535,6 +582,138 @@ export function maybeResyncHooks(opts?: {
     return { ran: true, refreshed, reason: refreshed.length ? "refreshed" : "stamped" };
   } catch (e) {
     return { ran: false, refreshed: [], reason: "error:" + (e as Error).message };
+  }
+}
+
+// --- MCP command auto-heal (self-heal a poisoned ~/.claude.json on upgrade) ----
+//
+// maybeResyncHooks (above) deliberately NEVER touches ~/.claude.json, so it does
+// not fix the one thing that broke the meetless MCP for real users: an older
+// @yao-pkg/pkg binary baked the mcpServers.meetless `command` from process.argv[1]
+// = `/snapshot/.../cli.js`, a snapshot-VFS path Claude Code cannot spawn (ENOENT),
+// so the meetless__* tools silently never load. `mla doctor` now flags it, but a
+// nag only helps operators who run doctor. This closes the loop: on a binary
+// upgrade, the moment ANY mla command runs (the capture hooks survive the poison
+// via their PATH fallback, so they fire even while the MCP is dead), re-point a
+// PROVABLY-BROKEN meetless command at this binary via the same trusted writer
+// `mla init`/`rewire` use. Claude Code then spawns the healed command on its next
+// MCP (re)connect.
+
+// Sibling of HOOK_STAMP_FILE, co-located in HOOKS_DIR (which only exists on a
+// wired machine). A SEPARATE stamp so the MCP reconcile pass is independent of the
+// hook resync: either can run/retry without the other's success masking it.
+const MCP_HEAL_STAMP_FILE = ".mla-mcp-heal-stamp";
+
+export interface McpHealResult {
+  // True only when a broken command was found and rewritten. False on every skip
+  // (gate, unwired, dev build, no entry, already healthy, or an error).
+  ran: boolean;
+  // Why we stopped / what happened, for observability and tests.
+  reason: string;
+  // The broken command we found (heal + healthy branches).
+  from?: string;
+  // What we re-pointed it to (heal branch only).
+  to?: string;
+}
+
+// Self-heal a broken Meetless MCP `command` in ~/.claude.json when the running
+// binary differs from the one that last reconciled it. Called at CLI bootstrap
+// for EVERY command (including the hook-invoked `_internal` calls, which is how a
+// poisoned machine first heals mid-session). CHEAP in the steady state (one small
+// stamp read that matches -> immediate return, no claude.json parse) and NEVER
+// throws: any failure leaves ~/.claude.json untouched and the command runs.
+//
+// Deliberately NARROW. It only REPAIRS an entry that already exists and is
+// provably broken (a /snapshot mount, or a stale/moved absolute path). It never
+// CREATES the entry from absence (that is `mla init`/`rewire`, the create-from-zero
+// installer) and never re-canonicalizes a healthy or bare-name command. This keeps
+// a machine that deliberately never wired the MCP from being silently opted in, and
+// keeps a hand-edited healthy command from being clobbered.
+export function maybeHealMcpCommand(opts?: {
+  buildInfo?: BuildInfo;
+  env?: NodeJS.ProcessEnv;
+  claudeJsonPath?: string;
+  stampDir?: string;
+  // Heal target override, forwarded to ensureClaudeMcpServer (mirrors its own
+  // mlaPathOverride). Production leaves it undefined -> resolveMlaPath(); tests set
+  // it so the rewritten command is deterministic instead of the jest runner path.
+  mlaPath?: string;
+}): McpHealResult {
+  try {
+    const env = opts?.env ?? process.env;
+    // Kill switch: any non-falsy value disables the self-heal.
+    const off = env.MLA_DISABLE_MCP_HEAL;
+    if (off && off !== "0" && off.toLowerCase() !== "false") {
+      return { ran: false, reason: "disabled" };
+    }
+    const buildInfo = opts?.buildInfo ?? loadBuildInfo();
+    // Unbuilt ts-node (sha "dev"): no shipped binary owns this reconcile, and a
+    // per-process builtAt would re-parse claude.json every source-dev command.
+    if (buildInfo.sha === "dev") {
+      return { ran: false, reason: "dev-build" };
+    }
+    // The stamp lives beside the hook stamp in HOOKS_DIR, which init/rewire create.
+    // Its absence means the machine never opted in, so there is nothing of ours to
+    // heal (and nowhere to record the stamp).
+    const stampDir = opts?.stampDir ?? HOOKS_DIR;
+    if (!fs.existsSync(stampDir)) {
+      return { ran: false, reason: "not-wired" };
+    }
+    const claudeJsonPath =
+      opts?.claudeJsonPath ?? path.join(os.homedir(), ".claude.json");
+    if (!fs.existsSync(claudeJsonPath)) {
+      return { ran: false, reason: "no-claude-json" };
+    }
+
+    const want = buildStampId(buildInfo);
+    const stampPath = path.join(stampDir, MCP_HEAL_STAMP_FILE);
+    // Hot path: this exact binary already reconciled the MCP command. One small
+    // read, and crucially NO parse of the (potentially large) claude.json.
+    if (readHookStamp(stampPath) === want) {
+      return { ran: false, reason: "current" };
+    }
+
+    // A different binary is in charge: read the current meetless command once.
+    let parsed: any;
+    try {
+      parsed = JSON.parse(fs.readFileSync(claudeJsonPath, "utf8"));
+    } catch {
+      // Unparseable claude.json: ensureClaudeMcpServer could not heal it either
+      // (it also bails on invalid JSON), and re-reading a possibly-large broken
+      // file on every hook fire would add real latency. Record this build's pass
+      // and move on; the user fixes the JSON out of band (`mla rewire` / doctor
+      // --fix re-register once it parses).
+      atomicWriteInto(stampPath, (tmp) => fs.writeFileSync(tmp, want + "\n"));
+      return { ran: false, reason: "unparseable-claude-json" };
+    }
+
+    const cmd: unknown = parsed?.mcpServers?.[MCP_SERVER_KEY]?.command;
+    // No entry: not ours to create. Stamp so we do not re-parse every command.
+    if (typeof cmd !== "string" || cmd.length === 0) {
+      atomicWriteInto(stampPath, (tmp) => fs.writeFileSync(tmp, want + "\n"));
+      return { ran: false, reason: "no-entry" };
+    }
+    // Entry present and Claude Code can spawn it: healthy, record and move on.
+    if (mcpCommandExecutable(cmd)) {
+      atomicWriteInto(stampPath, (tmp) => fs.writeFileSync(tmp, want + "\n"));
+      return { ran: false, reason: "healthy", from: cmd };
+    }
+
+    // Provably broken: re-point it at THIS binary via the trusted writer, which
+    // backs up ~/.claude.json byte-exact and preserves every other key. In a pkg
+    // binary resolveMlaPath() returns the real on-disk execPath, never /snapshot.
+    const to = opts?.mlaPath ?? resolveMlaPath();
+    const res = ensureClaudeMcpServer(claudeJsonPath, opts?.mlaPath);
+    if (res.action === "updated" || res.action === "added") {
+      atomicWriteInto(stampPath, (tmp) => fs.writeFileSync(tmp, want + "\n"));
+      return { ran: true, reason: "healed", from: cmd, to };
+    }
+    // Writer did not change the file (unparseable race, or the broken command
+    // already equals resolveMlaPath -- both effectively impossible here). Do NOT
+    // stamp; let a later invocation retry.
+    return { ran: false, reason: "writer:" + res.action, from: cmd };
+  } catch (e) {
+    return { ran: false, reason: "error:" + (e as Error).message };
   }
 }
 

@@ -263,13 +263,25 @@ export async function listRules(
   return http.get<RuleNodeView[]>(cfg, path);
 }
 
-/** Read one rule plus its live version; rejects 404 when the rule is not visible. */
+/**
+ * Read one rule plus its live version; rejects 404 when the rule is not visible.
+ *
+ * Carries workspaceId as the marker (exactly like listRules/getBundle) so the
+ * cli-session tenant guard resolves effectiveWorkspaceId to cfg.workspaceId. GET
+ * carries no body, so without this query param the guard would fall back to the
+ * session HOME workspace and 404 on any non-home rule. That silently broke the
+ * `edit`/`revoke` preflight for every non-home target (folder marker OR
+ * --workspace) -- the BUG-4 migration path (list --workspace + revoke --workspace).
+ */
 export async function getRule(
   cfg: WorkspaceCliConfig,
   ruleId: string,
   http: RuleClientHttp = defaultHttp,
 ): Promise<RuleNodeView> {
-  return http.get<RuleNodeView>(cfg, `${BASE}/${encodeURIComponent(ruleId)}`);
+  const path = withQuery(`${BASE}/${encodeURIComponent(ruleId)}`, {
+    workspaceId: cfg.workspaceId,
+  });
+  return http.get<RuleNodeView>(cfg, path);
 }
 
 /**

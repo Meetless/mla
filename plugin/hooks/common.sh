@@ -436,15 +436,9 @@ steer_dir() { printf '%s/steer' "$LOG_DIR"; }
 steer_cache_file() { printf '%s/steer/steer-%s.json' "$LOG_DIR" "$1"; }
 steer_inject_file() { printf '%s/steer/inject-%s.json' "$LOG_DIR" "$1"; }
 
-# Regime-1 (first-run pack) per-session inject-state. The first-run block is a
-# LARGE static grounding pack (confirmed-rules + stale signals) read from the scan
-# cache. Without a gate it re-injects on every turn, bloating additionalContext past
-# the harness inline cap (the agent then only sees a truncated preview) and burning
-# tokens. The hook stores the content hash it last emitted here, keyed by session, so
-# it injects once per session and re-injects ONLY when a rescan changes the cache.
-# Keyed by the opaque session id, co-located under logs/ like the siblings above.
-regime1_dir() { printf '%s/regime1' "$LOG_DIR"; }
-regime1_inject_file() { printf '%s/regime1/inject-%s.json' "$LOG_DIR" "$1"; }
+# (The regime-1 first-run pack and its per-session inject-state are RETIRED:
+# targeted-rule-injection §Phase 2 moved rule delivery to the per-turn assemble-context head,
+# so there is no once-per-session bulk block to gate anymore.)
 
 # The closed CoordinationTrigger enum (§5.4.1). Both hooks hard-filter to this set
 # so a malformed or injected trigger type can never manufacture an escalation.

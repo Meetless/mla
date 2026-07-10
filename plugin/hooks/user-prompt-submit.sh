@@ -206,49 +206,51 @@ build_floor_rules() {
   jq -r '.floorRulesXml // empty' "$cache" 2>/dev/null || true
 }
 
-# Regime-1 deterministic context pack: read pre-rendered XML from the scan cache.
-# Zero network, zero Node startup on the hot path (jq read of a small local JSON).
-# Written by `mla _internal scan-context` (Task 9 rescanAndCache). Two fields:
-#   .confirmedRulesXml: accepted project directives, rendered as <confirmed-rules>.
-#   .staleContextXml:   stale-context signals still pending review.
-# Both are optional: absent or empty fields silently produce no output.
-# MUST always exit 0 so `REGIME1="$(build_regime1)"` never aborts the hook.
-build_regime1() {
+# Floor delivery receipt (matrix doc, Phase 2 observability). Records whether THIS turn's
+# hook actually emitted the floor block, and if so its currency + identity, so the async
+# flush can prove the load-bearing global rules are reaching the model turn over turn.
+# $1 = the FLOOR_RULES string this turn already built (empty == not emitted). Reads the
+# currency/provenance from `.floorMeta` in the SAME cache the scan wrote (no bundle
+# re-read, no Node). Latest-state, one small local file overwritten each turn. Delivery is
+# `emitted` (with freshness/bundleId/bundleHash) or `missing` (with a reason); freshness
+# is never "unknown" (a delivered floor is fresh or stale). MUST exit 0: a receipt is
+# observability, never a gate, so any failure is swallowed and the hook proceeds.
+emit_floor_receipt() {
+  local floor_xml="$1"
   local cache="$MEETLESS_HOME_DIR/workspaces/$WORKSPACE_ID/scan-cache.json"
-  [[ -r "$cache" ]] || return 0
-  local rules stale
-  rules="$(jq -r '.confirmedRulesXml // empty' "$cache" 2>/dev/null || true)"
-  stale="$(jq -r '.staleContextXml // empty' "$cache" 2>/dev/null || true)"
-  [[ -z "$rules" && -z "$stale" ]] && return 0
-  local block
-  block="<meetless-context kind=\"first-run\" trust=\"provisional\">
-$rules
-$stale
-</meetless-context>"
-
-  # Once-per-session gate (mirrors maybe_governance_block / maybe_steer_block).
-  # This pack is large; re-emitting it every turn bloats additionalContext past the
-  # harness inline cap (so the agent only ever sees a truncated preview = the
-  # grounding is never read) and burns tokens. Emit on the first turn of a session,
-  # then RE-emit only when a rescan changes the cached content. The decision is a
-  # content hash keyed by session; a stable cache stays silent for the rest of the
-  # session. Fail-open: if the hash can't be computed we emit (never worse than the
-  # old every-turn behavior and never silently swallows fresh grounding).
-  local inject_file hash prev
-  inject_file="$(regime1_inject_file "$SESSION_ID")"
-  hash="$(printf '%s' "$block" | cksum 2>/dev/null || true)"
-  if [[ -n "$hash" && -f "$inject_file" ]]; then
-    prev="$(jq -r '.hash // empty' "$inject_file" 2>/dev/null || true)"
-    [[ -n "$prev" && "$prev" == "$hash" ]] && return 0
+  local receipt="$MEETLESS_HOME_DIR/workspaces/$WORKSPACE_ID/hook-receipt.json"
+  local line
+  if [[ -n "$floor_xml" ]]; then
+    local freshness bundle_id bundle_hash
+    # floorMeta is absent in a pre-floorMeta cache; default freshness to "fresh" (the
+    # next scan backfills it) rather than emit a forbidden "unknown".
+    freshness="$(jq -r '.floorMeta.freshness // "fresh"' "$cache" 2>/dev/null || printf 'fresh')"
+    bundle_id="$(jq -r '.floorMeta.bundleId // "unavailable"' "$cache" 2>/dev/null || printf 'unavailable')"
+    bundle_hash="$(jq -r '.floorMeta.bundleHash // empty' "$cache" 2>/dev/null || true)"
+    line="$(jq -cn --arg ts "$TS" --arg fr "$freshness" --arg bi "$bundle_id" --arg bh "$bundle_hash" \
+      '{at:$ts, delivery:"emitted", freshness:$fr, bundleId:$bi}
+       + (if $bh == "" then {} else {bundleHash:$bh} end)' 2>/dev/null || true)"
+  else
+    # No floor emitted: distinguish an unreadable/absent cache from a readable cache that
+    # simply carries no floor (bundle unavailable, or no rule-bundle MUSTs).
+    local reason
+    if [[ ! -r "$cache" ]]; then reason="scan_cache_missing"; else reason="floor_empty"; fi
+    line="$(jq -cn --arg ts "$TS" --arg r "$reason" \
+      '{at:$ts, delivery:"missing", reason:$r}' 2>/dev/null || true)"
   fi
-  if [[ -n "$hash" ]]; then
-    mkdir -p "$(regime1_dir)" 2>/dev/null || true
-    jq -cn --arg h "$hash" --argjson ts "$(date +%s)" '{hash:$h, ts:$ts}' \
-      > "$inject_file" 2>/dev/null || true
-  fi
-
-  printf '%s' "$block"
+  [[ -z "$line" ]] && return 0
+  mkdir -p "$(dirname "$receipt")" 2>/dev/null || true
+  printf '%s\n' "$line" > "$receipt" 2>/dev/null || true
+  return 0
 }
+
+# Regime-1 bulk grounding pack: RETIRED (targeted-rule-injection §Phase 2). The
+# kind="first-run" block carried .confirmedRulesXml + .staleContextXml, was emitted LAST
+# (tail position) so it always landed past the ~2KB harness inline window, and so was never
+# actually read by the model. Scoped rules now ride the per-turn `mla _internal
+# assemble-context` head (byte-asserted to fit the window); the floor rides that same head or
+# the bash fallback. The stale-context surface moves to the stop-hook review card (render.ts
+# renderStopCard), which is where review signals belong.
 
 # PE (§5.4.1): the IMPERATIVE rung. Rendered ONLY by the gate in intercept_main
 # (high-confidence inject AND >= 1 validated CoordinationTrigger). This is the one
@@ -619,12 +621,14 @@ spool_injection_trace() {
   [[ -z "$_it_blocks" ]] && _it_blocks="[]"
 
   # summary stamped from the per-block data (§4.3.3); ruleCount/evidenceCount read
-  # the first-run/evidence block itemCounts, layer2Injected mirrors LAYER2_INJECTED.
+  # the rule/evidence block itemCounts, layer2Injected mirrors LAYER2_INJECTED. Rule bullets
+  # now ride the assemble-context head's floor-rules + scoped-rules blocks (the retired
+  # first-run pack is gone), so ruleCount sums those two kinds.
   local _l2_bool; _l2_bool="$([[ "$LAYER2_INJECTED" == "true" ]] && printf true || printf false)"
   _it_summary="$(printf '%s' "$_it_blocks" | jq -c --argjson l2 "$_l2_bool" '{
     blockCount: length,
     injectedCharCount: ([ .[].charCount // 0 ] | add // 0),
-    ruleCount: ([ .[] | select(.kind == "first-run") | .itemCount // 0 ] | add // 0),
+    ruleCount: ([ .[] | select(.kind == "floor-rules" or .kind == "scoped-rules") | .itemCount // 0 ] | add // 0),
     evidenceCount: ([ .[] | select(.kind == "evidence") | .itemCount // 0 ] | add // 0),
     layer2Injected: $l2
   }' 2>/dev/null || printf 'null')"
@@ -704,11 +708,12 @@ arbitrate_layer2() {
 # stored blocks can never drift from the bytes the agent actually saw.
 #
 # DELIBERATE DEVIATION from the spec's literal `append_context_block "$kind" "$body"`
-# signature: we pass the ALREADY-WRAPPED block string. The build_* functions and the
-# inline sites keep owning their own <meetless-context ...> opening tag, because the
-# per-kind attributes differ (static/coordination/evidence/carry-forward/governance/
-# steer/active-review carry trace=; first-run carries trust="provisional" and NO
-# trace; evidence adds confidence=; turn-recap carries for-turn=). Re-deriving those
+# signature: we pass the ALREADY-WRAPPED block string. The build_* functions, the
+# assemble-context head, and the inline sites keep owning their own <meetless-context ...>
+# opening tag, because the per-kind attributes differ (static/coordination/evidence/
+# carry-forward/governance/steer/active-review carry trace=; floor-rules and the
+# degradation markers carry trust="must-follow" and NO trace; scoped-rules carries neither;
+# evidence adds confidence=; turn-recap carries for-turn=). Re-deriving those
 # in the helper would change the delivered bytes and force a refactor of five build
 # functions; passing the full block keeps a single source of truth. The helper
 # appends that exact string to OUTPUT_ACC AND derives the captured entry (kind +
@@ -776,6 +781,39 @@ append_context_block() {
   _append_output_acc "$full_block"
   _record_block_entry "$(_block_kind_of "$full_block")" \
     "$(_strip_context_wrapper "$full_block")" "$citations" "$item_count"
+}
+
+# Emit the byte-asserted rule head (base + floor + matched scoped rules) that
+# `mla _internal assemble-context` returns, then record each constituent block for the
+# governed-story trace. The head is ONE model-facing string whose EXACT internal bytes were
+# asserted <= SAFE_TOTAL by the assembler (targeted-rule-injection §4.1); it MUST reach the
+# model verbatim, so it is appended to OUTPUT_ACC as a single unit here rather than re-joined
+# through per-block append_context_block calls (which would re-insert the '\n\n' block
+# separators and break the asserted byte count). For trace fidelity we still split it back
+# into its <meetless-context> blocks: the head is blocks joined by a single '\n', and all rule
+# text is XML-escaped, so `</meetless-context>` and `<meetless-context` never appear inside a
+# body -- the boundary between blocks is unambiguous. itemCount is the rendered `- ` bullet
+# count so the trace's ruleCount tracks exactly what the agent saw.
+#   emit_and_capture_head <head>
+emit_and_capture_head() {
+  local head="$1"
+  [[ -z "$head" ]] && return 0
+  _append_output_acc "$head"
+  local delim="</meetless-context>"$'\n'"<meetless-context"
+  local rest="$head" block _ic
+  while [[ -n "$rest" ]]; do
+    if [[ "$rest" == *"$delim"* ]]; then
+      block="${rest%%"$delim"*}</meetless-context>"
+      rest="<meetless-context${rest#*"$delim"}"
+    else
+      block="$rest"; rest=""
+    fi
+    [[ -z "$block" ]] && continue
+    _ic="$(printf '%s' "$block" | grep -c '^- ' 2>/dev/null || printf 0)"
+    [[ "$_ic" =~ ^[0-9]+$ ]] || _ic=0
+    _record_block_entry "$(_block_kind_of "$block")" \
+      "$(_strip_context_wrapper "$block")" "[]" "$_ic"
+  done
 }
 
 intercept_main() {
@@ -915,12 +953,10 @@ intercept_main() {
   # Layer 1 shows a DISPLAY of the touched set, never the raw JSON (the full array of up
   # to 50 long paths is variable-size and would blow the static floor past the ~2KB inline
   # cap on a busy tree -- the original every-turn-floor bug). Show the first 6 paths +
-  # "+N more". This is the DESIRED display; it is the elastic buffer that the Layer-1
-  # build below trims to whatever inline budget remains after the load-bearing floor, so
-  # the always-on floor rules inline BY CONSTRUCTION regardless of how busy the tree is.
-  # The 300-char cut here is only a pathological upper bound (a tree of very long paths
-  # can't create a multi-KB string); the real bound is the dynamic fit at LAYER1 build.
-  # The FULL TOUCHED_FILES_JSON is still sent to intel below (line ~986), so retrieval
+  # "+N more", hard-capped at 300 chars. This display rides inside `base` (LAYER1), which the
+  # assemble-context subcommand counts as part of the always-fit base and byte-asserts under
+  # SAFE_TOTAL; the 300-char cap keeps that base bounded so a busy tree cannot push the head
+  # past the window. The FULL TOUCHED_FILES_JSON is still sent to intel below, so retrieval
   # seeding is unaffected. Best-effort: any jq failure yields "(none)".
   local TOUCHED_FILES_DISPLAY
   TOUCHED_FILES_DISPLAY="$(printf '%s' "$TOUCHED_FILES_JSON" | jq -r '
@@ -950,37 +986,45 @@ intercept_main() {
   # rule-bundle MUSTs). Built here because the Layer-1 budget fit below needs its size.
   local FLOOR_RULES
   FLOOR_RULES="$(build_floor_rules)"
+  # Stamp the per-turn floor delivery receipt (observability; never gates the hook).
+  emit_floor_receipt "$FLOOR_RULES"
 
-  # Budget-fit the elastic touched_files display so the floor inlines BY CONSTRUCTION.
-  # The harness inlines only the first ~2048 bytes of additionalContext; everything past
-  # it spills to a sidecar the model merely previews. LAYER1 + separator + FLOOR_RULES
-  # must therefore close inside that window. touched_files is the ONLY variable,
-  # display-only field in LAYER1 (its full JSON still goes to intel), so it is the buffer
-  # that absorbs whatever budget remains: build LAYER1 with the desired display, and if
-  # the floor would close past CAP-MARGIN, trim the display by exactly the overshoot and
-  # rebuild once. This self-corrects as the floor rules / LAYER1 prose evolve -- no magic
-  # per-signal cut to re-tune. _SEP=2 mirrors the '\n\n' _append_output_acc joins blocks
-  # with; _MARGIN keeps a safety cushion below the hard 2048 cap.
-  local _CAP=2048 _SEP=2 _MARGIN=48
   local LAYER1
   LAYER1="$(build_layer1)"
-  local _total=$(( ${#LAYER1} + _SEP + ${#FLOOR_RULES} ))
-  if (( _total > _CAP - _MARGIN )); then
-    local _over=$(( _total - (_CAP - _MARGIN) ))
-    local _keep=$(( ${#TOUCHED_FILES_DISPLAY} - _over ))
-    if (( _keep <= 0 )); then
-      TOUCHED_FILES_DISPLAY="(none)"
-    else
-      TOUCHED_FILES_DISPLAY="$(printf '%s' "$TOUCHED_FILES_DISPLAY" | cut -c1-"$_keep" || true)"
-      [[ -z "$TOUCHED_FILES_DISPLAY" ]] && TOUCHED_FILES_DISPLAY="(none)"
-    fi
-    LAYER1="$(build_layer1)"   # rebuild with the fitted display
-  fi
   INJECTED="true"
-  # Regime-1: read pre-rendered XML from the scan cache (zero network, zero Node).
-  # Trails all other layers; best-effort (empty when no cache or cache unreadable).
-  local REGIME1
-  REGIME1="$(build_regime1)"
+
+  # The byte-asserted rule head (targeted-rule-injection §4.1): hand LAYER1 (base), this
+  # turn's prompt, and the FULL git working set to `mla _internal assemble-context`, which
+  # matches scoped rules with the SAME glob engine Plane B enforcement uses, fills the exact
+  # remaining inline capacity with the floor + matched scoped rules, and asserts the total is
+  # under SAFE_TOTAL before printing. It prints the head on success (including the §6 degraded
+  # markers, which are non-empty success outputs), or NOTHING on hard failure, in which case
+  # the bash fallback below (LAYER1 + floor XML) still delivers the floor. Best-effort and
+  # fully isolated: any error leaves ASSEMBLE_HEAD empty and the fallback owns delivery.
+  local ASSEMBLE_HEAD=""
+  if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
+    # Full dirty set, NOT the 50-capped telemetry array: matching must see every touched path.
+    # The env override is scoped to this subshell so it never leaks to TOUCHED_FILES_JSON above.
+    local _asm_ws _asm_root _asm_input
+    _asm_ws="$(MEETLESS_TOUCHED_FILES_MAX=1000000 collect_touched_files 2>/dev/null || printf '[]')"
+    [[ -z "$_asm_ws" ]] && _asm_ws="[]"
+    # Repo root for repo-relative path resolution, coordinate-consistent with the working set
+    # (both derived from $PWD's git tree); fall back to the marker dir when not in a git tree.
+    _asm_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -z "$_asm_root" ]] && _asm_root="$(dirname "${MEETLESS_MARKER_FILE:-$PWD/.}" 2>/dev/null || printf '%s' "$PWD")"
+    _asm_input="$(jq -cn \
+      --arg base "$LAYER1" \
+      --arg prompt "$PROMPT" \
+      --argjson workingSet "$_asm_ws" \
+      --arg workspaceId "${WORKSPACE_ID:-}" \
+      --arg repoRoot "$_asm_root" \
+      '{base:$base, prompt:$prompt, workingSet:$workingSet, workspaceId:$workspaceId}
+        + (if $repoRoot == "" then {} else {repoRoot:$repoRoot} end)' 2>/dev/null || true)"
+    if [[ -n "$_asm_input" ]]; then
+      ASSEMBLE_HEAD="$(printf '%s' "$_asm_input" \
+        | "$MLA_PATH" _internal assemble-context 2>/dev/null || true)"
+    fi
+  fi
 
   # --- Layer 2 best-effort: needs the intel token; otherwise floor stands alone ---
   local INTEL_URL INTEL_TOKEN
@@ -1160,34 +1204,41 @@ ${PROMPT:$((PLEN - 500))}"
     fi
   fi
 
-  # --- assemble (Layer 1, then Layer 2 if usable) + emit + trace ---
-  # Build the delivered prompt block-by-block through append_context_block, which
-  # mirrors each block into BLOCKS_JSON for the governed-story capture (spec §4.3).
-  # The static floor is always first.
-  append_context_block "$LAYER1"
+  # --- assemble (Layer 1 rule head, then Layer 2 if usable) + emit + trace ---
+  # The rule head (base + floor + matched scoped rules) reaches the model ONE of two ways.
+  # Either way, everything variable/large (evidence, coordination) trails it, appended
+  # block-by-block through append_context_block, which mirrors each block into BLOCKS_JSON
+  # for the governed-story capture (spec §4.3).
+  #
+  # Path 1 (assemble-context succeeded): emit its byte-asserted head VERBATIM as a single
+  # unit. Its internal bytes were asserted under SAFE_TOTAL by the subcommand, so it must not
+  # be re-joined through per-block appends (which would re-insert the '\n\n' separators and
+  # break the count). emit_and_capture_head splits it back into blocks for the trace only.
+  #
+  # Path 2 (empty head = hard failure): bash fallback = LAYER1 then the pre-rendered floor XML,
+  # exactly the pre-assembler behavior. Scoped rules cannot be surfaced on this path (matching
+  # lives in the subcommand), but the always-on floor still rides inside the inline window.
+  if [[ -n "$ASSEMBLE_HEAD" ]]; then
+    emit_and_capture_head "$ASSEMBLE_HEAD"
+  else
+    append_context_block "$LAYER1"
+    if [[ -n "$FLOOR_RULES" ]]; then
+      local _floor_rule_count
+      _floor_rule_count="$(printf '%s' "$FLOOR_RULES" | grep -c '^- ' 2>/dev/null || printf 0)"
+      [[ "$_floor_rule_count" =~ ^[0-9]+$ ]] || _floor_rule_count=0
+      append_context_block "$FLOOR_RULES" "[]" "$_floor_rule_count"
 
-  # Floor rules SECOND, before the variable evidence/context blocks: the always-on
-  # global MUST set must ride inside the harness ~2KB inline window, so it goes right
-  # behind the static floor while there is still budget. Everything variable/large
-  # (evidence, coordination, the once-per-session pack) trails it. itemCount = the
-  # rendered <rule> count so the trace chip tracks exactly what the agent saw.
-  if [[ -n "$FLOOR_RULES" ]]; then
-    local _floor_rule_count
-    _floor_rule_count="$(printf '%s' "$FLOOR_RULES" | grep -c '<rule ' 2>/dev/null || printf 0)"
-    [[ "$_floor_rule_count" =~ ^[0-9]+$ ]] || _floor_rule_count=0
-    append_context_block "$FLOOR_RULES" "[]" "$_floor_rule_count"
-
-    # Budget gate (fail LOUD, never silent): the elastic touched_files fit above already
-    # trims the display to keep the floor inline. This gate is the HONEST last-resort
-    # signal -- it fires ONLY when the load-bearing essentials alone (LAYER1 with the
-    # display already collapsed + floor rules) still close PAST the hard 2048 inline cap.
-    # That is not a busy-tree artifact; it means the floor set itself has outgrown the
-    # window, so an operator must reclassify a rule (demote a marginal MUST to SHOULD, or
-    # scope it) before the tail spills to the preview-only sidecar. Bytes only; zero cost.
-    local _floor_close
-    _floor_close=$(( ${#LAYER1} + _SEP + ${#FLOOR_RULES} ))
-    if [[ "$_floor_close" -gt "$_CAP" ]]; then
-      log "WARN floor-budget: LAYER1+floor-rules closes at ${_floor_close}B, past the ${_CAP}B inline cap even after collapsing touched_files ($_floor_rule_count floor rules); reclassify a marginal global MUST (SHOULD or scope it) before it spills past the inline window"
+      # Budget gate (fail LOUD, never silent): fires ONLY when the fallback essentials alone
+      # (LAYER1 + the floor block, joined by the 2-byte block separator) close PAST the hard
+      # 2048 inline cap. That means the floor set itself has outgrown the window, so an
+      # operator must reclassify a rule (demote a marginal MUST to SHOULD, or scope it) before
+      # the tail spills to the preview-only sidecar. Bytes only; zero cost. (The success path
+      # asserts this same bound inside the subcommand under the tighter SAFE_TOTAL.)
+      local _floor_close
+      _floor_close=$(( ${#LAYER1} + 2 + ${#FLOOR_RULES} ))
+      if [[ "$_floor_close" -gt 2048 ]]; then
+        log "WARN floor-budget: LAYER1+floor-rules closes at ${_floor_close}B, past the 2048B inline cap ($_floor_rule_count floor rules); reclassify a marginal global MUST (demote to SHOULD or scope it) before it spills past the inline window"
+      fi
     fi
   fi
 
@@ -1303,7 +1354,7 @@ Informational only (shown once). Open any with meetless__kb_doc_detail; verify a
 
   # INJECTED_CHARS keeps its historical semantics: the length of the BEFORE-the-turn
   # context (static + evidence/coordination/carry + governance + steer), measured
-  # here BEFORE active-review / turn-recap / first-run append. write_trace's sidecar
+  # here BEFORE active-review / turn-recap append. write_trace's sidecar
   # metric (ask-traces.jsonl) is unchanged by the governed-story rework; the
   # InjectionTrace summary computes its own injectedCharCount from per-block
   # charCounts at spool time (spec §4.6), independent of this number.
@@ -1313,7 +1364,7 @@ Informational only (shown once). Open any with meetless__kb_doc_detail; verify a
   write_trace
 
   # InjectionTrace keystone has MOVED to the end of intercept_main (after the
-  # active-review / turn-recap / first-run blocks append), so BLOCKS_JSON is
+  # active-review / turn-recap blocks append), so BLOCKS_JSON is
   # complete before the v2 trace is stamped (governed-story §4.3). Spooling it here
   # would capture only the BEFORE-the-turn blocks and miss the trailing ones.
 
@@ -1439,17 +1490,11 @@ $AR_TEXT
     fi
   fi
 
-  # Regime-1 deterministic context pack: append after all dynamic layers.
-  # Static, zero-network grounding from the scan cache; empty when no cache exists
-  # or the cache contains no confirmed rules and no stale signals. itemCount = the
-  # confirmed-rule count (the chip's "N rules"); counted off the rendered <rule >
-  # elements so it tracks exactly what the agent saw.
-  if [[ -n "$REGIME1" ]]; then
-    local _rule_count
-    _rule_count="$(printf '%s' "$REGIME1" | grep -c '<rule ' 2>/dev/null || printf 0)"
-    [[ "$_rule_count" =~ ^[0-9]+$ ]] || _rule_count=0
-    append_context_block "$REGIME1" "[]" "$_rule_count"
-  fi
+  # Regime-1 bulk grounding pack: RETIRED (targeted-rule-injection §Phase 2). It was emitted
+  # here, in tail position, so it always landed past the ~2KB harness inline window and was
+  # never actually read by the model. Rule delivery now rides the assemble-context head at the
+  # top of the emit sequence (floor + matched scoped rules, byte-asserted to fit the window);
+  # stale-context review moved to the stop-hook card. Nothing appends here anymore.
   OUTPUT="$OUTPUT_ACC"
 
   jq -n --arg ctx "$OUTPUT" \

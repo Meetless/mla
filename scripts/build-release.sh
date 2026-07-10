@@ -2,7 +2,15 @@
 # build-release.sh: compile one mla release artifact for a single platform.
 #
 # Usage:   scripts/build-release.sh <platform-key>
-#   platform-key = macos-arm64 | macos-x64 | linux-x64
+#   platform-key = macos-arm64 | macos-x64 | linux-x64 | linux-arm64
+#
+# The live release matrix (.github/workflows/release-cli.yml) builds only
+# macos-arm64 + linux-x64; macos-x64 and linux-arm64 are the two install.sh can
+# ask for but the matrix deliberately skips (runner cost / thin audience), so
+# those users take the npm fallback. Their keys exist here so that "if demand
+# ever justifies it" is a one-line matrix add, never a build-script change under
+# release pressure. pkg cross-compiles every target from any host (it fetches the
+# per-target node22 base), so a macos-14 arm64 runner can build all four.
 #
 # Produces, under the release dir:
 #   mla-<triple>.tar.gz          (executable `mla` at the archive root)
@@ -43,17 +51,20 @@ set -euo pipefail
 
 KEY="${1:-}"
 if [ -z "$KEY" ]; then
-  echo "build-release: error: missing platform key (macos-arm64|macos-x64|linux-x64)" >&2
+  echo "build-release: error: missing platform key (macos-arm64|macos-x64|linux-x64|linux-arm64)" >&2
   exit 2
 fi
 
 # map platform key -> pkg target, release triple. Windows is deliberately absent.
+# The triples MUST equal install.sh's detect_target output (<arch>-<os>) so the
+# published asset name is the one the installer resolves.
 case "$KEY" in
   macos-arm64) PKG_TARGET="node22-macos-arm64"; TRIPLE="aarch64-apple-darwin";      SIGN=1 ;;
   macos-x64)   PKG_TARGET="node22-macos-x64";   TRIPLE="x86_64-apple-darwin";       SIGN=1 ;;
   linux-x64)   PKG_TARGET="node22-linux-x64";   TRIPLE="x86_64-unknown-linux-gnu";  SIGN=0 ;;
+  linux-arm64) PKG_TARGET="node22-linux-arm64"; TRIPLE="aarch64-unknown-linux-gnu"; SIGN=0 ;;
   *)
-    echo "build-release: error: unknown platform key '$KEY' (want macos-arm64|macos-x64|linux-x64)" >&2
+    echo "build-release: error: unknown platform key '$KEY' (want macos-arm64|macos-x64|linux-x64|linux-arm64)" >&2
     exit 2 ;;
 esac
 

@@ -63,27 +63,25 @@ SESSION_ID="$(echo "$INPUT" | jq -r '.session_id // empty')"
 # an activated folder. See meetless_session_disabled in common.sh.
 meetless_session_disabled "$SESSION_ID" && exit 0
 
-# Regime-1 rule-pack recovery after a context wipe. Claude Code REUSES this
+# Once-per-session marker recovery after a context wipe. Claude Code REUSES this
 # session_id across a COMPACTION and a `/clear` (same id, fresh context window; see
-# the gitBaseline note below, which already relies on the same re-fire). The
-# Regime-1 first-run pack (the confirmed MUST_FOLLOW rules) is injected
-# once-per-session, content-hash gated on this id -- so after compaction wipes the
-# injected <meetless-context> block out of the window, build_regime1 still sees a
-# marker whose hash matches and returns 0 forever, and the rules silently evaporate
-# for the rest of the session. That is the exact failure that let a MUST_FOLLOW rule
-# go unseen post-compaction. Claude Code's own guidance is a SessionStart `compact`
-# matcher that re-injects critical context; we do the minimal equivalent by dropping
-# the inject-marker so the NEXT UserPromptSubmit (the compaction continuation is
-# delivered as a user prompt, so it always fires) re-emits the full pack. The
-# governance nudge shares the same once-per-session shape and is dropped too. We do
-# NOT drop the steer inject-marker: steer-sync reads it back to mark steers delivered
-# on the backend, so deleting it here would corrupt that accounting (steer recovery
-# needs its own deliberate handling). Only compact/clear wipe the window; a resume
-# reloads the transcript WITH the original block intact, so it is left alone.
+# the gitBaseline note below, which already relies on the same re-fire). Rule delivery
+# no longer needs recovery here: the floor + scoped rules ride the assemble-context head
+# on EVERY UserPromptSubmit (targeted-rule-injection §Phase 2 retired the once-per-session
+# first-run pack), so a compaction that wipes the window is automatically re-filled by the
+# next turn. The governance nudge, however, is still once-per-session and content-hash gated,
+# so after compaction its marker would match and it would evaporate for the rest of the
+# session. Claude Code's own guidance is a SessionStart `compact` matcher that re-injects
+# critical context; we do the minimal equivalent by dropping the governance inject-marker so
+# the NEXT UserPromptSubmit (the compaction continuation is delivered as a user prompt, so it
+# always fires) re-emits it. We do NOT drop the steer inject-marker: steer-sync reads it back
+# to mark steers delivered on the backend, so deleting it here would corrupt that accounting
+# (steer recovery needs its own deliberate handling). Only compact/clear wipe the window; a
+# resume reloads the transcript WITH the original block intact, so it is left alone.
 # Best-effort; never fails the hook.
 SOURCE="$(printf '%s' "$INPUT" | jq -r '.source // empty' 2>/dev/null || true)"
 if [[ "$SOURCE" == "compact" || "$SOURCE" == "clear" ]]; then
-  rm -f "$(regime1_inject_file "$SESSION_ID")" "$(governance_inject_file "$SESSION_ID")" 2>/dev/null || true
+  rm -f "$(governance_inject_file "$SESSION_ID")" 2>/dev/null || true
 fi
 
 TRANSCRIPT="$(echo "$INPUT" | jq -r '.transcript_path // empty')"

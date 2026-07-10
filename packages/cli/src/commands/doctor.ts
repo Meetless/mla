@@ -7,7 +7,7 @@ import { tryResolveWorkspaceId } from "../lib/workspace";
 import { get, ping } from "../lib/http";
 import { queueDepth, reapQueue } from "../lib/spool";
 import { findActivation } from "../lib/activation";
-import { checkHookDrift, MCP_SERVER_KEY } from "../lib/wire";
+import { checkHookDrift, MCP_SERVER_KEY, mcpCommandExecutable, isPkgSnapshotPath } from "../lib/wire";
 import { openCe0Store, closeCe0Store, type Ce0Store } from "../lib/rules/ce0-store";
 import { CE0_INTERCEPTION_SCHEMA_VERSION } from "../lib/rules/interception-schema";
 import { type InputAuthorityResolution } from "../lib/rules/input-authority-resolver";
@@ -108,6 +108,13 @@ export const OPTIONAL_HOOKS = ["post-tool-use.sh"];
 // fires and the pilot silently stops enforcing. RED on missing.
 export const REQUIRED_HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "PreToolUse"];
 const OPTIONAL_HOOK_EVENTS = ["PostToolUse"];
+
+// The MCP command-health probe (check 5b, below) and the pkg-snapshot guard live
+// in wire.ts now, next to resolveMlaPath and the ensureClaudeMcpServer auto-heal
+// that share them, so the health definition has one home and there is no
+// wire<->doctor import cycle. Re-exported here so tests and callers that reach the
+// check via the doctor surface keep their import path.
+export { mcpCommandExecutable, isPkgSnapshotPath };
 
 // `mla doctor` takes at most one flag, --fix, which reconciles legacy home-dir
 // wiring against an installed plugin (removing the duplicate legacy hooks/MCP when
@@ -729,27 +736,48 @@ export async function runDoctor(argv: string[]): Promise<number> {
   // a `.mcp.json` that registers the server before going RED, and only suggest
   // `mla rewire` when neither path has it.
   {
-    const hasServer = (obj: any): boolean => {
+    const serverCommand = (obj: any): string | null => {
       const s = obj?.mcpServers?.[MCP_SERVER_KEY];
-      return !!s && typeof s === "object" && typeof s.command === "string";
+      return s && typeof s === "object" && typeof s.command === "string"
+        ? s.command
+        : null;
     };
+    const hasServer = (obj: any): boolean => serverCommand(obj) !== null;
     const claudeJsonPath = path.join(os.homedir(), ".claude.json");
-    let userScope = false;
+    let userCommand: string | null = null;
     if (fs.existsSync(claudeJsonPath)) {
       try {
-        userScope = hasServer(JSON.parse(fs.readFileSync(claudeJsonPath, "utf8")));
+        userCommand = serverCommand(
+          JSON.parse(fs.readFileSync(claudeJsonPath, "utf8")),
+        );
       } catch {
         // unparseable ~/.claude.json: treat as not-registered; the wire step
         // reports the parse failure separately.
-        userScope = false;
+        userCommand = null;
       }
     }
-    if (userScope) {
-      checks.push({
-        ok: true,
-        label: "Meetless MCP server registered (user scope)",
-        detail: claudeJsonPath,
-      });
+    if (userCommand) {
+      // Registered is NOT enough. Claude Code spawns `command` directly with no
+      // PATH fallback, so a stale absolute path -- e.g. the `/snapshot/...`
+      // pkg-VFS entry an older binary baked from process.argv[1] -- leaves the
+      // meetless__* tools silently absent while a presence-only check stays
+      // green. Verify the command actually resolves to an executable; a broken
+      // one goes RED with a rewire hint (which now re-derives it from execPath).
+      // A non-absolute command (bare `mla`) relies on PATH at spawn time and
+      // can't be cheaply proven here, so it is left as present, not failed.
+      if (mcpCommandExecutable(userCommand)) {
+        checks.push({
+          ok: true,
+          label: "Meetless MCP server registered (user scope)",
+          detail: claudeJsonPath,
+        });
+      } else {
+        checks.push({
+          ok: false,
+          label: "Meetless MCP server command executable",
+          detail: `${userCommand} is not executable (stale/moved binary); run \`mla rewire\` then restart Claude Code`,
+        });
+      }
     } else {
       // Walk up from cwd to the filesystem root, stopping if we pass home, and
       // look for a project-scope `.mcp.json` that registers the server.

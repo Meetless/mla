@@ -33,7 +33,7 @@ main() {
   trap 'rm -rf "$tmp"' EXIT
 
   say "Downloading $APP ($target)..."
-  download "$url" "$tmp/pkg.tar.gz" || err "download failed: $url"
+  download "$url" "$tmp/pkg.tar.gz" || download_failed "$target" "$url"
 
   if [ "$ALLOW_UNVERIFIED" = "1" ]; then
     say "warning: MLA_ALLOW_UNVERIFIED=1 set; skipping checksum verification (dev only)"
@@ -118,6 +118,21 @@ resolve_url() {
   else
     printf '%s/download/v%s/%s-%s.tar.gz' "$DOWNLOAD_BASE" "$VERSION" "$APP" "$_t"
   fi
+}
+
+# A failed binary download is most often "no prebuilt binary for this target yet"
+# (the GCS release set is a subset of platforms -- e.g. Intel Mac / Linux ARM may
+# lag a release), or a transient network error. Either way the npm package is the
+# universal fallback: it ships the same CLI for every platform Node runs on. Point
+# the user there instead of dead-ending on a bare failing URL.
+download_failed() {
+  _t="$1"; _u="$2"
+  printf 'mla: error: could not download a prebuilt binary for %s\n' "$_t" >&2
+  printf '  tried: %s\n' "$_u" >&2
+  printf '  There may be no prebuilt binary for %s yet, or the download failed.\n' "$_t" >&2
+  printf '  Install via npm instead (works on every platform Node 18+ supports):\n' >&2
+  printf '    npm i -g @meetless/mla\n' >&2
+  exit 1
 }
 
 download() {

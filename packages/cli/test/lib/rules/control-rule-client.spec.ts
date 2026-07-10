@@ -78,10 +78,18 @@ describe("listRules", () => {
 });
 
 describe("getRule", () => {
-  it("GETs the detail path and url-encodes the rule id", async () => {
+  it("GETs the detail path, url-encodes the rule id, and carries the workspace marker", async () => {
     const { http, calls } = recorder();
     await getRule(cfg, "rule/with space", http);
-    expect(calls[0]).toEqual({ verb: "get", path: "/internal/v1/rules/rule%2Fwith%20space" });
+    // The workspaceId query is the marker the cli-session tenant guard resolves to
+    // effectiveWorkspaceId. GET has no body, so without it the guard falls back to
+    // the session HOME workspace and 404s on any non-home rule -- which silently
+    // broke the edit/revoke preflight for every non-home target (folder marker OR
+    // --workspace), i.e. the BUG-4 migration path. Must match listRules/getBundle.
+    expect(calls[0]).toEqual({
+      verb: "get",
+      path: "/internal/v1/rules/rule%2Fwith%20space?workspaceId=ws_1",
+    });
   });
 });
 

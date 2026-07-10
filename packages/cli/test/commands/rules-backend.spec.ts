@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 
 import {
+  extractWorkspaceOverride,
   runRulesAddBackend,
   runRulesAttestBackend,
   runRulesDemoteBackend,
@@ -502,8 +503,9 @@ describe("backend rule arg parsing", () => {
       { loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
     );
     expect(code).toBe(0);
-    // The GET targets the nodeId (positional[0]), not the source value.
-    expect(calls[0].path).toBe("/internal/v1/rules/node_1");
+    // The GET targets the nodeId (positional[0]), not the source value, and carries
+    // the workspace marker so the tenant guard scopes the read to cfg's workspace.
+    expect(calls[0].path).toBe("/internal/v1/rules/node_1?workspaceId=ws_1");
     expect((patched!.payload as RulePayloadV1).text).toBe("the new statement");
   });
 
@@ -919,7 +921,7 @@ describe("runRulesDemoteBackend", () => {
     expect(code).toBe(0);
     // Order: read the node, mint the personal copy, THEN revoke the team node.
     expect(calls.map((c) => `${c.verb} ${c.path}`)).toEqual([
-      "get /internal/v1/rules/node_1",
+      "get /internal/v1/rules/node_1?workspaceId=ws_1",
       "post /internal/v1/rules",
       "post /internal/v1/rules/node_1/revoke",
     ]);
@@ -1295,5 +1297,151 @@ describe("runRulesRemoveBackend", () => {
     const code = runRulesRemoveBackend([], { err });
     expect(code).toBe(2);
     expect(rec.err.join("\n")).toContain("mla rules revoke");
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// --workspace override (BUG-3 / BUG-4). Pulling `--workspace <id>` out FIRST does two
+// jobs: (1) it never leaks into the verb's positional parse (statement / nodeId), and
+// (2) it is threaded into loadWorkspaceConfig so the outgoing call carries THAT workspace,
+// which the backend tenant guard then authorizes (a non-member id 403s server-side). The
+// pure extractor is unit-tested for the leak; the verb tests prove the thread-through.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("extractWorkspaceOverride", () => {
+  it("pulls --workspace <id> out and returns the rest without it", () => {
+    expect(extractWorkspaceOverride(["--workspace", "ws_team", "node_1", "--yes"])).toEqual({
+      workspace: "ws_team",
+      rest: ["node_1", "--yes"],
+    });
+  });
+
+  it("accepts the --workspace-id alias", () => {
+    expect(extractWorkspaceOverride(["a", "--workspace-id", "ws_team", "b"])).toEqual({
+      workspace: "ws_team",
+      rest: ["a", "b"],
+    });
+  });
+
+  it("passes argv through untouched when no --workspace is present", () => {
+    expect(extractWorkspaceOverride(["Defer SSO", "--must"])).toEqual({
+      workspace: undefined,
+      rest: ["Defer SSO", "--must"],
+    });
+  });
+
+  it("flags a dangling --workspace at end-of-argv (no value)", () => {
+    const r = extractWorkspaceOverride(["node_1", "--workspace"]);
+    expect(r.danglingFlag).toBe("--workspace");
+    expect(r.workspace).toBeUndefined();
+  });
+
+  it("treats a following flag as a missing value (dangling), never eating the next flag", () => {
+    const r = extractWorkspaceOverride(["--workspace", "--yes", "node_1"]);
+    expect(r.danglingFlag).toBe("--workspace");
+    expect(r.workspace).toBeUndefined();
+  });
+
+  it("keeps every other positional and flag in rest, in order", () => {
+    expect(extractWorkspaceOverride(["stmt", "--scope", "a/**", "--workspace", "ws_x", "--source", "s1"])).toEqual({
+      workspace: "ws_x",
+      rest: ["stmt", "--scope", "a/**", "--source", "s1"],
+    });
+  });
+});
+
+describe("rules verbs thread --workspace into loadWorkspaceConfig", () => {
+  /** A loadConfig seam that records the override it was handed and echoes it into workspaceId. */
+  function capturingLoadConfig(): {
+    loadConfig: (override?: string) => WorkspaceCliConfig;
+    seen: (string | undefined)[];
+  } {
+    const seen: (string | undefined)[] = [];
+    const loadConfig = (override?: string): WorkspaceCliConfig => {
+      seen.push(override);
+      return { ...cfg(), workspaceId: override ?? WS } as WorkspaceCliConfig;
+    };
+    return { loadConfig, seen };
+  }
+
+  it("list --workspace <id> loads that workspace and queries it on the wire", async () => {
+    const { loadConfig, seen } = capturingLoadConfig();
+    const { http, calls } = fakeHttp({ get: () => [] });
+    const { out, err } = sink();
+    const code = await runRulesListBackend(["--workspace", "ws_team"], { loadConfig, http, out, err });
+    expect(code).toBe(0);
+    expect(seen).toEqual(["ws_team"]);
+    expect(calls[0].path).toBe("/internal/v1/rules?workspaceId=ws_team&lifecycleStatus=ACTIVE");
+  });
+
+  it("add --workspace <id> files into that workspace, and the id never leaks into the statement", async () => {
+    const { loadConfig, seen } = capturingLoadConfig();
+    let captured: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      post: (_p, body) => {
+        captured = body as Record<string, unknown>;
+        return node();
+      },
+    });
+    const { out, err } = sink();
+    const code = await runRulesAddBackend(["--workspace", "ws_team", "Defer SSO"], {
+      loadConfig,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(seen).toEqual(["ws_team"]);
+    expect(captured!.workspaceId).toBe("ws_team");
+    // The statement is exactly "Defer SSO"; had the ws id leaked, the text would carry "ws_team".
+    const expected = managedRuleToRulePayload(
+      makeManagedRule({ statement: "Defer SSO", strength: "SHOULD_FOLLOW", scope: [], sources: [] }),
+      "scope_1",
+    );
+    expect((captured!.payload as RulePayloadV1).text).toBe(expected.text);
+  });
+
+  it("revoke --workspace <id> targets that workspace, and the id is never mistaken for the nodeId", async () => {
+    const { loadConfig, seen } = capturingLoadConfig();
+    let revokeBody: Record<string, unknown> | undefined;
+    const { http, calls } = fakeHttp({
+      get: () => node({ currentVersionId: "ver_1" }),
+      post: (_p, body) => {
+        revokeBody = body as Record<string, unknown>;
+        return node({ lifecycleStatusId: "REVOKED" });
+      },
+    });
+    const { out, err } = sink();
+    const code = await runRulesRevokeBackend(["--workspace", "ws_team", "node_1", "--yes"], {
+      loadConfig,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(seen).toEqual(["ws_team"]);
+    // The nodeId positional resolved to node_1 (not ws_team): the GET hit the node detail route,
+    // carrying ?workspaceId=ws_team so the preflight read is scoped to the --workspace target
+    // (without it the guard falls back to home and 404s -- the bug this verb path exercises).
+    expect(calls[0].path).toBe("/internal/v1/rules/node_1?workspaceId=ws_team");
+    expect(revokeBody!.workspaceId).toBe("ws_team");
+  });
+
+  it("add exits 2 on a dangling --workspace (no value), never reaching auth or the wire", async () => {
+    const { http, calls } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+    const code = await runRulesAddBackend(["--workspace"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(2);
+    expect(calls).toHaveLength(0);
+    expect(rec.err.join("\n")).toContain("--workspace needs a value");
   });
 });

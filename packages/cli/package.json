@@ -1,6 +1,6 @@
 {
   "name": "@meetless/mla",
-  "version": "0.2.7",
+  "version": "0.2.9",
   "license": "Apache-2.0",
   "private": false,
   "description": "Meetless CLI (mla): governed change-control and knowledge for AI coding agents.",
@@ -16,12 +16,9 @@
     "knowledge-base"
   ],
   "homepage": "https://meetless.ai",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Meetless/mla.git"
-  },
   "bugs": {
-    "url": "https://github.com/Meetless/mla/issues"
+    "url": "https://meetless.ai",
+    "email": "hi@meetless.ai"
   },
   "author": "Meetless",
   "type": "commonjs",

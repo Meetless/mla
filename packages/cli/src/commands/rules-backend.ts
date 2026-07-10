@@ -77,29 +77,31 @@ import { Strength } from "../lib/scanner/types";
 // ───────────────────────────────────────────────────────────────────────────
 
 export const RULES_LIST_BACKEND_USAGE =
-  "usage: mla rules list [--revoked] [--json]\n" +
+  "usage: mla rules list [--revoked] [--json] [--workspace <id>]\n" +
   "  Lists the workspace's rules from the backend store (matches the console).\n" +
-  "  --revoked  include revoked rules.  --json  raw RuleNode JSON.";
+  "  --revoked  include revoked rules.  --json  raw RuleNode JSON.\n" +
+  "  --workspace <id>  act on the given workspace instead of the folder-bound one.";
 
 export const RULES_ADD_BACKEND_USAGE =
-  "usage: mla rules add \"<statement>\" [--must] [--scope <glob>]... [--source <ref>]... [--json]\n" +
-  "  Mints a TEAM rule on the backend (the single source of truth). Requires `mla login`.";
+  "usage: mla rules add \"<statement>\" [--must] [--scope <glob>]... [--source <ref>]... [--json] [--workspace <id>]\n" +
+  "  Mints a TEAM rule on the backend (the single source of truth). Requires `mla login`.\n" +
+  "  --workspace <id>  file the rule into the given workspace instead of the folder-bound one.";
 
 export const RULES_EDIT_BACKEND_USAGE =
-  "usage: mla rules edit <nodeId> \"<new statement>\" [--must] [--scope <glob>]... [--source <ref>]... [--json]\n" +
+  "usage: mla rules edit <nodeId> \"<new statement>\" [--must] [--scope <glob>]... [--source <ref>]... [--json] [--workspace <id>]\n" +
   "  Mints the NEXT version of an existing rule (the previous version is retained).";
 
 export const RULES_REVOKE_BACKEND_USAGE =
-  "usage: mla rules revoke <nodeId> [--yes]\n" +
+  "usage: mla rules revoke <nodeId> [--yes] [--workspace <id>]\n" +
   "  Revokes a rule on the backend (the kill switch). Already-revoked is a no-op.";
 
 export const RULES_ATTEST_BACKEND_USAGE =
-  "usage: mla rules attest --from-observed <observedRuleHash> [--scope team|personal] [--agent-on-user-request --yes]\n" +
+  "usage: mla rules attest --from-observed <observedRuleHash> [--scope team|personal] [--agent-on-user-request --yes] [--workspace <id>]\n" +
   "  Mints a notes-location DENY rule on the backend from a local R0 observed snapshot.\n" +
   "  --scope personal (default) enforces only for you; --scope team enforces for the whole workspace.";
 
 export const RULES_DEMOTE_BACKEND_USAGE =
-  "usage: mla rules demote <nodeId> [--yes]\n" +
+  "usage: mla rules demote <nodeId> [--yes] [--workspace <id>]\n" +
   "  Demotes a TEAM rule to PERSONAL: mints a PERSONAL copy owned by you, then revokes the\n" +
   "  team rule. It then enforces for you alone, not the whole workspace. The audit trail is\n" +
   "  preserved (the personal version records you as its author).";
@@ -241,6 +243,40 @@ function firstPositional(argv: string[]): string | undefined {
   return argv.find((a) => !a.startsWith("--"));
 }
 
+/**
+ * Pull a `--workspace <id>` override out of argv (T1.1 folder=workspace admin escape hatch,
+ * matching `mla kb` / `mla bug` / `mla ask`). Returns the override plus argv with the flag AND
+ * its value removed, so each verb's own parse (parseRuleArgs / firstPositional / argv.includes)
+ * never mistakes the workspace id for a rule statement, a nodeId, or a boolean flag. The override
+ * is threaded into loadWorkspaceConfig(override), which authorizes it server-side (the tenant guard
+ * 403s a workspace the human is not a member of, and errors on an unknown id) instead of the CLI
+ * silently ignoring it. Run this FIRST in every rules verb.
+ */
+export function extractWorkspaceOverride(argv: string[]): {
+  workspace?: string;
+  rest: string[];
+  danglingFlag?: string;
+} {
+  const rest: string[] = [];
+  let workspace: string | undefined;
+  let danglingFlag: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--workspace" || a === "--workspace-id") {
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith("-")) {
+        danglingFlag = a;
+        break;
+      }
+      workspace = v;
+      i++; // consumed the value; never re-examine it as a positional
+      continue;
+    }
+    rest.push(a);
+  }
+  return { workspace, rest, danglingFlag };
+}
+
 function lifecycleOf(node: RuleNodeView): RuleLifecycleStatus {
   return node.lifecycleStatusId === "REVOKED" ? "REVOKED" : "ACTIVE";
 }
@@ -269,7 +305,7 @@ function renderRuleLine(node: RuleNodeView): string {
 // ───────────────────────────────────────────────────────────────────────────
 
 export interface RulesListBackendDeps {
-  loadConfig?: () => WorkspaceCliConfig;
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: RuleClientHttp;
   /** Offline fallback: read the principal bundle cache (acceptance 16). */
   readBundle?: (principal: BundlePrincipal) => BundleCacheRead;
@@ -288,13 +324,20 @@ export interface RulesListBackendDeps {
 export async function runRulesListBackend(argv: string[], deps: RulesListBackendDeps = {}): Promise<number> {
   const out = deps.out ?? ((l: string) => console.log(l));
   const err = deps.err ?? ((l: string) => console.error(l));
-  const loadConfig = deps.loadConfig ?? loadWorkspaceConfig;
-  const json = argv.includes("--json");
-  const includeRevoked = argv.includes("--revoked");
+
+  // Pull `--workspace <id>` out FIRST so its value never leaks into the boolean-flag checks
+  // below, then thread it into loadWorkspaceConfig so the server authorizes the target (BUG-3/BUG-4).
+  const { workspace, rest, danglingFlag } = extractWorkspaceOverride(argv);
+  if (danglingFlag) {
+    err(`${danglingFlag} needs a value\n${RULES_LIST_BACKEND_USAGE}`);
+    return 2;
+  }
+  const json = rest.includes("--json");
+  const includeRevoked = rest.includes("--revoked");
 
   let cfg: WorkspaceCliConfig;
   try {
-    cfg = loadConfig();
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspace);
   } catch (e) {
     err(`rules list: ${(e as Error).message}`);
     return 2;
@@ -370,7 +413,7 @@ function listFromBundle(
 // ───────────────────────────────────────────────────────────────────────────
 
 export interface RulesAddBackendDeps {
-  loadConfig?: () => WorkspaceCliConfig;
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: RuleClientHttp;
   resolveOperator?: () => BackendOperator | null;
   resolveRuntimeScopeId?: (cwd?: string) => string;
@@ -391,9 +434,18 @@ export interface RulesAddBackendDeps {
 export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDeps = {}): Promise<number> {
   const out = deps.out ?? ((l: string) => console.log(l));
   const err = deps.err ?? ((l: string) => console.error(l));
-  const json = argv.includes("--json");
 
-  const parsed = parseRuleArgs(argv);
+  // Pull `--workspace <id>` out FIRST so its value can never be joined into the statement, then
+  // thread it into loadWorkspaceConfig so the rule is filed into (and authorized against) the
+  // named workspace instead of the folder-bound one (BUG-3/BUG-4).
+  const { workspace, rest, danglingFlag: wsFlag } = extractWorkspaceOverride(argv);
+  if (wsFlag) {
+    err(`${wsFlag} needs a value\n${RULES_ADD_BACKEND_USAGE}`);
+    return 2;
+  }
+  const json = rest.includes("--json");
+
+  const parsed = parseRuleArgs(rest);
   if (parsed.danglingFlag) {
     err(`${parsed.danglingFlag} needs a value\n${RULES_ADD_BACKEND_USAGE}`);
     return 2;
@@ -406,7 +458,7 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
     err(RULES_ADD_BACKEND_USAGE);
     return 2;
   }
-  const strength: Strength = argv.includes("--must") ? "MUST_FOLLOW" : "SHOULD_FOLLOW";
+  const strength: Strength = rest.includes("--must") ? "MUST_FOLLOW" : "SHOULD_FOLLOW";
   const scope = parsed.scope;
   const sources = parsed.sources;
 
@@ -429,7 +481,7 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
 
   let cfg: WorkspaceCliConfig;
   try {
-    cfg = (deps.loadConfig ?? loadWorkspaceConfig)();
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspace);
   } catch (e) {
     err(`rules add: ${(e as Error).message}`);
     return 2;
@@ -479,7 +531,7 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
 // ───────────────────────────────────────────────────────────────────────────
 
 export interface RulesEditBackendDeps {
-  loadConfig?: () => WorkspaceCliConfig;
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: RuleClientHttp;
   resolveOperator?: () => BackendOperator | null;
   out?: (line: string) => void;
@@ -496,9 +548,17 @@ export interface RulesEditBackendDeps {
 export async function runRulesEditBackend(argv: string[], deps: RulesEditBackendDeps = {}): Promise<number> {
   const out = deps.out ?? ((l: string) => console.log(l));
   const err = deps.err ?? ((l: string) => console.error(l));
-  const json = argv.includes("--json");
 
-  const parsed = parseRuleArgs(argv);
+  // Pull `--workspace <id>` out FIRST so its value never lands in the nodeId/statement positionals,
+  // then thread it into loadWorkspaceConfig so the edit targets the named workspace (BUG-3/BUG-4).
+  const { workspace, rest, danglingFlag: wsFlag } = extractWorkspaceOverride(argv);
+  if (wsFlag) {
+    err(`${wsFlag} needs a value\n${RULES_EDIT_BACKEND_USAGE}`);
+    return 2;
+  }
+  const json = rest.includes("--json");
+
+  const parsed = parseRuleArgs(rest);
   if (parsed.danglingFlag) {
     err(`${parsed.danglingFlag} needs a value\n${RULES_EDIT_BACKEND_USAGE}`);
     return 2;
@@ -511,7 +571,7 @@ export async function runRulesEditBackend(argv: string[], deps: RulesEditBackend
     err(RULES_EDIT_BACKEND_USAGE);
     return 2;
   }
-  const strength: Strength = argv.includes("--must") ? "MUST_FOLLOW" : "SHOULD_FOLLOW";
+  const strength: Strength = rest.includes("--must") ? "MUST_FOLLOW" : "SHOULD_FOLLOW";
   const scope = parsed.scope;
   const sources = parsed.sources;
 
@@ -530,7 +590,7 @@ export async function runRulesEditBackend(argv: string[], deps: RulesEditBackend
 
   let cfg: WorkspaceCliConfig;
   try {
-    cfg = (deps.loadConfig ?? loadWorkspaceConfig)();
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspace);
   } catch (e) {
     err(`rules edit: ${(e as Error).message}`);
     return 2;
@@ -614,7 +674,7 @@ export async function runRulesEditBackend(argv: string[], deps: RulesEditBackend
 // ───────────────────────────────────────────────────────────────────────────
 
 export interface RulesRevokeBackendDeps {
-  loadConfig?: () => WorkspaceCliConfig;
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: RuleClientHttp;
   resolveOperator?: () => BackendOperator | null;
   isInteractive?: () => boolean;
@@ -633,12 +693,20 @@ export async function runRulesRevokeBackend(argv: string[], deps: RulesRevokeBac
   const out = deps.out ?? ((l: string) => console.log(l));
   const err = deps.err ?? ((l: string) => console.error(l));
 
-  const nodeId = firstPositional(argv);
+  // Pull `--workspace <id>` out FIRST so it is never mistaken for the nodeId, then thread it into
+  // loadWorkspaceConfig so `list --workspace <ws>` + `revoke --workspace <ws> <id>` can clean up
+  // rules mis-filed into another workspace (the BUG-4 migration path).
+  const { workspace, rest, danglingFlag } = extractWorkspaceOverride(argv);
+  if (danglingFlag) {
+    err(`${danglingFlag} needs a value\n${RULES_REVOKE_BACKEND_USAGE}`);
+    return 2;
+  }
+  const nodeId = firstPositional(rest);
   if (!nodeId) {
     err(RULES_REVOKE_BACKEND_USAGE);
     return 2;
   }
-  const yes = argv.includes("--yes");
+  const yes = rest.includes("--yes");
 
   const resolveOperator = deps.resolveOperator ?? defaultResolveOperator;
   if (!resolveOperator()) {
@@ -648,7 +716,7 @@ export async function runRulesRevokeBackend(argv: string[], deps: RulesRevokeBac
 
   let cfg: WorkspaceCliConfig;
   try {
-    cfg = (deps.loadConfig ?? loadWorkspaceConfig)();
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspace);
   } catch (e) {
     err(`rules revoke: ${(e as Error).message}`);
     return 2;
@@ -723,7 +791,7 @@ export async function runRulesRevokeBackend(argv: string[], deps: RulesRevokeBac
 // ───────────────────────────────────────────────────────────────────────────
 
 export interface RulesAttestBackendDeps {
-  loadConfig?: () => WorkspaceCliConfig;
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: RuleClientHttp;
   resolveOperator?: () => BackendOperator | null;
   resolveRuntimeScopeId?: (cwd?: string) => string;
@@ -768,14 +836,22 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   const out = deps.out ?? ((l: string) => console.log(l));
   const err = deps.err ?? ((l: string) => console.error(l));
 
-  if (argv.includes("--from-code-rule")) {
+  // Pull `--workspace <id>` out FIRST so it never collides with --from-observed / --scope parsing,
+  // then thread it into loadWorkspaceConfig so the attested rule is minted into the named workspace.
+  const { workspace, rest, danglingFlag: wsFlag } = extractWorkspaceOverride(argv);
+  if (wsFlag) {
+    err(`${wsFlag} needs a value\n${RULES_ATTEST_BACKEND_USAGE}`);
+    return 2;
+  }
+
+  if (rest.includes("--from-code-rule")) {
     err(
       "`mla rules attest --from-code-rule` is deferred to Phase 2 under the backend store " +
         "(it arms a RECORD_ONLY rule that changes no runtime behavior); not available yet",
     );
     return 2;
   }
-  if (argv.includes("--new-rule") || argv.includes("--rule")) {
+  if (rest.includes("--new-rule") || rest.includes("--rule")) {
     err(
       "--new-rule / --rule are subsumed by the backend nodeId model: attest mints a " +
         "fresh node; target an existing rule by nodeId with `mla rules edit` / `revoke`",
@@ -783,14 +859,14 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
     return 2;
   }
 
-  const flagIdx = argv.indexOf("--from-observed");
-  const observedRuleHash = flagIdx >= 0 ? argv[flagIdx + 1] : undefined;
+  const flagIdx = rest.indexOf("--from-observed");
+  const observedRuleHash = flagIdx >= 0 ? rest[flagIdx + 1] : undefined;
   if (!observedRuleHash || observedRuleHash.startsWith("--")) {
     err(RULES_ATTEST_BACKEND_USAGE);
     return 2;
   }
-  const agentOnUserRequest = argv.includes("--agent-on-user-request");
-  const yes = argv.includes("--yes");
+  const agentOnUserRequest = rest.includes("--agent-on-user-request");
+  const yes = rest.includes("--yes");
 
   // --scope selects the authority plane. An's rule: enforcement takes BOTH personal and team
   // into account, so team is a first-class attest target, not a separate verb. The enforcer
@@ -798,10 +874,10 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // non-PERSONAL rules, so a TEAM attest binds the SAME DENY payload for the whole workspace;
   // only the minted node's authorityScope + ownerUserId change. Default personal (enforces for
   // you alone) preserves the prior single-operator behavior when the flag is omitted.
-  const scopeIdx = argv.indexOf("--scope");
+  const scopeIdx = rest.indexOf("--scope");
   let authorityScope: RuleAuthorityScope = "PERSONAL";
   if (scopeIdx >= 0) {
-    const raw = argv[scopeIdx + 1];
+    const raw = rest[scopeIdx + 1];
     if (raw === "team") authorityScope = "TEAM";
     else if (raw === "personal") authorityScope = "PERSONAL";
     else {
@@ -829,7 +905,7 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
 
   let cfg: WorkspaceCliConfig;
   try {
-    cfg = (deps.loadConfig ?? loadWorkspaceConfig)();
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspace);
   } catch (e) {
     err(`rules attest: ${(e as Error).message}`);
     return 2;
@@ -939,7 +1015,7 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
 // ───────────────────────────────────────────────────────────────────────────
 
 export interface RulesDemoteBackendDeps {
-  loadConfig?: () => WorkspaceCliConfig;
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: RuleClientHttp;
   resolveOperator?: () => BackendOperator | null;
   isInteractive?: () => boolean;
@@ -970,12 +1046,19 @@ export async function runRulesDemoteBackend(argv: string[], deps: RulesDemoteBac
   const out = deps.out ?? ((l: string) => console.log(l));
   const err = deps.err ?? ((l: string) => console.error(l));
 
-  const nodeId = firstPositional(argv);
+  // Pull `--workspace <id>` out FIRST so it is never mistaken for the nodeId, then thread it into
+  // loadWorkspaceConfig so the demote targets the named workspace (BUG-3/BUG-4).
+  const { workspace, rest, danglingFlag } = extractWorkspaceOverride(argv);
+  if (danglingFlag) {
+    err(`${danglingFlag} needs a value\n${RULES_DEMOTE_BACKEND_USAGE}`);
+    return 2;
+  }
+  const nodeId = firstPositional(rest);
   if (!nodeId) {
     err(RULES_DEMOTE_BACKEND_USAGE);
     return 2;
   }
-  const yes = argv.includes("--yes");
+  const yes = rest.includes("--yes");
 
   const resolveOperator = deps.resolveOperator ?? defaultResolveOperator;
   const operator = resolveOperator();
@@ -986,7 +1069,7 @@ export async function runRulesDemoteBackend(argv: string[], deps: RulesDemoteBac
 
   let cfg: WorkspaceCliConfig;
   try {
-    cfg = (deps.loadConfig ?? loadWorkspaceConfig)();
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspace);
   } catch (e) {
     err(`rules demote: ${(e as Error).message}`);
     return 2;

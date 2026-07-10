@@ -76,7 +76,7 @@ import {
   runInternalUpdateCheck,
 } from "./lib/update-notifier";
 import { runUpgrade, maybePromoteStagedAndReExec } from "./lib/upgrade-apply";
-import { maybeResyncHooks } from "./lib/wire";
+import { maybeResyncHooks, maybeHealMcpCommand } from "./lib/wire";
 import { runScanContext } from "./commands/scan-context";
 import { runAssembleContext } from "./commands/assemble-context";
 import { runKb } from "./commands/kb";
@@ -869,6 +869,19 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   // a fresh binary first heals mid-session) since it is idempotent and gated on
   // the stamp. See notes/20260626-hook-auto-resync.md.
   maybeResyncHooks();
+
+  // MCP command auto-heal, the THIRD thing of all: maybeResyncHooks (above)
+  // deliberately never touches ~/.claude.json, so a binary upgrade does NOT fix an
+  // older pkg binary's poisoned mcpServers.meetless command (`/snapshot/.../cli.js`,
+  // which Claude Code cannot spawn). This re-points a provably-broken meetless
+  // command at the current binary the moment any command runs -- the capture hooks
+  // survive the poison via their PATH fallback, so they carry the heal even while
+  // the MCP itself is dead. Same shape as the hook resync: a cheap stamp read
+  // short-circuits the steady state (no claude.json parse), it only repairs an
+  // EXISTING broken entry (never creates or re-canonicalizes a healthy one), and it
+  // is best-effort/fail-open (never throws, never changes the exit code). Runs for
+  // every command including the hook-invoked `_internal` calls.
+  maybeHealMcpCommand();
 
   // Wall-clock at the very top: duration_ms for the mla_command journey event is
   // measured from here to finalize, and the sequence idle-gap uses this as the
