@@ -399,7 +399,10 @@ describe("runKbReviewWith: end-to-end wiring + exit codes", () => {
     expect(rec.submitted[0].verdict).toBe("accept");
     expect(rec.submitted[0].body).toEqual({ workspaceId: "ws_test", userId: "user_an" });
     expect(res.stdout).toMatch(/ACCEPTED/);
-    expect(res.stdout).toContain(`/relationships/${cand().id}`);
+    // Deep link pins the active workspace via /open; the relative path is URL-encoded.
+    expect(res.stdout).toContain(
+      `https://console.example.test/open?workspaceId=ws_test&to=%2Frelationships%2F${cand().id}`,
+    );
   });
 
   // A-0 (A4 surface 1): an accept is a governed change. The CLI caller is unknown
@@ -498,7 +501,9 @@ describe("runKbReviewWith: propose-correction (A-2 write-side)", () => {
     });
     expect(res.stdout).toMatch(/proposed/i);
     expect(res.stdout).toMatch(/REFINES/);
-    expect(res.stdout).toContain(`/relationships/${cand().id}`);
+    expect(res.stdout).toContain(
+      `https://console.example.test/open?workspaceId=ws_test&to=%2Frelationships%2F${cand().id}`,
+    );
   });
 
   it("--reclassify carries an optional reviewer note alongside the structured correction", async () => {

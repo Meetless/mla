@@ -18,9 +18,9 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { HOME, getConsoleUrl, readKbConfig, type KbCliConfig } from "../lib/config";
+import { HOME, consoleDeepLink, readKbConfig, type KbCliConfig } from "../lib/config";
 import { resolveWorkspaceContext } from "../lib/workspace";
-import { intelPost } from "../lib/http";
+import { intelGet, intelPost } from "../lib/http";
 import type { KbAddReceipt } from "../lib/render";
 import { buildPlan, persistPlan, loadRunRecord } from "../lib/enrichment/plan";
 import {
@@ -40,6 +40,7 @@ import {
   type ScoutIngestOutcome,
   type EnrichmentCandidate,
   type CandidateValidationError,
+  type OnboardingRun,
 } from "../lib/enrichment/protocol";
 import { MANAGED_RULES_PATH } from "../lib/scanner/managed-rules";
 import {
@@ -132,6 +133,84 @@ export function resolveBudgetMs(
     return { warning: `ignoring invalid MLA_ENRICH_BUDGET_MS=${rawEnv} (expected a positive number of milliseconds)` };
   }
   return { budgetMs: v };
+}
+
+// --- Workspace-grain idempotency gate (§4A) --------------------------------------
+//
+// The local run record only proves onboarding happened on THIS machine at THIS path;
+// it cannot stop a teammate's clone (or the same user on a second clone / re-clone at a
+// different path) from re-onboarding the SAME git HEAD and dumping LLM-drifted near-dup
+// PENDING candidates into the shared KB. The gate is therefore an OR over two sources:
+// the local record (fast, offline, path-precise) and the workspace marker keyed on the
+// cross-machine git HEAD. `--force` bypasses both.
+
+export interface WorkspaceOnboardStatus {
+  onboarded: boolean;
+  completedAt?: string;
+  candidatesPersisted?: number;
+}
+
+export type GateDecision = { gated: false } | { gated: true; by: "local" | "workspace" };
+
+// Pure precedence: --force wins (never gated); else the local record wins over the
+// workspace marker (it carries the precise same-path candidate count and needs no
+// network). Isolated so the precedence table is unit-tested without touching git,
+// the filesystem, or intel.
+export function decideOnboardingGate(input: {
+  force: boolean;
+  localHit: boolean;
+  workspaceOnboarded: boolean;
+}): GateDecision {
+  if (input.force) return { gated: false };
+  if (input.localHit) return { gated: true, by: "local" };
+  if (input.workspaceOnboarded) return { gated: true, by: "workspace" };
+  return { gated: false };
+}
+
+// Consult the workspace marker for this git HEAD. FAIL-OPEN is the whole contract: a
+// missing headCommit (no usable git), an unreachable intel, a 5xx, or an un-authed CLI
+// must NEVER block onboarding, so every failure resolves to `onboarded:false` and the
+// command proceeds (the local gate still applies). A true marker is the only thing that
+// can gate here.
+export async function checkWorkspaceOnboarded(
+  cfg: KbCliConfig,
+  headCommit: string | null,
+): Promise<WorkspaceOnboardStatus> {
+  if (!headCommit) return { onboarded: false };
+  try {
+    const q = new URLSearchParams({ headCommit, workspaceId: cfg.workspaceId }).toString();
+    const res = await intelGet<{ onboarded?: boolean; completedAt?: string; candidatesPersisted?: number }>(
+      cfg,
+      `/internal/v1/onboarding/status?${q}`,
+    );
+    return {
+      onboarded: !!res.onboarded,
+      completedAt: res.completedAt,
+      candidatesPersisted: res.candidatesPersisted,
+    };
+  } catch {
+    return { onboarded: false }; // fail open: never let a network hiccup block onboarding
+  }
+}
+
+// Build the best-effort marker request written after a successful ingest (§4C). Returns
+// null when the run has no git HEAD to key on (nothing to record cross-machine). Pure so
+// the payload (candidate sum, carried root/digest) is pinned by a test without a network.
+export function buildOnboardingMarkerRequest(
+  run: OnboardingRun | null,
+  outcomes: ScoutIngestOutcome[],
+  workspaceId: string,
+): { workspaceId: string; headCommit: string; rootCommit: string | null; planDigest: string | null; candidatesPersisted: number } | null {
+  const headCommit = run?.headCommit ?? null;
+  if (!headCommit) return null;
+  const candidatesPersisted = outcomes.reduce((n, o) => n + o.persisted, 0);
+  return {
+    workspaceId,
+    headCommit,
+    rootCommit: run?.rootCommit ?? null,
+    planDigest: run?.planDigest ?? null,
+    candidatesPersisted,
+  };
 }
 
 // Exported for unit tests: the pure flag/payload helpers are the only new logic in this
@@ -227,26 +306,42 @@ async function runEnrichPlan(argv: string[]): Promise<number> {
   }
 
   // Idempotency gate (verdict: re-running onboarding on an unchanged repo must add nothing).
-  // If this repo was already onboarded at this exact plan digest, re-running only spawns
-  // near-duplicate PENDING candidates (LLM scout output is non-deterministic, so candidateIds
-  // drift and server dedup never fires). Short-circuit to a no-op unless --force. Release the
-  // lock first: a no-op holds no run, and we must NOT persist or prune (pruning would delete
-  // the very completed record we are gating against).
-  if (!flags.force) {
-    const prior = findCompletedRunWithDigest(HOME, cfg.workspaceId, repositoryRoot, built.run.planDigest, runId);
-    if (prior) {
-      releaseOnboardingLock(HOME, cfg.workspaceId, runId);
+  // Re-onboarding only spawns near-duplicate PENDING candidates (LLM scout output is
+  // non-deterministic, so candidateIds drift and server dedup never fires). We gate on an OR
+  // of two sources: the LOCAL record (this machine, this path, same plan digest) and the
+  // WORKSPACE marker keyed on the cross-machine git HEAD (a teammate's clone, or this user on
+  // a second clone). Short-circuit to a no-op unless --force. Release the lock first: a no-op
+  // holds no run, and we must NOT persist or prune (pruning would delete the very completed
+  // local record we are gating against).
+  const localPrior = flags.force
+    ? null
+    : findCompletedRunWithDigest(HOME, cfg.workspaceId, repositoryRoot, built.run.planDigest, runId);
+  // OR short-circuit: only pay the network round-trip when the local gate missed (and never
+  // under --force). checkWorkspaceOnboarded is fail-open, so an unreachable intel is a miss.
+  const workspace: WorkspaceOnboardStatus =
+    flags.force || localPrior ? { onboarded: false } : await checkWorkspaceOnboarded(cfg, built.run.headCommit ?? null);
+  const decision = decideOnboardingGate({
+    force: flags.force,
+    localHit: !!localPrior,
+    workspaceOnboarded: workspace.onboarded,
+  });
+
+  if (decision.gated) {
+    releaseOnboardingLock(HOME, cfg.workspaceId, runId);
+
+    if (decision.by === "local" && localPrior) {
       const persisted =
-        (prior.state.scouts.documentation.candidateCount ?? 0) + (prior.state.scouts.history.candidateCount ?? 0);
+        (localPrior.state.scouts.documentation.candidateCount ?? 0) + (localPrior.state.scouts.history.candidateCount ?? 0);
       if (flags.json) {
         console.log(
           JSON.stringify(
             {
               gated: true,
+              gatedBy: "local",
               reason: "unchanged_repository",
               planDigest: built.run.planDigest,
-              priorRunId: prior.run.runId,
-              priorCompletedAt: prior.state.updatedAt,
+              priorRunId: localPrior.run.runId,
+              priorCompletedAt: localPrior.state.updatedAt,
               candidatesPersisted: persisted,
               workspaceId: cfg.workspaceId,
               repositoryRoot,
@@ -260,13 +355,46 @@ async function runEnrichPlan(argv: string[]): Promise<number> {
       const plural = persisted === 1 ? "" : "s";
       console.log(
         [
-          `Repository unchanged since onboarding run ${prior.run.runId} (plan digest ${built.run.planDigest.slice(0, 12)}).`,
-          `That run persisted ${persisted} candidate${plural} born PENDING; review them in the console at ${getConsoleUrl(cfg)} (the "Needs Review" tab).`,
+          `Repository unchanged since onboarding run ${localPrior.run.runId} (plan digest ${built.run.planDigest.slice(0, 12)}).`,
+          `That run persisted ${persisted} candidate${plural} born PENDING; review them in the console at ${consoleDeepLink(cfg, "/")} (the "Needs Review" tab).`,
           `Nothing new to onboard. Re-run with \`--force\` to onboard this repository again.`,
         ].join("\n"),
       );
       return 0;
     }
+
+    // Workspace hit: another clone already onboarded this exact git HEAD in this workspace.
+    const head = built.run.headCommit ?? "";
+    const persisted = workspace.candidatesPersisted ?? 0;
+    if (flags.json) {
+      console.log(
+        JSON.stringify(
+          {
+            gated: true,
+            gatedBy: "workspace",
+            reason: "already_onboarded_in_workspace",
+            planDigest: built.run.planDigest,
+            headCommit: head,
+            completedAt: workspace.completedAt ?? null,
+            candidatesPersisted: persisted,
+            workspaceId: cfg.workspaceId,
+            repositoryRoot,
+          },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+    const plural = persisted === 1 ? "" : "s";
+    console.log(
+      [
+        `This repository (HEAD ${head.slice(0, 12)}) was already onboarded in this workspace from another clone.`,
+        `That run persisted ${persisted} candidate${plural} born PENDING; review them in the console at ${consoleDeepLink(cfg, "/")} (the "Needs Review" tab).`,
+        `Nothing new to onboard. Re-run with \`--force\` to onboard this repository again.`,
+      ].join("\n"),
+    );
+    return 0;
   }
 
   // Not gated (or --force): commit the built plan to disk and prune this repo's stale runs.
@@ -518,6 +646,26 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
   // runId, so this only ever frees THIS run's lock, never a successor that reclaimed it.
   if (res.ok && res.runId && res.state?.status === "complete") {
     releaseOnboardingLock(HOME, cfg.workspaceId, res.runId);
+
+    // Best-effort workspace marker (§4C): record that this git HEAD was onboarded in this
+    // workspace so a teammate's clone (or this user on another clone) short-circuits the gate
+    // instead of dumping near-dup PENDING candidates. NON-FATAL by design: the candidates
+    // already landed, so a failed marker only risks one future re-onboard that self-heals on
+    // the next successful run. Never changes the exit code. Skipped when there is no git HEAD.
+    const markerBody = buildOnboardingMarkerRequest(
+      loadRunRecord(HOME, cfg.workspaceId, res.runId),
+      res.outcomes,
+      cfg.workspaceId,
+    );
+    if (markerBody) {
+      try {
+        await intelPost(cfg, "/internal/v1/onboarding/marker", markerBody);
+      } catch (e) {
+        console.error(
+          `note: onboarding marker not recorded (${(e as Error).message}); a future re-onboard of this HEAD may re-run.`,
+        );
+      }
+    }
   }
 
   if (!res.ok) {
@@ -529,7 +677,7 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
   if (flags.json) {
     console.log(JSON.stringify(res, null, 2));
   } else {
-    console.log(renderIngestSummary(res.outcomes, res.state?.status, `${getConsoleUrl(cfg)}/kb`));
+    console.log(renderIngestSummary(res.outcomes, res.state?.status, consoleDeepLink(cfg, "/kb")));
   }
 
   // 1 when a scout needs attention (infra failure or a malformed envelope worth a retry);

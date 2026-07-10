@@ -32,13 +32,27 @@ describe("openUrl: platform launcher selection", () => {
     expect(calls[0].cmd).toBe("xdg-open");
   });
 
-  it("uses cmd start on win32", () => {
+  it("uses cmd start on win32 with the URL quoted as one token", () => {
     const { calls, run } = rec();
     const r = openUrl("https://x.test/y", { platform: "win32", run });
     expect(r.ok).toBe(true);
     expect(calls[0].cmd).toBe("cmd");
     expect(calls[0].args).toContain("start");
-    expect(calls[0].args).toContain("https://x.test/y");
+    // Quoted so cmd.exe treats it as a single token, not raw (which would let cmd
+    // split a query string on `&`). The empty "" is the required window title.
+    expect(calls[0].args).toEqual(["/c", "start", '""', '"https://x.test/y"']);
+  });
+
+  it("keeps an &-laden query as ONE quoted token on win32 (no cmd split)", () => {
+    const { calls, run } = rec();
+    const url =
+      "https://app.meetless.ai/cli/authorize?state=X&code_challenge=Y&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback";
+    const r = openUrl(url, { platform: "win32", run });
+    expect(r.ok).toBe(true);
+    // The whole URL, ampersands and all, is a single argv element wrapped in quotes.
+    expect(calls[0].args[calls[0].args.length - 1]).toBe(`"${url}"`);
+    // And code_challenge survives inside that token (the exact prod-failure param).
+    expect(calls[0].args[calls[0].args.length - 1]).toContain("code_challenge=Y");
   });
 });
 

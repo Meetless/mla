@@ -16,6 +16,8 @@
 // gate to RELATION_TYPE_REGISTRY (and risking false rejects on registry drift) is
 // off the table by construction.
 
+import { consoleDeepLinkFrom } from "./config";
+
 // Confidence below this floor, combined with no supporting quote, marks a candidate
 // as mechanical noise. Set below the detector's "medium" tier (~0.45) so it only
 // ever fires on the genuinely unsupported tail, never on a borderline-real edge.
@@ -100,7 +102,13 @@ export function classifyMechanicalInvalidity(c: RelationshipCandidate): Mechanic
 }
 
 // Canonical Console deep link for a relationship candidate. consoleBase must already
-// be trailing-slash-stripped (see getConsoleUrl).
-export function candidateConsoleUrl(consoleBase: string, candidateId: string): string {
-  return `${consoleBase}/relationships/${candidateId}`;
+// be trailing-slash-stripped (see getConsoleUrl). The workspaceId is threaded through
+// so the link pins the active workspace (via the /open landing page); a caller with
+// no known workspace passes undefined and gets the plain URL.
+export function candidateConsoleUrl(
+  consoleBase: string,
+  workspaceId: string | undefined | null,
+  candidateId: string,
+): string {
+  return consoleDeepLinkFrom(consoleBase, workspaceId, `/relationships/${candidateId}`);
 }

@@ -39,6 +39,40 @@ export function defaultGitRunner(repoRoot: string): GitRunner {
     execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 }
 
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+export interface GitIdentity {
+  headCommit: string | null; // `git rev-parse HEAD`: cross-machine snapshot key for the workspace gate
+  rootCommit: string | null; // oldest root commit: repo identity, telemetry-only
+}
+
+// Read the git-native identity of the working snapshot for the workspace-grain gate.
+// headCommit is the gate key (identical across clones of the same content); rootCommit
+// is repo identity for telemetry. Both degrade to null on any failure (no git, empty
+// repo) so a repo without usable git simply falls back to the local gate rather than
+// throwing. A repo can have MULTIPLE root commits (grafted / merged histories); we take
+// the last line deterministically since it is telemetry-only.
+export function readGitIdentity(gitRunner: GitRunner): GitIdentity {
+  let headCommit: string | null = null;
+  try {
+    const out = gitRunner(["rev-parse", "HEAD"]).trim().toLowerCase();
+    headCommit = FULL_SHA.test(out) ? out : null;
+  } catch {
+    headCommit = null;
+  }
+  let rootCommit: string | null = null;
+  try {
+    const roots = gitRunner(["rev-list", "--max-parents=0", "HEAD"])
+      .split("\n")
+      .map((l) => l.trim().toLowerCase())
+      .filter((l) => FULL_SHA.test(l));
+    rootCommit = roots.length ? roots[roots.length - 1] : null;
+  } catch {
+    rootCommit = null;
+  }
+  return { headCommit, rootCommit };
+}
+
 // Within-target ordering band (lower is read first). T1 instruction files first; then,
 // among T2, curated decision/instruction-adjacent docs (known doc names, ADR/RFC/spec
 // dirs) ahead of arbitrary prose, so a tight target budget surfaces a repo's ADRs and
@@ -201,6 +235,8 @@ export function buildOnboardingRun(input: {
   limits?: EnrichmentLimits;
   documentationTargets: DocumentationTarget[];
   historyEvidence: PreparedGitEvidence[];
+  headCommit?: string | null;
+  rootCommit?: string | null;
 }): OnboardingRun {
   const limits = input.limits ?? defaultLimits();
   const deadlineAt = new Date(Date.parse(input.now) + limits.budgetMs).toISOString();
@@ -212,12 +248,19 @@ export function buildOnboardingRun(input: {
     documentationTargets: input.documentationTargets,
     historyEvidence: input.historyEvidence,
   };
+  // headCommit/rootCommit are DELIBERATELY excluded from `partial`: computePlanDigest
+  // pins the plan's commitments only, and the snapshot identity is orchestration
+  // metadata, not a commitment. Two clones at the same HEAD but different paths still
+  // produce different planDigests (repositoryRoot differs) yet the SAME headCommit,
+  // which is exactly why the workspace gate keys on headCommit and not the digest.
   return {
     ...partial,
     runId: input.runId,
     createdAt: input.now,
     deadlineAt,
     planDigest: computePlanDigest(partial),
+    headCommit: input.headCommit ?? null,
+    rootCommit: input.rootCommit ?? null,
   };
 }
 
@@ -277,8 +320,17 @@ export function pruneOldRuns(
   const currentRepoReal = safeRealpath(currentRepoRoot);
   let removed = 0;
   for (const name of readdirSync(dir)) {
-    // Only run-record files (`<runId>.json`); skip state sidecars and the current record.
-    if (!name.endsWith(".json") || name.endsWith(".state.json") || name === `${currentRunId}.json`) continue;
+    // Only run-record files (`<runId>.json`); skip state/candidates sidecars and the current
+    // record. The `.candidates.json` skip is load-bearing: a sidecar carries a repositoryRoot
+    // too, so without it prune would parse the sidecar as a run and delete the CURRENT run's
+    // candidates (its runId differs from currentRunId, so the current-record skip misses it).
+    if (
+      !name.endsWith(".json") ||
+      name.endsWith(".state.json") ||
+      name.endsWith(".candidates.json") ||
+      name === `${currentRunId}.json`
+    )
+      continue;
     const recordPath = join(dir, name);
     let sameRepo = false;
     try {
@@ -294,11 +346,16 @@ export function pruneOldRuns(
     } catch {
       // best-effort cleanup; a leftover record is harmless (ingest loads by runId)
     }
-    // Drop the paired resume-state sidecar, if any, so it cannot outlive its record.
-    try {
-      unlinkSync(join(dir, `${name.slice(0, -".json".length)}.state.json`));
-    } catch {
-      // no sidecar (run never ingested) or already gone: nothing to do
+    // Drop the paired resume-state + candidates sidecars, if any, so neither outlives its
+    // record (a stale candidates sidecar would otherwise let `enrich accept` materialize a
+    // pruned run's rules).
+    const stem = name.slice(0, -".json".length);
+    for (const sidecar of [`${stem}.state.json`, `${stem}.candidates.json`]) {
+      try {
+        unlinkSync(join(dir, sidecar));
+      } catch {
+        // no sidecar (run never ingested / never produced candidates) or already gone: skip
+      }
     }
   }
   return removed;
@@ -324,6 +381,7 @@ export function buildPlan(input: {
     maxBytes: limits.maxPreparedInputBytes,
     gitRunner,
   });
+  const { headCommit, rootCommit } = readGitIdentity(gitRunner);
   const run = buildOnboardingRun({
     runId: input.runId,
     workspaceId: input.workspaceId,
@@ -332,6 +390,8 @@ export function buildPlan(input: {
     limits,
     documentationTargets,
     historyEvidence,
+    headCommit,
+    rootCommit,
   });
   return { run, historyTruncated };
 }

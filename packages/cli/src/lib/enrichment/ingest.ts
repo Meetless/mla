@@ -7,7 +7,7 @@
 // intel server; the command wires the real kb-add POST. The filesystem/git probe is
 // likewise injectable, default-built from the repo root.
 
-import { realpathSync, readFileSync, readdirSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { realpathSync, readFileSync, readdirSync, mkdirSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { join, sep, isAbsolute } from "node:path";
 import {
   computePlanDigest,
@@ -26,6 +26,8 @@ import {
   type MergedCandidate,
   type OnboardingRun,
   type OnboardingState,
+  type OnboardingCandidateRecord,
+  type OnboardingCandidatesSidecar,
   type ScoutIngestOutcome,
   type ScoutName,
   type ScoutRunState,
@@ -398,6 +400,67 @@ export function writeState(home: string, state: OnboardingState): void {
   writeFileSync(statePath(home, state.workspaceId, state.runId), JSON.stringify(state, null, 2), "utf8");
 }
 
+// --- candidates sidecar (the accept half's durable record) -----------------------
+
+// The candidates a run produced live BESIDE the run record + resume state, keyed by runId, as
+// `<runId>.candidates.json` (sorts next to `<runId>.json` / `<runId>.state.json`; prune drops
+// the trio together). ingest writes it; `enrich accept` reads it to materialize the durable
+// ones into .meetless/rules.md. It is the missing bridge between ingest (which parks EVERY
+// candidate born PENDING in the governed KB) and the local accept half: after ingest, only the
+// rendered markdown remains in the KB, so the structured post-merge candidates would otherwise
+// be gone and accept would have nothing to materialize from without re-parsing markdown.
+export function candidatesSidecarPath(home: string, workspaceId: string, runId: string): string {
+  return join(home, "workspaces", workspaceId, "onboarding-runs", `${runId}.candidates.json`);
+}
+
+export function loadCandidatesSidecar(
+  home: string,
+  workspaceId: string,
+  runId: string,
+): OnboardingCandidatesSidecar | null {
+  const path = candidatesSidecarPath(home, workspaceId, runId);
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as OnboardingCandidatesSidecar;
+    if (parsed?.schemaVersion !== 1) return null;
+    // A sidecar is only valid for the run it names: ignore one whose stored runId drifted from
+    // its path (corruption / hand-edit) rather than materializing another run's candidates.
+    if (parsed.runId !== runId) return null;
+    if (!Array.isArray(parsed.candidates)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// Accumulate candidates into the sidecar, deduped by candidateId, preserving first-seen order
+// (existing entries first, new ones appended; a repeated candidateId is overwritten in place so
+// its landed outcome reflects the latest ingest). Merge, never overwrite: a resuming scout's
+// candidates arrive in a LATER ingest call with the other scout already complete, so a blind
+// overwrite would drop the first scout's candidates. Atomic temp+rename so a crash mid-write
+// never leaves accept a half-written sidecar. Idempotent: re-ingesting the same inputs yields
+// the same candidateIds and the same sidecar.
+export function upsertCandidatesSidecar(home: string, incoming: OnboardingCandidatesSidecar): void {
+  const existing = loadCandidatesSidecar(home, incoming.workspaceId, incoming.runId);
+  const byId = new Map<string, OnboardingCandidateRecord>();
+  if (existing) for (const c of existing.candidates) byId.set(c.candidateId, c);
+  for (const c of incoming.candidates) byId.set(c.candidateId, c);
+  const merged: OnboardingCandidatesSidecar = {
+    schemaVersion: 1,
+    workspaceId: incoming.workspaceId,
+    runId: incoming.runId,
+    repositoryRoot: incoming.repositoryRoot,
+    updatedAt: incoming.updatedAt,
+    candidates: [...byId.values()],
+  };
+  const dir = join(home, "workspaces", incoming.workspaceId, "onboarding-runs");
+  mkdirSync(dir, { recursive: true });
+  const path = candidatesSidecarPath(home, incoming.workspaceId, incoming.runId);
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(merged, null, 2), "utf8");
+  renameSync(tmp, path);
+}
+
 // Idempotency gate (notes/20260627-onboarding-idempotency-plandigest-gate.md): find a PRIOR
 // COMPLETED onboarding run for this repo whose plan is byte-identical (same planDigest) to the
 // one just built. Re-running `enrich plan` on an unchanged repo only re-surfaces the same
@@ -424,8 +487,8 @@ export function findCompletedRunWithDigest(
     return null;
   }
   for (const name of entries) {
-    // Only run-record files (`<runId>.json`); skip state sidecars.
-    if (!name.endsWith(".json") || name.endsWith(".state.json")) continue;
+    // Only run-record files (`<runId>.json`); skip state + candidates sidecars.
+    if (!name.endsWith(".json") || name.endsWith(".state.json") || name.endsWith(".candidates.json")) continue;
     const runId = name.slice(0, -".json".length);
     if (excludeRunId && runId === excludeRunId) continue;
     const rec = loadRunRecord(home, workspaceId, runId);
@@ -685,6 +748,38 @@ export async function ingestRun(input: {
       persisted: newByScout[b.scout] + dedupedByScout[b.scout],
       deduped: dedupedByScout[b.scout],
       errors,
+    });
+  }
+
+  // Persist the accept half's durable record: the exact post-merge candidates this call
+  // produced, so `enrich accept` can later materialize the durable ones (constraint /
+  // convention / boundary) into .meetless/rules.md. Skip on a whole-POST failure (nothing
+  // landed; the retry rewrites) and when there is nothing to add (an empty or already-complete
+  // scout), so a no-op call never churns the sidecar. upsert MERGES with any prior sidecar, so
+  // a resuming second scout appends to the first scout's candidates rather than replacing them.
+  if (!persistFailed && merged.size > 0) {
+    const records: OnboardingCandidateRecord[] = [];
+    for (const m of merged.values()) {
+      const relPath = candidateRelPath(m);
+      records.push({
+        candidateId: candidateId(m),
+        kind: m.kind,
+        statement: m.statement,
+        evidence: m.evidence,
+        sourceScouts: [...m.sourceScouts],
+        rationale: m.rationale ?? null,
+        rationaleSource: m.rationaleSource ?? null,
+        relPath,
+        landed: outcomeByPath.get(relPath) ?? "failed",
+      });
+    }
+    upsertCandidatesSidecar(env.home, {
+      schemaVersion: 1,
+      workspaceId: env.workspaceId,
+      runId,
+      repositoryRoot: env.repositoryRoot,
+      updatedAt: now,
+      candidates: records,
     });
   }
 

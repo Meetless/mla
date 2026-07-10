@@ -291,7 +291,7 @@ describe("runConflicts", () => {
     expect(joined).toContain("mla conflicts resolve <id>");
     expect(joined).toContain("dismiss <id> --rationale <text>");
     expect(joined).toContain(
-      "Full evidence + resolve in the console: https://console.test/conflicts",
+      "Full evidence + resolve in the console: https://console.test/open?workspaceId=ws_test&to=%2Fconflicts",
     );
     assertNoSmellDashes(joined);
   });
@@ -364,7 +364,7 @@ describe("runConflicts", () => {
     expect(h.out[0]).toBe(
       "No open conflicts involving this session (sess-current). " +
         "See the whole workspace with `mla conflicts --global`, or open " +
-        "https://console.test/conflicts.",
+        "https://console.test/open?workspaceId=ws_test&to=%2Fconflicts.",
     );
   });
 
@@ -378,7 +378,7 @@ describe("runConflicts", () => {
     const code = await runConflicts(["--global"], deps);
     expect(code).toBe(0);
     expect(h.out).toEqual([
-      "No open cross-session conflicts in this workspace. Queue: https://console.test/conflicts",
+      "No open cross-session conflicts in this workspace. Queue: https://console.test/open?workspaceId=ws_test&to=%2Fconflicts",
     ]);
   });
 

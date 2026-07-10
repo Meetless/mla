@@ -155,6 +155,14 @@ export interface OnboardingRun {
   limits: EnrichmentLimits;
   documentationTargets: DocumentationTarget[];
   historyEvidence: PreparedGitEvidence[]; // the commit allowlist + prepared context
+  // Git-native snapshot identity for the WORKSPACE-grain idempotency gate. headCommit
+  // (`git rev-parse HEAD`) is identical across every clone of the same content, so it,
+  // not planDigest (which embeds the absolute repositoryRoot), is the cross-machine key
+  // the intel marker is keyed on. rootCommit (oldest root) is repo identity, telemetry
+  // only. Both null when git is unavailable (gate then degrades to the local record).
+  // Optional so a run record written before this field existed still parses.
+  headCommit?: string | null;
+  rootCommit?: string | null;
 }
 
 export interface ScoutResult {
@@ -200,6 +208,46 @@ export interface OnboardingState {
   status: "complete" | "partial";
   updatedAt: string;
   scouts: { documentation: ScoutRunState; history: ScoutRunState };
+}
+
+// --- Candidates sidecar (the accept half's durable record) -----------------------
+
+// The landed KB outcome for a candidate this run persisted, mirroring ingest's PersistOutcome
+// ("ingested" minted a revision, "noop_unchanged" deduped against the governed head, "failed"
+// the server could not persist). Recorded so `enrich accept` can report it and the operator
+// can cross-reference the console; it does NOT gate local materialization (the managed rule
+// file is independent of KB persistence).
+export type OnboardingCandidateLanded = "ingested" | "noop_unchanged" | "failed";
+
+// One merged candidate this onboarding run produced, captured AFTER ingest merged + validated
+// it. This is the exact, post-merge shape `enrich accept` reads to materialize the durable ones
+// into .meetless/rules.md, so it carries everything materializeRules needs (kind, statement,
+// evidence) plus display/audit context (which scouts surfaced it, where it landed in the KB).
+// kind/statement/evidence satisfy CandidateIdentityInput and EnrichmentCandidate's rule-bearing
+// fields, so a record reconstructs a materializable candidate without re-parsing markdown.
+export interface OnboardingCandidateRecord {
+  candidateId: string; // the sha256 identity (protocol.candidateId); selection + dedup key
+  kind: EnrichmentKind;
+  statement: string;
+  evidence: EnrichmentEvidence[];
+  sourceScouts: ScoutName[]; // which scouts surfaced it (display/provenance)
+  rationale: string | null;
+  rationaleSource: RationaleSource | null;
+  relPath: string; // the governed KB doc path it persisted to (onboarding/<id>-<slug>.md)
+  landed: OnboardingCandidateLanded;
+}
+
+// The per-run sidecar `enrich ingest` writes beside the run record + resume state, so the
+// candidates a run produced survive the session for `enrich accept` to materialize later.
+// Accumulated across ingest calls (a resuming scout's candidates are appended, deduped by
+// candidateId), keyed by runId so two repos sharing a workspace never collide.
+export interface OnboardingCandidatesSidecar {
+  schemaVersion: 1;
+  workspaceId: string;
+  runId: string;
+  repositoryRoot: string;
+  updatedAt: string;
+  candidates: OnboardingCandidateRecord[];
 }
 
 export interface CandidateValidationError {

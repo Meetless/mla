@@ -130,7 +130,9 @@ describe("mla kb review (list mode): rendering", () => {
     expect(json.candidates[0].autoRejectable).toBe(false);
     expect(json.candidates[1].autoRejectable).toBe(true);
     expect(json.candidates[1].autoRejectReasonCode).toBe("self_edge");
-    expect(json.candidates[0].consoleUrl).toBe(`${base}/relationships/${cand().id}`);
+    expect(json.candidates[0].consoleUrl).toBe(
+      `${base}/open?workspaceId=ws_test&to=%2Frelationships%2F${cand().id}`,
+    );
   });
 
   it("human view reuses the 'needs your decision' digest and shows the console URL", () => {
@@ -138,7 +140,9 @@ describe("mla kb review (list mode): rendering", () => {
     expect(text).toMatch(/needs your decision/i);
     expect(text).toContain("DEPENDS_ON");
     expect(text).toContain("note:a.md");
-    expect(text).toContain(`${base}/relationships/${cand().id}`);
+    expect(text).toContain(
+      `${base}/open?workspaceId=ws_test&to=%2Frelationships%2F${cand().id}`,
+    );
   });
 
   it("human view reports an empty queue plainly", () => {

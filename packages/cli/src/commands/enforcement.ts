@@ -31,7 +31,7 @@
 // command is still useful from a plain terminal.
 
 import * as fs from "fs";
-import { loadWorkspaceConfig, getConsoleUrl, WorkspaceCliConfig } from "../lib/config";
+import { loadWorkspaceConfig, consoleDeepLink, WorkspaceCliConfig } from "../lib/config";
 import { get, post, HttpError } from "../lib/http";
 
 // The two verdicts control accepts (ADJUDICATION_VERDICTS in
@@ -266,7 +266,6 @@ export async function runEnforcement(
   }
 
   const cfg = loadWorkspaceConfig();
-  const consoleBase = getConsoleUrl(cfg);
   const listIncidents = deps.listIncidents ?? defaultListIncidents;
   const adjudicate = deps.adjudicate ?? defaultAdjudicate;
 
@@ -309,7 +308,7 @@ export async function runEnforcement(
     return 0;
   }
 
-  const queueUrl = `${consoleBase.replace(/\/$/, "")}/value`;
+  const queueUrl = consoleDeepLink(cfg, "/value");
 
   if (scoped.length === 0) {
     if (scopeToSession && workspaceUnreviewed > 0) {

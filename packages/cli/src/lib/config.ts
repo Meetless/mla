@@ -127,6 +127,39 @@ export function getConsoleUrl(cfg: CliConfig): string {
   return raw.replace(/\/+$/, "");
 }
 
+// Build a workspace-pinned Console deep link from an already-resolved base + the
+// active workspaceId. A multi-workspace human whose Console session is bound to a
+// DIFFERENT workspace would otherwise open a bare `/relationships/<id>` link and
+// silently land in the wrong workspace (a 404 for id-scoped paths, or worse, the
+// wrong queue for list paths). Routing through the `/open` landing page carries
+// the target workspaceId so the Console switches sessions, then lands on `to`.
+//
+// Without a workspaceId (shared-key / an unbound folder) we cannot pin, so we
+// fall back to the plain URL: an unpinned link is strictly better than a broken
+// one. `to` is emitted as a single relative path in the `to` query param; the
+// `/open` page re-validates it as a same-origin path (open-redirect guard).
+export function consoleDeepLinkFrom(
+  consoleBase: string,
+  workspaceId: string | undefined | null,
+  path: string,
+): string {
+  const base = consoleBase.replace(/\/+$/, "");
+  const to = path.startsWith("/") ? path : `/${path}`;
+  const ws = (workspaceId ?? "").trim();
+  if (!ws) return `${base}${to}`;
+  const qs = new URLSearchParams({ workspaceId: ws, to });
+  return `${base}/open?${qs.toString()}`;
+}
+
+// cfg convenience over consoleDeepLinkFrom: resolve the base via getConsoleUrl and
+// read cfg.workspaceId. Use this from workspace-scoped commands (loadWorkspaceConfig
+// / readKbConfig populate cfg.workspaceId from the marker). When the workspace is
+// resolved OUTSIDE cfg (e.g. `kb show`, which reads a bare readConfig() and resolves
+// the marker itself), call consoleDeepLinkFrom directly with that id.
+export function consoleDeepLink(cfg: CliConfig, path: string): string {
+  return consoleDeepLinkFrom(getConsoleUrl(cfg), cfg.workspaceId, path);
+}
+
 export const HOME = process.env.MEETLESS_HOME || path.join(os.homedir(), ".meetless");
 export const CFG_PATH = path.join(HOME, "cli-config.json");
 export const QUEUE_DIR = path.join(HOME, "queue");

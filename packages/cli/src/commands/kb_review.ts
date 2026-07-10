@@ -348,7 +348,7 @@ export async function runKbReviewWith(
     const footer = renderCorrectionFooter(
       parsed.candidateId,
       cresult,
-      candidateConsoleUrl(ctx.consoleBase, parsed.candidateId),
+      candidateConsoleUrl(ctx.consoleBase, ctx.workspaceId, parsed.candidateId),
     );
     for (const line of footer) console.log(line);
     return 0;
@@ -382,7 +382,7 @@ export async function runKbReviewWith(
     verb,
     parsed.candidateId,
     result.statusId,
-    candidateConsoleUrl(ctx.consoleBase, parsed.candidateId),
+    candidateConsoleUrl(ctx.consoleBase, ctx.workspaceId, parsed.candidateId),
   );
   for (const line of footer) console.log(line);
   return 0;

@@ -17,7 +17,7 @@
 // MCP `relationship_verdict` tool (the claim-grain decision path). This command
 // is discovery + a pointer to that path and the console.
 
-import { loadWorkspaceConfig, WorkspaceCliConfig, getConsoleUrl } from "../lib/config";
+import { loadWorkspaceConfig, WorkspaceCliConfig, getConsoleUrl, consoleDeepLinkFrom } from "../lib/config";
 import { get } from "../lib/http";
 
 // One pending relation assertion as Control proxies it from Intel. Loose on
@@ -110,7 +110,7 @@ export function renderConnectionsJson(view: ConnectionsView): string {
       // any `mla` verb — state that once, machine-readably, so an agent does not
       // hunt for a nonexistent `mla graph connections --accept`.
       verdictPath: "mcp:relationship_verdict",
-      consoleUrl: `${view.consoleBase}/relationships`,
+      consoleUrl: consoleDeepLinkFrom(view.consoleBase, view.workspaceId, "/relationships"),
       connections: view.items.map((it) => ({
         assertionId: it.assertionId,
         relationType: it.relationType,
@@ -166,7 +166,7 @@ export function renderConnectionsHuman(view: ConnectionsView): string {
   // one hunts for a CLI accept/reject that does not exist for this surface.
   lines.push("These are claim-grain relationship connections pending review.");
   lines.push("Record a verdict with the Meetless MCP tool `relationship_verdict`,");
-  lines.push(`or review them in the console: ${view.consoleBase}/relationships`);
+  lines.push(`or review them in the console: ${consoleDeepLinkFrom(view.consoleBase, view.workspaceId, "/relationships")}`);
   return lines.join("\n");
 }
 

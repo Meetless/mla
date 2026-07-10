@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { createHash } from "crypto";
-import { readKbConfig, KbCliConfig, getConsoleUrl, HOME } from "../lib/config";
+import { readKbConfig, KbCliConfig, consoleDeepLink, HOME } from "../lib/config";
 import { intelGet, intelPost } from "../lib/http";
 import { verifyKbActorIsOwner, KbOwnerCheckError } from "../lib/kb_acl";
 import { KbAddReceipt, renderKbAddReceipt } from "../lib/render";
@@ -779,8 +779,9 @@ export async function runKbAdd(argv: string[]): Promise<number> {
 
   // B4a: stamp the Console review URL onto every receipt so `kb add` always
   // surfaces the clickable human review surface. The server does not know the
-  // console base; the CLI owns it via getConsoleUrl(cfg).
-  const consoleUrl = `${getConsoleUrl(cfg)}/relationships`;
+  // console base; the CLI owns it and pins the active workspace so the link
+  // lands in THIS workspace, not whichever one the Console session is bound to.
+  const consoleUrl = consoleDeepLink(cfg, "/relationships");
   for (const receipt of receipts) {
     receipt.consoleUrl = consoleUrl;
     console.log(renderKbAddReceipt(receipt));

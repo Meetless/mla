@@ -40,7 +40,7 @@
 
 import {
   loadWorkspaceConfig,
-  getConsoleUrl,
+  consoleDeepLink,
   WorkspaceCliConfig,
 } from "../lib/config";
 import { get, post, HttpError } from "../lib/http";
@@ -375,8 +375,7 @@ export async function runConflicts(
   }
 
   const cfg = (deps.loadConfig ?? loadWorkspaceConfig)();
-  const consoleBase = getConsoleUrl(cfg);
-  const queueUrl = `${consoleBase.replace(/\/$/, "")}/conflicts`;
+  const queueUrl = consoleDeepLink(cfg, "/conflicts");
 
   // Direct-action verbs: record one verdict by case id, no listing, no prompt.
   // (Parse guarantees caseId + rationale are set, and outcome for both verbs.)

@@ -178,7 +178,7 @@ export function buildPendingView(
     rows: items.map((candidate) => ({
       candidate,
       mechanical: classifyMechanicalInvalidity(candidate),
-      consoleUrl: candidateConsoleUrl(ctx.consoleBase, candidate.id),
+      consoleUrl: candidateConsoleUrl(ctx.consoleBase, ctx.workspaceId, candidate.id),
     })),
   };
 }

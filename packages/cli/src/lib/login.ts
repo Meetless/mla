@@ -230,10 +230,26 @@ export function openLoopbackServer(opts: {
 // the loopback listening.
 // ---------------------------------------------------------------------------
 
-function spawnOpener(cmd: string, args: string[]): Promise<number> {
+// The opener is injected (default: real spawn) so the launcher-selection logic
+// can be unit-tested per platform without opening a browser. `windowsVerbatimArguments`
+// is threaded through because the win32 launcher hand-quotes its args (see openBrowser).
+export type BrowserOpener = (
+  cmd: string,
+  args: string[],
+  opts?: { windowsVerbatimArguments?: boolean },
+) => Promise<number>;
+
+function spawnOpener(
+  cmd: string,
+  args: string[],
+  opts: { windowsVerbatimArguments?: boolean } = {},
+): Promise<number> {
   return new Promise((resolve) => {
     try {
-      const child = spawn(cmd, args, { stdio: "ignore" });
+      const child = spawn(cmd, args, {
+        stdio: "ignore",
+        windowsVerbatimArguments: opts.windowsVerbatimArguments,
+      });
       child.on("error", () => resolve(127)); // ENOENT / not installed
       child.on("exit", (code) => resolve(code ?? 0));
     } catch {
@@ -242,16 +258,31 @@ function spawnOpener(cmd: string, args: string[]): Promise<number> {
   });
 }
 
-export async function openBrowser(url: string): Promise<number> {
-  const platform = process.platform;
-  if (platform === "darwin") return spawnOpener("open", [url]);
-  if (platform === "win32") return spawnOpener("cmd", ["/c", "start", "", url]);
+export async function openBrowser(
+  url: string,
+  opts: { platform?: NodeJS.Platform; run?: BrowserOpener } = {},
+): Promise<number> {
+  const platform = opts.platform ?? process.platform;
+  const run = opts.run ?? spawnOpener;
+  if (platform === "darwin") return run("open", [url]);
+  if (platform === "win32") {
+    // cmd.exe's `start` re-parses its command line and treats `&` as a command
+    // separator, so an unquoted OAuth URL is truncated at the first query param
+    // (dropping code_challenge/redirect_uri) even though `url` is a distinct argv
+    // element. Wrap the URL in quotes so cmd sees ONE token, and pass the args
+    // verbatim so Node does not re-escape those quotes. The empty "" is the
+    // (required) window-title arg so `start` does not treat the quoted URL as the
+    // title. A real Windows prod login hit this: only `?state=...` reached Console.
+    return run("cmd", ["/c", "start", '""', `"${url}"`], {
+      windowsVerbatimArguments: true,
+    });
+  }
   // Linux / *BSD: try xdg-open, then sensible-browser, then $BROWSER.
   const candidates = ["xdg-open", "sensible-browser"];
   const envBrowser = process.env.BROWSER;
   if (envBrowser && envBrowser.trim().length > 0) candidates.push(envBrowser.trim());
   for (const cmd of candidates) {
-    const code = await spawnOpener(cmd, [url]);
+    const code = await run(cmd, [url]);
     if (code === 0) return 0;
   }
   return 1;

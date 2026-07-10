@@ -23,16 +23,36 @@ export interface OpenUrlResult {
 // The launcher is injected (default: spawnSync) so the suite never opens a real
 // browser. open / xdg-open / start all return promptly after handing the URL to the
 // OS, so a synchronous spawn does not block the CLI.
-export type OpenRunner = (cmd: string, args: string[]) => OpenRunResult;
+export type OpenRunner = (
+  cmd: string,
+  args: string[],
+  opts?: { windowsVerbatimArguments?: boolean },
+) => OpenRunResult;
 
-const defaultRunner: OpenRunner = (cmd, args) => {
-  const r = spawnSync(cmd, args, { stdio: "ignore" });
+const defaultRunner: OpenRunner = (cmd, args, opts) => {
+  const r = spawnSync(cmd, args, {
+    stdio: "ignore",
+    windowsVerbatimArguments: opts?.windowsVerbatimArguments,
+  });
   return { error: r.error ?? undefined, status: r.status };
 };
 
-function launcherFor(platform: NodeJS.Platform, url: string): { cmd: string; args: string[] } {
+function launcherFor(
+  platform: NodeJS.Platform,
+  url: string,
+): { cmd: string; args: string[]; windowsVerbatimArguments?: boolean } {
   if (platform === "darwin") return { cmd: "open", args: [url] };
-  if (platform === "win32") return { cmd: "cmd", args: ["/c", "start", "", url] };
+  if (platform === "win32") {
+    // cmd.exe's `start` re-parses its command line and treats `&` as a command
+    // separator, truncating a URL with query params even though `url` is a distinct
+    // argv element. Quote the URL so cmd sees ONE token and pass args verbatim so
+    // Node does not re-escape the quotes; "" is the (required) empty window title.
+    return {
+      cmd: "cmd",
+      args: ["/c", "start", '""', `"${url}"`],
+      windowsVerbatimArguments: true,
+    };
+  }
   return { cmd: "xdg-open", args: [url] };
 }
 
@@ -49,9 +69,9 @@ export function openUrl(
 
   const platform = opts.platform ?? process.platform;
   const run = opts.run ?? defaultRunner;
-  const { cmd, args } = launcherFor(platform, url);
+  const { cmd, args, windowsVerbatimArguments } = launcherFor(platform, url);
 
-  const r = run(cmd, args);
+  const r = run(cmd, args, { windowsVerbatimArguments });
   if (r.error) return { ok: false, error: r.error.message };
   if (typeof r.status === "number" && r.status !== 0) {
     return { ok: false, error: `${cmd} exited ${r.status}` };

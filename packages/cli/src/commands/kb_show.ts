@@ -1,4 +1,4 @@
-import { readConfig, CliConfig, getConsoleUrl } from "../lib/config";
+import { readConfig, CliConfig, getConsoleUrl, consoleDeepLinkFrom } from "../lib/config";
 import { resolveWorkspaceId } from "../lib/workspace";
 import { intelGet, HttpError, DEFAULT_INTEL_URL } from "../lib/http";
 import { openUrl } from "../lib/open-url";
@@ -490,8 +490,10 @@ export async function runKbShow(argv: string[]): Promise<number> {
 
   const view = buildShowView(detail, flags);
   // B4a: always surface the Console review URL. The renderer stays pure, so the
-  // command layer resolves it via getConsoleUrl(cfg) and stamps it on the view.
-  view.consoleUrl = `${getConsoleUrl(cfg)}/relationships`;
+  // command layer resolves it and stamps it on the view. Pin the resolved
+  // workspaceId (cfg here is a bare readConfig() without it) so the link lands in
+  // THIS workspace, not whichever one the Console session happens to be bound to.
+  view.consoleUrl = consoleDeepLinkFrom(getConsoleUrl(cfg), workspaceId, "/relationships");
 
   if (flags.json) {
     console.log(JSON.stringify(view, null, 2));

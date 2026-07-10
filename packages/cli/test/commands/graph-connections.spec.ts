@@ -67,7 +67,8 @@ describe("renderConnectionsHuman", () => {
     expect(text).toContain("id ra_1");
     // The verdict path for THIS surface is the MCP tool, never an `mla` verb.
     expect(text).toContain("relationship_verdict");
-    expect(text).toContain(`${base}/relationships`);
+    // Deep link pins the active workspace via the /open landing page.
+    expect(text).toContain(`${base}/open?workspaceId=ws1&to=%2Frelationships`);
   });
 
   it("distinguishes the page from the full backlog (showing X of N)", () => {
@@ -97,7 +98,7 @@ describe("renderConnectionsJson", () => {
     expect(json.count).toEqual(2657);
     expect(json.shown).toEqual(1);
     expect(json.verdictPath).toEqual("mcp:relationship_verdict");
-    expect(json.consoleUrl).toEqual(`${base}/relationships`);
+    expect(json.consoleUrl).toEqual(`${base}/open?workspaceId=ws1&to=%2Frelationships`);
     expect(json.connections[0]).toMatchObject({
       assertionId: "ra_1",
       relationType: "CONTRADICTS",

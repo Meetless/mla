@@ -10,6 +10,8 @@ import {
   pruneOldRuns,
   runsDir,
   createPlan,
+  buildPlan,
+  readGitIdentity,
   runRecordPath,
   type GitRunner,
 } from "../../../src/lib/enrichment/plan";
@@ -383,5 +385,111 @@ describe("createPlan", () => {
     expect(run.planDigest).toBe(computePlanDigest(run));
     expect(pruned).toBe(1);
     expect(loadRunRecord(home, "ws_1", "stale")).toBeNull();
+  });
+});
+
+// A git runner that answers ONLY the two identity probes (rev-parse HEAD, rev-list root),
+// so we can assert readGitIdentity in isolation from ls-files / log.
+const fakeIdentityGit = (opts: {
+  head?: string | Error;
+  roots?: string[] | Error;
+}): GitRunner => {
+  return (args) => {
+    if (args[0] === "rev-parse") {
+      if (opts.head instanceof Error) throw opts.head;
+      return `${opts.head ?? ""}\n`;
+    }
+    if (args[0] === "rev-list") {
+      if (opts.roots instanceof Error) throw opts.roots;
+      return `${(opts.roots ?? []).join("\n")}\n`;
+    }
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+};
+
+describe("readGitIdentity", () => {
+  const HEAD = "a".repeat(40);
+  const ROOT_A = "b".repeat(40);
+  const ROOT_B = "c".repeat(40);
+
+  it("returns the lowercased 40-hex HEAD and the LAST root commit (git ... | tail -1)", () => {
+    const id = readGitIdentity(fakeIdentityGit({ head: HEAD.toUpperCase(), roots: [ROOT_A, ROOT_B] }));
+    expect(id.headCommit).toBe(HEAD); // lowercased
+    expect(id.rootCommit).toBe(ROOT_B); // the oldest root when several exist (last line)
+  });
+
+  it("rejects a HEAD that is not a full 40-hex sha (abbreviated / non-sha => null)", () => {
+    expect(readGitIdentity(fakeIdentityGit({ head: "abc1234", roots: [ROOT_A] })).headCommit).toBeNull();
+    expect(readGitIdentity(fakeIdentityGit({ head: "not-a-sha", roots: [ROOT_A] })).headCommit).toBeNull();
+  });
+
+  it("fails soft when git has no HEAD (unborn branch): headCommit null, no throw", () => {
+    const id = readGitIdentity(fakeIdentityGit({ head: new Error("fatal: bad revision 'HEAD'"), roots: [ROOT_A] }));
+    expect(id.headCommit).toBeNull();
+    expect(id.rootCommit).toBe(ROOT_A); // root probe is independent
+  });
+
+  it("fails soft when the root probe throws: rootCommit null, HEAD still resolved", () => {
+    const id = readGitIdentity(fakeIdentityGit({ head: HEAD, roots: new Error("boom") }));
+    expect(id.headCommit).toBe(HEAD);
+    expect(id.rootCommit).toBeNull();
+  });
+
+  it("filters non-hex noise from the root listing", () => {
+    const id = readGitIdentity(fakeIdentityGit({ head: HEAD, roots: ["", "garbage", ROOT_A] }));
+    expect(id.rootCommit).toBe(ROOT_A);
+  });
+
+  it("is null/null outside a git repo (both probes throw)", () => {
+    const id = readGitIdentity(fakeIdentityGit({ head: new Error("not a repo"), roots: new Error("not a repo") }));
+    expect(id).toEqual({ headCommit: null, rootCommit: null });
+  });
+});
+
+describe("buildPlan git identity", () => {
+  const HEAD = "d".repeat(40);
+  const ROOT = "e".repeat(40);
+
+  // A runner covering all four probes buildPlan issues: ls-files, log, rev-parse, rev-list.
+  const fullGit: GitRunner = (args) => {
+    if (args[0] === "ls-files") return ["CLAUDE.md"].join("\n");
+    if (args[0] === "log") return GIT_LOG_FIXTURE;
+    if (args[0] === "rev-parse") return `${HEAD}\n`;
+    if (args[0] === "rev-list") return `${ROOT}\n`;
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+
+  it("stamps the run with the git HEAD/root and keeps the digest independent of them", () => {
+    const { run } = buildPlan({
+      runId: "run-git",
+      workspaceId: "ws_1",
+      repositoryRoot: "/repo",
+      now: "2026-06-26T00:00:00.000Z",
+      gitRunner: fullGit,
+    });
+    expect(run.headCommit).toBe(HEAD);
+    expect(run.rootCommit).toBe(ROOT);
+    // The gate keys on headCommit precisely BECAUSE the digest cannot: the digest excludes
+    // head/root, so it stays stable when only the commit advances (and would differ across
+    // clones by repositoryRoot). Its own integrity check must still hold.
+    expect(run.planDigest).toBe(computePlanDigest(run));
+  });
+
+  it("tolerates a repo where the identity probes fail (null head/root, run still builds)", () => {
+    const noId: GitRunner = (args) => {
+      if (args[0] === "ls-files") return "CLAUDE.md";
+      if (args[0] === "log") return GIT_LOG_FIXTURE;
+      throw new Error("no identity here");
+    };
+    const { run } = buildPlan({
+      runId: "run-noid",
+      workspaceId: "ws_1",
+      repositoryRoot: "/repo",
+      now: "2026-06-26T00:00:00.000Z",
+      gitRunner: noId,
+    });
+    expect(run.headCommit).toBeNull();
+    expect(run.rootCommit).toBeNull();
+    expect(run.planDigest).toBe(computePlanDigest(run));
   });
 });

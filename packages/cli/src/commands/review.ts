@@ -1,4 +1,4 @@
-import { loadWorkspaceConfig, getConsoleUrl, WorkspaceCliConfig } from "../lib/config";
+import { loadWorkspaceConfig, consoleDeepLink, WorkspaceCliConfig } from "../lib/config";
 import { get, HttpError } from "../lib/http";
 import { renderPacket, ReviewPacketView } from "../lib/render";
 import { runFlush } from "./flush";
@@ -214,11 +214,11 @@ async function autoFlushAll(): Promise<void> {
 // so we need to surface the right web UI under the right command." The
 // terminal packet render is a convenience snapshot, NOT the review surface.
 // Leading with URLs makes the contract obvious.
-function consoleUrlsBlock(consoleBase: string): string {
+function consoleUrlsBlock(cfg: WorkspaceCliConfig): string {
   return [
     "Review in Console:",
-    `  Relationships queue:  ${consoleBase}/relationships`,
-    `  Cases queue:          ${consoleBase}/cases`,
+    `  Relationships queue:  ${consoleDeepLink(cfg, "/relationships")}`,
+    `  Cases queue:          ${consoleDeepLink(cfg, "/cases")}`,
     "",
     // The Relationships queue above is Intel's claim-grain connections. It is
     // NOT what `mla graph review` lists (that is control's artifact-grain
@@ -234,8 +234,8 @@ function consoleUrlsBlock(consoleBase: string): string {
 // guess which session the user means and the locked design forbids inferring
 // one. Print the workspace URLs and exit 0 -- that still routes them to the UI,
 // which is the locked outcome.
-function printConsoleOnly(consoleBase: string): void {
-  console.log(consoleUrlsBlock(consoleBase));
+function printConsoleOnly(cfg: WorkspaceCliConfig): void {
+  console.log(consoleUrlsBlock(cfg));
   console.log(
     "`mla review` shows the current session's review packet when run INSIDE a " +
       "Claude Code session (CLAUDE_CODE_SESSION_ID is unset here). Open the queues " +
@@ -303,12 +303,11 @@ export function reviewUsage(): string {
 // difference is who supplies the session id.
 export async function runReview(argv: string[]): Promise<number> {
   const cfg = loadWorkspaceConfig();
-  const consoleBase = getConsoleUrl(cfg);
   const flags = parseArgs(argv);
 
   const sid = process.env.CLAUDE_CODE_SESSION_ID;
   if (!sid) {
-    printConsoleOnly(consoleBase);
+    printConsoleOnly(cfg);
     return 0;
   }
 
@@ -327,7 +326,7 @@ export async function runReview(argv: string[]): Promise<number> {
   // Lead every render path with the console URL block. The previous CLI buried
   // the URL deep in the packet body (or omitted it entirely); An's lock made
   // surfacing the right web UI under the right command the deliverable.
-  console.log(consoleUrlsBlock(consoleBase));
+  console.log(consoleUrlsBlock(cfg));
 
   if (result.kind === "timeout") {
     console.error(buildTimeoutMessage(result.lastStatus, result.lastSyn));
@@ -414,7 +413,6 @@ async function existsAgentReviewCase(
 
 export async function runReviewById(argv: string[]): Promise<number> {
   const cfg = loadWorkspaceConfig();
-  const consoleBase = getConsoleUrl(cfg);
   let parsed: { id: string };
   try {
     parsed = parseReviewByIdArgs(argv);
@@ -432,11 +430,11 @@ export async function runReviewById(argv: string[]): Promise<number> {
   }
 
   if (await existsRelationshipCandidate(cfg, parsed.id)) {
-    console.log(`${consoleBase}/relationships/${parsed.id}`);
+    console.log(consoleDeepLink(cfg, `/relationships/${parsed.id}`));
     return 0;
   }
   if (await existsAgentReviewCase(cfg, parsed.id)) {
-    console.log(`${consoleBase}/cases/${parsed.id}`);
+    console.log(consoleDeepLink(cfg, `/cases/${parsed.id}`));
     return 0;
   }
 
