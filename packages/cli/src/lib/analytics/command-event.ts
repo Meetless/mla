@@ -13,32 +13,59 @@ import {
   CommandScope,
 } from "./envelope";
 
-// The closed set of top-level commands `mla` dispatches (cli.ts:215). A first
-// token outside this set is normalized to "unknown" so a typo'd path or secret
-// pasted as argv[0] never reaches the wire.
+// The closed set of top-level commands `mla` dispatches. A first token outside
+// this set is normalized to "unknown" so a typo'd path or secret pasted as
+// argv[0] never reaches the wire.
+//
+// This MUST mirror the `switch (cmd)` dispatch in cli.ts (runDispatch). It is
+// ordered to match that switch top-to-bottom so a reviewer can diff the two by
+// eye and catch drift: when the switch grows a case, this set grows the same
+// line. Drift here is not benign; a dispatched command absent from this set
+// collapses to command="unknown" in the funnel and erases its own dimension
+// from every failure and retention view (the exact bug the 2026-07-09 cohort
+// forensics surfaced, where `rules` failures were invisible). The spec test
+// "mirrors the cli.ts dispatch set" pins this invariant.
 export const KNOWN_COMMANDS = new Set<string>([
   "init",
+  "wire",
   "rewire",
+  "login",
+  "logout",
+  "uninstall",
+  "whoami",
   "activate",
   "deactivate",
   "mute",
   "unmute",
   "workspace",
   "doctor",
+  "status",
+  "scan",
+  "context",
   "flush",
+  "queue",
+  "rules",
   "review",
+  "enforcement",
+  "conflicts",
   "cases",
   "session",
   "ask",
   "kb",
+  "agent-memory",
+  "enrich",
+  "graph",
+  "cg",
   "summary",
   "label",
-  "adoption",
   "stats",
-  "whoami",
-  "login",
-  "logout",
+  "turn",
+  "adoption",
   "debug",
+  "bug",
+  "evidence",
+  "mcp",
+  "upgrade",
   "_internal",
 ]);
 
@@ -47,6 +74,11 @@ export const KNOWN_COMMANDS = new Set<string>([
 // a query, a doc path) and `subcommand` is null. This is what stops
 // `mla review <case-id>` or `mla ask "<query>"` from leaking the positional as a
 // subcommand.
+// The `graph` command and its alias `cg` dispatch through the same handler
+// (cli.ts routes both to runGraph), so they share a subcommand set. Defined once
+// and bound to both keys below to keep them from drifting apart.
+const GRAPH_SUBS = new Set(["review", "pending", "connections"]);
+
 export const KNOWN_SUBCOMMANDS: Record<string, Set<string>> = {
   kb: new Set([
     "add",
@@ -63,8 +95,37 @@ export const KNOWN_SUBCOMMANDS: Record<string, Set<string>> = {
     "retime",
     "summary",
   ]),
-  workspace: new Set(["show", "use"]),
-  session: new Set(["show"]),
+  workspace: new Set(["show", "use", "invite", "members", "remove"]),
+  session: new Set(["show", "reconcile"]),
+  queue: new Set(["prune"]),
+  rules: new Set([
+    "add",
+    "edit",
+    "remove",
+    "rm",
+    "list",
+    "activity",
+    "attest",
+    "revoke",
+    "demote",
+    "publish",
+    "import",
+  ]),
+  review: new Set(["latest", "by-session"]),
+  enforcement: new Set(["list", "confirm", "dismiss"]),
+  conflicts: new Set(["list", "resolve", "dismiss"]),
+  enrich: new Set(["plan", "brief", "ingest", "materialize", "accept"]),
+  graph: GRAPH_SUBS,
+  cg: GRAPH_SUBS,
+  "agent-memory": new Set([
+    "enable",
+    "disable",
+    "status",
+    "scan",
+    "push",
+    "report",
+  ]),
+  evidence: new Set(["ce0-export", "ce0-import-labels", "ce0-emit-telemetry"]),
   stats: new Set(["evidence"]),
   _internal: new Set(["finalize-session", "active-review", "auto-index"]),
 };
@@ -310,6 +371,26 @@ export function classifyOutcome(
     return { outcome: "network_error", error_class: "network_error", retryable: true };
   }
 
+  // Node OS/filesystem faults carry a classic errno on `.code` (ENOENT, EACCES,
+  // EPERM, ENOSPC, ...). The network/timeout errnos are already consumed above, so
+  // what reaches here is the fresh-box first-run failure surface: a missing dir,
+  // an unwritable ~/.meetless, a full disk. Emitting the errno (lowercased to
+  // match the http_*/config_error token style) is what turns that from an opaque
+  // "Error" into a diagnosable class. `code` is already uppercased and the
+  // `^E[A-Z0-9]+$` shape is itself the PII guard: only an uppercase E-prefixed
+  // alnum token can pass, and a path / email / query / secret never can (they
+  // carry lowercase, slashes, dots, @, or dashes), so no message or argument can
+  // leak through .code. EACCES/EPERM are a local permission denial (the user's to
+  // fix by chmod, so classified quiet as permission_denied, never a bug to file);
+  // every other errno is an unexpected system-level fault kept as system_error
+  // with the errno preserved.
+  if (/^E[A-Z0-9]+$/.test(code)) {
+    if (code === "EACCES" || code === "EPERM") {
+      return { outcome: "permission_denied", error_class: code.toLowerCase(), retryable: false };
+    }
+    return { outcome: "system_error", error_class: code.toLowerCase(), retryable: false };
+  }
+
   // Unknown thrown error: a class name is PII-safe (it is a type, not a message).
   return { outcome: "system_error", error_class: name || "Error", retryable: false };
 }
@@ -318,12 +399,18 @@ export function classifyOutcome(
 // and so should surface the "file a bug report" nudge: a 5xx from a reachable
 // backend, or an unhandled in-process crash. A 429 is bucketed as system_error
 // for analytics but is a client-side throttle (back off, not a bug), so it is
-// excluded. Everything else (auth, permission, validation, user error,
+// excluded. Environment-capacity errnos (disk full, read-only fs, over quota) are
+// likewise system_error for analytics but are the user's environment to fix, not a
+// bug in our code, so filing a report is useless and they stay quiet (same
+// rationale as 429). Everything else (auth, permission, validation, user error,
 // offline/timeout/network) is the user's to act on and stays quiet. This is the
 // single source of truth for the nudge policy so the analytics outcome and the
 // user-facing nudge can never disagree.
+const ENVIRONMENT_ERROR_CLASSES = new Set(["enospc", "erofs", "edquot"]);
+
 export function isReportableFault(c: OutcomeClassification): boolean {
   if (c.outcome !== "system_error") return false;
   if (c.error_class === "http_429") return false;
+  if (c.error_class && ENVIRONMENT_ERROR_CLASSES.has(c.error_class)) return false;
   return true;
 }

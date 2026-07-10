@@ -21,8 +21,14 @@ import {
 import { backfillSessionPrompts } from "../lib/transcript-prompts";
 import { runLogin } from "./login";
 import { get, HttpError, post } from "../lib/http";
-import { renderActivationCard, renderBootstrapSummary } from "../lib/scanner/bootstrap-summary";
-import { renderManualScoutMission, renderAgenticInvitation } from "../lib/scanner/scout-mission";
+import {
+  renderActivationCard,
+  renderBootstrapSummary,
+} from "../lib/scanner/bootstrap-summary";
+import {
+  renderManualScoutMission,
+  renderAgenticInvitation,
+} from "../lib/scanner/scout-mission";
 import { rescanAndCache } from "./scan-context";
 import { removeOwnedProjection } from "../lib/scanner/floor-projection-writer";
 import { FLOOR_PROJECTION_RELPATH } from "../lib/scanner/floor-projection";
@@ -145,7 +151,9 @@ export function parseActivateArgs(argv: string[]): ActivateFlags {
 // The activation tail defaults to the `fast` tier when no `--bootstrap` was given,
 // so the long-standing behavior is unchanged unless the operator opts into a
 // deeper tier.
-export function resolveBootstrapTier(flags: { bootstrap?: BootstrapTier }): BootstrapTier {
+export function resolveBootstrapTier(flags: {
+  bootstrap?: BootstrapTier;
+}): BootstrapTier {
   return flags.bootstrap ?? "fast";
 }
 
@@ -257,17 +265,62 @@ interface BootstrapResult {
 // this folder still captures via the marker gate; this only buys the current
 // one. Production stays dir-wise; this is the "get one session working now"
 // affordance.
+
+// Locate the session-start capture hook from whichever wiring surface is live on
+// THIS machine, so "is capture wired?" matches how the user actually installed.
+// Two surfaces ship the IDENTICAL self-contained hook (it `source`s common.sh
+// relative to its own dir, so it runs the same launched from either path):
+//   - legacy home-dir wiring: ~/.meetless/hooks/session-start.sh (written by `mla init`)
+//   - the Claude Code plugin `mla@meetless`: <installPath>/hooks/session-start.sh.
+//     This is the SHIPPED marketplace install; its hooks live under the plugin
+//     root, NOT ~/.meetless/hooks, so a home-only check falsely reports capture
+//     as unwired and tells plugin users to run `mla init` (dogfood 2026-07-10).
+//     detectPluginOwnership() surfaces installPath only when owned (user/managed
+//     scope = global wiring); non-global/unknown/absent do not provide it.
+// Precedence is home-first: an explicit `mla init` on this box is the more direct
+// signal, and when both exist the reconcile backstop tears out the shadowing
+// legacy copy immediately after. Returns the absolute hook path, or null when
+// NEITHER surface is present (the only case that genuinely warrants an install nudge).
+export function resolveSessionStartHook(
+  detect: typeof detectPluginOwnership = detectPluginOwnership,
+): string | null {
+  const homeHook = path.join(HOOKS_DIR, "session-start.sh");
+  if (fs.existsSync(homeHook)) return homeHook;
+  try {
+    const ownership = detect();
+    if (ownership.status === "owned" && ownership.installPath) {
+      const pluginHook = path.join(
+        ownership.installPath,
+        "hooks",
+        "session-start.sh",
+      );
+      if (fs.existsSync(pluginHook)) return pluginHook;
+    }
+  } catch {
+    // Detection is best-effort (`claude plugin list` may be absent/slow/wedged); a
+    // failure must not crash the bootstrap. Fall through to null and let the caller
+    // emit the neutral install nudge rather than a false "wired" claim.
+  }
+  return null;
+}
+
 export function bootstrapCurrentSession(dir: string): BootstrapResult {
   const sessionId = process.env.CLAUDE_CODE_SESSION_ID;
   if (!sessionId) {
-    return { ok: false, detail: "not inside a Claude Code session (CLAUDE_CODE_SESSION_ID unset)" };
+    return {
+      ok: false,
+      detail: "not inside a Claude Code session (CLAUDE_CODE_SESSION_ID unset)",
+    };
   }
-  const sessionStart = path.join(HOOKS_DIR, "session-start.sh");
-  if (!fs.existsSync(sessionStart)) {
+  const sessionStart = resolveSessionStartHook();
+  if (!sessionStart) {
     return {
       ok: false,
       sessionId,
-      detail: `installed hooks not found at ${sessionStart}; run 'mla init' to wire capture`,
+      detail:
+        "capture hooks are not installed on this machine (checked ~/.meetless/hooks " +
+        "and the mla@meetless Claude Code plugin); run `mla init` or install the mla " +
+        "plugin to wire capture",
     };
   }
   // Recover the user prompts the marker gate dropped BEFORE this folder was
@@ -318,7 +371,9 @@ function resolveActivationInstant(dir: string): string {
   const found = findActivation(dir);
   if (found) {
     try {
-      const parsed = JSON.parse(fs.readFileSync(found.path, "utf8")) as ActivationMarker;
+      const parsed = JSON.parse(
+        fs.readFileSync(found.path, "utf8"),
+      ) as ActivationMarker;
       if (typeof parsed.activatedAt === "string" && parsed.activatedAt) {
         return parsed.activatedAt;
       }
@@ -475,9 +530,13 @@ function checkCreateGuard(
     // the safe paths are the repo root (no flag) or a subdir (`--here`).
     if (git.insideWorkTree) {
       const atRoot = git.root ? sameDir(cwd, git.root) : false;
-      console.error("`--create` is for directories that are NOT inside a Git repository.");
+      console.error(
+        "`--create` is for directories that are NOT inside a Git repository.",
+      );
       if (atRoot) {
-        console.error("You are at a Git repo root; run `mla activate` (no flag) to provision here.");
+        console.error(
+          "You are at a Git repo root; run `mla activate` (no flag) to provision here.",
+        );
       } else {
         console.error(
           "You are in a Git subdir; run `mla activate --here` to bind this subdir, " +
@@ -491,7 +550,9 @@ function checkCreateGuard(
 
   // No override flag. Outside Git, refuse and point at --create.
   if (!git.insideWorkTree) {
-    console.error("No Meetless workspace is bound here, and this directory is not inside a Git repository.");
+    console.error(
+      "No Meetless workspace is bound here, and this directory is not inside a Git repository.",
+    );
     console.error("To create a workspace here, run `mla activate --create`.");
     return 2;
   }
@@ -516,7 +577,10 @@ function checkCreateGuard(
 // cwd. The owner is the authenticated caller (resolved server-side from the
 // actor identity), never the request body, so a caller cannot mint a workspace
 // owned by someone else.
-async function runProvision(cwd: string, flags: ActivateFlags): Promise<number> {
+async function runProvision(
+  cwd: string,
+  flags: ActivateFlags,
+): Promise<number> {
   const loaded = loadCfgOrExplain();
   if (typeof loaded === "number") return loaded;
   const cfg = loaded;
@@ -537,9 +601,13 @@ async function runProvision(cwd: string, flags: ActivateFlags): Promise<number> 
         "Control rejected the provision request (not authorized). Check `mla doctor` and your token.",
       );
     } else if (err.status !== undefined) {
-      console.error(`Control could not provision the workspace (HTTP ${err.status}).`);
+      console.error(
+        `Control could not provision the workspace (HTTP ${err.status}).`,
+      );
     } else {
-      console.error("Could not reach control to provision the workspace. Is it running? (`mla doctor`)");
+      console.error(
+        "Could not reach control to provision the workspace. Is it running? (`mla doctor`)",
+      );
     }
     return 1;
   }
@@ -555,8 +623,12 @@ async function runProvision(cwd: string, flags: ActivateFlags): Promise<number> 
   console.log(`  workspaceId: ${resp.id}`);
   console.log("");
   console.log("Commit guidance:");
-  console.log(`  ${ACTIVATION_FILENAME} is untracked and not gitignored; it holds no secrets.`);
-  console.log("  Commit it to share this workspace binding with the team, or leave it");
+  console.log(
+    `  ${ACTIVATION_FILENAME} is untracked and not gitignored; it holds no secrets.`,
+  );
+  console.log(
+    "  Commit it to share this workspace binding with the team, or leave it",
+  );
   console.log("  uncommitted to keep the binding local to this clone.");
 
   const giResult = removeStaleGitignoreEntry(cwd);
@@ -568,11 +640,17 @@ async function runProvision(cwd: string, flags: ActivateFlags): Promise<number> 
 
 // Bind to an already-resolved marker. Provisions nothing; the marker is local
 // truth for "which workspace this folder runs under".
-function runBind(found: FoundActivation, cwd: string, tier: BootstrapTier): number {
+function runBind(
+  found: FoundActivation,
+  cwd: string,
+  tier: BootstrapTier,
+): number {
   const nameSuffix = found.workspaceName ? ` (${found.workspaceName})` : "";
   const id = found.workspaceId ?? "(no workspaceId in marker)";
   console.log(`Already activated: ${found.path} -> ${id}${nameSuffix}`);
-  console.log("  Marker unchanged; this folder is already bound to a workspace.");
+  console.log(
+    "  Marker unchanged; this folder is already bound to a workspace.",
+  );
 
   const giResult = removeStaleGitignoreEntry(found.dir);
   if (giResult) console.log(`  gitignore:   ${giResult}`);
@@ -587,13 +665,19 @@ function runBind(found: FoundActivation, cwd: string, tier: BootstrapTier): numb
 async function runRepair(cwd: string): Promise<number> {
   const found = findActivation(cwd);
   if (!found) {
-    console.error("Nothing to repair: no .meetless.json is bound to this folder.");
+    console.error(
+      "Nothing to repair: no .meetless.json is bound to this folder.",
+    );
     console.error("  Run `mla activate` to create or bind a workspace here.");
     return 2;
   }
   if (!found.workspaceId) {
-    console.error(`Nothing to repair: ${found.path} has no usable workspaceId (stale marker).`);
-    console.error("  Re-create the binding with `mla deactivate` then `mla activate`.");
+    console.error(
+      `Nothing to repair: ${found.path} has no usable workspaceId (stale marker).`,
+    );
+    console.error(
+      "  Re-create the binding with `mla deactivate` then `mla activate`.",
+    );
     return 2;
   }
 
@@ -675,11 +759,13 @@ export function onboardRecommendation(opts: {
 // error is caught and reported as `failed: true` (NOT silently swallowed) so the caller
 // can WARN, and activate never aborts on a wiring hiccup. The paths + executor are
 // injectable so the whole thing is testable without touching the real home dir.
-export function reconcileWiringBackstop(io: {
-  paths?: LegacyWiringPaths;
-  detect?: typeof detectPluginOwnership;
-  reconcileIO?: ReconcileIO;
-} = {}): {
+export function reconcileWiringBackstop(
+  io: {
+    paths?: LegacyWiringPaths;
+    detect?: typeof detectPluginOwnership;
+    reconcileIO?: ReconcileIO;
+  } = {},
+): {
   action: ReconcileAction;
   changed: boolean;
   restartRequired: boolean;
@@ -708,7 +794,12 @@ export function reconcileWiringBackstop(io: {
     };
   } catch {
     // Never let a wiring reconcile abort activate; surface failed so the caller warns.
-    return { action: "noop", changed: false, restartRequired: false, failed: true };
+    return {
+      action: "noop",
+      changed: false,
+      restartRequired: false,
+      failed: true,
+    };
   }
 }
 
@@ -718,7 +809,11 @@ export function reconcileWiringBackstop(io: {
 // scout mission (fast = review bundle only; agentic/full = bundle + mission).
 // recommendOnboard is set only by the provision path, so the `/mla onboard` nudge
 // fires once per fresh workspace (see onboardRecommendation).
-function finishActivate(cwd: string, tier: BootstrapTier, recommendOnboard = false): number {
+function finishActivate(
+  cwd: string,
+  tier: BootstrapTier,
+  recommendOnboard = false,
+): number {
   // Re-running `mla activate` inside a session that was previously muted with
   // `mla mute` is one supported way to turn it back ON (the other is
   // `mla unmute`): clear the per-session sentinel FIRST, so the bootstrap below
@@ -773,9 +868,13 @@ function finishActivate(cwd: string, tier: BootstrapTier, recommendOnboard = fal
     console.log(
       `Capture is active NOW for this session (${boot.sessionId!.slice(0, 8)}); no restart needed.`,
     );
-    console.log("Run `mla review` inside this session to see the console URLs + captured review.");
+    console.log(
+      "Run `mla review` inside this session to see the console URLs + captured review.",
+    );
   } else {
-    console.log("Capture takes effect on the NEXT Claude Code session started from this folder.");
+    console.log(
+      "Capture takes effect on the NEXT Claude Code session started from this folder.",
+    );
     // Only explain when we were inside a session but the bootstrap could not
     // run (e.g. hooks not installed); a plain non-session invocation needs no
     // scary detail.
@@ -833,7 +932,9 @@ function finishActivate(cwd: string, tier: BootstrapTier, recommendOnboard = fal
 // `mla deactivate`. Re-enable this session with `mla unmute` (or `mla activate`).
 export async function runMute(argv: string[]): Promise<number> {
   if (argv.length > 0) {
-    console.error(`Unknown argument: ${argv[0]}. \`mla mute\` takes no arguments.`);
+    console.error(
+      `Unknown argument: ${argv[0]}. \`mla mute\` takes no arguments.`,
+    );
     return 2;
   }
 
@@ -852,10 +953,16 @@ export async function runMute(argv: string[]): Promise<number> {
   const sentinel = path.join(SESSION_GATE_DIR, `${sessionId}.off`);
   fs.writeFileSync(sentinel, new Date().toISOString() + "\n", "utf8");
 
-  console.log(`Muted this session (${sessionId.slice(0, 8)}): capture AND Push are now OFF.`);
+  console.log(
+    `Muted this session (${sessionId.slice(0, 8)}): capture AND Push are now OFF.`,
+  );
   console.log(`  sentinel: ${sentinel}`);
-  console.log("  Takes effect on the next hook fire (prompt, tool use, or stop).");
-  console.log("  Re-run `mla unmute` (or `mla activate`) in this session to turn it back on.");
+  console.log(
+    "  Takes effect on the next hook fire (prompt, tool use, or stop).",
+  );
+  console.log(
+    "  Re-run `mla unmute` (or `mla activate`) in this session to turn it back on.",
+  );
   return 0;
 }
 
@@ -866,7 +973,9 @@ export async function runMute(argv: string[]): Promise<number> {
 // `.meetless.json`. A no-op (exit 0) when the session was not muted.
 export async function runUnmute(argv: string[]): Promise<number> {
   if (argv.length > 0) {
-    console.error(`Unknown argument: ${argv[0]}. \`mla unmute\` takes no arguments.`);
+    console.error(
+      `Unknown argument: ${argv[0]}. \`mla unmute\` takes no arguments.`,
+    );
     return 2;
   }
 
@@ -881,13 +990,19 @@ export async function runUnmute(argv: string[]): Promise<number> {
 
   const sentinel = path.join(SESSION_GATE_DIR, `${sessionId}.off`);
   if (!fs.existsSync(sentinel)) {
-    console.log(`This session (${sessionId.slice(0, 8)}) was not muted; nothing to do.`);
+    console.log(
+      `This session (${sessionId.slice(0, 8)}) was not muted; nothing to do.`,
+    );
     return 0;
   }
   fs.rmSync(sentinel, { force: true });
 
-  console.log(`Unmuted this session (${sessionId.slice(0, 8)}): capture is back ON.`);
-  console.log("  Takes effect on the next hook fire (prompt, tool use, or stop).");
+  console.log(
+    `Unmuted this session (${sessionId.slice(0, 8)}): capture is back ON.`,
+  );
+  console.log(
+    "  Takes effect on the next hook fire (prompt, tool use, or stop).",
+  );
   return 0;
 }
 
@@ -903,7 +1018,8 @@ function parseDeactivateArgs(argv: string[]): DeactivateFlags {
     const a = argv[i];
     if (a === "--marker") {
       const v = argv[i + 1];
-      if (v === undefined || v.startsWith("-")) throw new Error("Missing value for --marker");
+      if (v === undefined || v.startsWith("-"))
+        throw new Error("Missing value for --marker");
       out.marker = v;
       i += 1;
       continue;
@@ -927,7 +1043,9 @@ function parseDeactivateArgs(argv: string[]): DeactivateFlags {
 // malformed or missing file yields undefined; never throws.
 function readMarkerWorkspaceId(markerPath: string): string | undefined {
   try {
-    const raw = JSON.parse(fs.readFileSync(markerPath, "utf8")) as { workspaceId?: unknown };
+    const raw = JSON.parse(fs.readFileSync(markerPath, "utf8")) as {
+      workspaceId?: unknown;
+    };
     return typeof raw.workspaceId === "string" && raw.workspaceId.trim()
       ? raw.workspaceId
       : undefined;
@@ -943,7 +1061,10 @@ function readMarkerWorkspaceId(markerPath: string): string | undefined {
 // happy path is "yes, log me in").
 function promptYesNo(question: string, defaultYes = false): Promise<boolean> {
   return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
     rl.question(question, (answer) => {
       rl.close();
       const a = answer.trim().toLowerCase();
@@ -977,7 +1098,9 @@ export interface OfferLoginDeps {
   login?: (argv: string[]) => Promise<number>;
 }
 
-export async function maybeOfferLogin(deps: OfferLoginDeps = {}): Promise<void> {
+export async function maybeOfferLogin(
+  deps: OfferLoginDeps = {},
+): Promise<void> {
   if (!configExists()) return;
   let cfg: CliConfig;
   try {
@@ -1061,7 +1184,9 @@ export async function runDeactivate(argv: string[]): Promise<number> {
       p = path.join(p, ACTIVATION_FILENAME);
     }
     if (path.basename(p) !== ACTIVATION_FILENAME) {
-      console.error(`--marker must point at a ${ACTIVATION_FILENAME} file (got ${flags.marker}).`);
+      console.error(
+        `--marker must point at a ${ACTIVATION_FILENAME} file (got ${flags.marker}).`,
+      );
       return 2;
     }
     if (!fs.existsSync(p)) {
@@ -1074,19 +1199,27 @@ export async function runDeactivate(argv: string[]): Promise<number> {
   } else {
     const found = findActivation(cwd);
     if (!found) {
-      console.error("Nothing to deactivate: no .meetless.json binding resolves from here.");
+      console.error(
+        "Nothing to deactivate: no .meetless.json binding resolves from here.",
+      );
       console.error("  (Use `mla mute` to silence just the current session.)");
       return 1;
     }
     // Nested-dir safety: an ancestor marker is not removed from a subdir without
     // an explicit opt-in, even with `--yes` (which only skips the y/N prompt).
     if (!sameDir(found.dir, cwd) && !flags.fromRoot) {
-      console.error("The nearest workspace binding is in a parent directory, not here:");
+      console.error(
+        "The nearest workspace binding is in a parent directory, not here:",
+      );
       console.error(`  marker: ${found.path}`);
       console.error(`  cwd:    ${cwd}`);
       console.error("");
-      console.error("Removing it would unbind the whole subtree, not just this folder.");
-      console.error("Re-run with `--from-root` to remove that parent binding, or");
+      console.error(
+        "Removing it would unbind the whole subtree, not just this folder.",
+      );
+      console.error(
+        "Re-run with `--from-root` to remove that parent binding, or",
+      );
       console.error("`--marker <path>` to target a specific .meetless.json.");
       return 1;
     }
@@ -1100,7 +1233,9 @@ export async function runDeactivate(argv: string[]): Promise<number> {
   console.log("Found marker:");
   console.log(`  ${targetPath}`);
   console.log("");
-  console.log("`mla deactivate` REMOVES this folder workspace binding (it no longer");
+  console.log(
+    "`mla deactivate` REMOVES this folder workspace binding (it no longer",
+  );
   console.log("just suppresses this session; that is `mla mute`).");
   console.log("");
 
@@ -1126,7 +1261,9 @@ export async function runDeactivate(argv: string[]): Promise<number> {
   // removal hiccup never aborts the unbind that already happened above.
   const removed = removeOwnedProjection(targetDir);
   if (removed.removed) {
-    console.log(`Removed the MLA floor projection (${FLOOR_PROJECTION_RELPATH}).`);
+    console.log(
+      `Removed the MLA floor projection (${FLOOR_PROJECTION_RELPATH}).`,
+    );
   }
 
   const wasBound = workspaceId ? ` (was bound to ${workspaceId})` : "";
@@ -1139,8 +1276,12 @@ export async function runDeactivate(argv: string[]): Promise<number> {
   // same dir to see whether a parent marker now governs the subtree, and say so.
   const stillApplies = findActivation(targetDir);
   if (stillApplies) {
-    const sfx = stillApplies.workspaceId ? ` -> ${stillApplies.workspaceId}` : "";
-    console.log(`  Note: a parent marker still governs this subtree: ${stillApplies.path}${sfx}`);
+    const sfx = stillApplies.workspaceId
+      ? ` -> ${stillApplies.workspaceId}`
+      : "";
+    console.log(
+      `  Note: a parent marker still governs this subtree: ${stillApplies.path}${sfx}`,
+    );
   }
   return 0;
 }

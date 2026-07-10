@@ -2,17 +2,34 @@ import { execSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { readConfig, CliAuth, HOOKS_DIR, SESSION_GATE_DIR } from "../lib/config";
+import {
+  readConfig,
+  CliAuth,
+  HOOKS_DIR,
+  SESSION_GATE_DIR,
+} from "../lib/config";
 import { tryResolveWorkspaceId } from "../lib/workspace";
 import { get, ping } from "../lib/http";
 import { queueDepth, reapQueue } from "../lib/spool";
 import { findActivation } from "../lib/activation";
-import { checkHookDrift, MCP_SERVER_KEY, mcpCommandExecutable, isPkgSnapshotPath } from "../lib/wire";
-import { openCe0Store, closeCe0Store, type Ce0Store } from "../lib/rules/ce0-store";
+import {
+  checkHookDrift,
+  MCP_SERVER_KEY,
+  mcpCommandExecutable,
+  isPkgSnapshotPath,
+} from "../lib/wire";
+import {
+  openCe0Store,
+  closeCe0Store,
+  type Ce0Store,
+} from "../lib/rules/ce0-store";
 import { CE0_INTERCEPTION_SCHEMA_VERSION } from "../lib/rules/interception-schema";
 import { type InputAuthorityResolution } from "../lib/rules/input-authority-resolver";
 import { resolveLiveInputAuthority } from "../lib/rules/live-input-authority";
-import { resolveAttestedPathRoot, type PathRootAdmission } from "../lib/rules/deny-admission";
+import {
+  resolveAttestedPathRoot,
+  type PathRootAdmission,
+} from "../lib/rules/deny-admission";
 import {
   countDenyDecisionsAwaitingEmission,
   countFailOpenEnforcementViolations,
@@ -22,7 +39,10 @@ import { NOTES_LOCATION_RULE_ID } from "../lib/rules/attest-notes-location";
 import { resolveActiveRuntimeScopeId } from "../lib/rules/runtime-scope";
 import { type RulePayloadV1 } from "../lib/rules/types";
 import { defaultCe0StorePath } from "./evidence";
-import { detectPluginOwnership, type PluginOwnership } from "../connectors/claude-code/plugin-detect";
+import {
+  detectPluginOwnership,
+  type PluginOwnership,
+} from "../connectors/claude-code/plugin-detect";
 import {
   inspectLegacyWiring,
   planLegacyReconcile,
@@ -106,7 +126,12 @@ export const OPTIONAL_HOOKS = ["post-tool-use.sh"];
 // PreToolUse joins the required events with A1: wire.ts registers it unconditionally (it carries no
 // opt-out flag, unlike PostToolUse), so a missing registration means the live enforcement hook never
 // fires and the pilot silently stops enforcing. RED on missing.
-export const REQUIRED_HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "PreToolUse"];
+export const REQUIRED_HOOK_EVENTS = [
+  "SessionStart",
+  "UserPromptSubmit",
+  "Stop",
+  "PreToolUse",
+];
 const OPTIONAL_HOOK_EVENTS = ["PostToolUse"];
 
 // The MCP command-health probe (check 5b, below) and the pkg-snapshot guard live
@@ -130,7 +155,8 @@ export function parseDoctorArgs(argv: string[]): { fix: boolean } {
       fix = true;
       continue;
     }
-    const gcNote = a === "--gc" ? " (the --gc flag was a no-op and has been removed)" : "";
+    const gcNote =
+      a === "--gc" ? " (the --gc flag was a no-op and has been removed)" : "";
     throw new Error(
       `mla doctor accepts only the optional --fix flag; got: ${argv.join(" ")}${gcNote}`,
     );
@@ -146,7 +172,8 @@ interface Check {
 }
 
 function fmt(c: Check): string {
-  if (c.level === "info") return `  ⓘ ${c.label}${c.detail ? `: ${c.detail}` : ""}`;
+  if (c.level === "info")
+    return `  ⓘ ${c.label}${c.detail ? `: ${c.detail}` : ""}`;
   const mark = c.ok ? "✓" : "✗";
   return `  ${mark} ${c.label}${c.detail ? ` (${c.detail})` : ""}`;
 }
@@ -191,12 +218,80 @@ export function pluginStatusCheck(ownership: PluginOwnership): Check {
   };
 }
 
+// Resolve the directory that actually holds the live capture hooks, so doctor's
+// presence + drift checks match how the user installed rather than assuming the
+// legacy home dir. Mirrors activate's resolveSessionStartHook precedence exactly:
+// legacy home-dir wiring (~/.meetless/hooks) first, else the owned plugin's
+// bundled hooks (<installPath>/hooks). Without this, a fully-wired plugin user
+// (the shipped marketplace install, whose hooks live under the plugin root) sees
+// an UNFIXABLE red "hook script session-start.sh installed" -- the exact
+// contradiction behind activate telling those users to run `mla init`
+// (dogfood 2026-07-10). Falls back to HOOKS_DIR (the `mla init` target) when
+// neither surface is present, so a genuinely-unwired machine still goes red
+// against the path a repair would populate.
+export function resolveHooksDir(ownership: PluginOwnership): {
+  dir: string;
+  surface: string;
+} {
+  if (fs.existsSync(path.join(HOOKS_DIR, "session-start.sh"))) {
+    return { dir: HOOKS_DIR, surface: "home-dir wiring" };
+  }
+  if (ownership.status === "owned" && ownership.installPath) {
+    const pluginDir = path.join(ownership.installPath, "hooks");
+    if (fs.existsSync(path.join(pluginDir, "session-start.sh"))) {
+      return {
+        dir: pluginDir,
+        surface: `mla@meetless plugin, ${ownership.scope} scope`,
+      };
+    }
+  }
+  return { dir: HOOKS_DIR, surface: "home-dir wiring" };
+}
+
+// The workspace-binding assertion, extracted from runDoctor's IO shell so it can be pinned
+// directly (like doctorExitCode). doctor sends the folder's marker workspaceId to control's
+// whoami; control echoes back the workspace it actually resolved for that (token, workspaceId).
+// Reporting "workspace resolves" GREEN without confirming the resolved id EQUALS the marker id
+// is a false-green: it hides a real misbinding -- a stale marker, a phantom workspace, or a
+// cli-config aimed at a backend that cannot see this folder's workspace (the dogfood marker was
+// once silently re-pointed to a workspace no local control had, and doctor showed green anyway).
+// On a match we surface the id (not just the slug) so this line and the "folder activated" line
+// are visibly the SAME workspace even when their display names differ (marker name vs live slug).
+export function workspaceBindingCheck(
+  markerWorkspaceId: string,
+  whoami: { workspace?: { id?: string; slug?: string } } | null | undefined,
+): Check {
+  const resolvedId = whoami?.workspace?.id;
+  const slug = whoami?.workspace?.slug;
+  const shown = (id: string) => (slug ? `${id} (${slug})` : id);
+  if (resolvedId && resolvedId === markerWorkspaceId) {
+    return {
+      ok: true,
+      label: "token valid + workspace resolves",
+      detail: shown(resolvedId),
+    };
+  }
+  return {
+    ok: false,
+    label: "resolved workspace does not match the folder binding",
+    detail:
+      `marker binds ${markerWorkspaceId} but the token resolves ` +
+      `${resolvedId ? shown(resolvedId) : "no workspace"}; the backend in cli-config cannot ` +
+      `see this folder's workspace. Re-run \`mla activate\` here, or point cli-config at the ` +
+      `backend that owns ${markerWorkspaceId}.`,
+  };
+}
+
 // Turn a reconcile plan + mode into doctor Check lines. PURE except for the injected
 // `io` (applied only when `fix` is true). Blocker 3: the `plan.warn` advisory is
 // appended INDEPENDENT of `fix` AND of `plan.action`, so a plain `mla doctor` on a
 // non-global install (which is ALWAYS a noop, Task 7) still surfaces the reinstall
 // notice. Info-level + ok:true keeps it advisory (never flips the §6.7 CI exit code).
-export function reconcileChecks(plan: ReconcilePlan, fix: boolean, io: ReconcileIO): Check[] {
+export function reconcileChecks(
+  plan: ReconcilePlan,
+  fix: boolean,
+  io: ReconcileIO,
+): Check[] {
   const out: Check[] = [];
   if (fix) {
     const { changed } = applyLegacyReconcile(plan, io);
@@ -218,7 +313,12 @@ export function reconcileChecks(plan: ReconcilePlan, fix: boolean, io: Reconcile
     });
   }
   if (plan.warn) {
-    out.push({ ok: true, label: "wiring reconcile", detail: plan.warn, level: "info" });
+    out.push({
+      ok: true,
+      label: "wiring reconcile",
+      detail: plan.warn,
+      level: "info",
+    });
   }
   return out;
 }
@@ -335,7 +435,9 @@ export function busyTimeoutCheck(busyTimeoutMs: number): Check {
 
 // (4) MLA is the sole effective PreToolUse Write/Edit input authority (P0.58). Anything else
 // (a foreign mutator, an unreadable layer, or no MLA hook at all) means a deny is not admissible.
-export function managedPreToolUseHookCheck(resolution: InputAuthorityResolution): Check {
+export function managedPreToolUseHookCheck(
+  resolution: InputAuthorityResolution,
+): Check {
   if (resolution.kind === "MLA_SOLE_AUTHORITY") {
     return {
       ok: true,
@@ -411,7 +513,11 @@ export function failOpenEnforcementCheck(failedOpen: number): Check {
 export function ce0IntegrityCheck(quickCheckResult: string): Check {
   const ok = quickCheckResult.trim().toLowerCase() === "ok";
   if (ok) {
-    return { ok: true, label: "CE0 store integrity (PRAGMA quick_check)", detail: "ok" };
+    return {
+      ok: true,
+      label: "CE0 store integrity (PRAGMA quick_check)",
+      detail: "ok",
+    };
   }
   const summary = quickCheckResult.trim().slice(0, 200);
   return {
@@ -427,7 +533,9 @@ export function ce0IntegrityCheck(quickCheckResult: string): Check {
 // and the pure check above goes RED.
 export function ce0QuickCheckResult(store: Ce0Store): string {
   try {
-    const rows = store.db.pragma("quick_check") as Array<Record<string, unknown>>;
+    const rows = store.db.pragma("quick_check") as Array<
+      Record<string, unknown>
+    >;
     return rows.map((r) => String(Object.values(r)[0])).join("; ");
   } catch (e) {
     return (e as Error).message;
@@ -489,7 +597,10 @@ export function describeAuthMode(auth: CliAuth): string {
         : "session expired; run `mla login`";
   } else {
     const hours = Math.floor(ms / (60 * 60 * 1000));
-    runway = hours < 48 ? `access expires ~${hours}h` : `access expires ~${Math.floor(hours / 24)}d`;
+    runway =
+      hours < 48
+        ? `access expires ~${hours}h`
+        : `access expires ~${Math.floor(hours / 24)}d`;
   }
   return `user-token (${who}; ${runway})`;
 }
@@ -501,7 +612,11 @@ export async function runDoctor(argv: string[]): Promise<number> {
   let cfg: ReturnType<typeof readConfig> | null = null;
   try {
     cfg = readConfig();
-    checks.push({ ok: true, label: "cli-config.json present", detail: cfg.controlUrl });
+    checks.push({
+      ok: true,
+      label: "cli-config.json present",
+      detail: cfg.controlUrl,
+    });
     // §6.4: surface which credential path is active at a glance. Info-level (does
     // not fail the doctor): all three modes are valid states. NEVER prints a
     // token, only the mode and, for a user session, the display name + expiry.
@@ -512,7 +627,11 @@ export async function runDoctor(argv: string[]): Promise<number> {
       level: "info",
     });
   } catch (e) {
-    checks.push({ ok: false, label: "cli-config.json present", detail: (e as Error).message });
+    checks.push({
+      ok: false,
+      label: "cli-config.json present",
+      detail: (e as Error).message,
+    });
     console.log("Doctor:");
     for (const c of checks) console.log(fmt(c));
     return 1;
@@ -570,7 +689,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
         ? `/internal/v1/whoami?workspaceId=${encodeURIComponent(markerWorkspaceId)}&actorUserId=${encodeURIComponent(actorUserId)}`
         : `/internal/v1/whoami?workspaceId=${encodeURIComponent(markerWorkspaceId)}`;
       whoami = await get(cfg, whoamiPath, 6000);
-      checks.push({ ok: true, label: `token valid + workspace resolves`, detail: whoami?.workspace?.slug ?? whoami?.workspace?.id });
+      checks.push(workspaceBindingCheck(markerWorkspaceId, whoami));
       checks.push({
         ok: !!whoami?.actor,
         label: "actor resolves (workspace member)",
@@ -610,11 +729,21 @@ export async function runDoctor(argv: string[]): Promise<number> {
   let intelReachable = false;
   if (cfg.intelUrl) {
     try {
-      const res = await fetch(`${cfg.intelUrl}/health`, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(`${cfg.intelUrl}/health`, {
+        signal: AbortSignal.timeout(5000),
+      });
       intelReachable = res.ok;
-      checks.push({ ok: res.ok, label: "intel reachable (GET /health)", detail: cfg.intelUrl });
+      checks.push({
+        ok: res.ok,
+        label: "intel reachable (GET /health)",
+        detail: cfg.intelUrl,
+      });
     } catch (e) {
-      checks.push({ ok: false, label: "intel reachable (GET /health)", detail: (e as Error).message });
+      checks.push({
+        ok: false,
+        label: "intel reachable (GET /health)",
+        detail: (e as Error).message,
+      });
     }
   }
 
@@ -643,7 +772,8 @@ export async function runDoctor(argv: string[]): Promise<number> {
         checks.push({
           ok: true,
           level: "info",
-          label: "KB health probe: endpoint absent on this intel build (skipped)",
+          label:
+            "KB health probe: endpoint absent on this intel build (skipped)",
         });
       } else if (!res.ok) {
         checks.push({
@@ -655,10 +785,15 @@ export async function runDoctor(argv: string[]): Promise<number> {
         const body: any = await res.json();
         const lag: number | null = body?.outboxConsumerLagSec ?? null;
         const pending: number = body?.hardDeletePendingCount ?? 0;
-        const pendingAge: number | null = body?.hardDeletePendingMaxAgeSec ?? null;
-        const warnings: string[] = Array.isArray(body?.warnings) ? body.warnings : [];
+        const pendingAge: number | null =
+          body?.hardDeletePendingMaxAgeSec ?? null;
+        const warnings: string[] = Array.isArray(body?.warnings)
+          ? body.warnings
+          : [];
         const lagOk = !warnings.some((w) => w.includes("outbox consumer lag"));
-        const pendingOk = !warnings.some((w) => w.includes("HARD_DELETE_PENDING"));
+        const pendingOk = !warnings.some((w) =>
+          w.includes("HARD_DELETE_PENDING"),
+        );
         checks.push({
           ok: lagOk,
           label: "KB outbox consumer lag (warn > 5min)",
@@ -694,7 +829,8 @@ export async function runDoctor(argv: string[]): Promise<number> {
       for (const ev of Object.keys(s.hooks ?? {})) {
         for (const entry of s.hooks[ev] ?? []) {
           for (const h of entry.hooks ?? []) {
-            if (h?.type === "command" && typeof h.command === "string") installedCmds.add(h.command);
+            if (h?.type === "command" && typeof h.command === "string")
+              installedCmds.add(h.command);
           }
         }
       }
@@ -712,15 +848,29 @@ export async function runDoctor(argv: string[]): Promise<number> {
       }
       void installedCmds;
     } catch (e) {
-      checks.push({ ok: false, label: "~/.claude/settings.json parseable", detail: (e as Error).message });
+      checks.push({
+        ok: false,
+        label: "~/.claude/settings.json parseable",
+        detail: (e as Error).message,
+      });
     }
   } else {
     checks.push({ ok: false, label: "~/.claude/settings.json present" });
   }
 
   // 5. /mla skill installed
-  const skillPath = path.join(os.homedir(), ".claude", "skills", "mla", "SKILL.md");
-  checks.push({ ok: fs.existsSync(skillPath), label: "/mla skill installed", detail: skillPath });
+  const skillPath = path.join(
+    os.homedir(),
+    ".claude",
+    "skills",
+    "mla",
+    "SKILL.md",
+  );
+  checks.push({
+    ok: fs.existsSync(skillPath),
+    label: "/mla skill installed",
+    detail: skillPath,
+  });
 
   // 5b. Meetless MCP server registered for Claude Code.
   //
@@ -833,7 +983,9 @@ export async function runDoctor(argv: string[]): Promise<number> {
     inspection: inspectLegacyWiring(paths),
     mode: "repair", // doctor --fix MAY restore an existing degraded install (never create-from-zero)
   });
-  checks.push(...reconcileChecks(reconcilePlan, fix, defaultReconcileIO(paths)));
+  checks.push(
+    ...reconcileChecks(reconcilePlan, fix, defaultReconcileIO(paths)),
+  );
 
   // 6. mlaPath resolves + executable
   let mlaExec = false;
@@ -843,7 +995,11 @@ export async function runDoctor(argv: string[]): Promise<number> {
   } catch {
     mlaExec = false;
   }
-  checks.push({ ok: mlaExec, label: "mlaPath resolves + executable", detail: cfg.mlaPath });
+  checks.push({
+    ok: mlaExec,
+    label: "mlaPath resolves + executable",
+    detail: cfg.mlaPath,
+  });
 
   // 6b. build freshness (stale-dist footgun).
   //
@@ -874,10 +1030,15 @@ export async function runDoctor(argv: string[]): Promise<number> {
       }
       const srcMs = newestTsMtimeMs(srcDir);
       const stale = distMs === 0 || srcMs > distMs;
-      let freshDetail = distMs ? `built ${new Date(distMs).toISOString()}` : "dist/cli.js missing";
+      let freshDetail = distMs
+        ? `built ${new Date(distMs).toISOString()}`
+        : "dist/cli.js missing";
       try {
         const bi = JSON.parse(
-          fs.readFileSync(path.join(__dirname, "..", "build-info.json"), "utf8"),
+          fs.readFileSync(
+            path.join(__dirname, "..", "build-info.json"),
+            "utf8",
+          ),
         );
         freshDetail = `${bi.sha ?? "?"}${bi.dirty ? "-dirty" : ""}, built ${bi.builtAt ?? freshDetail}`;
       } catch {
@@ -893,25 +1054,40 @@ export async function runDoctor(argv: string[]): Promise<number> {
     }
   }
 
-  // 7a. flock present in PATH. flush.sh + common.sh use `flock -n 9` for
-  // hook concurrency; macOS does not ship it. If flock is missing the hook
-  // pipeline silently no-ops (`|| exit 0` after the failed flock call), so
-  // events queue forever and never reach control. `brew install flock`.
+  // 7a. hook lock primitive. common.sh locks via flock when present and falls
+  // back to a portable mkdir(2) mutex when it is absent (Windows Git Bash ships
+  // no flock, macOS ships none by default). So flock is an OPTIMIZATION, never a
+  // requirement: present -> a passing check; absent -> an info line, not a RED
+  // failure, because the mkdir fallback keeps passive capture working.
   let flockPath: string | null = null;
   try {
-    flockPath = execSync("command -v flock", { encoding: "utf8" }).trim() || null;
+    flockPath =
+      execSync("command -v flock", { encoding: "utf8" }).trim() || null;
   } catch {
     flockPath = null;
   }
-  checks.push({
-    ok: !!flockPath,
-    label: "flock available on PATH (hook concurrency primitive)",
-    detail: flockPath ?? "missing. Run `brew install flock` (macOS) or `apt-get install util-linux` (Linux).",
-  });
+  if (flockPath) {
+    checks.push({
+      ok: true,
+      label: "hook lock primitive (flock on PATH)",
+      detail: flockPath,
+    });
+  } else {
+    checks.push({
+      ok: true,
+      level: "info",
+      label: "hook lock primitive",
+      detail:
+        "flock not on PATH; hooks use the portable mkdir lock fallback (works without flock). Optional: `brew install flock` (macOS) / `apt-get install util-linux` (Linux) for a marginally faster lock.",
+    });
+  }
 
-  // 7b. hook scripts present + executable
+  // 7b. hook scripts present + executable. Resolve the live hooks dir from the
+  // install surface (home-dir wiring OR the owned plugin's bundled hooks) so a
+  // plugin user is not falsely reported unwired against ~/.meetless/hooks.
+  const { dir: hooksDir, surface: hooksSurface } = resolveHooksDir(ownership);
   for (const f of REQUIRED_HOOKS) {
-    const p = path.join(HOOKS_DIR, f);
+    const p = path.join(hooksDir, f);
     const ok = fs.existsSync(p);
     let exec = false;
     if (ok) {
@@ -922,10 +1098,14 @@ export async function runDoctor(argv: string[]): Promise<number> {
         exec = false;
       }
     }
-    checks.push({ ok: ok && (f.endsWith(".sh") ? exec : true), label: `hook script ${f} installed`, detail: p });
+    checks.push({
+      ok: ok && (f.endsWith(".sh") ? exec : true),
+      label: `hook script ${f} installed (${hooksSurface})`,
+      detail: p,
+    });
   }
   for (const f of OPTIONAL_HOOKS) {
-    const p = path.join(HOOKS_DIR, f);
+    const p = path.join(hooksDir, f);
     const present = fs.existsSync(p);
     checks.push({
       ok: true,
@@ -950,35 +1130,50 @@ export async function runDoctor(argv: string[]): Promise<number> {
   // Missing files are NOT drift: presence is reported by the per-hook checks
   // above, and a legit opt-out (post-tool-use.sh under --no-post-tool-use)
   // would otherwise false-positive.
-  try {
-    const drift = checkHookDrift();
-    const stale = drift.drifted;
-    checks.push({
-      ok: stale.length === 0,
-      label:
-        stale.length === 0
-          ? "hook scripts match shipped templates"
-          : `hook scripts stale: ${stale.join(", ")}`,
-      detail:
-        stale.length === 0
-          ? undefined
-          : "installed copy differs from this binary's template; run `mla wire` to refresh",
-    });
-    for (const e of drift.errors) {
-      checks.push({
-        ok: false,
-        label: `hook drift check: ${e.file}`,
-        detail: e.error,
-      });
-    }
-  } catch (e) {
-    // Template dir not found (published install lacking dist/hooks-template).
-    // Not a failure of the operator's wiring; surface as info, not red.
+  //
+  // Skipped under plugin ownership: the plugin bundles its hooks and its `mla`
+  // binary as one release and updates atomically via `claude plugin update`
+  // (never `mla rewire`), so comparing the plugin's hooks against THIS binary's
+  // template would false-positive whenever the running binary is a different
+  // standalone install. Drift is only actionable for home-dir wiring, where the
+  // binary and the installed hooks version independently.
+  if (hooksDir !== HOOKS_DIR) {
     checks.push({
       ok: true,
       level: "info",
-      label: `hook drift check skipped (template not found): ${(e as Error).message}`,
+      label: `hook drift check skipped (hooks managed by ${hooksSurface}; update via \`claude plugin update\`)`,
     });
+  } else {
+    try {
+      const drift = checkHookDrift({ hooksDir });
+      const stale = drift.drifted;
+      checks.push({
+        ok: stale.length === 0,
+        label:
+          stale.length === 0
+            ? "hook scripts match shipped templates"
+            : `hook scripts stale: ${stale.join(", ")}`,
+        detail:
+          stale.length === 0
+            ? undefined
+            : "installed copy differs from this binary's template; run `mla wire` to refresh",
+      });
+      for (const e of drift.errors) {
+        checks.push({
+          ok: false,
+          label: `hook drift check: ${e.file}`,
+          detail: e.error,
+        });
+      }
+    } catch (e) {
+      // Template dir not found (published install lacking dist/hooks-template).
+      // Not a failure of the operator's wiring; surface as info, not red.
+      checks.push({
+        ok: true,
+        level: "info",
+        label: `hook drift check skipped (template not found): ${(e as Error).message}`,
+      });
+    }
   }
 
   // 8. queue depth
@@ -1080,35 +1275,58 @@ export async function runDoctor(argv: string[]): Promise<number> {
         const integrity = ce0IntegrityCheck(ce0QuickCheckResult(ce0));
         checks.push(integrity);
         if (integrity.ok) {
-          const version = ce0.db.pragma("user_version", { simple: true }) as number;
-          const journalMode = ce0.db.pragma("journal_mode", { simple: true }) as string;
-          const foreignKeys = ce0.db.pragma("foreign_keys", { simple: true }) as number;
-          const busyTimeout = ce0.db.pragma("busy_timeout", { simple: true }) as number;
-          checks.push(schemaVersionCheck(version, CE0_INTERCEPTION_SCHEMA_VERSION));
+          const version = ce0.db.pragma("user_version", {
+            simple: true,
+          }) as number;
+          const journalMode = ce0.db.pragma("journal_mode", {
+            simple: true,
+          }) as string;
+          const foreignKeys = ce0.db.pragma("foreign_keys", {
+            simple: true,
+          }) as number;
+          const busyTimeout = ce0.db.pragma("busy_timeout", {
+            simple: true,
+          }) as number;
+          checks.push(
+            schemaVersionCheck(version, CE0_INTERCEPTION_SCHEMA_VERSION),
+          );
           checks.push(walModeCheck(journalMode));
           checks.push(foreignKeysCheck(foreignKeys));
           checks.push(busyTimeoutCheck(busyTimeout));
 
           // P0.60: honest deny-emission accounting (never RED, just surfaces the count).
-          checks.push(denyEmissionAccountingCheck(countDenyDecisionsAwaitingEmission(ce0)));
+          checks.push(
+            denyEmissionAccountingCheck(
+              countDenyDecisionsAwaitingEmission(ce0),
+            ),
+          );
 
           // Historical fail-open visibility: any DENY-ceiling violation that ever passed un-governed
           // (RULE_ENFORCEMENT_UNAVAILABLE, decision 5). Info, not RED: the append-only ledger must not
           // pin doctor RED forever, so the count itself is the loud alert deny-admission.ts promises.
-          checks.push(failOpenEnforcementCheck(countFailOpenEnforcementViolations(ce0)));
+          checks.push(
+            failOpenEnforcementCheck(countFailOpenEnforcementViolations(ce0)),
+          );
 
           // P0.63: the attested forbidden root resolves for the active scope. Mirror the enforce seam:
           // read the active scope's LIVE notes-location version, and if one is attested, resolve its
           // forbidden root against the active runtime root exactly as the seam would at a would-be deny.
           // With no LIVE version the path-root gate is simply inactive (informational, not red).
           const runtimeRoot = resolveActiveRuntimeScopeId();
-          const liveVersion = getLiveLocalRuleVersion(ce0, runtimeRoot, NOTES_LOCATION_RULE_ID);
+          const liveVersion = getLiveLocalRuleVersion(
+            ce0,
+            runtimeRoot,
+            NOTES_LOCATION_RULE_ID,
+          );
           if (liveVersion) {
-            const payload = JSON.parse(liveVersion.rulePayload) as RulePayloadV1;
+            const payload = JSON.parse(
+              liveVersion.rulePayload,
+            ) as RulePayloadV1;
             checks.push(
               attestedPathRootCheck(
                 resolveAttestedPathRoot({
-                  configuredRelativeForbiddenPath: payload.compliance.config.forbiddenRootRelativePath,
+                  configuredRelativeForbiddenPath:
+                    payload.compliance.config.forbiddenRootRelativePath,
                   activeRuntimeProjectRoot: runtimeRoot,
                 }),
               ),
@@ -1122,7 +1340,11 @@ export async function runDoctor(argv: string[]): Promise<number> {
           }
         }
       } catch (e) {
-        checks.push({ ok: false, label: "CE0 interception store posture", detail: (e as Error).message });
+        checks.push({
+          ok: false,
+          label: "CE0 interception store posture",
+          detail: (e as Error).message,
+        });
       } finally {
         if (ce0) closeCe0Store(ce0);
       }

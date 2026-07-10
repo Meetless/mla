@@ -35,10 +35,13 @@ function entriesFor(p: string, event: string): any[] {
 }
 
 // The managed entry whose single command's basename is EXACTLY `script`. Basename
-// equality keeps "post-tool-use.sh" and "ce0-post-tool-use.sh" disjoint.
+// equality keeps "post-tool-use.sh" and "ce0-post-tool-use.sh" disjoint. The
+// command is forward-slash + double-quoted for the Windows shell fix, so strip
+// the surrounding quotes before taking the basename
+// (notes/20260710-windows-hook-wiring-and-portable-lock-fix.md).
 function entryForScript(p: string, event: string, script: string): any {
   return entriesFor(p, event).find(
-    (e) => path.basename(e.hooks?.[0]?.command ?? "") === script,
+    (e) => path.basename((e.hooks?.[0]?.command ?? "").replace(/^"|"$/g, "")) === script,
   );
 }
 

@@ -32,8 +32,11 @@ function entriesFor(p: string, event: string): any[] {
 // ce0-post-tool-use.sh). These dedup tests pin the load-bearing entry, so scope by
 // exact command basename (basename equality keeps the two scripts disjoint).
 function entriesForBasename(p: string, event: string, basename: string): any[] {
+  // The command is forward-slash + double-quoted for the Windows shell fix, so
+  // strip the surrounding quotes before taking the basename
+  // (notes/20260710-windows-hook-wiring-and-portable-lock-fix.md).
   return entriesFor(p, event).filter(
-    (e) => path.basename(e.hooks?.[0]?.command ?? "") === basename,
+    (e) => path.basename((e.hooks?.[0]?.command ?? "").replace(/^"|"$/g, "")) === basename,
   );
 }
 
@@ -44,7 +47,7 @@ describe("ensureClaudeSettings: stale-path hook dedup (F3-E double-hook fix)", (
       // Fresh install to learn the canonical managed command path.
       ensureClaudeSettings(false, p);
       const canonical = entriesFor(p, "Stop")[0].hooks[0].command;
-      expect(canonical).toMatch(/stop\.sh$/);
+      expect(canonical).toMatch(/stop\.sh"$/);
 
       // Simulate a prior rewire that ran under a temp MEETLESS_HOME: same
       // basename + `hooks/` parent + `.meetless` segment, but a different dir.
@@ -162,7 +165,7 @@ describe("ensureClaudeSettings: stale-path hook dedup (F3-E double-hook fix)", (
       // basename, and ce0-stop.sh is a separate managed entry. Exactly one canonical
       // stop.sh is appended; the operator's own hook is left untouched.
       const oursEntries = entries.filter((e) =>
-        /\.meetless\/hooks\/stop\.sh$/.test(e.hooks?.[0]?.command ?? ""),
+        /\.meetless\/hooks\/stop\.sh"$/.test(e.hooks?.[0]?.command ?? ""),
       );
       expect(oursEntries.length).toBe(1); // ours appended alongside, exactly once
     } finally {

@@ -731,14 +731,29 @@ export async function ingestRun(input: {
       });
       continue;
     }
-    scoutState[b.scout] = { status: "complete", candidateCount: b.accepted.length };
+    // A per-document failure (a 200 carrying a failed receipt for one of this scout's docs)
+    // means that doc landed for NOBODY, so the scout is not done: mark it retryable so the
+    // next ingest re-attempts it. A transient server-side failure (e.g. the KB DB was briefly
+    // unreachable and intel returned per-doc failed receipts instead of a whole-POST error)
+    // then self-heals on rerun; the docs that DID land re-POST as an idempotent noop_unchanged.
+    // Leaving the scout `complete` here would strand the failed doc forever, because resume
+    // skips a complete scout (already_complete) and never retries it. This keeps the run
+    // `partial` until every doc actually persists, matching the state-driven resume rule
+    // (§6: resume runs scouts whose status != complete).
+    const docFailed = docFailedByScout[b.scout];
     const errors = [...b.errors];
-    if (docFailedByScout[b.scout] > 0) {
+    if (docFailed > 0) {
       errors.push({
         index: -1,
         code: "persistence_partial",
-        message: `${docFailedByScout[b.scout]} document(s) the server could not persist`,
+        message: `${docFailed} document(s) the server could not persist; rerun ingest to retry`,
       });
+      scoutState[b.scout] = {
+        status: "persistence_failed",
+        error: `${docFailed} document(s) could not persist`,
+      };
+    } else {
+      scoutState[b.scout] = { status: "complete", candidateCount: b.accepted.length };
     }
     outcomes.push({
       scout: b.scout,

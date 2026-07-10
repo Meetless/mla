@@ -35,6 +35,66 @@ describe("normalizeCommand", () => {
     }
   });
 
+  it("recognizes EVERY command in the cli.ts dispatch switch (drift pin)", () => {
+    // This is the source-of-truth mirror of the `switch (cmd)` in cli.ts, in
+    // dispatch order. If cli.ts grows a case and this list (and KNOWN_COMMANDS)
+    // does not, the new command silently normalizes to "unknown" and vanishes
+    // from the funnel. Keep the three in lockstep; this test is the tripwire.
+    const DISPATCH = [
+      "init", "wire", "rewire", "login", "logout", "uninstall", "whoami",
+      "activate", "deactivate", "mute", "unmute", "workspace", "doctor",
+      "status", "scan", "context", "flush", "queue", "rules", "review",
+      "enforcement", "conflicts", "cases", "session", "ask", "kb",
+      "agent-memory", "enrich", "graph", "cg", "summary", "label", "stats",
+      "turn", "adoption", "debug", "bug", "evidence", "mcp", "upgrade",
+      "_internal",
+    ];
+    for (const cmd of DISPATCH) {
+      expect(normalizeCommand([cmd]).command).toBe(cmd);
+    }
+  });
+
+  it("recognizes the 18 commands reconciled after the 2026-07-09 cohort forensics", () => {
+    // These dispatch in cli.ts but had drifted out of KNOWN_COMMANDS, so every
+    // invocation collapsed to command="unknown" and every FAILURE of theirs was
+    // uncountable in the funnel. `rules` is the headline case: the cohort filed
+    // bugs about `mla rules ...` while its failures were invisible in analytics.
+    const RECONCILED = [
+      "wire", "uninstall", "status", "scan", "context", "queue", "rules",
+      "enforcement", "conflicts", "agent-memory", "enrich", "graph", "cg",
+      "turn", "bug", "evidence", "mcp", "upgrade",
+    ];
+    for (const cmd of RECONCILED) {
+      expect(normalizeCommand([cmd]).command).toBe(cmd);
+      expect(normalizeCommand([cmd]).command).not.toBe("unknown");
+    }
+  });
+
+  it("captures the new subcommand keywords without leaking the positional after them", () => {
+    // Each sub-bearing command emits argv[1] as `subcommand` ONLY for a known
+    // keyword; the id/path that follows is a positional and must stay off-wire.
+    const cases: Array<[string[], string, string]> = [
+      [["rules", "edit", "rul_secret_id"], "rules", "edit"],
+      [["rules", "revoke", "rul_secret_id"], "rules", "revoke"],
+      [["enforcement", "confirm", "inc_secret_id"], "enforcement", "confirm"],
+      [["conflicts", "resolve", "cfl_secret_id"], "conflicts", "resolve"],
+      [["queue", "prune"], "queue", "prune"],
+      [["session", "reconcile"], "session", "reconcile"],
+      [["enrich", "ingest"], "enrich", "ingest"],
+      [["graph", "review", "ddx_secret"], "graph", "review"],
+      [["cg", "review", "ddx_secret"], "cg", "review"], // alias shares the set
+      [["workspace", "members"], "workspace", "members"],
+      [["agent-memory", "scan"], "agent-memory", "scan"],
+      [["evidence", "ce0-export"], "evidence", "ce0-export"],
+    ];
+    for (const [argv, command, subcommand] of cases) {
+      const n = normalizeCommand(argv);
+      expect(n.command).toBe(command);
+      expect(n.subcommand).toBe(subcommand);
+      expect(JSON.stringify(n)).not.toContain("secret");
+    }
+  });
+
   it("maps the help/version shortcuts", () => {
     expect(normalizeCommand([]).command).toBe("help");
     expect(normalizeCommand(["--help"]).command).toBe("help");
@@ -229,6 +289,54 @@ describe("classifyOutcome", () => {
     expect(JSON.stringify(res)).not.toContain("meetless.ai");
     expect(JSON.stringify(res)).not.toContain("/secret/path");
   });
+
+  it("passes a filesystem errno through as the error_class (fresh-box diagnosability)", () => {
+    // Before this, a Node fs error (name "Error", code "ENOENT") collapsed to the
+    // opaque error_class "Error"; the fresh-box first-run failure surface (missing
+    // dir, unwritable ~/.meetless, full disk) was undiagnosable. The errno is now
+    // preserved, lowercased to match the http_*/config_error token style.
+    expect(classifyOutcome(1, true, { name: "Error", code: "ENOENT" })).toEqual({
+      outcome: "system_error",
+      error_class: "enoent",
+      retryable: false,
+    });
+    expect(classifyOutcome(1, true, { code: "ENOSPC" })).toMatchObject({
+      outcome: "system_error",
+      error_class: "enospc",
+    });
+    expect(classifyOutcome(1, true, { code: "EISDIR" })).toMatchObject({
+      outcome: "system_error",
+      error_class: "eisdir",
+    });
+  });
+
+  it("classifies a local permission errno as permission_denied (quiet, not our bug)", () => {
+    // EACCES/EPERM writing to the local FS is the user's to fix (chmod), not a
+    // backend permission (http_403) and not a bug to report.
+    expect(classifyOutcome(1, true, { code: "EACCES" })).toEqual({
+      outcome: "permission_denied",
+      error_class: "eacces",
+      retryable: false,
+    });
+    expect(classifyOutcome(1, true, { code: "EPERM" })).toMatchObject({
+      outcome: "permission_denied",
+      error_class: "eperm",
+    });
+  });
+
+  it("the errno shape guard is itself the PII filter: a non-errno .code never leaks", () => {
+    // The `^E[A-Z0-9]+$` guard only admits an uppercase E-prefixed alnum token. A
+    // path/email/secret pasted where a code would be cannot match (slashes, dots,
+    // @, dashes, lowercase), so it falls through to the class-NAME path and never
+    // surfaces the raw value.
+    const res = classifyOutcome(1, true, {
+      name: "Error",
+      code: "/Users/an/secret/eaccestoken@meetless.ai",
+    });
+    expect(res.error_class).toBe("Error");
+    expect(JSON.stringify(res)).not.toContain("secret");
+    expect(JSON.stringify(res)).not.toContain("meetless.ai");
+  });
 });
 
 describe("isReportableFault (bug-report nudge policy)", () => {
@@ -261,6 +369,16 @@ describe("isReportableFault (bug-report nudge policy)", () => {
     { label: "backend unreachable (ECONNREFUSED)", thrown: { code: "ECONNREFUSED" }, nudge: false },
     { label: "fetch failed (TypeError)", thrown: { name: "TypeError" }, nudge: false },
     { label: "aborted / timeout", thrown: { name: "AbortError" }, nudge: false },
+    // Local permission denial -> the user's chmod, not a bug (permission_denied).
+    { label: "local EACCES (unwritable ~/.meetless)", thrown: { code: "EACCES" }, nudge: false },
+    { label: "local EPERM", thrown: { code: "EPERM" }, nudge: false },
+    // Environment-capacity errnos -> the user's environment, filing a bug is useless.
+    { label: "disk full (ENOSPC)", thrown: { code: "ENOSPC" }, nudge: false },
+    { label: "read-only fs (EROFS)", thrown: { code: "EROFS" }, nudge: false },
+    { label: "over quota (EDQUOT)", thrown: { code: "EDQUOT" }, nudge: false },
+    // A generic fs errno CAN be our missing bundled asset / uncreated dir -> report.
+    { label: "missing path (ENOENT)", thrown: { code: "ENOENT" }, nudge: true },
+    { label: "not a directory (ENOTDIR)", thrown: { code: "ENOTDIR" }, nudge: true },
   ];
 
   it.each(cases)("$label -> nudge=$nudge", ({ thrown, nudge }) => {

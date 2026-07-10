@@ -121,6 +121,9 @@ describe("runWhoami", () => {
     const out = logs.join("\n");
     expect(out).toMatch(/Logged in as Ada Lovelace <ada@example.com>/);
     expect(out).toMatch(/Workspace: Acme \(acme\)/);
+    // BUG-6 Issue 2: the workspace CUID is printed so it can be lifted into
+    // `--workspace <id>`; the slug alone is not accepted by that override.
+    expect(out).toMatch(/Workspace ID: ws_1/);
     expect(out).not.toMatch(/at_1|rt_1/);
   });
 
@@ -151,5 +154,66 @@ describe("runWhoami", () => {
     seed(userTokenConfig());
     const runWhoami = loadRunWhoami();
     expect(await runWhoami(["extra"], { log: collect })).toBe(2);
+  });
+
+  // BUG-6 Issue 2: `--json` emits a single parseable object at every terminal
+  // branch, so a script can lift workspace.id without scraping formatted text.
+  describe("--json", () => {
+    it("emits a parseable object carrying the workspace CUID for a user-token", async () => {
+      seed(userTokenConfig());
+      const getMeFn = jest.fn(async () => ({
+        mode: "cli-session" as const,
+        user: { id: "u_1", displayName: "Ada Lovelace", email: "ada@example.com", role: "OWNER" },
+        workspace: { id: "ws_1", name: "Acme", slug: "acme" },
+        sessionId: "sess_1",
+        accessExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        refreshExpiresAt: new Date(Date.now() + 80 * 86_400_000).toISOString(),
+      }));
+      const runWhoami = loadRunWhoami();
+      const code = await runWhoami(["--json"], { log: collect, getMeFn });
+      expect(code).toBe(0);
+      // Exactly one line, and it parses.
+      expect(logs.length).toBe(1);
+      const parsed = JSON.parse(logs[0]);
+      expect(parsed.authMode).toBe("user-token");
+      expect(parsed.workspace).toEqual({ id: "ws_1", name: "Acme", slug: "acme" });
+      expect(parsed.user).toEqual({
+        id: "u_1",
+        displayName: "Ada Lovelace",
+        email: "ada@example.com",
+        role: "OWNER",
+      });
+      // Secrets never leak, even in the machine shape.
+      expect(logs[0]).not.toMatch(/at_1|rt_1/);
+    });
+
+    it("emits a JSON object (not human lines) for shared-key", async () => {
+      // readConfig never resolves cfg.workspaceId (folder = workspace: the
+      // binding comes from the per-folder .meetless.json marker, not the config),
+      // so an unbound shared-key session reports workspace: null. The point of
+      // this case is that --json emits a parseable object, not the human copy.
+      seed({ controlUrl: "http://127.0.0.1:3006", controlToken: "sk_1", mlaPath: "/m" });
+      const runWhoami = loadRunWhoami();
+      const code = await runWhoami(["--json"], { log: collect });
+      expect(code).toBe(0);
+      expect(logs.length).toBe(1);
+      const parsed = JSON.parse(logs[0]);
+      expect(parsed.authMode).toBe("shared-key");
+      expect(parsed.workspace).toBeNull();
+    });
+
+    it("emits a JSON object with configured:false when not configured", async () => {
+      const runWhoami = loadRunWhoami();
+      const code = await runWhoami(["--json"], { log: collect, getMeFn: async () => { throw new Error("nope"); } });
+      expect(code).toBe(1);
+      expect(logs.length).toBe(1);
+      expect(JSON.parse(logs[0])).toMatchObject({ configured: false });
+    });
+
+    it("still rejects a stray argument even alongside --json (exit 2)", async () => {
+      seed(userTokenConfig());
+      const runWhoami = loadRunWhoami();
+      expect(await runWhoami(["--json", "extra"], { log: collect })).toBe(2);
+    });
   });
 });

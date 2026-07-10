@@ -33,11 +33,19 @@ function postToolUse(p: string): any[] {
   return Array.isArray(s.hooks?.PostToolUse) ? s.hooks.PostToolUse : [];
 }
 
+// The managed command is written forward-slash + double-quoted
+// ("…/hooks/post-tool-use.sh") so it survives the shell on Windows (Git Bash
+// eats an unquoted backslash path). Strip the surrounding quotes before taking
+// the basename (notes/20260710-windows-hook-wiring-and-portable-lock-fix.md).
+function cmdBasename(command: string | undefined): string {
+  return path.basename((command ?? "").replace(/^"|"$/g, ""));
+}
+
 // PostToolUse now holds TWO managed entries: the load-bearing post-tool-use.sh and
 // the CE0 ce0-post-tool-use.sh. These tests pin the load-bearing entry, so scope by
 // the exact command basename (basename equality keeps the two scripts disjoint).
 function postToolUseForBasename(p: string, basename: string): any[] {
-  return postToolUse(p).filter((e) => path.basename(e.hooks?.[0]?.command ?? "") === basename);
+  return postToolUse(p).filter((e) => cmdBasename(e.hooks?.[0]?.command) === basename);
 }
 
 describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the heartbeat fires on every tool", () => {
@@ -59,7 +67,7 @@ describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the hear
       const entries = postToolUseForBasename(p, "post-tool-use.sh");
       expect(entries.length).toBe(1);
       expect(entries[0].matcher).toBe(POST_TOOL_USE_MATCHER);
-      expect(entries[0].hooks[0].command).toMatch(/post-tool-use\.sh$/);
+      expect(entries[0].hooks[0].command).toMatch(/post-tool-use\.sh"$/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -121,7 +129,7 @@ describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the hear
       const own = entries.find((e) => e.hooks?.[0]?.command === "/usr/local/bin/operator-own.sh");
       expect(own).toBeDefined();
       expect(own.matcher).toBe("Write");
-      const ours = entries.find((e) => /post-tool-use\.sh$/.test(e.hooks?.[0]?.command ?? ""));
+      const ours = entries.find((e) => cmdBasename(e.hooks?.[0]?.command) === "post-tool-use.sh");
       expect(ours).toBeDefined();
       expect(ours.matcher).toBe(POST_TOOL_USE_MATCHER);
     } finally {

@@ -464,7 +464,8 @@ write_sidecar() {
   } > "$MARKDOWN_PATH" 2>/dev/null || true
 }
 
-# Append the merged trace line under a flock so concurrent sessions can't
+# Append the merged trace line under the hook lock (ml_lock: flock where
+# present, portable mkdir mutex otherwise) so concurrent sessions can't
 # interleave a >PIPE_BUF line.
 write_trace() {
   local trace_line turn_index
@@ -530,10 +531,9 @@ write_trace() {
       error: null
     }')"
   [[ -z "$trace_line" ]] && return 0
-  exec 8>"$LOG_DIR/ask-traces.lock"
-  flock 8
+  ml_lock 8 "$LOG_DIR/ask-traces.lock"
   printf '%s\n' "$trace_line" >> "$LOG_DIR/ask-traces.jsonl"
-  exec 8>&-
+  ml_unlock 8 "$LOG_DIR/ask-traces.lock"
 }
 
 # InjectionTrace keystone (governed-story v2, spec

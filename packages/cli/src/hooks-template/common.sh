@@ -26,6 +26,88 @@ SESSION_GATE_DIR="$MEETLESS_HOME_DIR/session-gate"
 mkdir -p "$QUEUE_DIR"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
+# --- Portable hook mutex -----------------------------------------------------
+# All hooks contend on per-session lock files. The primitive used to be raw
+# `flock` on an fd. `flock(1)` is util-linux and is ABSENT on Git Bash / MSYS
+# (Windows) and on stock macOS (An's box only has it via `brew install flock`),
+# so under `set -euo pipefail` a missing flock is `command not found` (127) and
+# ABORTS the hook -- capture silently dies (Windows prod incident 2026-07-10,
+# notes/20260710-windows-hook-wiring-and-portable-lock-fix.md).
+#
+# ml_lock/ml_trylock/ml_unlock take the SAME (fd, lockfile) the old flock idiom
+# used, so call sites convert mechanically:
+#   exec 9>"$lock"; flock 9   -> ml_lock 9 "$lock"
+#   flock -n 9 || ...         -> ml_trylock 9 "$lock" || ...
+#   exec 9>&-                 -> ml_unlock 9 "$lock"
+# Where flock exists we defer to it (byte-for-byte the old behavior; the kernel
+# releases on process death). Where it does not, we use mkdir(2): atomic on every
+# filesystem, so the first `mkdir <lock>.d` wins and others spin. Deadlock is
+# impossible -- a lock dir older than the stale TTL is reaped, and every blocking
+# acquire steals after a bounded spin budget (our critical sections are a single
+# append, so a spin-out only ever happens on a dead holder).
+if command -v flock >/dev/null 2>&1; then
+  MEETLESS_HAVE_FLOCK=1
+else
+  MEETLESS_HAVE_FLOCK=0
+fi
+
+# Blocking acquire. Always returns 0 (safe under `set -e`).
+ml_lock() {
+  local fd="$1" lock="$2"
+  if [[ "$MEETLESS_HAVE_FLOCK" == "1" ]]; then
+    eval "exec $fd>\"\$lock\""
+    flock "$fd"
+    return 0
+  fi
+  local d="$lock.d" spins=0
+  while ! mkdir "$d" 2>/dev/null; do
+    # Reap a lock dir left by a crashed holder (older than the stale TTL).
+    if [[ -n "$(find "$d" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
+      rmdir "$d" 2>/dev/null || true
+      continue
+    fi
+    spins=$((spins + 1))
+    if (( spins > 500 )); then
+      # ~10s of contention on a sub-ms critical section => the holder is dead.
+      # Steal rather than block the hook forever.
+      rmdir "$d" 2>/dev/null || true
+      mkdir "$d" 2>/dev/null || true
+      break
+    fi
+    sleep 0.02 2>/dev/null || sleep 1
+  done
+  return 0
+}
+
+# Non-blocking acquire. 0 = acquired, 1 = held by another live holder.
+ml_trylock() {
+  local fd="$1" lock="$2"
+  if [[ "$MEETLESS_HAVE_FLOCK" == "1" ]]; then
+    eval "exec $fd>\"\$lock\""
+    if flock -n "$fd"; then return 0; fi
+    eval "exec $fd>&-"
+    return 1
+  fi
+  local d="$lock.d"
+  if mkdir "$d" 2>/dev/null; then return 0; fi
+  if [[ -n "$(find "$d" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
+    rmdir "$d" 2>/dev/null || true
+    mkdir "$d" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+# Release. Always returns 0. Idempotent (double-release is harmless).
+ml_unlock() {
+  local fd="$1" lock="$2"
+  if [[ "$MEETLESS_HAVE_FLOCK" == "1" ]]; then
+    eval "exec $fd>&-"
+    return 0
+  fi
+  rmdir "$lock.d" 2>/dev/null || true
+  return 0
+}
+
 # Meetless-branded observability log. The hook pipeline is otherwise a black
 # box (spawn_flush detaches flush.sh to a background process), so without this
 # there is no way to watch the spool -> control -> finalize hops live. Every
@@ -298,17 +380,16 @@ meetless_session_disabled() {
   [[ -n "$sid" && -f "$SESSION_GATE_DIR/$sid.off" ]]
 }
 
-# Correction 5: append-with-flock. ALL writers + flusher contend for the same
-# lock file ($QUEUE_DIR/$SESSION_ID.lock).
+# Correction 5: append-under-lock. ALL writers + flusher contend for the same
+# lock file ($QUEUE_DIR/$SESSION_ID.lock) via ml_lock (flock or mkdir mutex).
 spool_append() {
   local session_id="$1"
   local line="$2"
   local lock="$QUEUE_DIR/$session_id.lock"
   local queue="$QUEUE_DIR/$session_id.jsonl"
-  exec 9>"$lock"
-  flock 9
+  ml_lock 9 "$lock"
   printf '%s\n' "$line" >> "$queue"
-  exec 9>&-
+  ml_unlock 9 "$lock"
 }
 
 # Monotonic per-session turn counter. Returns (echoes) the next 1-based index
@@ -322,13 +403,12 @@ next_turn_index() {
   local lock="$QUEUE_DIR/$session_id.lock"
   local counter="$QUEUE_DIR/$session_id.turn"
   local n
-  exec 9>"$lock"
-  flock 9
+  ml_lock 9 "$lock"
   n="$(cat "$counter" 2>/dev/null || echo 0)"
   [[ "$n" =~ ^[0-9]+$ ]] || n=0
   n=$((n + 1))
   printf '%s' "$n" > "$counter"
-  exec 9>&-
+  ml_unlock 9 "$lock"
   printf '%s' "$n"
 }
 
@@ -345,11 +425,10 @@ current_turn_index() {
   local lock="$QUEUE_DIR/$session_id.lock"
   local counter="$QUEUE_DIR/$session_id.turn"
   local n
-  exec 9>"$lock"
-  flock 9
+  ml_lock 9 "$lock"
   n="$(cat "$counter" 2>/dev/null || echo 0)"
   [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  exec 9>&-
+  ml_unlock 9 "$lock"
   printf '%s' "$n"
 }
 
@@ -393,9 +472,10 @@ write_not_run_trace() {
     }' 2>/dev/null || printf '')"
   [[ -n "$line" ]] || return 0
   (
-    flock 8
+    ml_lock 8 "$LOG_DIR/ask-traces.lock"
     printf '%s\n' "$line" >> "$LOG_DIR/ask-traces.jsonl"
-  ) 8>"$LOG_DIR/ask-traces.lock" 2>/dev/null || true
+    ml_unlock 8 "$LOG_DIR/ask-traces.lock"
+  ) 2>/dev/null || true
   return 0
 }
 
@@ -573,7 +653,7 @@ spawn_flush() {
 # lastSeenAt keeps advancing. It spools NO new event -- a Read/Grep turn still
 # spools nothing; this is purely a periodic drain of the existing spool. Throttle
 # state is a per-session epoch sidecar ($QUEUE_DIR/<sid>.hb) guarded by the same
-# fd-9 flock idiom spool_append uses, so concurrent fires cannot double-flush.
+# fd-9 ml_lock idiom spool_append uses, so concurrent fires cannot double-flush.
 # Fail-soft and always returns 0 so it can never block the tool under `set -e`.
 heartbeat_flush() {
   local session_id="$1"
@@ -586,15 +666,14 @@ heartbeat_flush() {
   now="$(date +%s 2>/dev/null || echo 0)"
   [[ "$now" =~ ^[0-9]+$ ]] || now=0
   fire=0
-  exec 9>"$lock"
-  flock 9
+  ml_lock 9 "$lock"
   last="$(cat "$hb" 2>/dev/null || echo 0)"
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
   if (( now - last >= throttle )); then
     printf '%s' "$now" > "$hb"
     fire=1
   fi
-  exec 9>&-
+  ml_unlock 9 "$lock"
   if (( fire == 1 )); then
     spawn_flush "$session_id"
   fi
@@ -716,7 +795,7 @@ meetless_repo_root() {
   return 1
 }
 
-# Append one Active Review record (Zone 1). Pure local write under flock; never
+# Append one Active Review record (Zone 1). Pure local write under the hook lock; never
 # touches the network. Phase 0: this is the ONLY thing a produced-doc capture does.
 # Args: kind sessionId turnIndex workspaceId ownerUserId repoRootHash canonicalPath contentHash [repoRoot]
 # repoRoot (9th, optional) is the absolute repo root, stored LOCAL-only so the Zone 2
@@ -738,9 +817,10 @@ record_active_memory() {
     --arg repoRoot "$repoRoot" \
     '{ts:$ts,event:$event,workspaceId:$ws,ownerUserId:$owner,repoRootHash:$rrh,canonicalPath:$cpath,contentHash:$chash,sessionId:$sid,turnIndex:$turn,sourceProduct:$sp,kind:$kind,createdAt:$createdAt,repoRoot:$repoRoot}')"
   (
-    flock 9
+    ml_lock 9 "$LOG_DIR/kb-knowledge.lock"
     printf '%s\n' "$line" >> "$LOG_DIR/kb-knowledge.jsonl"
-  ) 9>"$LOG_DIR/kb-knowledge.lock"
+    ml_unlock 9 "$LOG_DIR/kb-knowledge.lock"
+  )
 }
 
 # Detached, age-gated stale-session GC. Runs `mla flush --reap-only` (reap

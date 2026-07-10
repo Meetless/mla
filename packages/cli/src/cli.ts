@@ -166,11 +166,12 @@ usage:
                      the Claude hook + MCP entries, and the /mla skill. Prints
                      how to remove the binary. Local only; server data and other
                      repos' .meetless.json markers are untouched.)
-  mla whoami
+  mla whoami [--json]
                     (print the identity behind the current cli-config.json: a
                      user session resolves live via the control /auth/me endpoint;
-                     a shared key prints its mode without a network call. Exit 1
-                     when not configured.)
+                     a shared key prints its mode without a network call. Prints
+                     the workspace CUID (for --workspace <id>); --json emits a
+                     parseable object. Exit 1 when not configured.)
   mla activate [--name <name>] [--note <text>]
                     (provision-or-bind a workspace for this folder: no marker in
                      the tree provisions a new one named after the dir; a marker

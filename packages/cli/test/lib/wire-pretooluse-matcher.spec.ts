@@ -48,7 +48,7 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       const entries = preToolUse(p);
       expect(entries.length).toBe(1);
       expect(entries[0].matcher).toBe(PRE_TOOL_USE_MATCHER);
-      expect(entries[0].hooks[0].command).toMatch(/pre-tool-use\.sh$/);
+      expect(entries[0].hooks[0].command).toMatch(/pre-tool-use\.sh"$/);
       // No static decision is baked into settings: it is a plain command hook.
       expect(entries[0].hooks[0].type).toBe("command");
       expect(JSON.stringify(entries[0])).not.toMatch(/permissionDecision|"decision"/);
@@ -94,7 +94,7 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       const own = entries.find((e) => e.hooks?.[0]?.command === "/usr/local/bin/operator-own.sh");
       expect(own).toBeDefined();
       expect(own.matcher).toBe("Bash");
-      const ours = entries.find((e) => /pre-tool-use\.sh$/.test(e.hooks?.[0]?.command ?? ""));
+      const ours = entries.find((e) => /pre-tool-use\.sh"$/.test(e.hooks?.[0]?.command ?? ""));
       expect(ours).toBeDefined();
       expect(ours.matcher).toBe(PRE_TOOL_USE_MATCHER);
     } finally {

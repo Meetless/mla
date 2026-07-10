@@ -1,6 +1,6 @@
 {
   "name": "@meetless/mla",
-  "version": "0.2.11",
+  "version": "0.2.13",
   "license": "Apache-2.0",
   "private": false,
   "description": "Meetless CLI (mla): governed change-control and knowledge for AI coding agents.",

@@ -95,8 +95,7 @@ fi
 # acquire (already-running flush exits cleanly; next hook write wakes the next
 # flush). Orphan recovery happens INSIDE the lock, BEFORE detach, so a crash
 # mid-POST in a previous flush cannot strand events forever.
-exec 9>"$LOCK"
-flock -n 9 || { FLUSH_STATUS="locked"; log "skip: another flush already holds the session lock"; exit 0; }
+ml_trylock 9 "$LOCK" || { FLUSH_STATUS="locked"; log "skip: another flush already holds the session lock"; exit 0; }
 
 # Correction 11: recover orphaned *.draining.* snapshots from prior interrupted
 # flushes (laptop sleep, terminal close, SIGKILL, mid-POST crash). Concat back
@@ -139,7 +138,7 @@ if [[ ! -s "$QUEUE_FILE" ]]; then
   FLUSH_STATUS="empty"
   log "nothing to flush (queue empty after orphan recovery)"
   rm -f "$QUEUE_FILE"
-  exec 9>&-
+  ml_unlock 9 "$LOCK"
   exit 0
 fi
 
@@ -187,7 +186,7 @@ log "draining $(wc -l < "$TMP" 2>/dev/null | tr -d ' ' || echo '?') queued line(
 
 # Release the lock once the snapshot is detached. Hook writers can append
 # concurrently while we POST.
-exec 9>&-
+ml_unlock 9 "$LOCK"
 
 HAS_FINALIZE=0
 EVENTS_OK=1
@@ -525,10 +524,9 @@ rm -f "$TMP"
 # "successful finalize" stranded every subsequent turn (prod session 11436b5c).
 # Teardown of the sidecars is the 24h age-gated idle reaper's job alone; it is
 # the only component with a real "session is truly dead" signal.
-exec 9>"$LOCK"
-if flock -n 9; then
+if ml_trylock 9 "$LOCK"; then
   [[ -s "$QUEUE_FILE" ]] || rm -f "$QUEUE_FILE"
-  exec 9>&-
+  ml_unlock 9 "$LOCK"
 fi
 
 exit 0

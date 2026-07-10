@@ -678,9 +678,11 @@ describe("ingestRun — orchestration", () => {
 
   // A 200 can still carry a per-document failure (kb_add.py appends a failed receipt and keeps
   // going). That doc landed for nobody: it counts toward neither persisted nor deduped, and is
-  // surfaced as a persistence_partial error, but it does NOT flip the scout to persistence_failed
-  // (that status is reserved for a whole-POST failure that warrants a retry).
-  it("treats a per-document failed receipt as not persisted and surfaces it", async () => {
+  // surfaced as a persistence_partial error. Because the doc did not persist, the scout is NOT
+  // done: it flips to persistence_failed (retryable) so resume re-attempts it, rather than being
+  // marked complete and stranded (a complete scout is skipped on resume, so the failed doc would
+  // never be retried). This keeps the run partial until every doc actually persists.
+  it("treats a per-document failed receipt as not persisted and marks the scout retryable", async () => {
     seedRun(home);
     const partial: Persister = jest.fn(async (docs) => ({
       docs: docs.map((d) => ({ relPath: d.relPath, outcome: "failed" as const })),
@@ -696,7 +698,48 @@ describe("ingestRun — orchestration", () => {
     expect(doc.persisted).toBe(0);
     expect(doc.deduped).toBe(0);
     expect(doc.errors.map((e) => e.code)).toContain("persistence_partial");
-    expect(res.state?.scouts.documentation.status).toBe("complete");
+    expect(res.state?.scouts.documentation.status).toBe("persistence_failed");
+    expect(res.state?.status).toBe("partial");
+  });
+
+  // The point of flipping a per-doc failure to persistence_failed: resume must RE-RUN it. A scout
+  // stranded as `complete` would be skipped (already_complete) and its failed doc lost forever. On
+  // rerun the transient failure self-heals (the doc persists) and the run completes.
+  it("re-runs a scout whose doc failed to persist, and completes on the retry", async () => {
+    seedRun(home);
+    // run 1: intel is up but its KB DB is briefly down -> a per-document failed receipt.
+    const failingOnce: Persister = jest.fn(async (docs) => ({
+      docs: docs.map((d) => ({ relPath: d.relPath, outcome: "failed" as const })),
+    }));
+    const first = await ingestRun({
+      env: { home, workspaceId: "ws_1", repositoryRoot: "/repo" },
+      request: { protocolVersion: 1, runId: "run-1", results: [{ scout: "documentation", status: "complete", candidates: [docCandidate()] }] },
+      persist: failingOnce,
+      now: NOW,
+      probe: makeProbe(),
+    });
+    expect(first.state?.scouts.documentation.status).toBe("persistence_failed");
+    expect(first.state?.status).toBe("partial");
+
+    // run 2: same scout re-reported. It must NOT be skipped as already_complete; the DB is back,
+    // so the doc persists and the run finishes.
+    const healthy: Persister = jest.fn(async (docs) => ({
+      docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })),
+    }));
+    const second = await ingestRun({
+      env: { home, workspaceId: "ws_1", repositoryRoot: "/repo" },
+      request: { protocolVersion: 1, runId: "run-1", results: [{ scout: "documentation", status: "complete", candidates: [docCandidate()] }] },
+      persist: healthy,
+      now: NOW,
+      probe: makeProbe(),
+    });
+    expect(healthy).toHaveBeenCalledTimes(1); // the scout re-ran, it was not skipped
+    const doc = second.outcomes.find((o) => o.scout === "documentation")!;
+    expect(doc.errors.map((e) => e.code)).not.toContain("already_complete");
+    expect(doc.persisted).toBe(1);
+    // The scout itself is now done (the run stays partial only because this single-scout request
+    // never exercised the history slot; a complete scout is what drives resume to skip it).
+    expect(second.state?.scouts.documentation.status).toBe("complete");
   });
 
   // A receipt-count mismatch (the server returned more/fewer outcomes than documents sent) is a

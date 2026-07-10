@@ -73,7 +73,7 @@ if [[ -n "$NARR_TRANSCRIPT" && -f "$NARR_TRANSCRIPT" ]]; then
   mkdir -p "$QUEUE_DIR"
   NARR_CURSOR_FILE="$QUEUE_DIR/$SESSION_ID.narration-cursor"
   (
-    flock 8
+    ml_lock 8 "$NARR_CURSOR_FILE.lock"
     NARR_CURSOR="$(cat "$NARR_CURSOR_FILE" 2>/dev/null || echo '')"
     # tail caps the per-fire read; the cursor guarantees completeness because
     # each narration entry is followed immediately by the tool_use that fires
@@ -110,7 +110,8 @@ if [[ -n "$NARR_TRANSCRIPT" && -f "$NARR_TRANSCRIPT" ]]; then
       NARR_NEW_CURSOR="$(printf '%s\n' "$NARR_LINES" | jq -rs 'map(.ts) | max // empty' 2>/dev/null || true)"
       [[ -n "$NARR_NEW_CURSOR" ]] && printf '%s' "$NARR_NEW_CURSOR" > "$NARR_CURSOR_FILE"
     fi
-  ) 8>"$NARR_CURSOR_FILE.lock" || true
+    ml_unlock 8 "$NARR_CURSOR_FILE.lock"
+  ) || true
 fi
 
 # ---- meetless MCP-call capture (P1) -------------------------------------
@@ -145,9 +146,10 @@ if [[ "$TOOL" == mcp__meetless__meetless__* ]]; then
     --arg query "$QUERY" --argjson sids "$SOURCE_IDS_JSON" \
     '{ts: $ts, event: $event, session_id: $sessionId, turn_index: $turn, tool: $tool, evidence_tool: $evidence, query: $query, source_ids: $sids}')"
   (
-    flock 9
+    ml_lock 9 "$LOG_DIR/mcp-calls.lock"
     printf '%s\n' "$LINE" >> "$LOG_DIR/mcp-calls.jsonl"
-  ) 9>"$LOG_DIR/mcp-calls.lock"
+    ml_unlock 9 "$LOG_DIR/mcp-calls.lock"
+  )
 
   # ---- Forward tool_used_mcp to control (governed-story §3.1 / §3.3) --------
   # The local mcp-calls.jsonl above stays (A1 evidence-followthrough joins it
@@ -442,9 +444,10 @@ if [[ "$TOOL" == "Edit" || "$TOOL" == "Write" || "$TOOL" == "MultiEdit" || "$TOO
     exit 0
   fi
   (
-    flock 9
+    ml_lock 9 "$FLAGGED_FILE.lock"
     printf '%s\n' "$FILE_PATH" >> "$FLAGGED_FILE"
-  ) 9>"$FLAGGED_FILE.lock"
+    ml_unlock 9 "$FLAGGED_FILE.lock"
+  )
 
   STATE_TRACE="$(jq -r '.trace_id // ""' "$STATE_FILE" 2>/dev/null || true)"
   COORD_LINES="$(printf '%s' "$MATCHED" | jq -r '.[] |

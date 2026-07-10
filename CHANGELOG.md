@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.13 (2026-07-10)
+
+- refactor(cli): implement portable hook mutex for concurrency management
+
+## 0.2.12 (2026-07-10)
+
+- fix(cli): route every workspace-membership 403 through one canonical handler
+- fix(cli): mla status distinguishes non-membership from not-activated; whoami prints the workspace CUID and gains --json
+- fix(cli): bug status/list accept --workspace and stop claiming a lookup "was not filed"
+- fix(cli): doctor hook checks follow the install surface, not just ~/.meetless
+- fix(cli): activate stops falsely telling plugin users to run mla init
+- fix(cli): doctor asserts the whoami-resolved workspace matches the folder binding
+- fix(cli): retry per-document persist failures on enrich ingest resume
+- fix(cli): preserve the errno on system faults so fresh-box failures are diagnosable
+- fix(cli): reconcile mla_command classifier with the real dispatch table
+
 ## 0.2.11 (2026-07-10)
 
 - fix(mla): mla login self-heals on a contended session probe instead of suppressing the browser

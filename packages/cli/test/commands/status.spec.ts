@@ -2,7 +2,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { renderStatus } from "../../src/commands/status";
+import { renderStatus, notMemberStatusMessage } from "../../src/commands/status";
 import { writeScanCache } from "../../src/lib/scanner/cache";
 
 describe("renderStatus", () => {
@@ -65,5 +65,73 @@ describe("renderStatus", () => {
   it("reports not-activated when there is no cache", () => {
     const out = renderStatus({ home, workspaceId: "ws-none", hooksInstalled: false });
     expect(out).toContain("not activated");
+  });
+
+  // renderStatus honours a pre-read cache passed by runStatus (so the file is
+  // read once, not twice). An explicit null means "no cache", same as reading
+  // an empty home.
+  it("uses a caller-supplied cache instead of reading disk", () => {
+    const out = renderStatus({
+      home,
+      workspaceId: "ws-passed",
+      hooksInstalled: true,
+      cache: {
+        schemaVersion: 1, workspaceId: "ws-passed", commitSha: "abc", generatedAt: "t",
+        inventory: { instructionFiles: 5, decisionDocs: 1, legacyNotes: 0, staleSignals: 0, agentMemoryRules: 0 },
+        directives: [], staleSignals: [],
+        confirmedRulesXml: "", floorRulesXml: "", staleContextXml: "", advisoryDirectives: [],
+      } as unknown as Parameters<typeof writeScanCache>[2],
+    });
+    expect(out).toContain("Meetless is active");
+    expect(out).toContain("5 instruction files");
+  });
+
+  it("treats an explicit null cache as not-activated (no disk read)", () => {
+    const out = renderStatus({ home, workspaceId: "ws-x", hooksInstalled: false, cache: null });
+    expect(out).toContain("not activated");
+  });
+});
+
+// BUG-6 Issue 1: a repo bound (via .meetless.json) to a workspace the operator
+// is not a member of must NOT be reported as "not activated". `mla status`
+// probes membership on the no-cache branch and, on a definite 403, renders this
+// status-framed message instead of the misleading "run `mla activate`" copy
+// (which would just loop on the same denial).
+describe("notMemberStatusMessage", () => {
+  // A 403 shaped like lib/http.ts buildError: `.status`, raw `.body`, and the
+  // body inlined into `.message`.
+  function denied(workspaceId: string): Error & { status: number; body: string } {
+    const body = JSON.stringify({
+      code: "WORKSPACE_ACCESS_DENIED",
+      message: `You are not a member of workspace '${workspaceId}'. Ask a workspace admin to add you to it.`,
+      details: { requestedWorkspaceId: workspaceId },
+    });
+    return Object.assign(
+      new Error(`GET /internal/v1/whoami -> HTTP 403: ${body}`),
+      { status: 403, body },
+    ) as Error & { status: number; body: string };
+  }
+
+  it("leads with the canonical membership line (shared with the rest of the CLI)", () => {
+    const msg = notMemberStatusMessage(denied("ws_target"), "ws_target");
+    expect(msg.startsWith("You are not a member of workspace 'ws_target'.")).toBe(true);
+    expect(msg).toContain("Ask a workspace admin to add you to it.");
+  });
+
+  it("adds the status-only context: the repo IS bound, so activate cannot fix it", () => {
+    const msg = notMemberStatusMessage(denied("ws_target"), "ws_target");
+    expect(msg).toContain(".meetless.json");
+    expect(msg).toContain("mla activate");
+    // Crucially, it must NOT reuse the misleading "not activated" copy.
+    expect(msg).not.toContain("not activated");
+  });
+
+  it("reconstructs the workspace id when the server body is unparseable", () => {
+    const opaque = Object.assign(
+      new Error("GET /internal/v1/whoami -> HTTP 403: <html>edge proxy</html>"),
+      { status: 403, body: "<html>edge proxy</html>" },
+    );
+    const msg = notMemberStatusMessage(opaque, "ws_fallback");
+    expect(msg).toContain("You are not a member of workspace 'ws_fallback'.");
   });
 });

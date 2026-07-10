@@ -4,18 +4,30 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readScanCache } from "../lib/scanner/cache";
 import { resolveWorkspaceIdWithEnv } from "../lib/workspace";
-import { HOOKS_DIR } from "../lib/config";
+import { CliConfig, HOOKS_DIR, readConfig } from "../lib/config";
+import { get } from "../lib/http";
+import {
+  isWorkspaceAccessDenied,
+  workspaceAccessDeniedMessage,
+} from "../lib/workspace-access";
+
+const NOT_ACTIVATED = "Meetless is not activated for this repo. Run `mla activate`.";
 
 export interface StatusView {
   home: string;
   workspaceId: string;
   hooksInstalled: boolean;
+  // Optional pre-read scan cache. When omitted, renderStatus reads it from disk
+  // (the behaviour specs rely on). runStatus reads it once to decide whether to
+  // probe membership, then passes it here so the file is not read twice.
+  cache?: ReturnType<typeof readScanCache>;
 }
 
 export function renderStatus(view: StatusView): string {
-  const cache = readScanCache(view.home, view.workspaceId);
+  const cache =
+    view.cache !== undefined ? view.cache : readScanCache(view.home, view.workspaceId);
   if (!cache) {
-    return `Meetless is not activated for this repo. Run \`mla activate\`.`;
+    return NOT_ACTIVATED;
   }
   const rules = cache.directives.length;
   const pending = cache.staleSignals.length;
@@ -55,13 +67,78 @@ function detectHooksInstalled(): boolean {
   }
 }
 
+// Status-framed message for a bound-but-not-a-member repo (BUG-6 Issue 1). Leads
+// with the SAME canonical membership line the rest of the CLI emits (BUG-5), then
+// adds the piece status uniquely knows: this repo IS bound, so `mla activate`
+// cannot fix it. This is what separates "activated but not a member of X" from
+// the "not activated" copy the operator would otherwise see and loop on.
+export function notMemberStatusMessage(e: unknown, workspaceId: string): string {
+  return (
+    `${workspaceAccessDeniedMessage(e, workspaceId)}\n` +
+    `This repo is bound to that workspace (.meetless.json), so \`mla activate\` ` +
+    `will keep failing until you are added.`
+  );
+}
+
+// Best-effort membership probe against control for the no-cache branch. Returns
+// the status-framed non-member message when control DEFINITIVELY denies access
+// to the bound workspace (403 WORKSPACE_ACCESS_DENIED), else null: a member, or
+// the probe simply could not run (no user-token session, control unreachable,
+// stale token, any non-membership error). status must never fail or hang on the
+// common local case, so anything inconclusive falls back to the activate hint.
+//
+// Only user-token sessions are probed: shared-key / none carry no per-user
+// membership to check, and CI paths should not pay a network round-trip here.
+async function probeMembershipDenied(workspaceId: string): Promise<string | null> {
+  let cfg: CliConfig;
+  try {
+    cfg = readConfig();
+  } catch {
+    // readConfig throws by design when MEETLESS_CONTROL_TOKEN shadows a
+    // user-token login; status must not crash on it.
+    return null;
+  }
+  if (cfg.auth.mode !== "user-token") return null;
+
+  const actorUserId = (cfg.actorUserId || "").trim();
+  const path = actorUserId
+    ? `/internal/v1/whoami?workspaceId=${encodeURIComponent(workspaceId)}&actorUserId=${encodeURIComponent(actorUserId)}`
+    : `/internal/v1/whoami?workspaceId=${encodeURIComponent(workspaceId)}`;
+  try {
+    await get(cfg, path, 6000);
+    return null; // 200 -> the session IS a member of this workspace.
+  } catch (e) {
+    if (isWorkspaceAccessDenied(e)) {
+      return notMemberStatusMessage(e, workspaceId);
+    }
+    // 401 / network / control down / workspace-not-found: inconclusive, don't
+    // block status. Fall through to the local activate hint.
+    return null;
+  }
+}
+
 export async function runStatus(_argv: string[]): Promise<number> {
   const workspaceId = resolveWorkspaceId();
   if (!workspaceId) {
-    console.log("Meetless is not activated for this repo. Run `mla activate`.");
+    console.log(NOT_ACTIVATED);
+    return 0;
+  }
+  const home = homedir();
+  const cache = readScanCache(home, workspaceId);
+  if (!cache) {
+    // No local scan for this bound workspace. Before advising `mla activate`,
+    // make sure the workspace is actually usable: a marker can name a workspace
+    // the operator is not a member of (activate 403'd, or access was later
+    // revoked), and "run mla activate" would just loop on the same denial.
+    const denied = await probeMembershipDenied(workspaceId);
+    if (denied) {
+      console.error(denied);
+      return 1;
+    }
+    console.log(NOT_ACTIVATED);
     return 0;
   }
   const hooksInstalled = detectHooksInstalled();
-  console.log(renderStatus({ home: homedir(), workspaceId, hooksInstalled }));
+  console.log(renderStatus({ home, workspaceId, hooksInstalled, cache }));
   return 0;
 }

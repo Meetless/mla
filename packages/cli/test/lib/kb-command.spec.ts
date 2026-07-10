@@ -294,12 +294,17 @@ describe("mla kb: errors", () => {
     expect(r.stderr).toMatch(/SERVER_ENV != production|non-production/);
   });
 
-  it("explains a 401 as a token problem", async () => {
+  it("explains a 401 as a token problem and routes to `mla doctor`", async () => {
     nextCounts = { status: 401, raw: "Unauthorized" };
     const r = await run(["summary"]);
     expect(r.code).toBe(1);
     expect(r.stderr).toMatch(/token/i);
-    expect(r.stderr).toContain("cli-config.json");
+    // BUG-5: the 401 hint points at `mla doctor` (login + workspace access),
+    // NOT the retired "Check controlToken in cli-config.json" copy, which is
+    // nonsense under a user-token login (there is no controlToken to check).
+    expect(r.stderr).toMatch(/mla doctor/);
+    expect(r.stderr).not.toContain("controlToken");
+    expect(r.stderr).not.toContain("cli-config.json");
   });
 
   it("explains an unreachable intel and points at mla doctor", async () => {

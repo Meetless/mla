@@ -264,8 +264,15 @@ export function ensureFlock(noInstall: boolean): { ok: boolean; detail: string }
   } catch {
     // fall through
   }
+  // flock is an OPTIMIZATION, not a requirement: the hooks carry a portable
+  // mkdir(2) lock fallback (common.sh) that works on any filesystem, including
+  // Windows Git Bash where flock is absent. So a missing flock is never a
+  // failure -- we still best-effort install it on macOS for a marginally faster
+  // lock, but every "not installed" path returns ok:false only to mean "using
+  // the portable fallback", and the copy says so.
+  const fallback = "flock not found; hooks use the portable mkdir lock fallback (no action needed)";
   if (noInstall) {
-    return { ok: false, detail: "flock missing and --no-install-flock set; install manually" };
+    return { ok: false, detail: `${fallback}; --no-install-flock set` };
   }
   if (process.platform === "darwin") {
     let hasBrew = false;
@@ -276,26 +283,23 @@ export function ensureFlock(noInstall: boolean): { ok: boolean; detail: string }
       hasBrew = false;
     }
     if (!hasBrew) {
-      return {
-        ok: false,
-        detail: "flock missing and Homebrew not installed; install Homebrew then run `brew install flock`",
-      };
+      return { ok: false, detail: `${fallback}; optional: install Homebrew then \`brew install flock\`` };
     }
-    console.log("Installing flock via Homebrew (hook concurrency primitive)...");
+    console.log("Installing flock via Homebrew (optional faster hook lock)...");
     const r = spawnSync("brew", ["install", "flock"], { stdio: "inherit" });
     if (r.status !== 0) {
-      return { ok: false, detail: "`brew install flock` failed; install manually" };
+      return { ok: false, detail: `${fallback}; optional \`brew install flock\` failed` };
     }
     try {
       const p = execSync("command -v flock", { encoding: "utf8" }).trim();
       return { ok: true, detail: `flock at ${p}` };
     } catch {
-      return { ok: false, detail: "brew install reported success but flock not on PATH" };
+      return { ok: false, detail: `${fallback}; brew reported success but flock not on PATH` };
     }
   }
   return {
     ok: false,
-    detail: "flock missing; install via your package manager (e.g. `apt-get install util-linux`)",
+    detail: `${fallback}; optional: install util-linux (e.g. \`apt-get install util-linux\`)`,
   };
 }
 
@@ -762,25 +766,58 @@ function backupAndPruneSettings(settingsPath: string): void {
   }
 }
 
+// Normalize a hook `command` string for structural comparison: strip one layer
+// of surrounding double quotes and unify path separators to "/". The canonical
+// command we now write is forward-slash + quoted; legacy entries are unquoted
+// and may be backslash (Windows) or forward-slash (macOS/Linux). Normalizing
+// lets ONE matcher recognize every form as ours so `mla init`/`rewire` heals it.
+function normalizeHookCommand(command: string): string {
+  let c = command.trim();
+  if (c.length >= 2 && c.startsWith('"') && c.endsWith('"')) {
+    c = c.slice(1, -1);
+  }
+  return c.split("\\").join("/");
+}
+
+// Build the hook `command` written into ~/.claude/settings.json. Claude Code runs
+// it through the shell (Git Bash on Windows), so we emit a forward-slash,
+// double-quoted path: forward slashes because an unquoted native backslash path
+// (C:\Users\..) has every "\" eaten as a shell escape, collapsing to
+// "C:Users.." -> ENOENT (Windows prod incident 2026-07-10,
+// notes/20260710-windows-hook-wiring-and-portable-lock-fix.md); quotes so a home
+// dir containing a space survives (C:/Users/John Doe/..). Git Bash accepts
+// forward-slash Windows paths natively, and on POSIX this is a plain quoted path.
+export function hookCommandPath(script: string): string {
+  const p = path.join(HOOKS_DIR, script).split(path.sep).join("/");
+  return `"${p}"`;
+}
+
 // Is `command` a meetless-managed hook for `script` (e.g. "stop.sh")? True when
 // the basename matches the script AND its parent directory is `hooks/` under a
 // meetless home: the canonical install path (`cmd`), anything beneath the
 // current HOOKS_DIR, or any `.meetless/hooks/` path a prior temp-HOME rewire
-// wrote. This recognizes a stale-path duplicate as ours so it can be reconciled
-// in place, while leaving an operator's own `hooks/<script>` outside a meetless
-// home untouched.
+// wrote. Separator- and quote-agnostic so a legacy backslash/unquoted entry is
+// recognized as ours and reconciled in place, while an operator's own
+// `hooks/<script>` outside a meetless home is left untouched.
 export function isManagedHookCommand(
   command: string,
   script: string,
   cmd: string,
 ): boolean {
   if (typeof command !== "string" || command.length === 0) return false;
-  if (path.basename(command) !== script) return false;
-  if (path.basename(path.dirname(command)) !== "hooks") return false;
   if (command === cmd) return true;
-  if (command.startsWith(HOOKS_DIR + path.sep)) return true;
+  const norm = normalizeHookCommand(command);
+  const slash = norm.lastIndexOf("/");
+  const base = slash >= 0 ? norm.slice(slash + 1) : norm;
+  if (base !== script) return false;
+  const parent = slash >= 0 ? norm.slice(0, slash) : "";
+  const pslash = parent.lastIndexOf("/");
+  const parentBase = pslash >= 0 ? parent.slice(pslash + 1) : parent;
+  if (parentBase !== "hooks") return false;
+  const hooksNorm = HOOKS_DIR.split(path.sep).join("/");
+  if (norm.startsWith(hooksNorm + "/")) return true;
   // A temp-HOME rewire leaves a `.../.meetless/hooks/<script>` path.
-  return command.split(path.sep).includes(".meetless");
+  return norm.split("/").includes(".meetless");
 }
 
 export function ensureClaudeSettings(
@@ -846,7 +883,7 @@ export function ensureClaudeSettings(
 
   const added: string[] = [];
   for (const w of wantedEvents) {
-    const cmd = path.join(HOOKS_DIR, w.script);
+    const cmd = hookCommandPath(w.script);
     const list: any[] = Array.isArray(existing.hooks[w.event]) ? existing.hooks[w.event] : [];
 
     // An entry is EXCLUSIVELY ours when it carries a single managed-hook command
@@ -886,13 +923,21 @@ export function ensureClaudeSettings(
       continue;
     }
 
-    // No exclusively-ours entry. If an operator merged our exact command into a
-    // multi-hook entry, it is already present: do not duplicate, do not rewrite
-    // its matcher (conservative: never edit a multi-hook entry the operator owns).
+    // No exclusively-ours entry. If an operator merged a managed command for
+    // this script into a multi-hook entry, it is already present: do not
+    // duplicate, do not rewrite its matcher (conservative: never edit a
+    // multi-hook entry the operator owns). Match on isManagedHookCommand, not an
+    // exact string, so a legacy backslash/unquoted merged entry is recognized as
+    // present and not appended a second time on upgrade.
     const presentInMultiHook = list.some(
       (entry) =>
         Array.isArray(entry?.hooks) &&
-        entry.hooks.some((h: any) => h?.type === "command" && h?.command === cmd),
+        entry.hooks.some(
+          (h: any) =>
+            h?.type === "command" &&
+            typeof h?.command === "string" &&
+            isManagedHookCommand(h.command, w.script, cmd),
+        ),
     );
     if (presentInMultiHook) continue;
 
@@ -1168,8 +1213,9 @@ export function printWireResult(r: WireResult, opts: { skillOnly?: boolean } = {
     if (r.flock.ok) {
       console.log(`flock ready (${r.flock.detail})`);
     } else {
-      console.log(`flock NOT ready: ${r.flock.detail}`);
-      console.log("  Hook pipeline will silently no-op until flock is on PATH. `mla doctor` will flag this.");
+      // Not a failure: the hooks lock via the portable mkdir fallback when flock
+      // is absent (e.g. Windows Git Bash), so passive capture works regardless.
+      console.log(`Hook lock: ${r.flock.detail}`);
     }
   }
   if (r.mcp) {

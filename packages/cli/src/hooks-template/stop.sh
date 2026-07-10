@@ -193,9 +193,10 @@ REPORT_LINE="$(jq -c -n \
   --argjson sids "$REPORT_SIDS" \
   '{ts: $ts, event: $event, session_id: $sessionId, turn_index: $turn, source_ids: $sids}')"
 (
-  flock 9
+  ml_lock 9 "$LOG_DIR/report-citations.lock"
   printf '%s\n' "$REPORT_LINE" >> "$LOG_DIR/report-citations.jsonl"
-) 9>"$LOG_DIR/report-citations.lock"
+  ml_unlock 9 "$LOG_DIR/report-citations.lock"
+)
 
 # End-of-run review card: surface up to 5 deterministic stale signals to the user.
 # P0A-minimal: written to a LOCAL jsonl only (review_card is not in the flush
