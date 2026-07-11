@@ -66,6 +66,26 @@ mla login      # browser OAuth; audits every action as you
 mla doctor     # verify backends, auth mode, and the MCP wiring
 ```
 
+## Platforms
+
+`mla` is tested on **macOS** and **Linux**. Windows is **community-supported**: it
+runs under [WSL](https://learn.microsoft.com/windows/wsl/), and that is the
+recommended path. Inside your WSL distro, install and use it exactly as on Linux.
+
+If a coding agent drives `mla` from the **Windows** side (Git Bash / PowerShell)
+instead of from inside WSL, call it through WSL and single-quote the argument so
+the path is not rewritten to `C:/Program Files/...` before it reaches WSL:
+
+```sh
+wsl -e bash -c '$HOME/.meetless/bin/mla <args>'
+```
+
+The single quotes and literal `$HOME` matter: they expand inside WSL, and the
+leading slash never hits Git Bash's POSIX-to-Windows path conversion.
+
+Windows issues and pull requests are welcome here; fixes are hand-ported into the
+upstream tree, so a merged PR may lag a release.
+
 ## Packages
 
 This repository is a single, self-contained pnpm workspace: the `mla` CLI plus the
