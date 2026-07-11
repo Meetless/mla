@@ -3,6 +3,7 @@ import {
   getLiveLocalRuleVersion,
   type LocalRuleVersionRecord,
 } from "./local-rule-version-repo";
+import { type EligibleEnforcement } from "./deny-admission";
 import { mintAttestedRuleVersion, type AttestIdentity, type MintOutcome } from "./attest-rule-version";
 import {
   ComplianceEvaluatorSpec,
@@ -35,7 +36,15 @@ export const NOTES_LOCATION_RULE_ID = "notes-location-v1";
 const PILOT_EFFECT: RuleEffect = "PROHIBIT";
 const PILOT_STRENGTH: RuleStrength = "MUST_FOLLOW";
 const PILOT_DELIVERY_CHANNELS: DeliveryChannel[] = ["preToolUse"];
-const PILOT_ENFORCEMENT_CEILING = "DENY" as const;
+// The notes pilot's EARNED authority. Only notes-location-v1 arms at DENY; it is the one rule proven
+// end-to-end (attested -> synced -> live-blocked -> adjudicated). Every OTHER newly-armed forbidden-root
+// rule defaults to WARN (the observe -> warn -> block ramp), a promotion to DENY being a deliberate,
+// separately-attested step. See DEFAULT_FORBIDDEN_ROOT_CEILING below.
+const PILOT_ENFORCEMENT_CEILING: EligibleEnforcement = "DENY";
+// The default authority a generic forbidden-root rule arms at: the non-blocking middle rung (INV-8). A
+// brand-new mechanically-evaluable rule must never hard-block on its first arming; it warns until it has
+// earned DENY. notes-location-v1 overrides this with PILOT_ENFORCEMENT_CEILING.
+const DEFAULT_FORBIDDEN_ROOT_CEILING: EligibleEnforcement = "WARN";
 const PILOT_INFRASTRUCTURE_FAILURE_POLICY = "PASS_WITH_ALERT" as const;
 const PILOT_EVALUATOR_CONTRACT_VERSION = "four-state-evaluator-v1";
 const PILOT_MATCHER_SCHEMA_VERSION = "action-applicability-v1";
@@ -184,8 +193,17 @@ function isExactlyWriteEdit(tools: string[]): boolean {
  * family contract, the forbidden root carried AS CONTENT (P0.63), the runtime scope bound from the
  * active evaluation scope. The compliance version triple is supported by construction (the minimal
  * observed spec carries no compliance spec), satisfying gate condition 6.
+ *
+ * `ceiling` is the attested enforcement authority minted INTO the payload (the ladder is
+ * OBSERVE < WARN < ASK < DENY). It defaults to WARN, the non-blocking middle rung (INV-8): a freshly
+ * armed rule warns, never blocks, until it has earned DENY end-to-end. The notes pilot passes DENY
+ * explicitly through `convertNotesLocationSnapshot`.
  */
-export function convertForbiddenRootSnapshot(snapshotJson: string, runtimeScopeId: string): AttestConversion {
+export function convertForbiddenRootSnapshot(
+  snapshotJson: string,
+  runtimeScopeId: string,
+  ceiling: EligibleEnforcement = DEFAULT_FORBIDDEN_ROOT_CEILING,
+): AttestConversion {
   const parsed = parseObservedSnapshot(snapshotJson);
   if ("admitted" in parsed) return parsed;
   const spec = parsed.spec;
@@ -216,7 +234,7 @@ export function convertForbiddenRootSnapshot(snapshotJson: string, runtimeScopeI
     effect: PILOT_EFFECT,
     strength: PILOT_STRENGTH,
     deliveryChannels: PILOT_DELIVERY_CHANNELS,
-    enforcementCeiling: PILOT_ENFORCEMENT_CEILING,
+    enforcementCeiling: ceiling,
     infrastructureFailurePolicy: PILOT_INFRASTRUCTURE_FAILURE_POLICY,
     runtimeScopeId,
     payloadSchemaVersion: PILOT_PAYLOAD_SCHEMA_VERSION,
@@ -232,7 +250,8 @@ export function convertForbiddenRootSnapshot(snapshotJson: string, runtimeScopeI
  * generic `convertForbiddenRootSnapshot` instead.
  */
 export function convertNotesLocationSnapshot(snapshotJson: string, runtimeScopeId: string): AttestConversion {
-  const generic = convertForbiddenRootSnapshot(snapshotJson, runtimeScopeId);
+  // The notes pilot keeps its EARNED DENY authority, passed explicitly, not the generic WARN default.
+  const generic = convertForbiddenRootSnapshot(snapshotJson, runtimeScopeId, PILOT_ENFORCEMENT_CEILING);
   if (!generic.admitted) return generic;
   const root = generic.payload.compliance.config.forbiddenRootRelativePath;
   if (root !== PILOT_FORBIDDEN_ROOT) {

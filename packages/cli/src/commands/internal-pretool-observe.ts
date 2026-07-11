@@ -45,6 +45,7 @@ import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 import { readRuleBundleCache, type BundleCacheRead, type BundlePrincipal } from "../lib/rules/bundle-cache";
 import { HOME } from "../lib/config";
 import { decideBundleEnforcement } from "../lib/rules/bundle-enforce";
+import { type EligibleEnforcement } from "../lib/rules/deny-admission";
 import { type ToolCall } from "../lib/rules/evaluator";
 import { ulid } from "../lib/rules/ulid";
 
@@ -97,24 +98,45 @@ export function renderPreToolUseAsk(reason: string): PretoolObserveOutput {
   };
 }
 
+/** The two audiences of a non-blocking advisory: `systemMessage` is human-facing (shown to the
+ * operator), `additionalContext` is model-facing (fed to the agent on its NEXT request). Both the
+ * cross-session conflict warning and the governed-rule WARN produce this shape, so they can be
+ * concatenated when both fire on one call. */
+export interface AdvisoryParts {
+  systemMessage: string;
+  additionalContext: string;
+}
+
 /**
- * Pure. Build the SOFT cross-session conflict warning (G8 / D1 §11.3, CRITICAL-5)
- * for the session's open conflicts. It carries NO `permissionDecision`, so the tool
- * is PERMITTED: Claude Code falls through to its normal permission flow. The body
- * splits the two audiences the way Claude Code routes them:
- *   - `systemMessage` is shown to the human operator (a one-line "heads up, an open
- *     conflict touches this work, resolve it in /now").
- *   - `hookSpecificOutput.additionalContext` is fed to the agent so it can pause the
- *     conflicting line of work on its own.
- * The hard default-deny is DEFERRED (§0.1): a fail-closed gate on a possibly-stale
- * snapshot would brick coding sessions, so this surface only ever warns. The mode is
- * named in the agent context purely for transparency; it never gates the wire shape
- * here (both soft and hard render the same warning until the deny path is built).
+ * Pure. Render a non-blocking advisory (INV-8): a body carrying `systemMessage` + `additionalContext`
+ * and NO `permissionDecision`, so the tool is PERMITTED and Claude Code falls through to its normal
+ * permission flow. The `additionalContext` reaches the model on its next request (post-action, alongside
+ * the tool result), so an advisory is a "you just did X, here is the concern" heads-up, never a
+ * pre-execution block. Exit code is ALWAYS 0. The key order (systemMessage first, then hookSpecificOutput)
+ * is byte-stable so the existing conflict-warning wire snapshot is preserved.
  */
-export function renderConflictWarning(
-  conflicts: ActiveConflict[],
-  mode: ConflictGateMode,
-): PretoolObserveOutput {
+export function renderAdvisory(parts: AdvisoryParts): PretoolObserveOutput {
+  return {
+    stdout: JSON.stringify({
+      systemMessage: parts.systemMessage,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext: parts.additionalContext,
+      },
+    }),
+    exitCode: 0,
+  };
+}
+
+/**
+ * Pure. Build the SOFT cross-session conflict warning parts (G8 / D1 §11.3, CRITICAL-5) for the
+ * session's open conflicts. The body carries NO `permissionDecision`, so the tool is PERMITTED. The
+ * `systemMessage` is the operator heads-up ("an open conflict touches this work, resolve it in /now")
+ * and the `additionalContext` is the agent steer ("pause this line of work"). The hard default-deny is
+ * DEFERRED (§0.1): a fail-closed gate on a possibly-stale snapshot would brick coding sessions, so this
+ * surface only ever warns. The mode is named purely for transparency; it never gates the wire shape.
+ */
+function buildConflictWarningParts(conflicts: ActiveConflict[], mode: ConflictGateMode): AdvisoryParts {
   const first = conflicts[0];
   const extra = conflicts.length - 1;
   const more = extra > 0 ? ` (and ${extra} more open on this session)` : "";
@@ -128,16 +150,41 @@ export function renderConflictWarning(
     `Case ${first.caseId} opened ${first.openedAt}${more}. ` +
     `This is advisory and the tool is permitted; pause this line of work and ` +
     `check /now for the human decision before continuing.`;
-  return {
-    stdout: JSON.stringify({
-      systemMessage,
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        additionalContext,
-      },
-    }),
-    exitCode: 0,
-  };
+  return { systemMessage, additionalContext };
+}
+
+/**
+ * Pure. Render the SOFT cross-session conflict warning. Byte-identical to the historical body (the
+ * wire snapshot test pins this): builds the parts and renders the advisory shape.
+ */
+export function renderConflictWarning(
+  conflicts: ActiveConflict[],
+  mode: ConflictGateMode,
+): PretoolObserveOutput {
+  return renderAdvisory(buildConflictWarningParts(conflicts, mode));
+}
+
+/**
+ * Pure. Build the governed-rule WARN parts (INV-8, the non-blocking middle rung). A VIOLATION whose
+ * attested ceiling is WARN surfaces the rule's concern to both audiences but NEVER a `permissionDecision`,
+ * so it can never false-positive-block. `reason` is already the aggregated, cap-honored advisory body from
+ * `decideBundleEnforcement`.
+ */
+function buildRuleWarnParts(reason: string): AdvisoryParts {
+  const systemMessage = `Meetless (advisory): ${reason}`;
+  const additionalContext =
+    `Meetless governed-rule warning (advisory, non-blocking). ${reason} ` +
+    `The tool was permitted; this is a heads-up, not a block. If the action violated the rule, ` +
+    `correct it (for example, write to the allowed location) before continuing.`;
+  return { systemMessage, additionalContext };
+}
+
+/**
+ * Pure. Render a governed-rule WARN as the non-blocking advisory body (allow + additionalContext, no
+ * permissionDecision, exit 0). This is the wire form of the enforcement ladder's WARN rung.
+ */
+export function renderPreToolUseWarn(reason: string): PretoolObserveOutput {
+  return renderAdvisory(buildRuleWarnParts(reason));
 }
 
 export interface PretoolObserveDeps {
@@ -171,6 +218,10 @@ export interface PretoolObserveDeps {
   /** The principal-bound, lease-stamped rule bundle cache reader (zero-network). Production reads the
    * gitignored bundle from the home cache; tests inject a fixed read (fresh | stale | unavailable). */
   readBundle?: (principal: BundlePrincipal, nowMs: number) => BundleCacheRead;
+  /** The session ceiling cap resolver (the `MEETLESS_ACTION_INTERCEPT_MAX` kill switch). Production reads
+   * the env var; tests pin the cap. Absent/unset/unrecognized => DENY (uncapped), preserving current
+   * behavior. Capping to WARN turns every would-be block into a non-blocking advisory. */
+  resolveMaxEnforcement?: () => EligibleEnforcement;
 }
 
 function readStdinReal(): Promise<string> {
@@ -207,11 +258,13 @@ async function computePretoolDecision(raw: string, deps: PretoolObserveDeps): Pr
     if (principal === null) return computeConflictWarning(raw, deps);
     const read = (deps.readBundle ?? defaultReadBundle)(principal, clock.now);
     const call: ToolCall = { toolName: parsed.tool_name, toolInput: parsed.tool_input };
+    const maxEnforcement = (deps.resolveMaxEnforcement ?? defaultResolveMaxEnforcement)();
     const decision = await decideBundleEnforcement({
       call,
       read,
       runtimeProjectRoot: scope.runtimeProjectRoot,
       classifyRuntime: deps.classifyRuntime,
+      maxEnforcement,
     });
     if (decision.kind === "DENY") {
       // Reuse the one analytics append the deny tile reads (§5.1). The bundle decision is not an
@@ -241,6 +294,18 @@ async function computePretoolDecision(raw: string, deps: PretoolObserveDeps): Pr
     if (decision.kind === "ASK") {
       return renderPreToolUseAsk(decision.reason);
     }
+    if (decision.kind === "WARN") {
+      // The non-blocking middle rung (INV-8). Surface the governed-rule advisory and, when the session
+      // also has an open cross-session conflict, concatenate both (they both ride additionalContext, so
+      // the model reads them together on its next request). Never a permissionDecision: never a block.
+      const warnParts = buildRuleWarnParts(decision.reason);
+      const conflictParts = computeConflictWarningParts(raw, deps);
+      if (conflictParts === null) return renderAdvisory(warnParts);
+      return renderAdvisory({
+        systemMessage: `${warnParts.systemMessage} ${conflictParts.systemMessage}`,
+        additionalContext: `${warnParts.additionalContext}\n\n${conflictParts.additionalContext}`,
+      });
+    }
     // UNAVAILABLE | PASS: nothing to enforce. Layer the SOFT cross-session conflict warning.
     return computeConflictWarning(raw, deps);
   } catch {
@@ -264,17 +329,29 @@ async function computePretoolDecision(raw: string, deps: PretoolObserveDeps): Pr
  * tool-agnostic, so broadening the matcher later needs no change here.
  */
 function computeConflictWarning(raw: string, deps: PretoolObserveDeps): PretoolObserveOutput {
+  const parts = computeConflictWarningParts(raw, deps);
+  if (parts === null) return renderPreToolUseResponse(PRETOOL_PASS_THROUGH);
+  return renderAdvisory(parts);
+}
+
+/**
+ * The parts of the SOFT conflict warning, or null when there is nothing to warn about. Split out from
+ * `computeConflictWarning` so the WARN branch can concatenate the conflict advisory onto a governed-rule
+ * warning (both ride additionalContext). Fails to null (no warning) on a missing session id, an empty or
+ * stale snapshot, or ANY error: the warning is advisory, so silence is always the safe direction.
+ */
+function computeConflictWarningParts(raw: string, deps: PretoolObserveDeps): AdvisoryParts | null {
   try {
     const sessionId = parsePreToolUseInput(raw)?.session_id;
-    if (!sessionId) return renderPreToolUseResponse(PRETOOL_PASS_THROUGH);
+    if (!sessionId) return null;
     const readConflicts = deps.readConflicts ?? ((sid: string) => readActiveConflicts(sid));
     const conflicts = readConflicts(sessionId);
-    if (conflicts.length === 0) return renderPreToolUseResponse(PRETOOL_PASS_THROUGH);
+    if (conflicts.length === 0) return null;
     const mode = (deps.resolveGateMode ?? resolveConflictGateMode)();
-    return renderConflictWarning(conflicts, mode);
+    return buildConflictWarningParts(conflicts, mode);
   } catch {
     // The conflict warning is advisory; any fault degrades to no warning, never a block.
-    return renderPreToolUseResponse(PRETOOL_PASS_THROUGH);
+    return null;
   }
 }
 
@@ -385,6 +462,29 @@ function defaultResolveScope(): { runtimeScopeId: string; runtimeProjectRoot: st
 function defaultClock(): { now: number; createdAt: string } {
   const now = Date.now();
   return { now, createdAt: new Date(now).toISOString() };
+}
+
+/**
+ * Pure. Parse the `MEETLESS_ACTION_INTERCEPT_MAX` kill-switch value into the session ceiling cap. Only
+ * `warn` | `ask` | `deny` (case-insensitive) are honored; anything else (unset, empty, or unrecognized)
+ * yields `DENY` (uncapped) so the default preserves the current, notes-location-DENY-fires behavior. A
+ * WARN cap turns every would-be block into a non-blocking advisory; an ASK cap forbids only DENY.
+ */
+export function parseMaxEnforcement(raw: string | undefined): EligibleEnforcement {
+  switch ((raw ?? "").trim().toLowerCase()) {
+    case "warn":
+      return "WARN";
+    case "ask":
+      return "ASK";
+    case "deny":
+      return "DENY";
+    default:
+      return "DENY";
+  }
+}
+
+function defaultResolveMaxEnforcement(): EligibleEnforcement {
+  return parseMaxEnforcement(process.env.MEETLESS_ACTION_INTERCEPT_MAX);
 }
 
 /** Principal resolver: bind the bundle read to the active workspace + project + login session

@@ -421,6 +421,34 @@ export function formatUpdateNag(opts: {
   return lead + `To upgrade, run: ${upgradeCommandFor(method)}\n`;
 }
 
+// The line appended to an "unknown command / unknown subcommand" error so an
+// operator (or a coding agent driving mla over a pipe) never concludes "mla
+// can't do this" when the real cause is a stale binary that predates the verb.
+// This is the one moment the TTY-gated update nag never reaches a piped agent,
+// so the hint rides the error path instead. Two shapes:
+//   - We KNOW a newer version is cached -> name it, and when the current build is
+//     below the floor (minVersion) say so with the stronger wording.
+//   - We don't know (empty/again-current cache, or an unparseable dev build) -> a
+//     soft "may be out of date" pointer. `mla upgrade` is a safe no-op when
+//     already current, so nudging it is never wrong. Pure so the copy is asserted
+//     verbatim in tests; the cache/version read is the IO wrapper in
+//     update-notifier.ts.
+export function formatStaleCommandHint(opts: {
+  current: string | null;
+  latestVersion: string | null;
+  minVersion?: string | null;
+}): string {
+  const { current, latestVersion, minVersion } = opts;
+  if (isNewerVersion(latestVersion, current)) {
+    const from = current ? `${current} ` : "";
+    const lead = isBelowMinVersion(current, minVersion ?? null)
+      ? `Your mla ${from}is below the minimum supported version; this command may only exist in a newer release. Please upgrade to ${latestVersion}.`
+      : `A newer mla is available (${from}-> ${latestVersion}); this command may only exist there.`;
+    return `\n${lead}\nRun 'mla upgrade' to update, then retry.`;
+  }
+  return `\nIf you expected this command to exist, your mla may be out of date. Run 'mla upgrade' to update, then retry.`;
+}
+
 // --- upgrade plan (the `mla upgrade` decision) -------------------------------
 
 export type UpgradeAction =

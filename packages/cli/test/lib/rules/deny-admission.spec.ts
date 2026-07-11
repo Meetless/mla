@@ -53,6 +53,18 @@ describe("projectEligibleEnforcement (R1-3, eligibility projected through result
   test("projects an UNKNOWN result down to OBSERVE so UNKNOWN can never reach a deny", () => {
     expect(projectEligibleEnforcement("UNKNOWN", "DENY")).toBe("OBSERVE");
   });
+
+  test("projects a VIOLATION onto a WARN ceiling (the non-blocking middle rung, INV-8)", () => {
+    expect(projectEligibleEnforcement("VIOLATION", "WARN")).toBe("WARN");
+  });
+
+  test("projects a COMPLIANT result at a WARN ceiling down to OBSERVE (no warning without a violation)", () => {
+    expect(projectEligibleEnforcement("COMPLIANT", "WARN")).toBe("OBSERVE");
+  });
+
+  test("projects an UNKNOWN result at a WARN ceiling down to OBSERVE (uncertainty never even warns)", () => {
+    expect(projectEligibleEnforcement("UNKNOWN", "WARN")).toBe("OBSERVE");
+  });
 });
 
 describe("EnforcementGateReasonCode closed set", () => {
@@ -125,6 +137,16 @@ describe("admitEnforcement (R1-5, gated decision not strength; single primary ga
     ).toEqual({ effectiveEnforcement: "OBSERVE", gateReasonCode: null });
   });
 
+  test("passes a WARN eligibility through untouched (only DENY is admission-gated, INV-8)", () => {
+    expect(
+      admitEnforcement({
+        eligibleEnforcement: "WARN",
+        inputAuthority: UNAVAILABLE,
+        pathRoot: refusedRoot,
+      }),
+    ).toEqual({ effectiveEnforcement: "WARN", gateReasonCode: null });
+  });
+
   test("admits a DENY when input authority is sole and the path root is admitted", () => {
     expect(
       admitEnforcement({
@@ -183,6 +205,13 @@ describe("planDenyAccounting (P0.60, durable DECISION_RECORDED before emission)"
 
   test("plans an effective NONE (failed-open infra) as NO_DECISION + NOT_APPLICABLE", () => {
     expect(planDenyAccounting("NONE")).toEqual({
+      aggregateDecision: "NO_DECISION",
+      denyEmissionStatus: "NOT_APPLICABLE",
+    });
+  });
+
+  test("plans an effective WARN as NO_DECISION + NOT_APPLICABLE (a warning is never a deny)", () => {
+    expect(planDenyAccounting("WARN")).toEqual({
       aggregateDecision: "NO_DECISION",
       denyEmissionStatus: "NOT_APPLICABLE",
     });

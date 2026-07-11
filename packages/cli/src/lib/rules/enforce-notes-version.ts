@@ -164,12 +164,18 @@ export type RecordDenyDecisionResult =
   | { committed: true; attemptId: string; evaluationId: string }
   | { committed: false; cause: "GENERATION_CHURN" };
 
-/** The enforcement fields one version-arm row pair carries beyond its subject and ids. */
+/** The enforcement fields one version-arm row pair carries beyond its subject and ids.
+ *
+ * The two enforcement fields are the CE0-persisted triple, deliberately WARN-free: WARN is the
+ * live bundle path's non-blocking advisory rung (delivered as model-facing context, never a durable
+ * decision), so it never structurally reaches this dormant CE0 arm path or its CHECK-constrained
+ * columns. Narrowing here keeps the widened `EligibleEnforcement`/`EffectiveEnforcement` enums out
+ * of CE0 persistence by construction rather than by convention. */
 interface ArmEnforcement {
   result: EvaluationResult;
   verdictReasonCode: VerdictReasonCode;
-  eligibleEnforcement: EligibleEnforcement;
-  effectiveEnforcement: EffectiveEnforcement;
+  eligibleEnforcement: "OBSERVE" | "ASK" | "DENY";
+  effectiveEnforcement: "NONE" | "OBSERVE" | "ASK" | "DENY";
   gateReasonCode: EnforcementGateReasonCode | null;
   inputAuthorityConfigHash: string | null;
 }

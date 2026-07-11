@@ -9,6 +9,7 @@ import {
   DEFAULT_UPDATE_URL,
   currentTriple,
   detectInstallMethod,
+  formatStaleCommandHint,
   formatUpdateNag,
   isBelowMinVersion,
   planUpgrade,
@@ -90,6 +91,25 @@ export function maybeShowUpdateNag(opts: {
     );
   } catch {
     // never let the notifier break the real command
+  }
+}
+
+// The stale-binary hint for an "unknown command / unknown subcommand" error,
+// built from the cached update state and this binary's version. Deliberately NOT
+// TTY-gated (unlike the nag): this is the exact moment someone asked mla for a
+// capability that is not present, and a piped coding agent must be told it might
+// be a stale install rather than a real gap. Best-effort: returns "" on any error
+// so an error path never throws. `mla upgrade` is a safe no-op when current.
+export function staleCommandHint(): string {
+  try {
+    const state = readUpdateState();
+    return formatStaleCommandHint({
+      current: loadBuildInfo().version,
+      latestVersion: state.latestVersion,
+      minVersion: state.minVersion ?? null,
+    });
+  } catch {
+    return "";
   }
 }
 

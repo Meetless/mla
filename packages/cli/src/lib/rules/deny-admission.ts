@@ -30,8 +30,12 @@ import { type InputAuthorityResolution } from "./input-authority-resolver";
  */
 
 export type EvaluationResult = "COMPLIANT" | "VIOLATION" | "UNKNOWN";
-export type EligibleEnforcement = "OBSERVE" | "ASK" | "DENY";
-export type EffectiveEnforcement = "NONE" | "OBSERVE" | "ASK" | "DENY";
+// The authority ladder, weakest -> strongest: OBSERVE < WARN < ASK < DENY. WARN is the non-blocking
+// middle rung (INV-8): a VIOLATION whose ceiling is WARN surfaces a model-facing advisory but never
+// gates the tool, so it can never manufacture a false-positive block. Only DENY is admission-gated
+// (admitEnforcement below); WARN and ASK pass through their eligibility untouched.
+export type EligibleEnforcement = "OBSERVE" | "WARN" | "ASK" | "DENY";
+export type EffectiveEnforcement = "NONE" | "OBSERVE" | "WARN" | "ASK" | "DENY";
 
 /*
  * The closed set of primary deny-admission gate reasons, in precedence order: the first whose

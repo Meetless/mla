@@ -61,6 +61,20 @@ main() {
   say "    mla login       sign in (opens your browser)"
   say "    mla activate    bind a repo to a workspace (run inside the repo)"
   say ""
+
+  # WSL-under-Windows: mla runs natively here, but a coding agent on the Windows
+  # side (Git Bash) mangles a leading-slash arg into C:/Program Files/... and
+  # breaks. Show the known-good cross-boundary invocation. Windows is community-
+  # supported; mla is tested on macOS and Linux.
+  case "$(uname -r 2>/dev/null | tr '[:upper:]' '[:lower:]')" in
+    *microsoft* | *wsl*)
+      say "  WSL detected. If a coding agent drives mla from the Windows side, call it"
+      say "  through WSL, single-quoted so the path survives:"
+      say "    wsl -e bash -c '\$HOME/.meetless/bin/mla <args>'"
+      say "  Windows is community-supported: https://github.com/Meetless/mla"
+      say ""
+      ;;
+  esac
 }
 
 # Wire mla into Claude Code (hooks, /mla skill, MCP server) so capture is live the

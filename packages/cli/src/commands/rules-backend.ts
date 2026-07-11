@@ -63,7 +63,8 @@ import { managedRuleToRulePayload } from "../lib/rules/rule-import-mapping";
 import { ruleVersionHash } from "../lib/rules/rule-version-hash";
 import { parseApplicability } from "../lib/rules/applicability";
 import { resolveActiveRuntimeScopeId } from "../lib/rules/runtime-scope";
-import type { RulePayloadV1, TurnTrigger } from "../lib/rules/types";
+import type { ObservedRuleSpec, RulePayloadV1, TurnTrigger } from "../lib/rules/types";
+import type { EligibleEnforcement } from "../lib/rules/deny-admission";
 import {
   readRuleBundleCache,
   type BundleCacheRead,
@@ -72,7 +73,12 @@ import {
 import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 import { openCe0Store, closeCe0Store, type Ce0Store } from "../lib/rules/ce0-store";
 import { resolveObservedSnapshotInScope } from "../lib/rules/interception-store";
-import { convertNotesLocationSnapshot, NOTES_LOCATION_RULE_ID } from "../lib/rules/attest-notes-location";
+import {
+  convertForbiddenRootSnapshot,
+  convertNotesLocationSnapshot,
+  NOTES_LOCATION_RULE_ID,
+} from "../lib/rules/attest-notes-location";
+import { serializeObservedRule } from "../lib/rules/observed-rule-hash";
 import { defaultCe0StorePath } from "./evidence";
 import { Strength } from "../lib/scanner/types";
 
@@ -87,8 +93,11 @@ export const RULES_LIST_BACKEND_USAGE =
   "  --workspace <id>  act on the given workspace instead of the folder-bound one.";
 
 export const RULES_ADD_BACKEND_USAGE =
-  "usage: mla rules add \"<statement>\" [--must] [--scope <glob>]... [--source <ref>]... [--json] [--workspace <id>]\n" +
-  "  Mints a TEAM rule on the backend (the single source of truth). Requires `mla login`.\n" +
+  "usage: mla rules add \"<statement>\" [--personal | --team] [--must] [--applies-to <glob>]... [--source <ref>]... [--json] [--workspace <id>]\n" +
+  "  Mints a rule on the backend (the single source of truth). Requires `mla login`.\n" +
+  "  --personal  (default) the rule enforces for you alone; promote it later to share.\n" +
+  "  --team      the rule enforces for the whole workspace (asks you to confirm).\n" +
+  "  --applies-to <glob>  restrict the rule to matching paths (repeatable). Alias: --scope.\n" +
   "  --workspace <id>  file the rule into the given workspace instead of the folder-bound one.";
 
 export const RULES_EDIT_BACKEND_USAGE =
@@ -100,8 +109,16 @@ export const RULES_REVOKE_BACKEND_USAGE =
   "  Revokes a rule on the backend (the kill switch). Already-revoked is a no-op.";
 
 export const RULES_ATTEST_BACKEND_USAGE =
-  "usage: mla rules attest --from-observed <observedRuleHash> [--scope team|personal] [--agent-on-user-request --yes] [--workspace <id>]\n" +
-  "  Mints a notes-location DENY rule on the backend from a local R0 observed snapshot.\n" +
+  "usage: mla rules attest (--from-observed <hash> | --forbidden-root <path>) [--ceiling observe|warn]\n" +
+  "                        [--text <rationale>] [--scope team|personal] [--agent-on-user-request --yes] [--workspace <id>]\n" +
+  "  Mints a forbidden-root PROHIBIT rule on the backend.\n" +
+  "  --from-observed <hash>   mint from a recorded R0 observed snapshot. With NO --ceiling this is the\n" +
+  "                           armed notes-location DENY pilot (the only DENY arming surface).\n" +
+  "  --forbidden-root <path>  author a rule for <path> directly, no observation needed. Defaults to the\n" +
+  "                           WARN ceiling (a non-blocking advisory; a freshly armed rule warns, INV-8).\n" +
+  "  --ceiling observe|warn   the enforcement authority to arm at. ask/deny are refused here: a new rule\n" +
+  "                           must earn DENY end to end before it blocks.\n" +
+  "  --text <rationale>       the rule statement shown to the agent (direct authoring only; defaulted).\n" +
   "  --scope personal (default) enforces only for you; --scope team enforces for the whole workspace.";
 
 export const RULES_DEMOTE_BACKEND_USAGE =
@@ -109,6 +126,12 @@ export const RULES_DEMOTE_BACKEND_USAGE =
   "  Demotes a TEAM rule to PERSONAL: mints a PERSONAL copy owned by you, then revokes the\n" +
   "  team rule. It then enforces for you alone, not the whole workspace. The audit trail is\n" +
   "  preserved (the personal version records you as its author).";
+
+export const RULES_PROMOTE_BACKEND_USAGE =
+  "usage: mla rules promote <nodeId> [--yes] [--workspace <id>]\n" +
+  "  Promotes a PERSONAL rule to TEAM: mints a TEAM copy (owned by no one), then revokes the\n" +
+  "  personal rule. It then enforces for the whole workspace, not you alone. The audit trail is\n" +
+  "  preserved (the team version records you as its author).";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Shared seams + helpers
@@ -166,7 +189,13 @@ function isOffline(err: unknown): boolean {
  * assemble path is in the build (§7): the parser understands them so the round-trip is testable now,
  * but no help text advertises authoring a turn rule before every reader can honor it.
  */
-const VALUE_FLAGS = new Set(["--scope", "--source", "--turn-when-prompt", "--turn-when-path"]);
+const VALUE_FLAGS = new Set([
+  "--applies-to",
+  "--scope",
+  "--source",
+  "--turn-when-prompt",
+  "--turn-when-path",
+]);
 
 interface ParsedRuleArgs {
   /** Positional tokens, in argv order, with every flag and consumed value removed. */
@@ -207,7 +236,9 @@ function parseRuleArgs(argv: string[]): ParsedRuleArgs {
         danglingFlag = a;
         break;
       }
-      if (a === "--scope") scope.push(v);
+      // `--applies-to` is the current name for the applicability glob; `--scope` is the deprecated
+      // alias (add/edit only; attest's `--scope` is authority plane and never reaches this parser).
+      if (a === "--applies-to" || a === "--scope") scope.push(v);
       else if (a === "--source") sources.push(v);
       else if (a === "--turn-when-prompt") turnPrompts.push(v);
       else turnPaths.push(v);
@@ -295,11 +326,21 @@ function payloadStrength(node: RuleNodeView): string {
   return p?.strength ?? "?";
 }
 
-/** Render one rule node as a human line: id, scope, strength, text, version, lifecycle. */
+/**
+ * Humanize the authority plane for a list row: a PERSONAL rule shows `PERSONAL owner:<id>` so the
+ * operator can see WHOSE rule it is (and never tries to demote someone else's); TEAM / ORGANIZATION
+ * carry no owner and print bare. This is the one place the raw authorityScopeId is turned into the
+ * "personal vs team" signal the whole feature is about.
+ */
+function humanScope(scope: string, ownerUserId: string | null | undefined): string {
+  return ownerUserId ? `${scope} owner:${ownerUserId}` : scope;
+}
+
+/** Render one rule node as a human line: id, scope+owner, strength, text, version, lifecycle. */
 function renderRuleLine(node: RuleNodeView): string {
   const ver = node.currentVersionId ? `v:${node.currentVersionId}` : "(no version)";
   return (
-    `${node.id}  [${node.authorityScopeId}/${lifecycleOf(node)}]  ` +
+    `${node.id}  [${humanScope(node.authorityScopeId, node.ownerUserId)}/${lifecycleOf(node)}]  ` +
     `(${payloadStrength(node)})  ${payloadText(node)}  ${ver}`
   );
 }
@@ -424,7 +465,7 @@ function listFromBundle(
   for (const entry of read.bundle.rules) {
     const p = entry.payload as Partial<RulePayloadV1> | undefined;
     out(
-      `${entry.ruleNodeId}  [${entry.authorityScope}]  (${p?.strength ?? "?"})  ` +
+      `${entry.ruleNodeId}  [${humanScope(entry.authorityScope, entry.ownerUserId)}]  (${p?.strength ?? "?"})  ` +
         `${p?.text ?? "(opaque)"}  v:${entry.ruleVersionId}`,
     );
   }
@@ -441,18 +482,23 @@ export interface RulesAddBackendDeps {
   resolveOperator?: () => BackendOperator | null;
   resolveRuntimeScopeId?: (cwd?: string) => string;
   cwd?: string;
+  isInteractive?: () => boolean;
+  confirm?: (prompt: string) => boolean | Promise<boolean>;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
 
 /**
- * `mla rules add`. Mints a TEAM RuleNode on the backend from the convention text +
- * flags (the legacy managed-rule shape, converted to the triple-safe RulePayloadV1 so it is
- * injected but never enforces). A binding rule REQUIRES an authenticated human (acceptance 8):
- * a shared-key / logged-out session is refused locally with a clear pointer, rather than a
- * bare server 403. requestIdempotencyKey = the payload hash is recorded on the version for
- * audit; the native mint does NOT dedup on it, so re-running `add` with identical text mints a
- * second TEAM RuleNode. Offline binding writes fail fast (loadWorkspaceConfig throws -> exit 2).
+ * `mla rules add`. Mints a RuleNode on the backend from the convention text + flags (the legacy
+ * managed-rule shape, converted to the triple-safe RulePayloadV1 so it is injected but never
+ * enforces). The authority plane defaults to PERSONAL (enforces for the author alone; every mint
+ * prints a promote nudge); `--team` opts into workspace-wide enforcement and, being higher blast
+ * radius, confirms exactly like attest/revoke (interactive Y/n or --yes). `--personal` + `--team`
+ * together is a usage error. A binding rule REQUIRES an authenticated human (acceptance 8): a
+ * shared-key / logged-out session is refused locally with a clear pointer, rather than a bare
+ * server 403. requestIdempotencyKey = the payload hash is recorded on the version for audit; the
+ * native mint does NOT dedup on it, so re-running `add` with identical text mints a second
+ * RuleNode. Offline binding writes fail fast (loadWorkspaceConfig throws -> exit 2).
  */
 export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDeps = {}): Promise<number> {
   const out = deps.out ?? ((l: string) => console.log(l));
@@ -485,6 +531,18 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
   const scope = parsed.scope;
   const sources = parsed.sources;
 
+  // Authority plane. Default PERSONAL (enforces for the author alone; promotable later); --team
+  // opts into workspace-wide enforcement. Passing both is a usage error; --personal spells out the
+  // default. Boolean flags (not --scope, which stays the applicability-glob alias) so add never
+  // overloads one flag with two meanings.
+  const wantTeam = rest.includes("--team");
+  const wantPersonal = rest.includes("--personal");
+  if (wantTeam && wantPersonal) {
+    err(`pass either --team or --personal, not both\n${RULES_ADD_BACKEND_USAGE}`);
+    return 2;
+  }
+  const authorityScope: RuleAuthorityScope = wantTeam ? "TEAM" : "PERSONAL";
+
   // A malformed turn trigger is a usage error (exit 2), surfaced BEFORE we touch auth or the network.
   const triggerResult = triggerFromArgs(parsed);
   if ("error" in triggerResult) {
@@ -501,6 +559,10 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
     );
     return 1;
   }
+  // PERSONAL is owner-private (the author owns the private-ACL row); TEAM carries no owner and is
+  // workspace-visible. The backend re-derives this via resolveOwner (ownerUserId is an ignored hint,
+  // INV-AUTH-1), so this is the wire value, not a trust boundary.
+  const ownerUserId = authorityScope === "PERSONAL" ? operator.userId : null;
 
   let cfg: WorkspaceCliConfig;
   try {
@@ -516,13 +578,30 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
   const payload = managedRuleToRulePayload(managed, runtimeScopeId, triggerResult.trigger);
   const requestIdempotencyKey = ruleVersionHash(payload);
 
+  // TEAM is higher blast radius (enforces workspace-wide), so it confirms exactly like
+  // attest/revoke: interactive Y/n, or --yes for an explicit non-interactive instruction. PERSONAL
+  // (the default, enforces for the author alone) needs no confirmation.
+  if (authorityScope === "TEAM" && !rest.includes("--yes")) {
+    const isInteractive = deps.isInteractive ?? defaultIsInteractive;
+    if (!isInteractive()) {
+      err("refusing to mint a TEAM rule non-interactively without --yes (it enforces workspace-wide)");
+      return 1;
+    }
+    const confirm = deps.confirm ?? defaultConfirm;
+    const ok = await confirm("Mint a TEAM rule (it will enforce for the whole workspace)?");
+    if (!ok) {
+      err("team rule not confirmed; nothing minted");
+      return 1;
+    }
+  }
+
   try {
     const node = await mintRule(
       cfg,
       {
         workspaceId: cfg.workspaceId,
-        authorityScope: "TEAM",
-        ownerUserId: null,
+        authorityScope,
+        ownerUserId,
         projectId: null,
         payload: payload as unknown as Record<string, unknown>,
         // Send the CLI hash as the canonical hash so the backend stores it verbatim and
@@ -537,7 +616,19 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
       out(JSON.stringify(node, null, 2));
       return 0;
     }
-    out(`MINTED rule ${node.id} version ${node.currentVersionId} (${requestIdempotencyKey})`);
+    // Loud, scope-stating success + the audience line. For PERSONAL, nudge toward promotion so the
+    // author knows the rule is theirs alone and how to share it (the one mitigation for the PERSONAL
+    // default undercutting team propagation).
+    const scopeLabel = authorityScope === "TEAM" ? "TEAM" : "PERSONAL";
+    out(`MINTED ${scopeLabel} rule ${node.id} version ${node.currentVersionId} (${requestIdempotencyKey})`);
+    if (authorityScope === "TEAM") {
+      out("This is a TEAM rule: it enforces for every member of the workspace.");
+    } else {
+      out(
+        "This is a PERSONAL rule: it enforces for you alone. " +
+          `Run \`mla rules promote ${node.id}\` to share it with the team.`,
+      );
+    }
     return 0;
   } catch (e) {
     if (isOffline(e)) {
@@ -822,6 +913,49 @@ export interface RulesAttestBackendDeps {
   err?: (line: string) => void;
 }
 
+/** Pull the token after `name` from argv. `dangling` is true when the flag is present but its value
+ * is missing or is itself another flag, so the caller can fail with the usage rather than swallow it. */
+function attestFlagValue(argv: string[], name: string): { value?: string; dangling: boolean } {
+  const i = argv.indexOf(name);
+  if (i < 0) return { dangling: false };
+  const v = argv[i + 1];
+  if (v === undefined || v.startsWith("--")) return { dangling: true };
+  return { value: v, dangling: false };
+}
+
+/** The four enforcement rungs as lowercase CLI tokens (the ladder OBSERVE < WARN < ASK < DENY). */
+const CEILING_TOKENS: Record<string, EligibleEnforcement> = {
+  observe: "OBSERVE",
+  warn: "WARN",
+  ask: "ASK",
+  deny: "DENY",
+};
+
+/** The operator-facing note describing what an armed rule at `ceiling` does at enforcement time. ASK is
+ * unreachable here (the notes pilot is DENY, the generic path is capped to observe|warn), so only the
+ * three armable rungs are described. */
+function ceilingArmingNote(ceiling: EligibleEnforcement, scopeLabel: string, audienceNote: string): string {
+  if (ceiling === "DENY") {
+    return (
+      `note: enforcementCeiling is DENY. Once this ${scopeLabel} rule is LIVE in the bundle and the ` +
+      "deny-admission gates pass, a VIOLATION is denied on the wire; otherwise it degrades to ASK. " +
+      audienceNote
+    );
+  }
+  if (ceiling === "OBSERVE") {
+    return (
+      `note: enforcementCeiling is OBSERVE. Once this ${scopeLabel} rule is LIVE it records matches but ` +
+      `never warns or blocks; it is the watch-only first rung of the ramp. ${audienceNote}`
+    );
+  }
+  // WARN (the default arming rung): non-blocking advisory on the next turn, never a hard stop (INV-8).
+  return (
+    `note: enforcementCeiling is WARN. Once this ${scopeLabel} rule is LIVE in the bundle, a VIOLATION ` +
+    "hands the agent a non-blocking advisory on its next turn; the action itself is never blocked (INV-8). " +
+    `Promote it to DENY only after it is proven end to end. ${audienceNote}`
+  );
+}
+
 /**
  * `mla rules attest --from-observed <hash> [--scope team|personal]` (fork assumption #7).
  * Observation is inherently LOCAL (R0 PreToolUse hooks record to the CE0 ledger), so the
@@ -844,11 +978,19 @@ export interface RulesAttestBackendDeps {
  * mint does NOT dedup on it, so re-attesting the same snapshot mints a fresh node (this matches
  * "attest always mints a fresh node" below; deduplicate by revoking the duplicate).
  *
- * SCOPE (noted for An): attest supports ONLY the default notes-location observed
- * conversion (the live DENY pilot the kill switch protects). The P0.55 logical-identity flags
- * (`--new-rule` / `--rule`) are SUBSUMED by the backend nodeId model: attest always mints a
- * fresh node; re-edit by nodeId via `edit`. `--from-code-rule` is deferred to Phase 2 (it arms
- * a RECORD_ONLY rule that changes no runtime behavior). Both error with a clear pointer.
+ * CEILING + SOURCE (the whole PROHIBIT forbidden-root family, not just the notes pilot). Two authoring
+ * sources, exactly one per call:
+ *   - --from-observed <hash>: convert a recorded R0 observation. With NO --ceiling this is the
+ *     notes-location DENY pilot (pinned to the "notes" root, EARNED DENY) exactly as before; with
+ *     --ceiling it is the generic family at the requested rung.
+ *   - --forbidden-root <path>: author a rule for any root directly, no observation needed (the WARN-first
+ *     arming surface). The spec is synthesized and run through the SAME production admission gate.
+ * --ceiling selects the enforcement authority and is capped to the non-blocking rungs (observe|warn):
+ * a freshly armed rule warns before it blocks (INV-8), so DENY/ASK are refused for a cold arming. The
+ * only DENY arming surface stays the proven notes-location pilot. The P0.55 logical-identity flags
+ * (`--new-rule` / `--rule`) are SUBSUMED by the backend nodeId model: attest always mints a fresh node;
+ * re-edit by nodeId via `edit`. `--from-code-rule` is deferred to Phase 2 (it arms a RECORD_ONLY rule
+ * that changes no runtime behavior). Both error with a clear pointer.
  */
 export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBackendDeps = {}): Promise<number> {
   const out = deps.out ?? ((l: string) => console.log(l));
@@ -877,12 +1019,58 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
     return 2;
   }
 
-  const flagIdx = rest.indexOf("--from-observed");
-  const observedRuleHash = flagIdx >= 0 ? rest[flagIdx + 1] : undefined;
-  if (!observedRuleHash || observedRuleHash.startsWith("--")) {
+  // A forbidden-root rule can be authored two ways, and exactly one source must be chosen:
+  //   --from-observed <hash>   pull the spec from a recorded R0 observation (the original path).
+  //   --forbidden-root <path>  author the spec directly by naming the root (no observation needed).
+  // --ceiling selects the enforcement authority to arm at. It is capped to the non-blocking rungs
+  // (observe|warn): a freshly armed rule warns before it blocks (INV-8), so DENY/ASK are refused here.
+  // The ONE DENY arming surface is --from-observed with NO --ceiling: the proven, notes-pinned
+  // notes-location pilot, whose EARNED DENY authority is preserved for backward compatibility.
+  const observed = attestFlagValue(rest, "--from-observed");
+  const forbiddenRoot = attestFlagValue(rest, "--forbidden-root");
+  const ceilingFlag = attestFlagValue(rest, "--ceiling");
+  const textFlag = attestFlagValue(rest, "--text");
+  if (observed.dangling || forbiddenRoot.dangling || ceilingFlag.dangling || textFlag.dangling) {
     err(RULES_ATTEST_BACKEND_USAGE);
     return 2;
   }
+  const observedRuleHash = observed.value;
+  const directRoot = forbiddenRoot.value;
+  if (observedRuleHash !== undefined && directRoot !== undefined) {
+    err(`pass either --from-observed <hash> or --forbidden-root <path>, not both\n${RULES_ATTEST_BACKEND_USAGE}`);
+    return 2;
+  }
+  if (observedRuleHash === undefined && directRoot === undefined) {
+    err(RULES_ATTEST_BACKEND_USAGE);
+    return 2;
+  }
+
+  // Parse the requested ceiling, if any. The generic forbidden-root family arms at WARN by default and
+  // admits only the non-blocking rungs from the CLI; DENY/ASK are earned promotions, not a cold arming,
+  // so refuse them with a pointer rather than mint a first-arming hard block.
+  let requestedCeiling: EligibleEnforcement | undefined;
+  if (ceilingFlag.value !== undefined) {
+    const mapped = CEILING_TOKENS[ceilingFlag.value.toLowerCase()];
+    if (!mapped) {
+      err(`--ceiling takes one of observe|warn|ask|deny\n${RULES_ATTEST_BACKEND_USAGE}`);
+      return 2;
+    }
+    requestedCeiling = mapped;
+  }
+  // Any --ceiling arming, and every --forbidden-root arming, is the GENERIC family (never the notes
+  // DENY pilot, which is reached only by --from-observed with no --ceiling).
+  const genericArming = directRoot !== undefined || requestedCeiling !== undefined;
+  if (genericArming && (requestedCeiling === "ASK" || requestedCeiling === "DENY")) {
+    err(
+      `--ceiling ${requestedCeiling.toLowerCase()} is refused when arming a new forbidden-root rule: a ` +
+        "freshly armed rule warns before it blocks (INV-8). Arm it at --ceiling warn, prove it end to " +
+        "end, then promote. Today only the notes-location pilot (--from-observed, no --ceiling) arms at DENY.",
+    );
+    return 2;
+  }
+  // The generic path arms at the requested rung, defaulting to WARN (the non-blocking middle rung).
+  const genericCeiling: EligibleEnforcement = requestedCeiling ?? "WARN";
+
   const agentOnUserRequest = rest.includes("--agent-on-user-request");
   const yes = rest.includes("--yes");
 
@@ -932,39 +1120,83 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   const resolveScope = deps.resolveRuntimeScopeId ?? resolveActiveRuntimeScopeId;
   const runtimeScopeId = resolveScope(deps.cwd);
 
-  const dbPath = deps.storePath ?? defaultCe0StorePath();
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  const open = deps.openStore ?? openCe0Store;
-  const store = open(dbPath);
-
   let payload: RulePayloadV1;
-  try {
-    const resolution = resolveObservedSnapshotInScope(store, runtimeScopeId, observedRuleHash);
-    if (resolution.kind === "NOT_FOUND") {
-      err(
-        `no observed rule with hash ${observedRuleHash} in runtime scope ${runtimeScopeId}: ` +
-          "not found, nothing to attest",
-      );
-      return 1;
+  // notesPilot marks the one EARNED-DENY, notes-pinned arming (--from-observed, no --ceiling), used
+  // only for the display label; every other arming is the generic forbidden-root family.
+  let notesPilot = false;
+  if (directRoot !== undefined) {
+    // Direct authoring: synthesize the exact observed-rule-v1 spec the scanner would emit for a
+    // whole-root Write/Edit PROHIBIT, then run it through the SAME production admission gate as the
+    // observed path (serialize -> convertForbiddenRootSnapshot). No CE0 store is touched: authoring a
+    // new root needs no prior observation. Omitting the matcher glob forbids ALL files under the root.
+    const spec: ObservedRuleSpec = {
+      text:
+        textFlag.value ??
+        `Files under ${directRoot}/ are governed; write them elsewhere unless a change is explicitly allowed there.`,
+      applicability: { mode: "action", tools: ["Write", "Edit"], matcher: { field: "file_path" } },
+      effect: "PROHIBIT",
+      forbiddenRootRelativePath: directRoot,
+    };
+    let snapshotJson: string;
+    try {
+      snapshotJson = serializeObservedRule(spec);
+    } catch (e) {
+      err(`rules attest: cannot author forbidden-root rule: ${(e as Error).message}`);
+      return 2;
     }
-    if (resolution.kind === "COLLISION") {
-      err(
-        `observed hash ${observedRuleHash} is a collision in scope ${runtimeScopeId}: ` +
-          `${resolution.distinctSnapshotCount} distinct snapshots share it; refusing to attest`,
-      );
-      return 1;
-    }
-    const conversion = convertNotesLocationSnapshot(resolution.observedRuleSnapshot, runtimeScopeId);
+    const conversion = convertForbiddenRootSnapshot(snapshotJson, runtimeScopeId, genericCeiling);
     if (!conversion.admitted) {
-      err(`snapshot is not a supported notes-location rule (${conversion.reason}): ${conversion.detail}`);
-      return 1;
+      err(`cannot author forbidden-root rule (${conversion.reason}): ${conversion.detail}`);
+      return 2;
     }
     payload = conversion.payload;
-  } finally {
-    closeCe0Store(store);
+  } else {
+    // Observed path: resolve the recorded snapshot from the local CE0 ledger, then convert. With NO
+    // --ceiling this is the notes-location DENY pilot (pinned to the "notes" root, EARNED DENY); with
+    // --ceiling it is the generic forbidden-root family at the requested (non-blocking) rung.
+    const dbPath = deps.storePath ?? defaultCe0StorePath();
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    const open = deps.openStore ?? openCe0Store;
+    const store = open(dbPath);
+    try {
+      const resolution = resolveObservedSnapshotInScope(store, runtimeScopeId, observedRuleHash as string);
+      if (resolution.kind === "NOT_FOUND") {
+        err(
+          `no observed rule with hash ${observedRuleHash} in runtime scope ${runtimeScopeId}: ` +
+            "not found, nothing to attest",
+        );
+        return 1;
+      }
+      if (resolution.kind === "COLLISION") {
+        err(
+          `observed hash ${observedRuleHash} is a collision in scope ${runtimeScopeId}: ` +
+            `${resolution.distinctSnapshotCount} distinct snapshots share it; refusing to attest`,
+        );
+        return 1;
+      }
+      const conversion =
+        requestedCeiling !== undefined
+          ? convertForbiddenRootSnapshot(resolution.observedRuleSnapshot, runtimeScopeId, genericCeiling)
+          : convertNotesLocationSnapshot(resolution.observedRuleSnapshot, runtimeScopeId);
+      if (!conversion.admitted) {
+        const what = requestedCeiling !== undefined ? "a forbidden-root rule" : "a supported notes-location rule";
+        err(`snapshot is not ${what} (${conversion.reason}): ${conversion.detail}`);
+        return 1;
+      }
+      payload = conversion.payload;
+      notesPilot = requestedCeiling === undefined;
+    } finally {
+      closeCe0Store(store);
+    }
   }
 
   const canonicalPayloadHash = ruleVersionHash(payload);
+
+  // Read the armed authority + root back off the frozen payload, so the display is always accurate
+  // regardless of which converter ran.
+  const ceiling = payload.enforcementCeiling;
+  const forbiddenRootLabel = payload.compliance.config.forbiddenRootRelativePath;
+  const ruleLabel = notesPilot ? NOTES_LOCATION_RULE_ID : `forbidden-root:${forbiddenRootLabel}`;
 
   const audienceNote =
     authorityScope === "TEAM"
@@ -972,13 +1204,9 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
       : "This is a PERSONAL rule: once LIVE it enforces only for you.";
   const identityLabel =
     authorityScope === "TEAM" ? `author ${operator.userId}` : `owner ${operator.userId}`;
+  out(ceilingArmingNote(ceiling, scopeLabel, audienceNote));
   out(
-    `note: enforcementCeiling is DENY. Once this ${scopeLabel} rule is LIVE in the bundle and the ` +
-      "deny-admission gates pass, a VIOLATION is denied on the wire; otherwise it degrades to ASK. " +
-      audienceNote,
-  );
-  out(
-    `rule:  ${NOTES_LOCATION_RULE_ID} (${scopeLabel}, ${identityLabel})\n` +
+    `rule:  ${ruleLabel} (${scopeLabel}, ${identityLabel})\n` +
       `scope: ${runtimeScopeId}\nhash:  ${canonicalPayloadHash}\ntext:  ${payload.text}`,
   );
 
@@ -993,7 +1221,8 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
     }
     const confirm = deps.confirm ?? defaultConfirm;
     const ok = await confirm(
-      `Attest this notes-location DENY rule as a ${scopeLabel} rule (runtime scope ${runtimeScopeId})?`,
+      `Attest this ${ceiling} forbidden-root rule for "${forbiddenRootLabel}/" as a ${scopeLabel} rule ` +
+        `(runtime scope ${runtimeScopeId})?`,
     );
     if (!ok) {
       err("attestation not confirmed; nothing minted");
@@ -1016,7 +1245,9 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
       },
       deps.http,
     );
-    out(`MINTED rule ${node.id} version ${node.currentVersionId} (${canonicalPayloadHash}) ${scopeLabel}`);
+    out(
+      `MINTED rule ${node.id} version ${node.currentVersionId} (${canonicalPayloadHash}) ${scopeLabel} ${ceiling}`,
+    );
     return 0;
   } catch (e) {
     if (isOffline(e)) {
@@ -1210,6 +1441,201 @@ export async function runRulesDemoteBackend(argv: string[], deps: RulesDemoteBac
   }
 
   out(`DEMOTED rule ${nodeId} (TEAM, revoked) -> ${personal.id} (PERSONAL, owner ${operator.userId})`);
+  return 0;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// promote (PERSONAL -> TEAM)
+// ───────────────────────────────────────────────────────────────────────────
+
+export interface RulesPromoteBackendDeps {
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
+  http?: RuleClientHttp;
+  resolveOperator?: () => BackendOperator | null;
+  isInteractive?: () => boolean;
+  confirm?: (prompt: string) => boolean | Promise<boolean>;
+  out?: (line: string) => void;
+  err?: (line: string) => void;
+}
+
+/**
+ * `mla rules promote <nodeId>`: raise a PERSONAL rule to TEAM so it enforces for the whole
+ * workspace instead of the owning human alone. The exact inverse of `demote`, and the operator-facing
+ * complement to the PERSONAL-default `add`.
+ *
+ * A node's authorityScope is IMMUTABLE (rules.service.ts: edit only mints a new payload version,
+ * revoke only flips lifecycle; nothing rewrites authorityScopeId). So promote is not an in-place scope
+ * bump: it is a MOVE. Mint a TEAM copy (ownerUserId null) carrying the PERSONAL node's exact live
+ * payload, then revoke the PERSONAL node. The new node gets a fresh id; the audit trail is preserved
+ * because the team version records the operator as attestedByUserId (server-stamped, never null). Order
+ * is mint-first, revoke-second: if the mint fails the PERSONAL rule is untouched; if the revoke fails
+ * the operator is told the promotion is half-done and how to finish it, so the failure mode is "the
+ * rule enforces for MORE people than intended plus a redundant personal copy" (recoverable), never "the
+ * rule silently stops enforcing".
+ *
+ * AUTHORIZATION: a PERSONAL rule is owner-private (personalAclWhere hides it from everyone but the
+ * owner), so only the owner can even read it here; a non-owner's promote 404s at the getRule step.
+ * The explicit owner guard below is defense in depth with a clear message.
+ */
+export async function runRulesPromoteBackend(argv: string[], deps: RulesPromoteBackendDeps = {}): Promise<number> {
+  const out = deps.out ?? ((l: string) => console.log(l));
+  const err = deps.err ?? ((l: string) => console.error(l));
+
+  // Pull `--workspace <id>` out FIRST so it is never mistaken for the nodeId, then thread it into
+  // loadWorkspaceConfig so the promote targets the named workspace (BUG-3/BUG-4).
+  const { workspace, rest, danglingFlag } = extractWorkspaceOverride(argv);
+  if (danglingFlag) {
+    err(`${danglingFlag} needs a value\n${RULES_PROMOTE_BACKEND_USAGE}`);
+    return 2;
+  }
+  const nodeId = firstPositional(rest);
+  if (!nodeId) {
+    err(RULES_PROMOTE_BACKEND_USAGE);
+    return 2;
+  }
+  const yes = rest.includes("--yes");
+
+  const resolveOperator = deps.resolveOperator ?? defaultResolveOperator;
+  const operator = resolveOperator();
+  if (!operator) {
+    err("refusing to promote: promoting a binding rule requires an authenticated human (run `mla login`)");
+    return 1;
+  }
+
+  let cfg: WorkspaceCliConfig;
+  try {
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspace);
+  } catch (e) {
+    err(`rules promote: ${(e as Error).message}`);
+    return 2;
+  }
+
+  let node: RuleNodeView;
+  try {
+    node = await getRule(cfg, nodeId, deps.http);
+  } catch (e) {
+    if (httpStatus(e) === 404) {
+      err(`no rule ${nodeId} is visible in this workspace`);
+      return 1;
+    }
+    if (isOffline(e)) {
+      err("rules promote failed: backend unreachable; nothing changed");
+      return 1;
+    }
+    return reportRulesBackendError(e, "rules promote failed", err);
+  }
+
+  if (lifecycleOf(node) === "REVOKED") {
+    err(`rule ${nodeId} is revoked; there is nothing to promote`);
+    return 1;
+  }
+  if (node.authorityScopeId !== "PERSONAL") {
+    err(
+      `rule ${nodeId} is ${node.authorityScopeId}, not a PERSONAL rule; ` +
+        "promote only raises a PERSONAL rule to TEAM",
+    );
+    return 1;
+  }
+  if (node.ownerUserId && node.ownerUserId !== operator.userId) {
+    err(
+      `rule ${nodeId} is owned by ${node.ownerUserId}, not you; ` +
+        "you can only promote your own personal rule",
+    );
+    return 1;
+  }
+  if (!node.currentVersionId || !node.currentVersion) {
+    err(`rule ${nodeId} has no live version to promote`);
+    return 1;
+  }
+
+  // Copy the PERSONAL node's live payload verbatim into the new TEAM node: RulePayloadV1 carries no
+  // authorityScope/ownerUserId (those are node-level mint args), so it is "the same rule, wider
+  // audience". The idempotency key is the payload hash, recorded on the version for forensics.
+  const payload = node.currentVersion.payload as Record<string, unknown>;
+  const requestIdempotencyKey = ruleVersionHash(payload as unknown as RulePayloadV1);
+
+  out(
+    `promote: PERSONAL rule ${nodeId} -> a TEAM copy (owned by no one).\n` +
+      `text:  ${payloadText(node)}\n` +
+      "after: it enforces for the whole workspace; your personal rule is revoked. The audit trail is preserved.",
+  );
+
+  if (!yes) {
+    const isInteractive = deps.isInteractive ?? defaultIsInteractive;
+    if (!isInteractive()) {
+      err("refusing to promote non-interactively without --yes (it enforces the rule workspace-wide)");
+      return 1;
+    }
+    const confirm = deps.confirm ?? defaultConfirm;
+    const ok = await confirm(
+      `Promote rule ${nodeId} from PERSONAL to TEAM (it will then enforce for the whole workspace)?`,
+    );
+    if (!ok) {
+      err("promote not confirmed; nothing changed");
+      return 1;
+    }
+  }
+
+  // Step 1: mint the TEAM copy. If this fails the PERSONAL rule is untouched (still enforcing for you).
+  let team: RuleNodeView;
+  try {
+    team = await mintRule(
+      cfg,
+      {
+        workspaceId: cfg.workspaceId,
+        authorityScope: "TEAM",
+        ownerUserId: null,
+        projectId: node.projectId,
+        payload,
+        // Store the CLI hash verbatim so the read-path re-hash agrees (see runRulesAddBackend).
+        canonicalPayloadHash: requestIdempotencyKey,
+        requestIdempotencyKey,
+      },
+      deps.http,
+    );
+  } catch (e) {
+    // A membership 403 at the mint step means the copy was never created, so the
+    // PERSONAL rule is still untouched: route to the canonical line (BUG-5) but keep
+    // that reassurance instead of a raw wire dump.
+    if (isWorkspaceAccessDenied(e)) {
+      err(`${workspaceAccessDeniedMessage(e)} (your personal rule is untouched)`);
+      return 1;
+    }
+    if (isOffline(e)) {
+      err("rules promote failed: backend unreachable; nothing changed (your personal rule is untouched)");
+      return 1;
+    }
+    err(`rules promote failed while minting the team copy: ${(e as Error).message}; your personal rule is untouched`);
+    return 1;
+  }
+
+  // Step 2: revoke the PERSONAL node (compare-and-swap on the version we read). If this fails the
+  // promotion is half-done: the TEAM copy exists AND the PERSONAL rule still enforces for you. The net
+  // is over-enforcement (the whole team, which includes you, plus a redundant personal copy), which is
+  // safe; tell the operator exactly how to remove the leftover, rather than leave them to find it.
+  try {
+    await revokeRule(
+      cfg,
+      nodeId,
+      { workspaceId: cfg.workspaceId, expectedCurrentVersionId: node.currentVersionId },
+      deps.http,
+    );
+  } catch (e) {
+    const why =
+      httpStatus(e) === 409
+        ? "it changed since read (a concurrent edit won the compare-and-swap)"
+        : isOffline(e)
+          ? "the backend became unreachable"
+          : (e as Error).message;
+    err(
+      `promote is half-done: TEAM rule ${team.id} was minted (it now enforces workspace-wide), but the ` +
+        `PERSONAL rule ${nodeId} was NOT revoked (${why}); it is STILL ACTIVE as a redundant copy for you. ` +
+        `Run \`mla rules revoke ${nodeId}\` to finish the promotion.`,
+    );
+    return 1;
+  }
+
+  out(`PROMOTED rule ${nodeId} (PERSONAL, revoked) -> ${team.id} (TEAM)`);
   return 0;
 }
 

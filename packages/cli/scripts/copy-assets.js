@@ -30,4 +30,34 @@ for (const asset of ASSETS) {
   total += fs.readdirSync(dst).length;
   console.log(`copy-assets: ${asset.from} -> dist/${asset.to}`);
 }
+
+// Embed the better-sqlite3 native addon so the pkg single-file binary can load
+// SQLite. pkg cannot dlopen a `.node` out of its read-only /snapshot VFS, so we
+// ship the addon as a pkg asset (package.json "pkg.assets": dist/native/**) and
+// materialize it to a real temp file at runtime (src/lib/rules/native-binding.ts).
+// Resolve the addon from the RESOLVED better-sqlite3 install (survives pnpm
+// version bumps) and copy the build-host's ABI-correct binary. Each release
+// target builds on its own native runner, so this is always the right ABI.
+// build/Release is better-sqlite3's canonical output; build/ (older prebuild
+// layouts) is the fallback.
+const bsqlitePkg = path.dirname(require.resolve("better-sqlite3/package.json"));
+const nativeCandidates = [
+  path.join(bsqlitePkg, "build", "Release", "better_sqlite3.node"),
+  path.join(bsqlitePkg, "build", "better_sqlite3.node"),
+];
+const nativeSrc = nativeCandidates.find((p) => fs.existsSync(p));
+if (!nativeSrc) {
+  throw new Error(
+    `copy-assets: better_sqlite3.node not found (looked in ${nativeCandidates.join(
+      ", ",
+    )}). Run pnpm install so the addon builds before packaging.`,
+  );
+}
+const nativeDstDir = path.join(distRoot, "native");
+fs.rmSync(nativeDstDir, { recursive: true, force: true });
+fs.mkdirSync(nativeDstDir, { recursive: true });
+fs.copyFileSync(nativeSrc, path.join(nativeDstDir, "better_sqlite3.node"));
+total += 1;
+console.log(`copy-assets: ${path.relative(pkgRoot, nativeSrc)} -> dist/native/better_sqlite3.node`);
+
 console.log(`copy-assets: ${total} file(s) copied`);

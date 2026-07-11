@@ -78,6 +78,7 @@ import {
   maybeSpawnBackgroundCheck,
   maybeShowUpdateNag,
   runInternalUpdateCheck,
+  staleCommandHint,
 } from "./lib/update-notifier";
 import { runUpgrade, maybePromoteStagedAndReExec } from "./lib/upgrade-apply";
 import { maybeResyncHooks, maybeHealMcpCommand } from "./lib/wire";
@@ -115,6 +116,7 @@ import {
   runRulesRevokeBackend,
   runRulesAttestBackend,
   runRulesDemoteBackend,
+  runRulesPromoteBackend,
   runRulesRemoveBackend,
 } from "./commands/rules-backend";
 
@@ -311,33 +313,34 @@ usage:
                      relationship axis its own home so it stops hiding under the
                      storage noun \`kb\`. Document ingestion + grounding (posture)
                      stay under \`mla kb\`; doc verbs typed here redirect there.)
-  mla rules add "<statement>" [--must] [--scope <glob>]... [--source <s>]...
+  mla rules add "<statement>" [--personal|--team] [--must] [--applies-to <glob>]... [--source <s>]...
                     (add an operator-dictated durable CONVENTION to the backend rule
                      store (the workspace source of truth), injected into every agent
-                     prompt via the local scan cache. SHOULD_FOLLOW by default; --must
-                     escalates to MUST_FOLLOW; no --scope is repository-wide. Born
-                     human_attested and idempotent by content. Lands server-side at once;
-                     run \`mla scan\` to refresh this repo's cache so the new rule is
-                     injected. Soft authoring-rule writer, distinct from the CE0 verbs
-                     below.)
+                     prompt via the local scan cache; run \`mla scan\` to refresh this
+                     repo's cache after minting. PERSONAL by default (enforces for you
+                     alone; promote it later to share); --team enforces workspace-wide
+                     (asks you to confirm). SHOULD_FOLLOW by default; --must escalates to
+                     MUST_FOLLOW; no --applies-to is repository-wide (alias: --scope).
+                     Soft authoring-rule writer, distinct from the CE0 verbs below.)
   mla rules remove (<ruleId> | "<statement>" [--scope <glob>]...)
                     (unsupported with the backend rule store: \`.meetless/rules.md\` is a
                      read projection, not an authority, so there is nothing local to
                      delete. Disarm a backend convention with \`mla rules revoke
                      <nodeId>\`, the CE0 kill switch.)
-  mla rules <list|activity|attest|revoke|demote|publish>
+  mla rules <list|activity|attest|revoke|demote|promote|publish>
                     (\`list\` shows BOTH stores: the managed conventions above and the
-                     CE0 enforcement rules observed in this scope, labeled distinctly.
+                     CE0 enforcement rules observed in this scope, labeled distinctly;
+                     each row states its plane ([PERSONAL owner:<id>] vs [TEAM]).
                      \`activity\` is the per-rule accountability (observed / violated /
                      denied); \`attest\` mints a LIVE notes-location rule from an
                      observed snapshot (--scope team enforces workspace-wide,
                      default personal enforces for you alone); \`revoke\` disarms
                      one (fail-open); \`demote\` lowers a TEAM rule to a PERSONAL copy
-                     (mints the copy owned by you, then revokes the team rule, so it
-                     enforces for you alone); \`publish\`
+                     (enforces for you alone) and \`promote\` raises a PERSONAL rule to a
+                     TEAM copy (enforces workspace-wide), both mint-then-revoke; \`publish\`
                      projects the attested set to the console Rules page. attest /
-                     revoke / demote / publish are action-level DENY ceilings, NOT soft
-                     authoring conventions; those are added via \`mla rules add\`.)
+                     revoke / demote / promote / publish are action-level DENY ceilings,
+                     NOT soft authoring conventions; those are added via \`mla rules add\`.)
   mla enrich <plan|brief|ingest|materialize>
                     (agent-orchestrated onboarding enrichment, usually driven by the
                      /mla onboard skill: \`plan\` scans the repo into an immutable run
@@ -570,11 +573,12 @@ export async function dispatch(argv: string[]): Promise<number> {
     }
     case "rules": {
       // The rules verbs operate on the unified backend Rule API (rules-store-unification). `add` mints a
-      // TEAM RuleNode, `edit` mints the next version carrying expectedCurrentVersionId, `revoke` is the
+      // RuleNode (PERSONAL by default, `--team` for workspace-wide), `edit` mints the next version
+      // carrying expectedCurrentVersionId, `revoke` is the
       // compare-and-swap kill switch that disarms a LIVE rule, `attest` keeps the LOCAL observed-snapshot
       // resolution but mints the DENY rule to the backend (fork #7), `demote` lowers a TEAM rule to a
-      // PERSONAL copy (mint-owned-by-operator then revoke the team node, since authorityScope is
-      // node-immutable), `list` reads the backend (matching
+      // PERSONAL copy and `promote` raises a PERSONAL rule to a TEAM copy (both mint-then-revoke, since
+      // authorityScope is node-immutable), `list` reads the backend (matching
       // the console) and falls back to the principal bundle offline, and `remove` is unsupported
       // (`.meetless/rules.md` is no longer an authority). `activity` is the R2-LOCAL accountability
       // projection (per LIVE rule: observed N, violated M, denied; proposal §2.6 / §3.7), `publish` is the
@@ -589,6 +593,7 @@ export async function dispatch(argv: string[]): Promise<number> {
       if (sub === "attest") return runRulesAttestBackend(rest);
       if (sub === "revoke") return runRulesRevokeBackend(rest);
       if (sub === "demote") return runRulesDemoteBackend(rest);
+      if (sub === "promote") return runRulesPromoteBackend(rest);
       if (sub === "publish") return runRulesPublish(rest);
       if (sub === "import") return runRulesImport(rest);
       console.error(`Unknown rules subcommand: ${sub ?? "(none)"}\n\n${USAGE}`);
@@ -776,7 +781,7 @@ export async function dispatch(argv: string[]): Promise<number> {
       return 2;
     }
     default:
-      console.error(`Unknown command: ${cmd}\n\n${USAGE}`);
+      console.error(`Unknown command: ${cmd}\n\n${USAGE}${staleCommandHint()}`);
       return 2;
   }
 }

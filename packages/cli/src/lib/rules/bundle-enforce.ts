@@ -28,7 +28,7 @@
 
 import type { BundleCacheRead } from "./bundle-cache";
 import type { RuleBundleEntry } from "./control-rule-client";
-import { projectEligibleEnforcement } from "./deny-admission";
+import { type EligibleEnforcement, projectEligibleEnforcement } from "./deny-admission";
 import type { EvaluationTarget } from "./evaluation-input-hash";
 import { selectRule, type ToolCall } from "./evaluator";
 import { classifyRuntimeTarget } from "./notes-path";
@@ -56,6 +56,12 @@ export type BundleEnforceDecision =
       ruleText: string;
     }
   | { kind: "ASK"; reason: string; ruleNodeId: string; ruleVersionId: string; degraded: boolean }
+  // The non-blocking middle rung (INV-8). One or more VIOLATIONs whose attested ceiling is WARN, with
+  // no DENY or ASK outranking them. `reason` is the already-aggregated, cap-honored advisory body the
+  // hook renders as model-facing additionalContext (never a permissionDecision); `count` is how many
+  // rules warned (>= the number of reasons shown, since the cap may have suppressed some) so the render
+  // and any future telemetry can note suppression honestly.
+  | { kind: "WARN"; reason: string; count: number }
   | { kind: "UNAVAILABLE"; reason: string }
   | { kind: "PASS" };
 
@@ -68,6 +74,14 @@ export interface BundleEnforceInput {
   runtimeProjectRoot: string;
   /** Runtime-scope path classifier; defaults to the real filesystem canonicalizer. Injected in tests. */
   classifyRuntime?: (rawFilePath: unknown, runtimeProjectRoot: string) => Promise<EvaluationTarget>;
+  /**
+   * The session's ceiling cap (the `MEETLESS_ACTION_INTERCEPT_MAX` kill switch). Every rule's eligible
+   * enforcement is clamped to at most this rung, so a `WARN`-capped session can never ASK or DENY and an
+   * `ASK`-capped session can never DENY. Defaults to `DENY` (uncapped). Headless callers set `WARN`
+   * because `ask` is undefined/aborts without a TTY: capping to WARN turns every would-be block into a
+   * non-blocking advisory instead of aborting the run.
+   */
+  maxEnforcement?: EligibleEnforcement;
 }
 
 /** The "no usable bundle" copy the runtime surfaces when it holds no rules (§6.3, acceptance 15). */
@@ -108,10 +122,45 @@ function buildAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: 
   return `Meetless rule ${entry.ruleNodeId} asks you to confirm writing ${where} under the "${forbidden}/" root. ${payload.text}`;
 }
 
-/** Per-entry resolution: DENY (fresh block), ASK (stale-degraded or native ask), or null (not selected). */
+/** The non-blocking WARN reason: a VIOLATION whose attested ceiling is WARN. Advises but never gates,
+ * so the copy names the concern and leaves the correction to the agent (INV-8: no false-positive block). */
+function buildWarnReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
+  const where = describeTarget(target);
+  const forbidden = payload.compliance.config.forbiddenRootRelativePath;
+  return `Meetless rule ${entry.ruleNodeId}: writing ${where} under the "${forbidden}/" root is discouraged. ${payload.text}`;
+}
+
+// The authority ladder as an ordinal so eligibility can be clamped to the session ceiling cap. The
+// order is load-bearing (OBSERVE < WARN < ASK < DENY, deny-admission.ts): clamping to a lower rung is
+// exactly "never escalate past this authority", the semantics the MEETLESS_ACTION_INTERCEPT_MAX kill
+// switch promises.
+const ENFORCEMENT_RANK: Record<EligibleEnforcement, number> = { OBSERVE: 0, WARN: 1, ASK: 2, DENY: 3 };
+
+/** Clamp an eligible enforcement to at most `max`. A DENY under a WARN cap becomes WARN; an ASK under a
+ * WARN cap becomes WARN; nothing is ever escalated. `max` defaults to DENY (uncapped) at the call site. */
+function clampEnforcement(eligible: EligibleEnforcement, max: EligibleEnforcement): EligibleEnforcement {
+  return ENFORCEMENT_RANK[eligible] <= ENFORCEMENT_RANK[max] ? eligible : max;
+}
+
+/** No-spam cap on how many distinct WARN reasons are surfaced in one aggregated advisory. Beyond this,
+ * the surplus is summarized ("(and N more ...)") rather than dumped, so a bundle with many WARN rules
+ * cannot flood a single tool call. */
+export const WARN_AGGREGATE_CAP = 3;
+
+/** Aggregate the collected WARN reasons into one advisory body, honoring the no-spam cap. */
+function aggregateWarnReasons(reasons: string[]): string {
+  if (reasons.length <= WARN_AGGREGATE_CAP) return reasons.join("\n\n");
+  const shown = reasons.slice(0, WARN_AGGREGATE_CAP);
+  const suppressed = reasons.length - WARN_AGGREGATE_CAP;
+  return `${shown.join("\n\n")}\n\n(and ${suppressed} more governed-rule warning(s) on this action)`;
+}
+
+/** Per-entry resolution: DENY (fresh block), ASK (stale-degraded or native ask), WARN (non-blocking
+ * advisory), or null (not selected). */
 type EntryDecision =
   | { kind: "DENY"; reason: string; targetPath: string | null; ruleText: string }
   | { kind: "ASK"; reason: string; degraded: boolean }
+  | { kind: "WARN"; reason: string }
   | null;
 
 /**
@@ -126,6 +175,7 @@ async function evaluateEntry(
   runtimeProjectRoot: string,
   classify: (rawFilePath: unknown, runtimeProjectRoot: string) => Promise<EvaluationTarget>,
   stale: boolean,
+  maxEnforcement: EligibleEnforcement,
 ): Promise<EntryDecision> {
   // A surviving bundle entry already passed re-hashing, so its payload is a structurally valid
   // RulePayloadV1; narrow defensively anyway so a malformed entry degrades to "not selected", never throws.
@@ -142,8 +192,15 @@ async function evaluateEntry(
 
   const target = await classify(call.toolInput[app.matcher.field], runtimeProjectRoot);
   const verdict = versionBackedVerdict(payload, target);
-  const eligible = projectEligibleEnforcement(verdict.result, payload.enforcementCeiling);
+  // Clamp the attested ceiling to the session cap BEFORE branching, so a WARN-capped session never
+  // reaches the DENY/ASK arms (a would-be block becomes the non-blocking advisory instead) and an
+  // ASK-capped session never reaches DENY. The clamp only ever lowers, never escalates.
+  const eligible = clampEnforcement(projectEligibleEnforcement(verdict.result, payload.enforcementCeiling), maxEnforcement);
   if (eligible === "OBSERVE") return null;
+  if (eligible === "WARN") {
+    // Non-blocking (INV-8): a WARN never degrades and never blocks, so bundle freshness is irrelevant.
+    return { kind: "WARN", reason: buildWarnReason(entry, payload, target) };
+  }
   if (eligible === "DENY") {
     return stale
       ? { kind: "ASK", reason: buildDegradedAskReason(entry, payload, target), degraded: true }
@@ -176,13 +233,17 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
 
   const stale = read.status === "stale";
   const classify = input.classifyRuntime ?? classifyRuntimeTarget;
+  // The session ceiling cap (MEETLESS_ACTION_INTERCEPT_MAX). Absent => DENY (uncapped): the pure kernel
+  // stays uncapped by default; the IO shell reads the env var and passes WARN for headless callers.
+  const maxEnforcement = input.maxEnforcement ?? "DENY";
   const entries = [...read.bundle.rules].sort((a, b) => (a.ruleNodeId < b.ruleNodeId ? -1 : a.ruleNodeId > b.ruleNodeId ? 1 : 0));
 
   let ask: { reason: string; ruleNodeId: string; ruleVersionId: string; degraded: boolean } | null = null;
+  const warns: string[] = [];
   for (const entry of entries) {
     let decided: EntryDecision;
     try {
-      decided = await evaluateEntry(entry, input.call, input.runtimeProjectRoot, classify, stale);
+      decided = await evaluateEntry(entry, input.call, input.runtimeProjectRoot, classify, stale, maxEnforcement);
     } catch {
       // One unparseable / faulty entry must never block the hook nor mask the rest of the bundle.
       continue;
@@ -198,12 +259,21 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
         ruleText: decided.ruleText,
       };
     }
+    if (decided.kind === "WARN") {
+      // WARN outranks nothing: collect ALL of them (in ruleNodeId order) so they aggregate into one
+      // advisory. DENY/ASK, if any also selected, still win below.
+      warns.push(decided.reason);
+      continue;
+    }
     if (ask === null) {
       ask = { reason: decided.reason, ruleNodeId: entry.ruleNodeId, ruleVersionId: entry.ruleVersionId, degraded: decided.degraded };
     }
   }
   if (ask !== null) {
     return { kind: "ASK", reason: ask.reason, ruleNodeId: ask.ruleNodeId, ruleVersionId: ask.ruleVersionId, degraded: ask.degraded };
+  }
+  if (warns.length > 0) {
+    return { kind: "WARN", reason: aggregateWarnReasons(warns), count: warns.length };
   }
   return { kind: "PASS" };
 }

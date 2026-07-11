@@ -22,6 +22,7 @@ import * as path from "path";
 import Database from "better-sqlite3";
 
 import { HOME } from "../config";
+import { betterSqlite3NativeBinding } from "./native-binding";
 import { samplingBucketFor } from "./ce0-sampling-bucket";
 import { INTERCEPTION_SCHEMA } from "./interception-schema";
 import type {
@@ -296,7 +297,11 @@ export class Ce0StoreSchemaVersionError extends Error {
  * CREATE TABLE IF NOT EXISTS bootstrap cannot reshape its existing tables). Refusing loudly here turns a
  * silent, fail-soft-swallowed write failure into a detectable one. */
 export function openCe0Store(dbPath: string): Ce0Store {
-  const db = new Database(dbPath);
+  // In a pkg binary the native addon lives in the read-only /snapshot VFS where
+  // dlopen fails; nativeBinding points better-sqlite3 at a real extracted copy.
+  // Outside pkg this is undefined and resolution is unchanged. See native-binding.ts.
+  const nativeBinding = betterSqlite3NativeBinding();
+  const db = new Database(dbPath, nativeBinding ? { nativeBinding } : {});
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 50");

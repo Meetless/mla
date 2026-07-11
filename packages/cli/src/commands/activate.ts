@@ -14,13 +14,21 @@ import {
   CliConfig,
   configExists,
   HOOKS_DIR,
+  loadWorkspaceConfig,
   QUEUE_DIR,
   readConfig,
   SESSION_GATE_DIR,
+  type WorkspaceCliConfig,
 } from "../lib/config";
 import { backfillSessionPrompts } from "../lib/transcript-prompts";
 import { runLogin } from "./login";
 import { get, HttpError, post } from "../lib/http";
+import {
+  deactivationPreflight,
+  deactivateWorkspace,
+  type DeactivationPreflightResult,
+  type DeactivateWorkspaceResult,
+} from "../lib/control-workspace-lifecycle-client";
 import {
   renderActivationCard,
   renderBootstrapSummary,
@@ -1010,6 +1018,10 @@ interface DeactivateFlags {
   yes?: boolean;
   fromRoot?: boolean;
   marker?: string;
+  // Two-verbs model (design §2/§3): E1 (unbind this folder) vs E2 (retire the
+  // Workspace). These flags override the interactive prompt selection for E2.
+  keepWorkspace?: boolean; // never retire; unbind locally only (sole-owner escape hatch)
+  deactivateWorkspace?: boolean; // force retire (E2), still server-gated OWNER/ADMIN
 }
 
 function parseDeactivateArgs(argv: string[]): DeactivateFlags {
@@ -1032,8 +1044,23 @@ function parseDeactivateArgs(argv: string[]): DeactivateFlags {
       out.fromRoot = true;
       continue;
     }
+    if (a === "--keep-workspace") {
+      out.keepWorkspace = true;
+      continue;
+    }
+    if (a === "--deactivate-workspace") {
+      out.deactivateWorkspace = true;
+      continue;
+    }
     throw new Error(
-      `Unknown argument: ${a}. \`mla deactivate\` accepts --yes, --from-root, --marker <path>.`,
+      `Unknown argument: ${a}. \`mla deactivate\` accepts --yes, --from-root, ` +
+        `--marker <path>, --keep-workspace, --deactivate-workspace.`,
+    );
+  }
+  if (out.keepWorkspace && out.deactivateWorkspace) {
+    throw new Error(
+      "`--keep-workspace` and `--deactivate-workspace` are contradictory: the " +
+        "first forbids retiring the workspace, the second forces it.",
     );
   }
   return out;
@@ -1138,11 +1165,56 @@ export async function maybeOfferLogin(
   console.log("");
 }
 
-// `mla deactivate` (workspace-binding removal, folder = workspace T2.2).
+// OWNER/ADMIN are the only roles allowed to retire a workspace (E2). Anything
+// else (MEMBER, or a null role when the actor could not be resolved) is E1-only.
+function isOwnerAdmin(role: string | null | undefined): boolean {
+  return role === "OWNER" || role === "ADMIN";
+}
+
+// Prefer control's human-readable `message` over the raw HttpError.message when
+// the retire (E2) call fails. Mirrors workspace.ts:serverMessage; kept local so
+// activate.ts does not depend on the workspace command module.
+function retireErrorMessage(e: unknown): string {
+  const err = e as HttpError;
+  if (err && typeof err.body === "string" && err.body) {
+    try {
+      const parsed = JSON.parse(err.body) as { message?: unknown };
+      if (typeof parsed.message === "string" && parsed.message) {
+        return err.status
+          ? `${parsed.message} (HTTP ${err.status})`
+          : parsed.message;
+      }
+    } catch {
+      // non-JSON body: fall through to the raw error message
+    }
+  }
+  return (e as Error).message;
+}
+
+// Injectable seams so the E2 (retire) matrix is unit-testable with no network,
+// no on-disk config, and no TTY. Every default resolves to the real production
+// path, so `runDeactivate(argv)` with no deps behaves exactly as before for E1.
+export interface DeactivateDeps {
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
+  preflight?: (
+    cfg: WorkspaceCliConfig,
+  ) => Promise<DeactivationPreflightResult>;
+  retire?: (cfg: WorkspaceCliConfig) => Promise<DeactivateWorkspaceResult>;
+  confirm?: (question: string, defaultYes: boolean) => Promise<boolean>;
+  isTTY?: () => boolean;
+}
+
+// `mla deactivate` (workspace-binding removal + reversible workspace retire,
+// folder = workspace T2.2; two-verbs model, design
+// notes/20260710-mla-workspace-deactivate-retired-state.md).
 //
-// Removes the nearest `.meetless.json`, unbinding this folder from its
-// workspace (future sessions under it stop capturing). This is NOT a per-session
-// off switch any more; that is `mla mute`.
+// Two independent effects, gated differently:
+//   E1 (unbind this folder): remove the nearest `.meetless.json` + floor
+//      projection. Local, offline-safe, allowed to anyone, unchanged.
+//   E2 (retire the workspace): set Workspace.retiredAt so the switcher demotes
+//      it. Backend, OWNER/ADMIN-gated, best-effort. Driven by a preflight that
+//      selects the prompt (sole-owner default-YES = retire+unbind; multi-member
+//      default-NO = unbind unless opted in; member = unbind only).
 //
 // Guards (INV-DEACTIVATE-1 + nested-dir safety):
 //   - Confirms before deleting; `--yes` skips the prompt. In a non-interactive
@@ -1151,7 +1223,12 @@ export async function maybeOfferLogin(
 //     a plain run refuses: removing it would unbind the whole subtree. The user
 //     opts in with `--from-root` (remove the resolved ancestor) or
 //     `--marker <path>` (target a specific marker explicitly).
-export async function runDeactivate(argv: string[]): Promise<number> {
+//   - E2 is SKIPPED for a `--marker` target (explicit foreign path = local
+//     intent only) and for `--keep-workspace`; forced by `--deactivate-workspace`.
+export async function runDeactivate(
+  argv: string[],
+  deps: DeactivateDeps = {},
+): Promise<number> {
   let flags: DeactivateFlags;
   try {
     flags = parseDeactivateArgs(argv);
@@ -1239,18 +1316,160 @@ export async function runDeactivate(argv: string[]): Promise<number> {
   console.log("just suppresses this session; that is `mla mute`).");
   console.log("");
 
-  if (!flags.yes) {
-    if (!process.stdin.isTTY) {
+  const confirm = deps.confirm ?? promptYesNo;
+  const isTTY = deps.isTTY ? deps.isTTY() : Boolean(process.stdin.isTTY);
+
+  // ── E2 decision: retire the workspace (global, OWNER/ADMIN-gated, §3 matrix) ──
+  // Best-effort and additive to E1: any config/preflight failure (offline, signed
+  // out, not a member) falls back to E1-only with a note, so an unbind never hangs
+  // or aborts on the backend. Skipped entirely for a `--marker` target (explicit
+  // foreign path = local intent) and for `--keep-workspace`.
+  let cfg: WorkspaceCliConfig | null = null;
+  let retire = false; // POST /deactivate before unbinding?
+  let combinedConfirmDone = false; // sole-owner default-YES already authorized E1
+  type Branch = "skip" | "member" | "sole" | "multi";
+  let branch: Branch = "skip";
+  let others = 0;
+
+  const e2Eligible =
+    !flags.marker && !flags.keepWorkspace && Boolean(workspaceId);
+  if (flags.keepWorkspace && workspaceId && !flags.marker) {
+    console.log(
+      "--keep-workspace: unbinding this folder only; the workspace stays active.",
+    );
+    console.log("");
+  }
+
+  if (e2Eligible) {
+    try {
+      cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspaceId);
+    } catch {
+      cfg = null; // no readable/authenticated config => cannot reach control
+    }
+    let preflight: DeactivationPreflightResult | null = null;
+    if (cfg) {
+      try {
+        preflight = await (deps.preflight ?? deactivationPreflight)(cfg);
+      } catch {
+        preflight = null; // control unreachable / not a member => E1-only
+      }
+    }
+
+    if (!preflight) {
+      console.log(
+        "Could not check the workspace with control (offline or signed out); " +
+          "unbinding this folder only. Retire it later from the Console or " +
+          "`mla deactivate` once you're back online.",
+      );
+      console.log("");
+      branch = "skip";
+    } else if (preflight.retiredAt) {
+      console.log(
+        `Workspace ${workspaceId} is already deactivated; unbinding this folder.`,
+      );
+      console.log("");
+      branch = "skip";
+    } else if (!isOwnerAdmin(preflight.callerRole)) {
+      console.log(
+        "Only an owner/admin can deactivate the workspace itself; unbinding this " +
+          "folder only.",
+      );
+      console.log("");
+      branch = "member";
+    } else if (preflight.activeMemberCount <= 1) {
+      branch = "sole";
+    } else {
+      branch = "multi";
+      others = preflight.activeMemberCount - 1;
+    }
+  }
+
+  // ── E1 confirm + E2 opt-in, selected by the matrix branch (§3) ──
+  if (branch === "sole") {
+    // Sole owner/admin: ONE default-YES prompt covers BOTH retire and unbind.
+    if (flags.yes || flags.deactivateWorkspace) {
+      retire = true;
+      combinedConfirmDone = true;
+    } else if (!isTTY) {
+      console.error(
+        "Refusing to deactivate without confirmation in a non-interactive context.",
+      );
+      console.error(
+        "Re-run with `--yes` (retire + unbind) or `--keep-workspace` (unbind only).",
+      );
+      return 1;
+    } else {
+      const ok = await confirm(
+        `Deactivate workspace ${workspaceId}? Unbinds this folder and retires the ` +
+          `workspace (reversible). [Y/n] `,
+        true,
+      );
+      if (!ok) {
+        console.log("Aborted; marker left in place.");
+        return 0;
+      }
+      retire = true;
+      combinedConfirmDone = true;
+    }
+  }
+
+  // Generic E1 confirm for the member / multi / skip branches (sole already
+  // authorized E1 via combinedConfirmDone). `--yes` skips the prompt; a non-TTY
+  // context without `--yes` refuses rather than hang.
+  if (!combinedConfirmDone && !flags.yes) {
+    if (!isTTY) {
       console.error(
         "Refusing to remove a workspace binding without confirmation in a non-interactive context.",
       );
       console.error("Re-run with `--yes` to deactivate non-interactively.");
       return 1;
     }
-    const ok = await promptYesNo("Deactivate this workspace binding? [y/N] ");
+    const ok = await confirm("Deactivate this workspace binding? [y/N] ", false);
     if (!ok) {
       console.log("Aborted; marker left in place.");
       return 0;
+    }
+  }
+
+  // Multi-member owner/admin: E1 (unbind) is confirmed above; retiring for everyone
+  // is a separate, default-NO opt-in (or `--deactivate-workspace`).
+  if (branch === "multi") {
+    if (flags.deactivateWorkspace) {
+      retire = true;
+    } else if (flags.yes || !isTTY) {
+      console.log(
+        `This workspace has ${others} other member(s); unbinding this folder only. ` +
+          `Pass --deactivate-workspace to also retire it for everyone.`,
+      );
+    } else {
+      retire = await confirm(
+        `This workspace has ${others} other member(s). Also deactivate it for ` +
+          `everyone? [y/N] `,
+        false,
+      );
+    }
+  }
+
+  // Run E2 (retire) BEFORE E1 (unbind) so an auth/role failure aborts cleanly with
+  // no partial local unbind (design §7.1). preflight reported OWNER/ADMIN moments
+  // ago, so a failure here is an anomaly (role changed, or INV-AUTH-1 re-gate).
+  if (retire && cfg) {
+    try {
+      await (deps.retire ?? deactivateWorkspace)(cfg);
+      console.log(
+        `Retired workspace ${workspaceId} (reversible: ` +
+          `\`mla workspace reactivate ${workspaceId}\` or the Console ` +
+          `Reactivate button).`,
+      );
+    } catch (e) {
+      console.error(
+        `Could not deactivate the workspace: ${retireErrorMessage(e)}`,
+      );
+      console.error(
+        "The folder is still bound; nothing was changed. Retry, or pass " +
+          "`--keep-workspace` to unbind locally only.",
+      );
+      return 1;
     }
   }
 

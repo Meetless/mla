@@ -2,9 +2,11 @@ import * as os from "os";
 
 import {
   defaultReadBundle,
+  parseMaxEnforcement,
   renderConflictWarning,
   renderPreToolUseAsk,
   renderPreToolUseResponse,
+  renderPreToolUseWarn,
   runInternalPretoolObserve,
   PRETOOL_PASS_THROUGH,
   type PretoolObserveDeps,
@@ -191,6 +193,21 @@ describe("renderPreToolUseResponse: the pure seam-to-wire mapper", () => {
     const parsed = JSON.parse(out.stdout);
     expect(parsed.hookSpecificOutput.permissionDecision).toBe("ask");
     expect(parsed.hookSpecificOutput.permissionDecisionReason).toBe("confirm: notes/x.md");
+  });
+
+  it("maps a WARN reason to the non-blocking advisory body (systemMessage + additionalContext, NO permissionDecision, exit 0)", () => {
+    const out = renderPreToolUseWarn("Meetless rule rn_x: writing references/scratch.md is discouraged. keep it in the vault.");
+    expect(out.exitCode).toBe(0);
+    const parsed = JSON.parse(out.stdout);
+    // A WARN is the middle rung: the tool is PERMITTED, so no permissionDecision is ever rendered (INV-8).
+    expect(parsed.hookSpecificOutput.hookEventName).toBe("PreToolUse");
+    expect(parsed.hookSpecificOutput).not.toHaveProperty("permissionDecision");
+    // Human-facing heads-up carries the advisory marker + the rule's own words.
+    expect(parsed.systemMessage).toContain("advisory");
+    expect(parsed.systemMessage).toContain("discouraged");
+    // Model-facing context makes the non-blocking nature explicit and steers a correction.
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("non-blocking");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("permitted");
   });
 });
 
@@ -570,6 +587,93 @@ describe("runInternalPretoolObserve: faces the backend bundle (P1G / G4)", () =>
     const parsed = JSON.parse(written());
     expect(parsed.systemMessage).toContain("case_42");
     expect(parsed.hookSpecificOutput).not.toHaveProperty("permissionDecision");
+  });
+});
+
+// INV-8: the non-blocking WARN rung. A VIOLATION whose attested ceiling is WARN (or a DENY clamped to
+// WARN by the MEETLESS_ACTION_INTERCEPT_MAX kill switch) surfaces the rule's concern to both the operator
+// and the model, but NEVER a permissionDecision, so it can never false-positive-block. It also never
+// emits a deny tile (a WARN is not a deny).
+describe("runInternalPretoolObserve: the WARN rung (non-blocking, INV-8)", () => {
+  it("surfaces a fresh WARN-ceiling forbidden write as a non-blocking advisory (no permissionDecision), exit 0", async () => {
+    const warnPayload = pilotPayload({ enforcementCeiling: "WARN" });
+    const { deps, written } = bundleDeps(freshRead([bundleEntry({ payload: warnPayload })]));
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(written());
+    expect(parsed.hookSpecificOutput.hookEventName).toBe("PreToolUse");
+    expect(parsed.hookSpecificOutput).not.toHaveProperty("permissionDecision");
+    // The advisory names the deciding rule + the rule's own statement to both audiences.
+    expect(parsed.systemMessage).toContain("advisory");
+    expect(parsed.systemMessage).toContain("rn_notes");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("non-blocking");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("standalone vault");
+  });
+
+  it("does NOT emit a deny tile on a WARN (a warning is not a deny)", async () => {
+    const emitIncident = jest.fn();
+    const warnPayload = pilotPayload({ enforcementCeiling: "WARN" });
+    const { deps } = bundleDeps(freshRead([bundleEntry({ payload: warnPayload })]), { emitIncident });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    expect(emitIncident).not.toHaveBeenCalled();
+  });
+
+  it("concatenates the governed-rule WARN and an open cross-session conflict into one advisory (both ride additionalContext)", async () => {
+    const warnPayload = pilotPayload({ enforcementCeiling: "WARN" });
+    const { deps, written } = bundleDeps(freshRead([bundleEntry({ payload: warnPayload })]), {
+      readConflicts: () => [activeConflict()],
+    });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(written());
+    expect(parsed.hookSpecificOutput).not.toHaveProperty("permissionDecision");
+    // Both the rule advisory and the conflict warning reach the operator...
+    expect(parsed.systemMessage).toContain("advisory");
+    expect(parsed.systemMessage).toContain("case_42");
+    // ...and the model, in one additionalContext blob.
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("non-blocking");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("case_42");
+  });
+
+  it("MEETLESS_ACTION_INTERCEPT_MAX=warn clamps a would-be DENY into a non-blocking advisory (kill switch), no deny tile", async () => {
+    const emitIncident = jest.fn();
+    // A DENY-ceiling rule on a forbidden path would normally hard-block; the session cap turns it into a WARN.
+    const { deps, written } = bundleDeps(freshRead([bundleEntry()]), {
+      resolveMaxEnforcement: () => "WARN",
+      emitIncident,
+    });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(written());
+    expect(parsed.hookSpecificOutput).not.toHaveProperty("permissionDecision");
+    expect(parsed.systemMessage).toContain("advisory");
+    expect(emitIncident).not.toHaveBeenCalled();
+  });
+
+  it("MEETLESS_ACTION_INTERCEPT_MAX=ask clamps a would-be DENY into an interactive ASK (not a block)", async () => {
+    const { deps, written } = bundleDeps(freshRead([bundleEntry()]), {
+      resolveMaxEnforcement: () => "ASK",
+    });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(written());
+    expect(parsed.hookSpecificOutput.permissionDecision).toBe("ask");
+  });
+});
+
+describe("parseMaxEnforcement: the MEETLESS_ACTION_INTERCEPT_MAX kill-switch parser", () => {
+  it("parses the three honored rungs case-insensitively", () => {
+    expect(parseMaxEnforcement("warn")).toBe("WARN");
+    expect(parseMaxEnforcement("ASK")).toBe("ASK");
+    expect(parseMaxEnforcement("  Deny  ")).toBe("DENY");
+  });
+
+  it("defaults to DENY (uncapped) for unset, empty, or unrecognized values (preserves current behavior)", () => {
+    expect(parseMaxEnforcement(undefined)).toBe("DENY");
+    expect(parseMaxEnforcement("")).toBe("DENY");
+    expect(parseMaxEnforcement("observe")).toBe("DENY");
+    expect(parseMaxEnforcement("block")).toBe("DENY");
   });
 });
 

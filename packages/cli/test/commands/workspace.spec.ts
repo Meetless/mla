@@ -3,6 +3,7 @@ import {
   runWorkspaceInvite,
   runWorkspaceMembers,
   runWorkspaceRemove,
+  runWorkspaceReactivate,
 } from "../../src/commands/workspace";
 import type { WorkspaceCliConfig } from "../../src/lib/config";
 import type {
@@ -11,6 +12,10 @@ import type {
   ListMembersResult,
   RemoveMemberResult,
 } from "../../src/lib/control-workspace-member-client";
+import type {
+  WorkspaceLifecycleClientHttp,
+  ReactivateWorkspaceResult,
+} from "../../src/lib/control-workspace-lifecycle-client";
 
 // The Shared-Workspace Membership Doorway CLI verbs (mla workspace
 // invite/members/remove), pinned with the deps-injection convention the
@@ -456,6 +461,167 @@ describe("runWorkspaceRemove", () => {
     expect(rec.err.join("\n")).toContain(
       "workspace remove failed: Cannot remove an owner or admin; demote them first (HTTP 409)",
     );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// reactivate (target resolution)
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("runWorkspaceReactivate", () => {
+  // Regression lock for the silent-wrong-target bug found in live exercise: an
+  // id typed as a positional (`mla workspace reactivate <id>`) was dropped, so
+  // the command no-oped on the folder-bound workspace and reported success on
+  // the WRONG one. This is the recovery path: after `mla deactivate` unbinds the
+  // marker the retired id is no longer folder-resolvable, so it MUST be passable.
+
+  // loadConfig that RESOLVES workspaceId from the override, mirroring the real
+  // loadWorkspaceConfig(override) so the POST body reflects the named workspace.
+  function resolvingLoader(): {
+    loadConfig: (override?: string) => WorkspaceCliConfig;
+    seen: (string | undefined)[];
+  } {
+    const seen: (string | undefined)[] = [];
+    return {
+      loadConfig: (override?: string) => {
+        seen.push(override);
+        return cfg(override && override.trim() ? override : WS);
+      },
+      seen,
+    };
+  }
+
+  // Minimal lifecycle http fake (reactivate only POSTs; GET must never fire).
+  function fakeLifecycleHttp(): {
+    http: WorkspaceLifecycleClientHttp;
+    posts: { path: string; body: unknown }[];
+  } {
+    const posts: { path: string; body: unknown }[] = [];
+    const http: WorkspaceLifecycleClientHttp = {
+      get: (async () => {
+        throw new Error("unexpected GET");
+      }) as WorkspaceLifecycleClientHttp["get"],
+      post: (async (_cfg: unknown, path: string, body?: unknown) => {
+        posts.push({ path, body });
+        return {
+          workspaceId: (body as { workspaceId: string }).workspaceId,
+          retiredAt: null,
+        } as ReactivateWorkspaceResult;
+      }) as WorkspaceLifecycleClientHttp["post"],
+    };
+    return { http, posts };
+  }
+
+  it("reactivates the workspace named as a positional (the recovery path)", async () => {
+    const { loadConfig, seen } = resolvingLoader();
+    const { http, posts } = fakeLifecycleHttp();
+    const { rec, out, err } = sink();
+    const code = await runWorkspaceReactivate(["ws_retired"], {
+      loadConfig,
+      http,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    // The positional reached loadConfig as the override, not undefined (the
+    // folder-bound fallback that silently no-ops on the wrong workspace).
+    expect(seen).toEqual(["ws_retired"]);
+    expect(posts).toEqual([
+      { path: "/internal/v1/workspaces/reactivate", body: { workspaceId: "ws_retired" } },
+    ]);
+    expect(rec.out.join("\n")).toContain("Workspace ws_retired is active again");
+  });
+
+  it("accepts --workspace <id> as the equivalent of the positional", async () => {
+    const { loadConfig, seen } = resolvingLoader();
+    const { http, posts } = fakeLifecycleHttp();
+    const { out, err } = sink();
+    const code = await runWorkspaceReactivate(["--workspace", "ws_retired"], {
+      loadConfig,
+      http,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(seen).toEqual(["ws_retired"]);
+    expect(posts[0].body).toEqual({ workspaceId: "ws_retired" });
+  });
+
+  it("defaults to the folder-bound workspace when no id is given", async () => {
+    const { loadConfig, seen } = resolvingLoader();
+    const { http, posts } = fakeLifecycleHttp();
+    const { out, err } = sink();
+    const code = await runWorkspaceReactivate([], { loadConfig, http, out, err });
+    expect(code).toBe(0);
+    expect(seen).toEqual([undefined]);
+    expect(posts[0].body).toEqual({ workspaceId: WS });
+  });
+
+  it("treats an empty --workspace \"\" as absent so the positional still wins", async () => {
+    // An unset `--workspace \"$VAR\"` in a script reaches here as \"\". Under the old
+    // `workspace ?? positionals[0]` this empty string WON (`?? ` only guards
+    // null/undefined), so loadConfig(\"\") fell back to the folder-bound workspace
+    // and the positional recovery id was silently dropped: the exact wrong-target
+    // bug reactivate was fixed to prevent. It must defer to the positional instead.
+    const { loadConfig, seen } = resolvingLoader();
+    const { http, posts } = fakeLifecycleHttp();
+    const { out, err } = sink();
+    const code = await runWorkspaceReactivate(["--workspace", "", "ws_retired"], {
+      loadConfig,
+      http,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(seen).toEqual(["ws_retired"]); // positional, not the folder fallback ("")
+    expect(posts[0].body).toEqual({ workspaceId: "ws_retired" });
+  });
+
+  it("rejects an extra positional instead of silently ignoring it (exit 2, no call)", async () => {
+    const { loadConfig } = resolvingLoader();
+    const { http, posts } = fakeLifecycleHttp();
+    const { rec, out, err } = sink();
+    const code = await runWorkspaceReactivate(["ws_a", "ws_b"], {
+      loadConfig,
+      http,
+      out,
+      err,
+    });
+    expect(code).toBe(2);
+    expect(posts).toEqual([]);
+    expect(rec.err.join("\n")).toContain("at most one workspace id");
+  });
+
+  it("rejects a positional that conflicts with --workspace (exit 2, no call)", async () => {
+    const { loadConfig } = resolvingLoader();
+    const { http, posts } = fakeLifecycleHttp();
+    const { rec, out, err } = sink();
+    const code = await runWorkspaceReactivate(["ws_a", "--workspace", "ws_b"], {
+      loadConfig,
+      http,
+      out,
+      err,
+    });
+    expect(code).toBe(2);
+    expect(posts).toEqual([]);
+    expect(rec.err.join("\n")).toContain("conflicting workspace ids");
+  });
+
+  it("--json dumps the raw ReactivateWorkspaceResult", async () => {
+    const { loadConfig } = resolvingLoader();
+    const { http } = fakeLifecycleHttp();
+    const { rec, out, err } = sink();
+    const code = await runWorkspaceReactivate(["ws_retired", "--json"], {
+      loadConfig,
+      http,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(JSON.parse(rec.out.join("\n"))).toEqual({
+      workspaceId: "ws_retired",
+      retiredAt: null,
+    });
   });
 });
 

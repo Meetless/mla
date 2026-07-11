@@ -228,8 +228,15 @@ export interface RulePayloadV1 {
   /** DESCRIPTIVE severity only; NOT an enforcement input (P0.9 / P0.12). */
   strength: RuleStrength;
   deliveryChannels: DeliveryChannel[];
-  /** The MAX authority the human attested (P0.20). */
-  enforcementCeiling: "OBSERVE" | "ASK" | "DENY";
+  /**
+   * The MAX authority the human attested (P0.20). The ladder is OBSERVE < WARN < ASK < DENY.
+   * WARN is the non-blocking middle rung (INV-8): a VIOLATION surfaces a model-facing advisory
+   * (allow + additionalContext, read next turn), never a permissionDecision, so it can never
+   * false-positive-block. DENY stays reserved for deterministic, high-cost, explicitly-attested
+   * violations; ASK is the interactive human gate. A newly-armed forbidden-root rule defaults to
+   * WARN; DENY is a deliberate promotion earned end-to-end (notes-location-v1).
+   */
+  enforcementCeiling: "OBSERVE" | "WARN" | "ASK" | "DENY";
   /** v1-locked; OnInfrastructureFailure (P0.15) is the future home. */
   infrastructureFailurePolicy: "PASS_WITH_ALERT";
   /** The project/checkout scope this rule binds to (P0.51); enforcement-relevant, so INSIDE the hash. NOT a bare workspaceId. */

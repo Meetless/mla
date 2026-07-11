@@ -193,12 +193,16 @@ EVENTS_OK=1
 
 # Process the snapshot in two passes:
 #   Pass 1: session_started lines -> POST /internal/v1/agent-runs (one per line).
-#   Pass 2: prompt_submitted | tool_used_bash | tool_used_file | session_stopped
-#           | agent_decision_captured | injection_trace | assistant_message lines
-#           -> batched PATCH
+#   Pass 2: prompt_submitted | tool_used_bash | tool_used_file | tool_used_mcp
+#           | session_stopped | agent_decision_captured | injection_trace
+#           | assistant_message lines -> batched PATCH
 #           /internal/v1/agent-runs/by-session/:sid/events. The forward whitelist
 #           (event-batch-filter.jq) and the re-spool whitelist below MUST list
 #           the same types or a type forwards on success but vanishes on retry.
+#           tool_used_mcp added 2026-07-11: it was in the forward filter but NOT
+#           here, so a transient PATCH failure silently dropped it instead of
+#           retrying (one half of the self-concealing gap that kept control at
+#           zero tool_used_mcp rows; the other half was control's ingest DTO).
 # finalize_requested is a control signal only; it never POSTs by itself, it
 # triggers the `mla _internal finalize-session` hop at the end. The server
 # dedupes on (runId, eventKey), so re-POSTing a batch on retry is safe.
@@ -413,7 +417,7 @@ if [[ "$EVENTS_OK" == "0" ]]; then
     # batch in .draining.$$ permanently.
     EVT="$(printf '%s' "$LINE" | jq -r '.event' 2>/dev/null || echo "")"
     case "$EVT" in
-      prompt_submitted|tool_used_bash|tool_used_file|session_stopped|agent_decision_captured|injection_trace|assistant_message)
+      prompt_submitted|tool_used_bash|tool_used_file|tool_used_mcp|session_stopped|agent_decision_captured|injection_trace|assistant_message)
         spool_append "$SESSION_ID" "$LINE"
         RESPOOLED=$((RESPOOLED + 1))
         ;;

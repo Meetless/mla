@@ -7,6 +7,7 @@ import {
   runRulesAddBackend,
   runRulesAttestBackend,
   runRulesDemoteBackend,
+  runRulesPromoteBackend,
   runRulesEditBackend,
   runRulesListBackend,
   runRulesRemoveBackend,
@@ -142,6 +143,19 @@ describe("runRulesListBackend", () => {
     ]);
     expect(rec.out).toHaveLength(2);
     expect(rec.out[0]).toContain("node_1");
+  });
+
+  it("humanizes the scope column: [TEAM] for a team rule, [PERSONAL owner:<id>] for a personal one", async () => {
+    const { http } = fakeHttp({
+      get: () => [
+        node({ id: "node_team", authorityScopeId: "TEAM", ownerUserId: null }),
+        node({ id: "node_mine", authorityScopeId: "PERSONAL", ownerUserId: "user_an" }),
+      ],
+    });
+    const { rec, out, err } = sink();
+    await runRulesListBackend([], { loadConfig: cfg, http, out, err });
+    expect(rec.out[0]).toContain("[TEAM/ACTIVE]");
+    expect(rec.out[1]).toContain("[PERSONAL owner:user_an/ACTIVE]");
   });
 
   it("includes revoked rules with --revoked (no lifecycle filter)", async () => {
@@ -290,12 +304,12 @@ describe("runRulesListBackend", () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("runRulesAddBackend", () => {
-  it("mints a TEAM rule with the triple-safe payload and a content-addressed idempotency key", async () => {
+  it("defaults to a PERSONAL rule owned by the operator, with the triple-safe payload and a content-addressed idempotency key", async () => {
     let captured: Record<string, unknown> | undefined;
     const { http, calls } = fakeHttp({
       post: (_p, body) => {
         captured = body as Record<string, unknown>;
-        return node();
+        return node({ id: "node_p", authorityScopeId: "PERSONAL", ownerUserId: "user_an" });
       },
     });
     const { rec, out, err } = sink();
@@ -313,13 +327,191 @@ describe("runRulesAddBackend", () => {
       makeManagedRule({ statement: "include a Mermaid diagram", strength: "SHOULD_FOLLOW", scope: [], sources: [] }),
       "scope_1",
     );
-    expect(captured!.authorityScope).toBe("TEAM");
-    expect(captured!.ownerUserId).toBeNull();
+    // An overrode the TEAM recommendation: add defaults PERSONAL (owner = the operator), the
+    // lower-blast-radius scope. Only --team opts into workspace-wide enforcement.
+    expect(captured!.authorityScope).toBe("PERSONAL");
+    expect(captured!.ownerUserId).toBe("user_an");
     expect(captured!.projectId).toBeNull();
     expect(captured!.requestIdempotencyKey).toBe(ruleVersionHash(expectedPayload));
     expect((captured!.payload as RulePayloadV1).text).toBe(expectedPayload.text);
     expect((captured!.payload as RulePayloadV1).strength).toBe("SHOULD_FOLLOW");
-    expect(rec.out.join("\n")).toContain("MINTED");
+    const outText = rec.out.join("\n");
+    expect(outText).toContain("MINTED PERSONAL rule node_p");
+    // The one mitigation for a PERSONAL default undercutting team propagation: a loud promote nudge.
+    expect(outText).toContain("enforces for you alone");
+    expect(outText).toContain("mla rules promote node_p");
+  });
+
+  it("mints a TEAM rule (owner null) when --team is passed, after confirming", async () => {
+    let captured: Record<string, unknown> | undefined;
+    let confirmPrompt: string | undefined;
+    const { http } = fakeHttp({
+      post: (_p, body) => {
+        captured = body as Record<string, unknown>;
+        return node({ id: "node_t", authorityScopeId: "TEAM", ownerUserId: null });
+      },
+    });
+    const { rec, out, err } = sink();
+    const code = await runRulesAddBackend(["always test", "--team"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      isInteractive: () => true,
+      confirm: (p) => {
+        confirmPrompt = p;
+        return true;
+      },
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(captured!.authorityScope).toBe("TEAM");
+    expect(captured!.ownerUserId).toBeNull();
+    expect(confirmPrompt).toContain("TEAM rule");
+    const outText = rec.out.join("\n");
+    expect(outText).toContain("MINTED TEAM rule node_t");
+    expect(outText).toContain("every member of the workspace");
+    // No personal promote nudge on a team rule.
+    expect(outText).not.toContain("mla rules promote");
+  });
+
+  it("mints nothing when the --team confirmation is declined (exit 1)", async () => {
+    const { http, calls } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+    const code = await runRulesAddBackend(["always test", "--team"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      isInteractive: () => true,
+      confirm: () => false,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.verb === "post")).toBe(false);
+    expect(rec.err.join("\n")).toContain("not confirmed");
+  });
+
+  it("refuses to mint a TEAM rule non-interactively without --yes (no wire call)", async () => {
+    const { http, calls } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+    const code = await runRulesAddBackend(["always test", "--team"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      isInteractive: () => false,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.verb === "post")).toBe(false);
+    expect(rec.err.join("\n")).toContain("--yes");
+  });
+
+  it("mints a TEAM rule non-interactively when --yes is passed (no confirm needed)", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      post: (_p, body) => {
+        captured = body as Record<string, unknown>;
+        return node({ id: "node_t", authorityScopeId: "TEAM", ownerUserId: null });
+      },
+    });
+    const { out, err } = sink();
+    const code = await runRulesAddBackend(["always test", "--team", "--yes"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      isInteractive: () => false,
+      confirm: () => {
+        throw new Error("confirm must not be called when --yes is present");
+      },
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(captured!.authorityScope).toBe("TEAM");
+  });
+
+  it("treats --personal as the explicit spelling of the default (PERSONAL, owner = operator)", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      post: (_p, body) => {
+        captured = body as Record<string, unknown>;
+        return node({ id: "node_p", authorityScopeId: "PERSONAL", ownerUserId: "user_an" });
+      },
+    });
+    const { out, err } = sink();
+    const code = await runRulesAddBackend(["prefer real doc over mocks", "--personal"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    expect(captured!.authorityScope).toBe("PERSONAL");
+    expect(captured!.ownerUserId).toBe("user_an");
+  });
+
+  it("rejects --team and --personal together as a usage error (exit 2, no wire call)", async () => {
+    const { http, calls } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+    const code = await runRulesAddBackend(["x", "--team", "--personal"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out,
+      err,
+    });
+    expect(code).toBe(2);
+    expect(calls.some((c) => c.verb === "post")).toBe(false);
+    expect(rec.err.join("\n")).toContain("not both");
+  });
+
+  it("accepts --applies-to as the glob flag, equivalent to the deprecated --scope alias", async () => {
+    let appliesToBody: Record<string, unknown> | undefined;
+    const { http: h1 } = fakeHttp({
+      post: (_p, body) => {
+        appliesToBody = body as Record<string, unknown>;
+        return node({ authorityScopeId: "PERSONAL", ownerUserId: "user_an" });
+      },
+    });
+    const s1 = sink();
+    await runRulesAddBackend(["guard the public API", "--applies-to", "src/**"], {
+      loadConfig: cfg,
+      http: h1,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out: s1.out,
+      err: s1.err,
+    });
+
+    let scopeBody: Record<string, unknown> | undefined;
+    const { http: h2 } = fakeHttp({
+      post: (_p, body) => {
+        scopeBody = body as Record<string, unknown>;
+        return node({ authorityScopeId: "PERSONAL", ownerUserId: "user_an" });
+      },
+    });
+    const s2 = sink();
+    await runRulesAddBackend(["guard the public API", "--scope", "src/**"], {
+      loadConfig: cfg,
+      http: h2,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out: s2.out,
+      err: s2.err,
+    });
+
+    // Both flags feed the same applicability glob: statement is clean and the payloads match.
+    expect((appliesToBody!.payload as RulePayloadV1).text).toBe("guard the public API");
+    expect(appliesToBody!.payload).toEqual(scopeBody!.payload);
   });
 
   it("honors --must as a MUST_FOLLOW strength", async () => {
@@ -1049,6 +1241,201 @@ describe("runRulesDemoteBackend", () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────────
+// promote (PERSONAL -> TEAM): mint-copy-owned-by-no-one, then revoke the personal node
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("runRulesPromoteBackend", () => {
+  // Distinguish the two POSTs (mint at BASE, revoke at BASE/:id/revoke) inside one handler.
+  function promoteHttp(over: { onRevoke?: () => unknown; personalNode?: RuleNodeView } = {}) {
+    const bodies: { mint?: Record<string, unknown>; revoke?: Record<string, unknown> } = {};
+    const { http, calls } = fakeHttp({
+      get: () =>
+        over.personalNode ??
+        node({
+          authorityScopeId: "PERSONAL",
+          ownerUserId: "user_an",
+          projectId: "proj_9",
+          currentVersionId: "ver_1",
+        }),
+      post: (p, body) => {
+        if (p.endsWith("/revoke")) {
+          bodies.revoke = body as Record<string, unknown>;
+          return (over.onRevoke ?? (() => node({ lifecycleStatusId: "REVOKED" })))();
+        }
+        bodies.mint = body as Record<string, unknown>;
+        return node({ id: "node_team", authorityScopeId: "TEAM", ownerUserId: null });
+      },
+    });
+    return { http, calls, bodies };
+  }
+
+  it("mints a TEAM copy (owner null, projectId + payload preserved) then revokes the personal node", async () => {
+    const personalNode = node({
+      authorityScopeId: "PERSONAL",
+      ownerUserId: "user_an",
+      projectId: "proj_9",
+      currentVersionId: "ver_1",
+    });
+    const expectedPayload = personalNode.currentVersion!.payload;
+    const { http, calls, bodies } = promoteHttp({ personalNode });
+    const { rec, out, err } = sink();
+
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    // Order: read the node, mint the team copy, THEN revoke the personal node.
+    expect(calls.map((c) => `${c.verb} ${c.path}`)).toEqual([
+      "get /internal/v1/rules/node_1?workspaceId=ws_1",
+      "post /internal/v1/rules",
+      "post /internal/v1/rules/node_1/revoke",
+    ]);
+    expect(bodies.mint!.authorityScope).toBe("TEAM");
+    expect(bodies.mint!.ownerUserId).toBeNull();
+    expect(bodies.mint!.projectId).toBe("proj_9");
+    expect(bodies.mint!.payload).toEqual(expectedPayload);
+    expect(bodies.mint!.requestIdempotencyKey).toBe(ruleVersionHash(expectedPayload as RulePayloadV1));
+    // Revoke carries the compare-and-swap token read from the personal node.
+    expect(bodies.revoke!.expectedCurrentVersionId).toBe("ver_1");
+    expect(rec.out.join("\n")).toContain("PROMOTED rule node_1");
+    expect(rec.out.join("\n")).toContain("node_team (TEAM)");
+  });
+
+  it("rejects a non-PERSONAL node (exit 1, mints nothing)", async () => {
+    const { http, calls } = promoteHttp({
+      personalNode: node({ authorityScopeId: "TEAM", ownerUserId: null }),
+    });
+    const { rec, out, err } = sink();
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.verb === "post")).toBe(false);
+    expect(rec.err.join("\n")).toContain("not a PERSONAL rule");
+  });
+
+  it("rejects another member's personal rule (exit 1, mints nothing)", async () => {
+    const { http, calls } = promoteHttp({
+      personalNode: node({ authorityScopeId: "PERSONAL", ownerUserId: "user_someone_else" }),
+    });
+    const { rec, out, err } = sink();
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.verb === "post")).toBe(false);
+    expect(rec.err.join("\n")).toContain("owned by user_someone_else");
+  });
+
+  it("rejects a revoked node (exit 1, mints nothing)", async () => {
+    const { http, calls } = promoteHttp({
+      personalNode: node({ authorityScopeId: "PERSONAL", ownerUserId: "user_an", lifecycleStatusId: "REVOKED" }),
+    });
+    const { rec, out, err } = sink();
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.verb === "post")).toBe(false);
+    expect(rec.err.join("\n")).toContain("revoked");
+  });
+
+  it("reports a half-done promotion when the mint succeeds but the revoke fails", async () => {
+    const { http, calls } = promoteHttp({
+      onRevoke: () => {
+        throw httpError(409);
+      },
+    });
+    const { rec, out, err } = sink();
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    // The team copy WAS minted; the operator is told exactly how to finish.
+    expect(calls.filter((c) => c.verb === "post" && c.path === "/internal/v1/rules")).toHaveLength(1);
+    const errText = rec.err.join("\n");
+    expect(errText).toContain("half-done");
+    expect(errText).toContain("STILL ACTIVE");
+    expect(errText).toContain("mla rules revoke node_1");
+  });
+
+  it("leaves the personal rule untouched when the mint fails offline (no revoke)", async () => {
+    const { http, calls } = fakeHttp({
+      get: () => node({ authorityScopeId: "PERSONAL", ownerUserId: "user_an", currentVersionId: "ver_1" }),
+      post: () => {
+        throw offlineError();
+      },
+    });
+    const { rec, out, err } = sink();
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    // Exactly one POST was attempted (the mint); no revoke followed.
+    expect(calls.filter((c) => c.verb === "post")).toHaveLength(1);
+    expect(rec.err.join("\n")).toContain("your personal rule is untouched");
+  });
+
+  it("refuses to promote non-interactively without --yes (no mint)", async () => {
+    const { http, calls } = promoteHttp();
+    const { rec, out, err } = sink();
+    const code = await runRulesPromoteBackend(["node_1"], {
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      isInteractive: () => false,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(calls.some((c) => c.verb === "post")).toBe(false);
+    expect(rec.err.join("\n")).toContain("--yes");
+  });
+
+  it("refuses without an authenticated human operator (exit 1)", async () => {
+    const { rec, out, err } = sink();
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      loadConfig: cfg,
+      resolveOperator: NO_OPERATOR,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(rec.err.join("\n")).toContain("authenticated human");
+  });
+
+  it("exits 2 on a missing nodeId", async () => {
+    const { out, err } = sink();
+    expect(await runRulesPromoteBackend(["--yes"], { loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
 // attest (fork #7): local resolution against a REAL ce0 db; backend mint via the http seam
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -1284,6 +1671,161 @@ describe("runRulesAttestBackend", () => {
     const code = await runRulesAttestBackend(["--from-observed", hash, "--agent-on-user-request", "--yes"], deps);
     expect(code).toBe(1);
     expect(rec.err.join("\n")).toContain("NOT minted");
+  });
+
+  // ── --forbidden-root / --ceiling: the WARN-first direct-authoring arming surface ──
+  // A brand-new mechanically-evaluable rule must WARN (non-blocking) before it can earn DENY (INV-8),
+  // so the generic path arms at WARN by default and refuses a cold DENY/ASK. Direct authoring needs
+  // no prior observation: the spec is synthesized and run through the SAME production admission gate
+  // (convertForbiddenRootSnapshot), so no CE0 store is opened.
+
+  it("mints a generic WARN rule from --forbidden-root directly, opening no store", async () => {
+    let body: Record<string, unknown> | undefined;
+    const { http, calls } = fakeHttp({
+      post: (_p, b) => {
+        body = b as Record<string, unknown>;
+        return node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID });
+      },
+    });
+    // A throwing openStore proves the direct path never touches the CE0 ledger.
+    const { rec, deps } = attestDeps({
+      http,
+      openStore: () => {
+        throw new Error("store must not be opened for direct authoring");
+      },
+    });
+    const code = await runRulesAttestBackend(
+      ["--forbidden-root", "references", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(calls[0].path).toBe("/internal/v1/rules");
+    const payload = body!.payload as RulePayloadV1;
+    expect(payload.enforcementCeiling).toBe("WARN");
+    expect(payload.compliance.config.forbiddenRootRelativePath).toBe("references");
+    // The wire key is the canonical hash of the admitted payload, round-tripped verbatim.
+    expect(body!.requestIdempotencyKey).toBe(ruleVersionHash(payload));
+    expect(body!.canonicalPayloadHash).toBe(ruleVersionHash(payload));
+    // The label is the generic family (NOT the notes-location pilot id) and the note explains WARN.
+    expect(rec.out.join("\n")).toContain("forbidden-root:references");
+    expect(rec.out.join("\n")).toContain("WARN");
+    expect(rec.out.join("\n")).toContain("INV-8");
+  });
+
+  it("arms at OBSERVE under --forbidden-root <path> --ceiling observe (watch-only rung)", async () => {
+    let body: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      post: (_p, b) => {
+        body = b as Record<string, unknown>;
+        return node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID });
+      },
+    });
+    const { deps } = attestDeps({ http });
+    const code = await runRulesAttestBackend(
+      ["--forbidden-root", "references", "--ceiling", "observe", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(0);
+    expect((body!.payload as RulePayloadV1).enforcementCeiling).toBe("OBSERVE");
+  });
+
+  it("refuses --ceiling deny on a cold arming (INV-8: warn before block), minting nothing", async () => {
+    const { http, calls } = fakeHttp({
+      post: () => node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID }),
+    });
+    const { rec, deps } = attestDeps({ http });
+    const code = await runRulesAttestBackend(
+      ["--forbidden-root", "references", "--ceiling", "deny", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(2);
+    expect(rec.err.join("\n")).toContain("INV-8");
+    // Refused before any backend mint.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses --ceiling ask on a cold arming (only observe|warn are armable here)", async () => {
+    const { http, calls } = fakeHttp({
+      post: () => node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID }),
+    });
+    const { deps } = attestDeps({ http });
+    const code = await runRulesAttestBackend(
+      ["--forbidden-root", "references", "--ceiling", "ask", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(2);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("carries --text as the rule rationale into the payload", async () => {
+    let body: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      post: (_p, b) => {
+        body = b as Record<string, unknown>;
+        return node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID });
+      },
+    });
+    const { deps } = attestDeps({ http });
+    const code = await runRulesAttestBackend(
+      ["--forbidden-root", "references", "--text", "keep references pristine", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(0);
+    expect((body!.payload as RulePayloadV1).text).toBe("keep references pristine");
+  });
+
+  it("mints a generic WARN rule from --from-observed <hash> --ceiling warn (NOT the DENY pilot)", async () => {
+    const hash = seedObserved();
+    let body: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      post: (_p, b) => {
+        body = b as Record<string, unknown>;
+        return node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID });
+      },
+    });
+    const { rec, deps } = attestDeps({ http });
+    const code = await runRulesAttestBackend(
+      ["--from-observed", hash, "--ceiling", "warn", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(0);
+    const payload = body!.payload as RulePayloadV1;
+    // Same observed snapshot as the DENY pilot, but --ceiling flips it to the generic WARN family.
+    expect(payload.enforcementCeiling).toBe("WARN");
+    expect(payload.compliance.config.forbiddenRootRelativePath).toBe("notes");
+    // Labelled as the generic family, NOT notes-location-v1 (that id is reserved for the earned DENY pilot).
+    expect(rec.out.join("\n")).toContain("forbidden-root:notes");
+    expect(rec.out.join("\n")).not.toContain("notes-location-v1");
+  });
+
+  it("rejects passing both --from-observed and --forbidden-root (exit 2), minting nothing", async () => {
+    const hash = seedObserved();
+    const { http, calls } = fakeHttp({
+      post: () => node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID }),
+    });
+    const { rec, deps } = attestDeps({ http });
+    const code = await runRulesAttestBackend(
+      ["--from-observed", hash, "--forbidden-root", "references", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(2);
+    expect(rec.err.join("\n")).toContain("not both");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects an unknown --ceiling token with a usage error (exit 2)", async () => {
+    const { rec, deps } = attestDeps();
+    const code = await runRulesAttestBackend(
+      ["--forbidden-root", "references", "--ceiling", "bogus", "--agent-on-user-request", "--yes"],
+      deps,
+    );
+    expect(code).toBe(2);
+    expect(rec.err.join("\n")).toContain("observe|warn|ask|deny");
+  });
+
+  it("flags a dangling --forbidden-root (no value) with the usage (exit 2)", async () => {
+    const { deps } = attestDeps();
+    expect(await runRulesAttestBackend(["--forbidden-root", "--agent-on-user-request", "--yes"], deps)).toBe(2);
   });
 });
 

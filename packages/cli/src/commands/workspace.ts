@@ -13,7 +13,12 @@ import {
   removeMember,
   type WorkspaceMemberClientHttp,
 } from "../lib/control-workspace-member-client";
+import {
+  reactivateWorkspace,
+  type WorkspaceLifecycleClientHttp,
+} from "../lib/control-workspace-lifecycle-client";
 import { extractWorkspaceOverride } from "./rules-backend";
+import { staleCommandHint } from "../lib/update-notifier";
 import {
   MarkerMissingWorkspaceIdError,
   NotActivatedError,
@@ -68,11 +73,31 @@ const WORKSPACE_REMOVE_USAGE =
   "  Revoke a MEMBER's access to the folder-bound workspace. Owner/admin only.\n" +
   "  --workspace <id>  target the given workspace instead of the folder-bound one.";
 
+const WORKSPACE_REACTIVATE_USAGE =
+  "usage: mla workspace reactivate [<id>] [--json] [--workspace <id>]\n" +
+  "  Reactivate a deactivated (retired) workspace so it rejoins the active\n" +
+  "  switcher list. Owner/admin only. Idempotent (an already-active workspace\n" +
+  "  is a no-op).\n" +
+  "  <id>              the workspace to reactivate (defaults to the folder-bound\n" +
+  "                    one). After `mla deactivate` unbinds the folder, pass the\n" +
+  "                    id it printed here.\n" +
+  "  --workspace <id>  same as the positional; target a workspace by id.\n" +
+  "  (The Console switcher's Reactivate button is the other way in.)";
+
 // Injectable seams so the membership verbs are unit-testable with no network and
 // no on-disk config, mirroring the rules-backend command deps convention.
 export interface WorkspaceMemberDeps {
   loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: WorkspaceMemberClientHttp;
+  out?: (line: string) => void;
+  err?: (line: string) => void;
+}
+
+// Same injectable-seam convention as WorkspaceMemberDeps, but the lifecycle client
+// only needs get/post (no del), so it takes the lifecycle http shape.
+export interface WorkspaceLifecycleDeps {
+  loadConfig?: (override?: string) => WorkspaceCliConfig;
+  http?: WorkspaceLifecycleClientHttp;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
@@ -343,6 +368,79 @@ export async function runWorkspaceRemove(
   }
 }
 
+// `mla workspace reactivate`: clear Workspace.retiredAt so a deactivated workspace
+// rejoins the active switcher list. Owner/admin only (server-gated). Idempotent: an
+// already-active workspace is a no-op. This is the CLI counterpart to the Console
+// switcher's Reactivate button, and the recovery path for `mla deactivate` when the
+// folder marker was already unbound (use `--workspace <id>` to target it by id).
+// There is intentionally no `mla workspace deactivate`: retiring a workspace flows
+// through `mla deactivate` (which also unbinds the folder), matching the two-verbs
+// model (notes/20260710-mla-workspace-deactivate-retired-state.md §7.2).
+export async function runWorkspaceReactivate(
+  argv: string[],
+  deps: WorkspaceLifecycleDeps = {},
+): Promise<number> {
+  const out = deps.out ?? ((l: string) => console.log(l));
+  const err = deps.err ?? ((l: string) => console.error(l));
+
+  const { workspace, rest, danglingFlag } = extractWorkspaceOverride(argv);
+  if (danglingFlag) {
+    err(`${danglingFlag} needs a value\n${WORKSPACE_REACTIVATE_USAGE}`);
+    return 2;
+  }
+  const json = rest.includes("--json");
+
+  // Accept the workspace id as a positional (`mla workspace reactivate <id>`),
+  // the natural syntax and the recovery path after `mla deactivate` unbinds the
+  // folder marker (the retired id is no longer folder-resolvable, so it MUST be
+  // passed by hand). `--workspace <id>` keeps working for consistency with the
+  // other subcommands. Never silently ignore an extra positional: that would
+  // no-op on the folder-bound workspace instead of the one the operator named.
+  const positionals = rest.filter((a) => !a.startsWith("-"));
+  if (positionals.length > 1) {
+    err(`reactivate takes at most one workspace id\n${WORKSPACE_REACTIVATE_USAGE}`);
+    return 2;
+  }
+  // Normalize an empty / whitespace-only `--workspace ""` to "absent" up front.
+  // `??` would treat "" as a present value, skip the conflict guard, and (via
+  // loadWorkspaceConfig's `(override||"").trim() || resolveWorkspaceId()`) fall
+  // back to the folder-bound workspace: the exact silent-wrong-target bug this
+  // command was fixed to prevent. A blank override reaching here (e.g. an unset
+  // `--workspace "$VAR"` in a script) must defer to the positional, not win.
+  const flagWorkspace = workspace && workspace.trim() ? workspace : undefined;
+  if (flagWorkspace && positionals[0] && flagWorkspace !== positionals[0]) {
+    err(
+      `conflicting workspace ids: --workspace ${flagWorkspace} vs ${positionals[0]}\n` +
+        WORKSPACE_REACTIVATE_USAGE,
+    );
+    return 2;
+  }
+  const target = flagWorkspace ?? positionals[0];
+
+  let cfg: WorkspaceCliConfig;
+  try {
+    cfg = (deps.loadConfig ?? loadWorkspaceConfig)(target);
+  } catch (e) {
+    err(`workspace reactivate: ${(e as Error).message}`);
+    return 2;
+  }
+
+  try {
+    const res = await reactivateWorkspace(cfg, deps.http);
+    if (json) {
+      out(JSON.stringify(res, null, 2));
+      return 0;
+    }
+    out(
+      `Workspace ${cfg.workspaceId} is active again; it rejoins the switcher list.`,
+    );
+    return 0;
+  } catch (e) {
+    err(`workspace reactivate failed: ${serverMessage(e)}`);
+    return 1;
+  }
+}
+
 // `mla workspace use <id>` is removed (T3.2). It rewrote the global cli-config
 // workspaceId, which is no longer a workspace source under folder = workspace.
 // Hard-error with a pointer to the replacement verb instead of silently doing
@@ -376,10 +474,14 @@ export async function runWorkspace(argv: string[]): Promise<number> {
   if (sub === "remove") {
     return runWorkspaceRemove(argv.slice(1));
   }
+  if (sub === "reactivate") {
+    return runWorkspaceReactivate(argv.slice(1));
+  }
   console.error(
     `Unknown workspace subcommand: ${sub}. Usage: mla workspace ` +
-      `[show | invite <email> | members | remove <email>] ` +
-      `(use 'mla activate' / 'mla deactivate' to change the folder binding).`,
+      `[show | invite <email> | members | remove <email> | reactivate] ` +
+      `(use 'mla activate' / 'mla deactivate' to change the folder binding).` +
+      staleCommandHint(),
   );
   return 2;
 }

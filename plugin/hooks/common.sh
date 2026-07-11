@@ -544,6 +544,48 @@ extract_source_ids() {
   printf '%s' "$ids"
 }
 
+# classify_mcp_outcome: read a full PostToolUse hook INPUT json on stdin, print
+# the honest three-valued outcome of a meetless MCP call: success | error |
+# unknown (governed-story §3.3; NEVER inferred from "PostToolUse fired").
+#
+# OBSERVED Claude Code shape (verified 2026-07-11 by dumping raw hook input):
+#   - SUCCESS: tool_response is the UNWRAPPED MCP content-block ARRAY
+#     ([{type:"text",text:"{...}"}]) with NO isError anywhere. The earlier
+#     classifier only matched a {content,isError} OBJECT, so every array-shaped
+#     success fell through to "unknown" and under-counted governed pulls.
+#   - ERROR: Claude Code marks the tool_result is_error:true but does NOT fire
+#     PostToolUse at all, so an errored pull never reaches this hook (absent, not
+#     mislabeled). We still classify defensively below in case CC re-wraps later.
+#
+# Classifier, most-specific first: object+isError:true -> error; object+content
+# -> success (legacy wrap, kept defensively); a non-empty array is a completed
+# pull -> success, but we cheaply probe its first text block: if that block parses
+# as JSON carrying an `error` key or a `status >= 400` (the meetless MCP server's
+# own error envelope) -> error, so we stay honest if CC ever fires PostToolUse on
+# MCP errors. Only key PRESENCE / the numeric status is read; NO raw error text
+# leaves the machine. Empty array / null / scalar / missing -> unknown.
+#
+# Kept here (not inline in post-tool-use.sh) so the hook and its regression test
+# (test/hooks/mcp-outcome-classify-bash.spec.ts) drive the SAME grammar and cannot
+# drift; the exact trap that let the array-shape bug ship silently.
+classify_mcp_outcome() {
+  local out
+  out="$(jq -r '
+    (.tool_response // .tool_result) as $r
+    | if ($r | type) == "object" and ($r.isError == true) then "error"
+      elif ($r | type) == "object" and ($r | has("content")) then "success"
+      elif ($r | type) == "array" and ($r | length) > 0 then
+        (($r[0].text // "") | (try fromjson catch null)) as $body
+        | if ($body | type) == "object"
+            and (($body.error != null) or (($body.status // 0) >= 400))
+          then "error" else "success" end
+      else "unknown" end' 2>/dev/null || printf 'unknown')"
+  case "$out" in
+    success|error|unknown) printf '%s' "$out" ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # A5 relevance-persistence ("carry ONCE"). P2 verified the prior trace line is
 # only written, never read into enrich at turn N+1, and that intel cannot read it
 # (two-DSN; the trace lives on this machine). So the carry read is HOOK-SIDE,

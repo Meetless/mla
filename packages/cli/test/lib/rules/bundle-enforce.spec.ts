@@ -12,7 +12,9 @@ import type { ToolCall } from "../../../src/lib/rules/evaluator";
 import {
   decideBundleEnforcement,
   RULE_PROTECTION_UNAVAILABLE,
+  WARN_AGGREGATE_CAP,
 } from "../../../src/lib/rules/bundle-enforce";
+import type { EligibleEnforcement } from "../../../src/lib/rules/deny-admission";
 
 // P1G / G4 (notes/20260627-rules-store-unification-backend-sot-proposal.md §6.3, §6.4, §7): the
 // PreToolUse enforcement decision, faced over the principal-bound rule bundle instead of the
@@ -197,6 +199,122 @@ describe("decideBundleEnforcement: native ASK ceiling", () => {
     expect(
       (await decide(fresh([entry("node_a", pilotPayload({ enforcementCeiling: "OBSERVE" }))]), writeMd("notes/x.md"))).kind,
     ).toBe("PASS");
+  });
+});
+
+// The same decide seam, but with a session ceiling cap (MEETLESS_ACTION_INTERCEPT_MAX). The kill switch
+// clamps every rule's eligible enforcement DOWN to `max` before the branch, so a would-be DENY becomes a
+// non-blocking WARN when the operator caps the session at warn. Default (no cap) is DENY (uncapped).
+function decideCapped(read: BundleCacheRead, call: ToolCall, maxEnforcement: EligibleEnforcement) {
+  return decideBundleEnforcement({ call, read, runtimeProjectRoot: "/runtime/root", classifyRuntime, maxEnforcement });
+}
+
+describe("decideBundleEnforcement: WARN rung (non-blocking middle rung, INV-8)", () => {
+  it("WARNS (never blocks) for a fresh rule whose attested ceiling is WARN, carrying the advisory reason + count", async () => {
+    const res = await decide(fresh([entry("node_a", pilotPayload({ enforcementCeiling: "WARN" }))]), writeMd("notes/x.md"));
+    expect(res.kind).toBe("WARN");
+    if (res.kind === "WARN") {
+      expect(res.count).toBe(1);
+      // The advisory body names the deciding rule, the discouraged root, and the rule's own statement, so the
+      // model sees WHAT to correct without a block. It never carries a permission decision (that is the caller).
+      expect(res.reason).toContain("node_a");
+      expect(res.reason).toContain("notes/");
+      expect(res.reason).toContain(pilotPayload().text);
+    }
+  });
+
+  it("a fresh DENY wins over a lower-id WARN match (DENY is the hard ceiling, WARN never suppresses a block)", async () => {
+    const read = fresh([
+      entry("node_a", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_b", pilotPayload({ enforcementCeiling: "DENY" })),
+    ]);
+    const res = await decide(read, writeMd("notes/x.md"));
+    expect(res.kind).toBe("DENY");
+    if (res.kind === "DENY") expect(res.ruleNodeId).toBe("node_b");
+  });
+
+  it("a fresh ASK wins over a lower-id WARN match (ASK outranks WARN in the ladder)", async () => {
+    const read = fresh([
+      entry("node_a", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_b", pilotPayload({ enforcementCeiling: "ASK" })),
+    ]);
+    const res = await decide(read, writeMd("notes/x.md"));
+    expect(res.kind).toBe("ASK");
+    if (res.kind === "ASK") expect(res.ruleNodeId).toBe("node_b");
+  });
+
+  it("aggregates multiple WARN matches into ONE advisory, honoring WARN_AGGREGATE_CAP with a suppression note, count reflects ALL", async () => {
+    const read = fresh([
+      entry("node_a", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_b", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_c", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_d", pilotPayload({ enforcementCeiling: "WARN" })),
+    ]);
+    const res = await decide(read, writeMd("notes/x.md"));
+    expect(res.kind).toBe("WARN");
+    if (res.kind === "WARN") {
+      // count is the true number of warnings (all four), even though only WARN_AGGREGATE_CAP bodies are shown.
+      expect(res.count).toBe(4);
+      expect(WARN_AGGREGATE_CAP).toBe(3);
+      // The first three (deterministic lowest-id-first order) are shown verbatim; the fourth is summarized.
+      expect(res.reason).toContain("node_a");
+      expect(res.reason).toContain("node_b");
+      expect(res.reason).toContain("node_c");
+      expect(res.reason).not.toContain("node_d");
+      expect(res.reason).toContain("and 1 more");
+    }
+  });
+
+  it("still WARNS on a STALE bundle (freshness is irrelevant to a rung that never blocks, so no degrade)", async () => {
+    const res = await decide(stale([entry("node_a", pilotPayload({ enforcementCeiling: "WARN" }))]), writeMd("notes/x.md"));
+    // A DENY degrades to ASK when stale (needs confirmation the block is still current); a WARN has nothing
+    // to degrade to. It stays a WARN whether the bundle is fresh or past its lease.
+    expect(res.kind).toBe("WARN");
+    if (res.kind === "WARN") expect(res.count).toBe(1);
+  });
+
+  it("PASSES a compliant write against a WARN rule (no violation, no warning)", async () => {
+    expect(
+      (await decide(fresh([entry("node_a", pilotPayload({ enforcementCeiling: "WARN" }))]), writeMd("src/app/main.md"))).kind,
+    ).toBe("PASS");
+  });
+});
+
+describe("decideBundleEnforcement: MEETLESS_ACTION_INTERCEPT_MAX session ceiling clamp (kill switch)", () => {
+  it("clamps a would-be DENY down to a non-blocking WARN when the session is capped at warn", async () => {
+    const res = await decideCapped(fresh([entry("node_a", pilotPayload())]), writeMd("notes/x.md"), "WARN");
+    expect(res.kind).toBe("WARN");
+    if (res.kind === "WARN") {
+      expect(res.count).toBe(1);
+      expect(res.reason).toContain("node_a");
+    }
+  });
+
+  it("clamps a would-be DENY down to ASK when the session is capped at ask", async () => {
+    const res = await decideCapped(fresh([entry("node_a", pilotPayload())]), writeMd("notes/x.md"), "ASK");
+    expect(res.kind).toBe("ASK");
+    if (res.kind === "ASK") expect(res.degraded).toBe(false);
+  });
+
+  it("clamps a native ASK rule down to WARN when the session is capped at warn", async () => {
+    const res = await decideCapped(
+      fresh([entry("node_a", pilotPayload({ enforcementCeiling: "ASK" }))]),
+      writeMd("notes/x.md"),
+      "WARN",
+    );
+    expect(res.kind).toBe("WARN");
+  });
+
+  it("a DENY cap is a no-op ceiling: the DENY still fires (uncapped default behavior)", async () => {
+    const res = await decideCapped(fresh([entry("node_a", pilotPayload())]), writeMd("notes/x.md"), "DENY");
+    expect(res.kind).toBe("DENY");
+  });
+
+  it("clamps every rule uniformly: two DENY rules capped at warn collapse to a single aggregated WARN", async () => {
+    const read = fresh([entry("node_a", pilotPayload()), entry("node_b", pilotPayload())]);
+    const res = await decideCapped(read, writeMd("notes/x.md"), "WARN");
+    expect(res.kind).toBe("WARN");
+    if (res.kind === "WARN") expect(res.count).toBe(2);
   });
 });
 

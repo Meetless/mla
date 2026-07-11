@@ -5,6 +5,7 @@ import * as path from "path";
 import { openCe0Store, closeCe0Store, type Ce0Store } from "../../../src/lib/rules/ce0-store";
 import {
   NOTES_LOCATION_RULE_ID,
+  convertForbiddenRootSnapshot,
   convertNotesLocationSnapshot,
   mintAttestedNotesLocationVersion,
 } from "../../../src/lib/rules/attest-notes-location";
@@ -173,6 +174,46 @@ describe("convertNotesLocationSnapshot REFUSES anything the single pilot cannot 
     expect(result.admitted).toBe(false);
     if (result.admitted) return;
     expect(result.reason).toBe("SNAPSHOT_UNPARSEABLE");
+  });
+});
+
+// The generic forbidden-root converter arms the WHOLE PROHIBIT family (any root), and its DEFAULT
+// authority is the non-blocking WARN rung (INV-8): a freshly armed mechanically-evaluable rule warns,
+// never blocks, until it has earned DENY end-to-end. notes-location-v1 is the sole rule that passes DENY
+// explicitly. This is the graduated-action ladder (OBSERVE < WARN < ASK < DENY) at the mint boundary.
+describe("convertForbiddenRootSnapshot defaults a newly-armed rule to the WARN rung (INV-8)", () => {
+  /** A generic (non-notes) forbidden-root observed snapshot: a sibling vault root the WARN default guards. */
+  function referencesSnapshot(over: Partial<ObservedRuleSpec> = {}): string {
+    return serializeObservedRule({
+      text: "References belong in the standalone references vault, not the repo references directory.",
+      applicability: { mode: "action", tools: ["Write", "Edit"], matcher: { field: "file_path", glob: "*.md" } },
+      effect: "PROHIBIT",
+      forbiddenRootRelativePath: "references",
+      ...over,
+    });
+  }
+
+  it("arms a brand-new forbidden-root rule at WARN when no ceiling is passed (never hard-blocks on first arming)", () => {
+    const result = convertForbiddenRootSnapshot(referencesSnapshot(), PILOT_SCOPE);
+    expect(result.admitted).toBe(true);
+    if (!result.admitted) return;
+    expect(result.payload.enforcementCeiling).toBe("WARN");
+    expect(result.payload.compliance.config.forbiddenRootRelativePath).toBe("references");
+  });
+
+  it("honors an explicit DENY ceiling (the earned-authority promotion path)", () => {
+    const result = convertForbiddenRootSnapshot(referencesSnapshot(), PILOT_SCOPE, "DENY");
+    expect(result.admitted).toBe(true);
+    if (!result.admitted) return;
+    expect(result.payload.enforcementCeiling).toBe("DENY");
+  });
+
+  it("keeps the notes pilot at its earned DENY even though the generic default is WARN", () => {
+    const notes = convertNotesLocationSnapshot(pilotSnapshot(), PILOT_SCOPE);
+    expect(notes.admitted).toBe(true);
+    if (!notes.admitted) return;
+    // The one rule proven end-to-end stays a hard block; the generic default did not soften it.
+    expect(notes.payload.enforcementCeiling).toBe("DENY");
   });
 });
 

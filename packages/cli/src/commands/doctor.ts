@@ -35,6 +35,11 @@ import {
   countFailOpenEnforcementViolations,
 } from "../lib/rules/interception-store";
 import { getLiveLocalRuleVersion } from "../lib/rules/local-rule-version-repo";
+import {
+  detectWslUnderWindows,
+  shouldSurfaceWslHint,
+  WSL_MLA_HINT,
+} from "../lib/wsl-detect";
 import { NOTES_LOCATION_RULE_ID } from "../lib/rules/attest-notes-location";
 import { resolveActiveRuntimeScopeId } from "../lib/rules/runtime-scope";
 import { type RulePayloadV1 } from "../lib/rules/types";
@@ -1360,6 +1365,13 @@ export async function runDoctor(argv: string[]): Promise<number> {
 
   console.log("Doctor:");
   for (const c of checks) console.log(fmt(c));
+
+  // Cross-boundary invocation nudge for a Windows-side agent driving mla under
+  // WSL. Gated to non-interactive runs (see shouldSurfaceWslHint) so an
+  // interactive WSL human's report stays clean. Prints on both GREEN and RED: the
+  // wiring can be perfect and the caller still invoke mla the wrong way.
+  if (shouldSurfaceWslHint(detectWslUnderWindows(), Boolean(process.stdout.isTTY)))
+    console.log(WSL_MLA_HINT);
 
   const code = doctorExitCode(checks);
   if (code !== 0) {

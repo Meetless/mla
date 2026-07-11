@@ -169,24 +169,17 @@ if [[ "$TOOL" == mcp__meetless__meetless__* ]]; then
   # parses the raw name; toolName keeps the raw value for provenance.
   #
   # outcome is HONEST and three-valued (success | error | unknown), NEVER inferred
-  # from "PostToolUse fired" (§3.3). Failure IS observable: the meetless MCP server
-  # stamps isError:true on every failure path and Claude Code surfaces the
-  # structured CallToolResult in tool_response. So isError==true -> error; a
-  # recognized success shape (an object carrying a content array, no isError) ->
-  # success; anything we cannot positively classify (missing / null / bare-string
-  # response) -> unknown.
+  # from "PostToolUse fired" (§3.3). The classifier lives in common.sh as
+  # classify_mcp_outcome (shared with its regression test so the grammar cannot
+  # drift); see there for the observed-shape rationale (array-shaped success, no
+  # PostToolUse on server error).
   MCP_TUID="$(printf '%s' "$INPUT" | jq -r '.tool_use_id // empty' 2>/dev/null || true)"
   if [[ -n "$MCP_TUID" ]]; then
     MCP_EVENT_KEY="mcp:${SESSION_ID}:${MCP_TUID}"
   else
     MCP_EVENT_KEY="mcp:$(gen_event_key)"
   fi
-  MCP_OUTCOME="$(printf '%s' "$INPUT" | jq -r '
-    (.tool_response // .tool_result) as $r
-    | if ($r | type) == "object" and ($r.isError == true) then "error"
-      elif ($r | type) == "object" and ($r | has("content")) then "success"
-      else "unknown" end' 2>/dev/null || printf 'unknown')"
-  [[ "$MCP_OUTCOME" =~ ^(success|error|unknown)$ ]] || MCP_OUTCOME="unknown"
+  MCP_OUTCOME="$(printf '%s' "$INPUT" | classify_mcp_outcome)"
   MCP_TURN_N="${TURN:-0}"; [[ "$MCP_TURN_N" =~ ^[0-9]+$ ]] || MCP_TURN_N=0
   if [[ "$MCP_TURN_N" -gt 0 ]]; then MCP_TURN_ID="${SESSION_ID}:${MCP_TURN_N}"; else MCP_TURN_ID=""; fi
   # Redact the query at spool time through the ONE parity-locked redactor (§4.4).

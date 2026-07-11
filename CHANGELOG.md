@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.14 (2026-07-11)
+
+- fix(mla): record governed MCP pulls end-to-end (tool_used_mcp outcome + ingest gap)
+- feat(cli): rules add defaults PERSONAL, add rules promote, humanize scope column
+- fix(cli): mla workspace reactivate accepts a positional workspace id
+- fix(cli): show doctor WSL hint only on non-interactive (agent-driven) runs
+- fix(cli): unknown-command errors point at 'mla upgrade', not a dead end
+- docs(cli): state macOS/Linux support and Windows-via-WSL in README
+- feat(cli): flag WSL cross-boundary mla invocation in doctor and installer
+- fix(cli): materialize better-sqlite3 native addon so CE0 store works in the packaged binary
+- feat(cli): add --ceiling/--forbidden-root WARN arming surface to rules attest
+- feat(cli): mla deactivate retires the workspace (two-verbs model)
+- feat(mla): add WARN rung so enforceable rules take non-blocking graduated action
+
 ## 0.2.13 (2026-07-10)
 
 - refactor(cli): implement portable hook mutex for concurrency management

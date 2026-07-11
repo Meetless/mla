@@ -41,13 +41,30 @@ describe("convertForbiddenRootSnapshot admits the whole PROHIBIT forbidden-root 
     expect(result.payload.runtimeScopeId).toBe(SCOPE);
   });
 
-  it("is byte-identical to the notes converter for the 'notes' root (same admitted payload hash)", () => {
+  it("is byte-identical to the notes pilot for the 'notes' root ONLY at an explicit DENY ceiling (same admitted payload hash)", () => {
     const notesSnap = snapshot({ forbiddenRootRelativePath: "notes" });
-    const generic = convertForbiddenRootSnapshot(notesSnap, SCOPE);
+    // The pilot is DENY-ceilinged; the generic converter reproduces it byte-for-byte only when handed
+    // the same explicit DENY ceiling. Everything else about the admitted payload is identical.
+    const generic = convertForbiddenRootSnapshot(notesSnap, SCOPE, "DENY");
     const pilot = convertNotesLocationSnapshot(notesSnap, SCOPE);
     expect(generic.admitted && pilot.admitted).toBe(true);
     if (!generic.admitted || !pilot.admitted) return;
     expect(ruleVersionHash(generic.payload)).toBe(ruleVersionHash(pilot.payload));
+  });
+
+  it("defaults a newly-armed forbidden-root rule to the non-blocking WARN rung, diverging from the DENY pilot ONLY in the ceiling (INV-8)", () => {
+    const notesSnap = snapshot({ forbiddenRootRelativePath: "notes" });
+    // Without an explicit ceiling the generic converter must NOT silently arm a hard block: a
+    // newly-admitted forbidden-root rule earns WARN, not DENY (INV-8, enforcement requires certainty).
+    const generic = convertForbiddenRootSnapshot(notesSnap, SCOPE);
+    const pilot = convertNotesLocationSnapshot(notesSnap, SCOPE);
+    expect(generic.admitted && pilot.admitted).toBe(true);
+    if (!generic.admitted || !pilot.admitted) return;
+    expect(generic.payload.enforcementCeiling).toBe("WARN");
+    expect(pilot.payload.enforcementCeiling).toBe("DENY");
+    // The divergence is confined to the ceiling: the rest of the payload is untouched, so the default
+    // WARN rung is a pure enforcement-strength decision, not a different rule.
+    expect({ ...generic.payload, enforcementCeiling: "DENY" }).toEqual(pilot.payload);
   });
 
   it("rejects an empty (or whitespace-only) forbidden root: a rule that forbids the repo root is nonsensical", () => {
