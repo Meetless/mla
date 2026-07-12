@@ -7,7 +7,7 @@ describe("user-prompt-submit tagged_reference capture (Phase 2, A3)", () => {
   it("captures a referenced doc path as a tagged_reference Active Memory record; never blocks", () => {
     const home = mkdtempSync(join(tmpdir(), "mlhome-"));
     const repo = mkdtempSync(join(tmpdir(), "repo-"));
-    writeFileSync(join(repo, ".meetless.json"), "{}");
+    writeFileSync(join(repo, ".meetless.json"), JSON.stringify({ workspaceId: "ws_1" }));
     mkdirSync(join(home, "logs"), { recursive: true });
     writeFileSync(
       join(home, "cli-config.json"),
@@ -17,6 +17,8 @@ describe("user-prompt-submit tagged_reference capture (Phase 2, A3)", () => {
     const r = spawnSync("bash", [hook], {
       input: JSON.stringify({ session_id: "sess_1", prompt: "please review old.md before we continue", cwd: repo }),
       encoding: "utf8",
+      // Activation gate walks up from the subprocess $PWD, not the stdin cwd field.
+      cwd: repo,
       env: { ...process.env, MEETLESS_HOME: home, HOME: home },
       timeout: 8000,
     });

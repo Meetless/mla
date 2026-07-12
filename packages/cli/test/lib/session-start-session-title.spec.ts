@@ -17,6 +17,10 @@ function seedHome(): { home: string } {
     join(home, "cli-config.json"),
     JSON.stringify({ workspaceId: "ws_1", actorUserId: "user_a", intelUrl: "http://127.0.0.1:8100" }),
   );
+  // The hook gates on meetless_activated, which walks up from the subprocess
+  // $PWD for a `.meetless.json` marker. Plant one in HOME and run the hook there
+  // so activation resolves on a clean runner (no ambient up-tree marker).
+  writeFileSync(join(home, ".meetless.json"), JSON.stringify({ workspaceId: "ws_1" }));
   return { home };
 }
 
@@ -25,6 +29,7 @@ function runHook(home: string, sessionId: string, transcript: string) {
   return spawnSync("bash", [hook], {
     input: JSON.stringify({ session_id: sessionId, transcript_path: transcript }),
     encoding: "utf8",
+    cwd: home,
     env: { ...process.env, MEETLESS_HOME: home, HOME: home },
     timeout: 8000,
   });

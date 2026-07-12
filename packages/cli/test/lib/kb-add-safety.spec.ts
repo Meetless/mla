@@ -26,6 +26,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import { bindWorkspaceMarker } from "./workspace-marker.helper";
+
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "mla-kb-add-"));
 process.env.MEETLESS_HOME = HOME;
 
@@ -198,6 +200,22 @@ describe("parseKbAddArgs", () => {
 });
 
 describe("runKbAdd preflight guards (§13.3 cases 1, 2, file-mode no-orphan)", () => {
+  // Folder = workspace (T1.1): runKbAdd resolves the workspace from the nearest
+  // `.meetless.json` marker (readKbConfig -> loadWorkspaceConfig ->
+  // resolveWorkspaceId) BEFORE the preflight stat guards. On a clean runner
+  // packages/cli has no up-tree marker, so without this the command exits 2 on
+  // NotActivatedError and never reaches the guard message under test (the exit
+  // code matches but the stderr does not). Bind a marker at TMP_ROOT and run from
+  // there; every case below targets an ABSOLUTE path, so the cwd change is inert
+  // to the assertions.
+  let restoreCwd: () => void;
+  beforeAll(() => {
+    restoreCwd = bindWorkspaceMarker(TMP_ROOT, "ws_test");
+  });
+  afterAll(() => {
+    restoreCwd();
+  });
+
   test("--mode file on a directory exits 2 with a clear message", async () => {
     const stderr = jest.spyOn(console, "error").mockImplementation(() => undefined);
     try {

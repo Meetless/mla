@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.16 (2026-07-12)
+
+Supersedes 0.2.15, which failed its release gate and never published to any surface.
+
+- feat(cli): collapse mla onboarding to two steps (install, then /mla activate)
+- feat(console,cli): retire KB document-grain review UI and CLI (Design A)
+- feat(cli): Phase 3a mla doctor --json emitter with stable check ids
+- feat(cli): Phase 2 npm exact-tarball publish (pack -> gate -> smoke -> publish)
+- feat(cli): stamp MOVE provenance on promote/demote mints
+- feat(cli): add userAgent to authentication requests for version tracking
+- fix(cli): mla doctor bad flag is a usage error (exit 2), not an internal fault
+- fix(cli): fold TEAM rules on a marker-bound foreign workspace
+- ci(mla): run the CLI test suite in CI as a release gate (--forceExit + 15m timeout)
+- test(cli): Phase 5 post-publish distribution canaries (per-surface)
+- test(cli): Phase 1 packaged-binary smokes + extract-verify release gate
+- test(cli): make 8 CI-non-hermetic specs self-provision their dogfood deps
+
 ## 0.2.14 (2026-07-11)
 
 - fix(mla): record governed MCP pulls end-to-end (tool_used_mcp outcome + ingest gap)

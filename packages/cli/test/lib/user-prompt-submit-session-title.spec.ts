@@ -14,7 +14,7 @@ import { spawnSync } from "child_process";
 function seedHome(): { home: string; repo: string } {
   const home = mkdtempSync(join(tmpdir(), "mlhome-"));
   const repo = mkdtempSync(join(tmpdir(), "repo-"));
-  writeFileSync(join(repo, ".meetless.json"), "{}");
+  writeFileSync(join(repo, ".meetless.json"), JSON.stringify({ workspaceId: "ws_1" }));
   mkdirSync(join(home, "logs"), { recursive: true });
   writeFileSync(
     join(home, "cli-config.json"),
@@ -28,6 +28,8 @@ function runHook(home: string, repo: string, sessionId: string, prompt: string, 
   return spawnSync("bash", [hook], {
     input: JSON.stringify({ session_id: sessionId, prompt, cwd: repo, transcript_path: transcript }),
     encoding: "utf8",
+    // Activation gate walks up from the subprocess $PWD, not the stdin cwd field.
+    cwd: repo,
     env: { ...process.env, MEETLESS_HOME: home, HOME: home },
     timeout: 8000,
   });

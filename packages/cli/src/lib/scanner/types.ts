@@ -24,6 +24,13 @@ export interface Directive {
   // (.claude/rules, per-service CLAUDE.md), which fall back to the content-hash `id`.
   ruleNodeId?: string;
   ruleVersionId?: string;
+  // The `ruleVersionId`s of other directives that were folded into THIS one during dedup
+  // under exact canonical identity (targeted-rule-injection §7.3). When two directives carry
+  // identical injected authority (same NFC text + strength + resolved applicability), the
+  // dedup keeps one survivor and records the losers' versions here, so the delivery audit can
+  // honestly report an absorbed MUST as REPRESENTED_BY_RULE_VERSION(survivor) rather than lost.
+  // Absent when nothing was absorbed.
+  representedVersionIds?: string[];
 }
 
 export type StaleReason = "adr_superseded" | "frontmatter_deprecated" | "frontmatter_superseded";
@@ -76,6 +83,9 @@ export interface FloorRuleEntry {
   versionId: string;
   text: string;
   strength: "MUST" | "SHOULD";
+  // Versions of other rules this entry canonically represents (§7.3), threaded from the
+  // deduped directive. Cache/audit-only; never rendered. Absent when nothing was absorbed.
+  representedVersionIds?: string[];
 }
 
 // A structured scoped rule: a rule matched per-turn rather than delivered on the always-on
@@ -90,6 +100,9 @@ export interface ScopedRuleEntry {
   strength: "MUST" | "SHOULD";
   globs: string[];
   trigger?: TurnTrigger;
+  // Versions of other rules this entry canonically represents (§7.3), threaded from the
+  // deduped directive. Cache/audit-only; never rendered. Absent when nothing was absorbed.
+  representedVersionIds?: string[];
 }
 
 export interface ScanResult {

@@ -153,20 +153,28 @@ export { mcpCommandExecutable, isPkgSnapshotPath };
 // installer). Any other argument is rejected: doctor is a read-only check by default, and
 // silently ignoring a typo'd flag would hide a mistake. The removed --gc flag (a
 // long-standing no-op) gets a targeted message so an old script fails loudly.
-export function parseDoctorArgs(argv: string[]): { fix: boolean } {
+export function parseDoctorArgs(argv: string[]): {
+  fix: boolean;
+  json: boolean;
+} {
   let fix = false;
+  let json = false;
   for (const a of argv) {
     if (a === "--fix") {
       fix = true;
       continue;
     }
+    if (a === "--json") {
+      json = true;
+      continue;
+    }
     const gcNote =
       a === "--gc" ? " (the --gc flag was a no-op and has been removed)" : "";
     throw new Error(
-      `mla doctor accepts only the optional --fix flag; got: ${argv.join(" ")}${gcNote}`,
+      `mla doctor accepts only the optional --fix and --json flags; got: ${argv.join(" ")}${gcNote}`,
     );
   }
-  return { fix };
+  return { fix, json };
 }
 
 interface Check {
@@ -174,6 +182,12 @@ interface Check {
   label: string;
   detail?: string;
   level?: "info";
+  // Stable machine identifier for the `--json` emitter. English labels are free
+  // to reword; `id` is the contract a harness asserts against (§6.3 names
+  // control.reachable, actor.member, actor.owner, casekind.seeded, plus
+  // mcp.registered / ce0.integrity). Optional: checks without an explicit id
+  // fall back to a slug derived from the label in doctorJson.
+  id?: string;
 }
 
 function fmt(c: Check): string {
@@ -337,6 +351,60 @@ export function reconcileChecks(
 // Pinned in doctor-exit-code.spec.ts.
 export function doctorExitCode(checks: Check[]): number {
   return checks.some((c) => c.level !== "info" && !c.ok) ? 1 : 0;
+}
+
+// The three-value status the `--json` emitter reports per check. `info` is the
+// same load-bearing carve-out doctorExitCode honors: an info row never flips the
+// roll-up, it is context (auth mode, muted session, append-only accounting), not
+// a pass/fail posture. A non-info check is pass when ok, fail otherwise.
+export type DoctorCheckStatus = "pass" | "fail" | "info";
+export function checkStatus(c: Check): DoctorCheckStatus {
+  if (c.level === "info") return "info";
+  return c.ok ? "pass" : "fail";
+}
+
+// Slug fallback for a check that carries no explicit stable id: lower-case, drop
+// any parenthetical (the human detail like "(GET /internal/v1/health)"), and
+// collapse the rest to dot-separated tokens. Only the named checks the harness
+// asserts (§6.3) carry explicit ids; this keeps the JSON well-formed for the
+// rest without inventing a contract nobody depends on.
+function slugifyCheckLabel(label: string): string {
+  const s = label
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-z0-9]+/g, ".")
+    .replace(/^\.+|\.+$/g, "");
+  return s.slice(0, 60) || "check";
+}
+
+export interface DoctorJson {
+  status: "green" | "red";
+  checks: { id: string; status: DoctorCheckStatus; message: string }[];
+}
+
+// The `--json` payload (proposal §217): a roll-up `status` plus one entry per
+// check with a stable `id`, a three-value `status`, and a human `message`. The
+// roll-up mirrors doctorExitCode exactly (green == exit 0), so `--json` and the
+// exit code can never disagree. Derived-slug collisions get a numeric suffix so
+// the array is well-formed; explicit stable ids fire once per run (their push
+// sites are mutually exclusive branches), so they are never suffixed.
+export function doctorJson(checks: Check[]): DoctorJson {
+  const seen = new Map<string, number>();
+  const out = checks.map((c) => {
+    const base = c.id ?? slugifyCheckLabel(c.label);
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    const id = n === 0 ? base : `${base}.${n + 1}`;
+    return {
+      id,
+      status: checkStatus(c),
+      message: c.detail ? `${c.label}: ${c.detail}` : c.label,
+    };
+  });
+  return {
+    status: doctorExitCode(checks) === 0 ? "green" : "red",
+    checks: out,
+  };
 }
 
 // Session-capture lifecycle status (folder = workspace, T3.3). DISTINCT from the
@@ -611,7 +679,26 @@ export function describeAuthMode(auth: CliAuth): string {
 }
 
 export async function runDoctor(argv: string[]): Promise<number> {
-  const { fix } = parseDoctorArgs(argv);
+  // A bad flag is a usage error, not an internal fault. parseDoctorArgs throws on
+  // one (its contract, locked by doctor-no-args.spec); catch it here and exit 2
+  // with the one-line reason, the same "you typed it wrong" path as "Unknown
+  // command" and every sub-dispatcher. Returning non-zero WITHOUT re-throwing
+  // keeps it out of cli.ts's top-level catch, so classifyOutcome buckets it as
+  // user_error and the "MLA hit an internal error -> mla bug report" nudge (which
+  // is for genuine faults on our side) never fires on an operator's typo.
+  let fix = false;
+  let json = false;
+  try {
+    ({ fix, json } = parseDoctorArgs(argv));
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 2;
+  }
+  // `--json` is a read-only emitter: a machine consumer never wants side effects,
+  // so it forces the reconcile plan to plan-only regardless of --fix. It also owns
+  // stdout exclusively (the single JSON line is the only thing printed), so every
+  // human "Doctor:" / GREEN / RED / WSL-hint write below is gated on `!json`.
+  const effectiveFix = json ? false : fix;
 
   const checks: Check[] = [];
   let cfg: ReturnType<typeof readConfig> | null = null;
@@ -637,14 +724,19 @@ export async function runDoctor(argv: string[]): Promise<number> {
       label: "cli-config.json present",
       detail: (e as Error).message,
     });
-    console.log("Doctor:");
-    for (const c of checks) console.log(fmt(c));
+    if (json) {
+      console.log(JSON.stringify(doctorJson(checks)));
+    } else {
+      console.log("Doctor:");
+      for (const c of checks) console.log(fmt(c));
+    }
     return 1;
   }
 
   // 1. control reachable
   const health = await ping(cfg, "/internal/v1/health");
   checks.push({
+    id: "control.reachable",
     ok: health.ok,
     label: "control reachable (GET /internal/v1/health)",
     detail: health.ok ? cfg.controlUrl : health.error,
@@ -696,6 +788,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
       whoami = await get(cfg, whoamiPath, 6000);
       checks.push(workspaceBindingCheck(markerWorkspaceId, whoami));
       checks.push({
+        id: "actor.member",
         ok: !!whoami?.actor,
         label: "actor resolves (workspace member)",
         detail: whoami?.actor?.displayName ?? whoami?.actor?.email,
@@ -709,6 +802,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
             ? whoami.actorIsOwner
             : whoami?.actor?.role === "OWNER";
         checks.push({
+          id: "actor.owner",
           ok: !!isOwner,
           label: "actor is workspace OWNER (KB curation §9.3)",
           detail: isOwner
@@ -717,6 +811,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
         });
       }
       checks.push({
+        id: "casekind.seeded",
         ok: !!whoami?.caseKindAgentReviewSeeded,
         label: "CaseKind 'agent_review' seeded",
       });
@@ -922,12 +1017,14 @@ export async function runDoctor(argv: string[]): Promise<number> {
       // can't be cheaply proven here, so it is left as present, not failed.
       if (mcpCommandExecutable(userCommand)) {
         checks.push({
+          id: "mcp.registered",
           ok: true,
           label: "Meetless MCP server registered (user scope)",
           detail: claudeJsonPath,
         });
       } else {
         checks.push({
+          id: "mcp.registered",
           ok: false,
           label: "Meetless MCP server command executable",
           detail: `${userCommand} is not executable (stale/moved binary); run \`mla rewire\` then restart Claude Code`,
@@ -957,6 +1054,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
       }
       if (projectMcp) {
         checks.push({
+          id: "mcp.registered",
           ok: true,
           label: "Meetless MCP server registered (project scope)",
           detail: projectMcp,
@@ -964,6 +1062,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
         });
       } else {
         checks.push({
+          id: "mcp.registered",
           ok: false,
           label: "Meetless MCP server registered",
           detail: `not found in ${claudeJsonPath}; run \`mla wire\` then restart Claude Code`,
@@ -989,7 +1088,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
     mode: "repair", // doctor --fix MAY restore an existing degraded install (never create-from-zero)
   });
   checks.push(
-    ...reconcileChecks(reconcilePlan, fix, defaultReconcileIO(paths)),
+    ...reconcileChecks(reconcilePlan, effectiveFix, defaultReconcileIO(paths)),
   );
 
   // 6. mlaPath resolves + executable
@@ -1278,7 +1377,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
         // reading anything else; the version/wal/fk/accounting/path-root reads below are meaningless
         // on an unsound store, so they only run once integrity holds.
         const integrity = ce0IntegrityCheck(ce0QuickCheckResult(ce0));
-        checks.push(integrity);
+        checks.push({ ...integrity, id: "ce0.integrity" });
         if (integrity.ok) {
           const version = ce0.db.pragma("user_version", {
             simple: true,
@@ -1363,6 +1462,16 @@ export async function runDoctor(argv: string[]): Promise<number> {
     checks.push(managedPreToolUseHookCheck(resolveLiveInputAuthority()));
   }
 
+  const code = doctorExitCode(checks);
+
+  // `--json`: emit the machine payload as the sole stdout line and return the
+  // same exit code the human path would. No "Doctor:" table, no GREEN/RED tail,
+  // no WSL hint (all human-only). The roll-up in doctorJson mirrors `code`.
+  if (json) {
+    console.log(JSON.stringify(doctorJson(checks)));
+    return code;
+  }
+
   console.log("Doctor:");
   for (const c of checks) console.log(fmt(c));
 
@@ -1373,7 +1482,6 @@ export async function runDoctor(argv: string[]): Promise<number> {
   if (shouldSurfaceWslHint(detectWslUnderWindows(), Boolean(process.stdout.isTTY)))
     console.log(WSL_MLA_HINT);
 
-  const code = doctorExitCode(checks);
   if (code !== 0) {
     console.error("\nDoctor RED. Fix the failing rows before dogfooding.");
     return code;

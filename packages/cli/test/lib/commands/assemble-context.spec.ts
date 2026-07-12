@@ -94,16 +94,19 @@ describe("assemble-context — Row 1/2: current schema, normal assembly", () => 
     expect(h.audits).toHaveLength(1);
     expect(h.audits[0].state).toBe("normal");
     expect(h.audits[0].overflow).toBe(false);
+    // Delivered entries carry the RuleVersion they delivered (§7.4 version-scoped delivery
+    // accounting): the audit records which version rode, so enforcement evidence and the
+    // represent-edge can be attributed to an exact version rather than a bare ruleId.
     expect(h.audits[0].delivered).toEqual([
-      { ruleId: "fm1", tier: "floor-must" },
-      { ruleId: "s1", tier: "scoped-required" },
+      { ruleId: "fm1", tier: "floor-must", versionId: "v1" },
+      { ruleId: "s1", tier: "scoped-required", versionId: "v1" },
     ]);
     // stdout is EXACTLY the assembled head, nothing appended after the assembler's byte assertion:
     // the audit records the assembler's own byte count, and stdout must equal it byte-for-byte.
     expect(Buffer.byteLength(h.stdout, "utf8")).toBe(h.audits[0].bytes);
   });
 
-  it("audits state=overflow and emits the marker when required scoped rules do not fit", async () => {
+  it("FAILS CLOSED (exit 3) and emits the marker when a required scoped MUST does not fit (§7.5)", async () => {
     const h = await run(
       stdin({ prompt: "edit apps/control/outbox.ts" }),
       cache({
@@ -113,13 +116,18 @@ describe("assemble-context — Row 1/2: current schema, normal assembly", () => 
         ],
       }),
     );
-    expect(h.code).toBe(0);
+    // A required scoped MUST that cannot be delivered is DELIVERY_FAILED (proposal L230/235): the
+    // subcommand exits 3 so the hook turns it into a block (exit 2), never a silent exit-0 drop.
+    expect(h.code).toBe(3);
+    // The base-preserving head (base + floor + marker) is still printed to stdout; the big rule's
+    // body is dropped, and the instructive overflow marker rides in its place.
     expect(h.stdout).toContain(OVERFLOW_MARKER_TEXT);
     expect(h.stdout).not.toContain("xxxx");
     expect(h.audits[0].state).toBe("overflow");
     expect(h.audits[0].overflow).toBe(true);
+    // The omitted MUST is named with the exact RuleVersion that could not be delivered (§7.4).
     expect(h.audits[0].omitted).toEqual([
-      { ruleId: "s_big", reason: "overflow:required-scoped-did-not-fit" },
+      { ruleId: "s_big", reason: "overflow:required-scoped-did-not-fit", versionId: "v1" },
     ]);
   });
 });

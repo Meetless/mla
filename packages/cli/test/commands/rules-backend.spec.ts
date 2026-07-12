@@ -1122,6 +1122,9 @@ describe("runRulesDemoteBackend", () => {
     expect(bodies.mint!.projectId).toBe("proj_9");
     expect(bodies.mint!.payload).toEqual(expectedPayload);
     expect(bodies.mint!.requestIdempotencyKey).toBe(ruleVersionHash(expectedPayload as RulePayloadV1));
+    // MOVE provenance: the new PERSONAL node records the TEAM origin it was demoted FROM, so
+    // /rules/[id] can reconstruct the cross-node lifecycle (the move-kind is derived from scopes).
+    expect(bodies.mint!.movedFromRuleId).toBe("node_1");
     // Revoke carries the compare-and-swap token read from the team node.
     expect(bodies.revoke!.expectedCurrentVersionId).toBe("ver_1");
     expect(rec.out.join("\n")).toContain("DEMOTED rule node_1");
@@ -1300,6 +1303,9 @@ describe("runRulesPromoteBackend", () => {
     expect(bodies.mint!.projectId).toBe("proj_9");
     expect(bodies.mint!.payload).toEqual(expectedPayload);
     expect(bodies.mint!.requestIdempotencyKey).toBe(ruleVersionHash(expectedPayload as RulePayloadV1));
+    // MOVE provenance: the new TEAM node records the PERSONAL origin it was promoted FROM, so
+    // /rules/[id] can reconstruct the cross-node lifecycle (the move-kind is derived from scopes).
+    expect(bodies.mint!.movedFromRuleId).toBe("node_1");
     // Revoke carries the compare-and-swap token read from the personal node.
     expect(bodies.revoke!.expectedCurrentVersionId).toBe("ver_1");
     expect(rec.out.join("\n")).toContain("PROMOTED rule node_1");

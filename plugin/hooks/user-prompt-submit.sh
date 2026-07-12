@@ -567,9 +567,11 @@ write_trace() {
 # Called on EVERY injecting turn (§4.3.2): INJECTED is true the moment the static
 # floor is built, so this fires for every non-pull_only / non-muted / non-synthetic
 # turn (those return before assembly). Kill switch MEETLESS_INJECTION_TRACE=0.
-# deliveryStatus is stamped INJECTED HERE, by the source surface, at the delivery
-# decision -- never inferred server-side from enrich `status`
-# (INV-INJECTIONTRACE-DELIVERY).
+# deliveryStatus is stamped HERE, by the source surface, at the delivery decision --
+# never inferred server-side from enrich `status` (INV-INJECTIONTRACE-DELIVERY). Its
+# value is the REAL verdict from $DELIVERY_STATUS (dynamic scope from intercept_main):
+# INJECTED on a successful head, DELIVERY_FAILED when an applicable MUST could not be
+# delivered and the prompt was blocked (§7.6, INV-DELIVERY) -- never a hardcoded literal.
 #
 # The injectId IS the eventKey: minted fresh per injection, baked into the spool
 # line, replayed byte-identical on a re-spool. Control's projection keys idempotency
@@ -642,6 +644,7 @@ spool_injection_trace() {
     --arg trace_id "$TRACE_ID" \
     --arg status "${ENRICH_STATUS:-}" \
     --arg confidence "${ENRICH_CONFIDENCE:-}" \
+    --arg delivery_status "${DELIVERY_STATUS:-INJECTED}" \
     --argjson context_items "$_it_items" \
     --argjson blocks "$_it_blocks" \
     --argjson summary "${_it_summary:-null}" \
@@ -653,7 +656,7 @@ spool_injection_trace() {
         turnId: (if $turn_id == "" then null else $turn_id end),
         injectId: $key,
         traceId: $trace_id,
-        deliveryStatus: "INJECTED",
+        deliveryStatus: $delivery_status,
         schemaVersion: 2,
         status: (if $status == "" then null else $status end),
         confidence: ($confidence | tonumber? // null),
@@ -1002,6 +1005,12 @@ intercept_main() {
   # the bash fallback below (LAYER1 + floor XML) still delivers the floor. Best-effort and
   # fully isolated: any error leaves ASSEMBLE_HEAD empty and the fallback owns delivery.
   local ASSEMBLE_HEAD=""
+  # Run-level delivery verdict (INV-DELIVERY / §7.6): INJECTED unless the subcommand signals a
+  # fail-closed overflow (rc==3), in which case an applicable MUST could not be delivered and this
+  # flips to DELIVERY_FAILED, which blocks the prompt below. Read by spool_injection_trace (dynamic
+  # scope) so the governed-story trace records the REAL verdict, never a hardcoded INJECTED.
+  local DELIVERY_STATUS="INJECTED"
+  local ASSEMBLE_BLOCK_MSG=""
   if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
     # Full dirty set, NOT the 50-capped telemetry array: matching must see every touched path.
     # The env override is scoped to this subshell so it never leaks to TOUCHED_FILES_JSON above.
@@ -1021,9 +1030,43 @@ intercept_main() {
       '{base:$base, prompt:$prompt, workingSet:$workingSet, workspaceId:$workspaceId}
         + (if $repoRoot == "" then {} else {repoRoot:$repoRoot} end)' 2>/dev/null || true)"
     if [[ -n "$_asm_input" ]]; then
-      ASSEMBLE_HEAD="$(printf '%s' "$_asm_input" \
-        | "$MLA_PATH" _internal assemble-context 2>/dev/null || true)"
+      # Capture rc AND stderr. rc==3 is the fail-closed signal (§7.5): the head still prints on
+      # stdout (base + floor + marker), the undelivered RuleVersions ride on stderr. `|| _asm_rc=$?`
+      # catches the non-zero without tripping any inherited `set -e`; rc 0/2 leave the head as-is.
+      local _asm_rc=0 _asm_err=""
+      _asm_err="$(mktemp 2>/dev/null || printf '')"
+      if [[ -n "$_asm_err" ]]; then
+        ASSEMBLE_HEAD="$(printf '%s' "$_asm_input" \
+          | "$MLA_PATH" _internal assemble-context 2>"$_asm_err")" || _asm_rc=$?
+      else
+        ASSEMBLE_HEAD="$(printf '%s' "$_asm_input" \
+          | "$MLA_PATH" _internal assemble-context 2>/dev/null)" || _asm_rc=$?
+      fi
+      if [[ "$_asm_rc" -eq 3 ]]; then
+        DELIVERY_STATUS="DELIVERY_FAILED"
+        [[ -n "$_asm_err" && -f "$_asm_err" ]] && ASSEMBLE_BLOCK_MSG="$(cat "$_asm_err" 2>/dev/null || true)"
+      fi
+      [[ -n "$_asm_err" && -f "$_asm_err" ]] && rm -f "$_asm_err" 2>/dev/null || true
     fi
+  fi
+
+  # §7.5 FAIL-CLOSED (INV-DELIVERY, acceptance tests 30/32): an applicable MUST could not be
+  # delivered within the inline budget. The prompt must NOT proceed reporting a successful inject.
+  # Record the honest DELIVERY_FAILED trace (empty blocks: nothing was delivered), flush it, then
+  # BLOCK: Claude Code shows our stderr to the user and never sends the prompt to the model. `exit`
+  # (not `return`) terminates the hook process, so the `intercept_main || true` at the bottom cannot
+  # swallow the block into a silent success.
+  if [[ "$DELIVERY_STATUS" == "DELIVERY_FAILED" ]]; then
+    if [[ "${MEETLESS_INJECTION_TRACE:-1}" != "0" && "$INJECTED" == "true" ]]; then
+      spool_injection_trace
+      spawn_flush "$SESSION_ID"
+    fi
+    if [[ -n "$ASSEMBLE_BLOCK_MSG" ]]; then
+      printf '%s\n' "$ASSEMBLE_BLOCK_MSG" >&2
+    else
+      printf '%s\n' "mla: required rules could not be delivered within the context budget for this prompt. Do not make file changes; narrow or split the task and retry." >&2
+    fi
+    exit 2
   fi
 
   # --- Layer 2 best-effort: needs the intel token; otherwise floor stands alone ---

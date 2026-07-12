@@ -1396,6 +1396,9 @@ export async function runRulesDemoteBackend(argv: string[], deps: RulesDemoteBac
         // Store the CLI hash verbatim so the read-path re-hash agrees (see runRulesAddBackend).
         canonicalPayloadHash: requestIdempotencyKey,
         requestIdempotencyKey,
+        // MOVE provenance: this PERSONAL copy was demoted FROM the TEAM node. The timeline
+        // derives the move-kind (TEAM->PERSONAL = demote) from the two nodes' scopes.
+        movedFromRuleId: nodeId,
       },
       deps.http,
     );
@@ -1590,6 +1593,9 @@ export async function runRulesPromoteBackend(argv: string[], deps: RulesPromoteB
         // Store the CLI hash verbatim so the read-path re-hash agrees (see runRulesAddBackend).
         canonicalPayloadHash: requestIdempotencyKey,
         requestIdempotencyKey,
+        // MOVE provenance: this TEAM copy was promoted FROM the PERSONAL node. The timeline
+        // derives the move-kind (PERSONAL->TEAM = promote) from the two nodes' scopes.
+        movedFromRuleId: nodeId,
       },
       deps.http,
     );

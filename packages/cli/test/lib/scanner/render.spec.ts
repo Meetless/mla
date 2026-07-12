@@ -48,9 +48,12 @@ describe("dedupeDirectives", () => {
     expect(out[0].id).toBe(directiveId(out[0].source, "Never log secrets."));
   });
 
-  it("keeps the strongest authority when attestation/strength differ across the group", () => {
+  it("keeps the strongest ATTESTATION within an equal-strength group (human > machine)", () => {
+    // §7.3: authorityRank is strength-dominant, so attestation only breaks the tie WITHIN one
+    // strength. Same text + same MUST strength + different attestation: one canonical rule, and the
+    // human copy survives the tie.
     const dirs = [
-      dir({ text: "Prefer absolute imports.", source: "a/CLAUDE.md", attestation: "machine_inferred", strength: "SHOULD_FOLLOW" }),
+      dir({ text: "Prefer absolute imports.", source: "a/CLAUDE.md", attestation: "machine_inferred", strength: "MUST_FOLLOW" }),
       dir({ text: "Prefer absolute imports.", source: "b/CLAUDE.md", attestation: "human_attested", strength: "MUST_FOLLOW" }),
     ];
     const out = dedupeDirectives(dirs);
@@ -59,6 +62,48 @@ describe("dedupeDirectives", () => {
     expect(out[0].strength).toBe("MUST_FOLLOW");
     // Rendered: a human-attested MUST rule earns must-follow authority.
     expect(renderConfirmedRulesXml(out)).toContain('authority="must-follow"');
+  });
+
+  it("29a. MERGES same-text rules that differ only in STRENGTH, keeping the MUST and dropping the SHOULD WITHOUT a represent-edge (§7.3)", () => {
+    // Grouping is STRENGTH-BLIND: a promoted rule that lives as both a repo SHOULD and a governed
+    // MUST is one obligation and must deliver once. authorityRank is strength-dominant, so the MUST
+    // survives (dedup never downgrades a mandatory rule). The absorbed SHOULD is NOT canonically
+    // equal to the MUST, so it is dropped without a REPRESENTED_BY edge, never claimed as an exact
+    // equivalent (§7.4).
+    const out = dedupeDirectives([
+      dir({ text: "Prefer absolute imports.", source: "a/CLAUDE.md", ruleVersionId: "rv_must", strength: "MUST_FOLLOW" }),
+      dir({ text: "Prefer absolute imports.", source: "b/CLAUDE.md", ruleVersionId: "rv_should", strength: "SHOULD_FOLLOW" }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].strength).toBe("MUST_FOLLOW");
+    // A weaker same-text member absorbed by a stronger survivor earns no represent-edge.
+    expect(out[0].representedVersionIds).toBeUndefined();
+  });
+
+  it("29b. does NOT merge same-text rules that differ in APPLICABILITY (globs / trigger, §7.3)", () => {
+    // Resolved applicability is part of the canonical key: a rule scoped to apps/control and the
+    // same text scoped to apps/worker inject different authority (different WHERE) and stay separate.
+    const out = dedupeDirectives([
+      dir({ text: "Guard the outbox.", source: "a/CLAUDE.md", globs: ["apps/control/**"] }),
+      dir({ text: "Guard the outbox.", source: "b/CLAUDE.md", globs: ["apps/worker/**"] }),
+    ]);
+    expect(out).toHaveLength(2);
+  });
+
+  it("29c. merges under EXACT canonical equality and records the absorbed-to-survivor ruleVersionId edge (§7.4)", () => {
+    // Identical NFC text + strength + applicability: one survivor, and the absorbed rule's durable
+    // ruleVersionId is recorded on representedVersionIds so the delivery audit can report the loser as
+    // REPRESENTED_BY_RULE_VERSION(survivor) rather than silently lost. The survivor's own version is
+    // never listed as represented-by-itself.
+    const out = dedupeDirectives([
+      dir({ text: "Never log secrets.", source: "a/CLAUDE.md", ruleVersionId: "rv_survivor", attestation: "human_attested", strength: "MUST_FOLLOW" }),
+      dir({ text: "Never log secrets.", source: "b/CLAUDE.md", ruleVersionId: "rv_absorbed", attestation: "machine_inferred", strength: "MUST_FOLLOW" }),
+    ]);
+    expect(out).toHaveLength(1);
+    // Human attestation survives the tie; the machine copy is absorbed.
+    expect(out[0].attestation).toBe("human_attested");
+    expect(out[0].representedVersionIds).toEqual(["rv_absorbed"]);
+    expect(out[0].representedVersionIds).not.toContain("rv_survivor");
   });
 
   it("preserves first-occurrence order of distinct texts and passes singletons through unchanged", () => {

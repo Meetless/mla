@@ -32,6 +32,15 @@ function readRaw(env: NodeJS.ProcessEnv): string {
   return fs.readFileSync(deadletterPath(env), "utf8");
 }
 
+// A home dir rooted under a non-directory: any mkdir beneath it fails fast with
+// ENOTDIR on every POSIX platform, exercising the "write failed, swallow it"
+// path without a hang. Do NOT use a "/proc/..." path here: procfs returns ENOENT
+// for mkdir under /proc, which livelocks Node's RECURSIVE mkdir on Linux (it
+// misreads the ENOENT as "create the missing parent", finds /proc already
+// exists, and retries the child forever). macOS has no /proc so it throws
+// immediately, which is why that path passed locally but hung the Linux CI gate.
+const UNWRITABLE_HOME = "/dev/null/cannot/write";
+
 describe("sanitizeTelemetry (INV-TELEMETRY-METADATA-CLASSIFICATION)", () => {
   it("keeps the allowlisted low-cardinality fields verbatim", () => {
     const out = sanitizeTelemetry({
@@ -345,7 +354,7 @@ describe("recordTelemetryUploadFailure (F8)", () => {
   });
 
   it("never throws even if the home dir is unwritable", () => {
-    const env = { MEETLESS_HOME: "/proc/nonexistent/cannot/write" } as NodeJS.ProcessEnv;
+    const env = { MEETLESS_HOME: UNWRITABLE_HOME } as NodeJS.ProcessEnv;
     expect(() => recordTelemetryUploadFailure({ traceId: "e".repeat(32) }, { env })).not.toThrow();
   });
 });
@@ -410,7 +419,7 @@ describe("recordKbWriteBlocked (F5)", () => {
   });
 
   it("never throws even if the home dir is unwritable", () => {
-    const env = { MEETLESS_HOME: "/proc/nonexistent/cannot/write" } as NodeJS.ProcessEnv;
+    const env = { MEETLESS_HOME: UNWRITABLE_HOME } as NodeJS.ProcessEnv;
     expect(() => recordKbWriteBlocked({ reasonCode: "owner_gate", status: 2 }, { env })).not.toThrow();
   });
 });

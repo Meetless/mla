@@ -15,7 +15,6 @@ import { runKbReview } from "./kb_review";
 import { runKbPersonal } from "./kb_personal";
 import { runKbPromote } from "./kb_promote";
 import { runKbRetime } from "./kb_retime";
-import { runKbAccept, runKbReject } from "./kb_revision";
 
 // `mla kb`: Knowledge Base subcommand router (T40, kb curation v2.3).
 //
@@ -321,15 +320,6 @@ Usage:
     mla kb show <kbdoc:<id>|note:<path>|<path>>
                       [--all] [--audit-all] [--json] [--open]
     mla kb reingest <kbdoc:<id>|note:<path>|<path>> [--path <new-path>] [--reason <s>]
-    mla kb accept <kbdoc:<id>|<doc-id>> [--workspace <id>] [--json]
-    mla kb reject <kbdoc:<id>|<doc-id>> [--workspace <id>] [--json]
-                      (record a trust verdict on the doc's HEAD revision. accept flips
-                       its reviewOutcome PENDING -> ACCEPTED; reject flips it to REJECTED
-                       (which also drops the revision from serving, so it stops grounding
-                       answers). This is the trust axis, separate from \`kb promote\`
-                       (grounding posture, SHADOW -> LIVE) and from \`kb review\` (which
-                       decides relationship edges, NOT documents, despite also taking
-                       --accept / --reject).)
     mla kb forget <kbdoc:<id>|note:<path>|<path>> [--reason <s>]
     mla kb purge <kbdoc:<id>|note:<path>|<path>> --reason <s> [--force]
     mla kb move <kbdoc:<id>|note:<path>|<path>> <new-path> [--reason <s>]
@@ -375,6 +365,19 @@ export function pendingAliasArgs(argv: string[]): string[] {
   return hasScope ? argv : ["--all", ...argv];
 }
 
+// The document-grain trust verdict (`mla kb accept` / `mla kb reject`) is retired
+// under Design A (kb-document-review-grain proposal §13.3). Print a one-line
+// pointer to the claim-grain replacement and exit non-zero so a script notices the
+// change instead of silently succeeding. No workspace or network is touched.
+export function runKbDocumentReviewRetired(sub: string): number {
+  console.error(
+    `\`mla kb ${sub}\` is retired: a KB document revision is navigate + withdraw only ` +
+      `(importing a source no longer implies trust, and there is no document accept / reject). ` +
+      `Trust now lives at CLAIM grain: review the extracted claims in the Console /claims queue.`,
+  );
+  return 2;
+}
+
 // Curation subcommand router (kb v2.3). Each subcommand owns its own arg
 // parser + exit codes inside commands/kb_*.ts. summary/dump fall through to
 // the legacy inspect handler below.
@@ -417,10 +420,18 @@ export async function runKb(argv: string[]): Promise<number> {
       return (await runKbPromote(rest)).code;
     case "retime":
       return runKbRetime(rest);
+    // `accept` / `reject` were the document-grain trust verdict (kbdoc HEAD
+    // revision PENDING -> ACCEPTED / REJECTED). RETIRED under Design A
+    // (kb-document-review-grain proposal §13.3): a KB document revision is now
+    // navigate + withdraw only; importing a source no longer implies trust and
+    // there is no document accept / reject. All human-promotable trust moved to
+    // CLAIM grain. Kept as explicit routed cases (not a silent "unknown
+    // subcommand") so an operator or script with the verb in muscle memory gets
+    // the retirement pointer, mirroring the intel route's 410
+    // KB_DOCUMENT_REVIEW_RETIRED signal.
     case "accept":
-      return runKbAccept(rest);
     case "reject":
-      return runKbReject(rest);
+      return runKbDocumentReviewRetired(sub);
   }
 
   // Anything that is not a routed subcommand and not summary/dump is unknown.

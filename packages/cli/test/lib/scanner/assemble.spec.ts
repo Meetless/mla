@@ -237,26 +237,31 @@ describe("assembleContext — turn-scoped rule delivery (§7 P3: required reserv
     expect(out.delivered.some((d) => d.ruleId === "s_turn")).toBe(false);
   });
 
-  it("2. matched turn rule + insufficient capacity: audited-dropped best-effort, floor returned, no BaseInvariantError", () => {
-    // Now the trigger fires (the prompt contains 'design doc'), so the rule is a best-effort
-    // candidate — but the budget only holds base+floor, so the turn rule cannot also fit. The
-    // assembler must audit-drop it as best-effort and return the normal floor, NEVER throw the base
-    // invariant (a best-effort rule never reserves failure capacity) and NEVER set overflow (that is
-    // reserved for a required explicit-path MUST).
+  it("2. matched turn MUST + insufficient capacity: fails LOUD (mandatory, §7.1/§7.5), floor preserved, NOT best-effort dropped", () => {
+    // §7 INVERSION of the old droppable-MUST behavior. The trigger fires (the prompt contains
+    // 'design doc'), so this turn-matched MUST is now MANDATORY, not a best-effort candidate. The
+    // 3000-byte rule cannot fit, so the assembler fails LOUD: overflow true, the fail-loud marker
+    // replaces the scoped block, the floor is preserved, and the MUST is audited with the OVERFLOW
+    // reason (never `best-effort:did-not-fit`, which would be a silent drop of a mandatory rule).
+    // Budget 1800 comfortably holds base+floor+marker, so this is a mandatory-overflow, NOT a
+    // BaseInvariantError (the floor itself still fits).
     const out = assembleContext(
       input({
         floorRules: [floorRule],
         scopedRules: [turnRule({ text: "d".repeat(3000) })],
         prompt: "draft the design doc for the approvals flow",
         explicitPaths: [],
-        safeTotal: headBytes,
+        safeTotal: 1800,
       }),
     );
-    expect(out.overflow).toBe(false);
-    expect(out.text).toBe(head);
+    expect(out.overflow).toBe(true);
+    expect(out.text).toContain(OVERFLOW_MARKER_TEXT);
+    expect(out.text).toContain("keep the compressed floor within the inline budget");
+    expect(out.text).not.toContain("dddd");
     expect(out.delivered).toEqual([{ ruleId: floorRule.ruleId, tier: "floor-must" }]);
-    expect(out.omitted).toContainEqual({ ruleId: "s_turn", reason: "best-effort:did-not-fit" });
-    expect(out.bytes).toBeLessThanOrEqual(headBytes);
+    expect(out.omitted).toEqual([{ ruleId: "s_turn", reason: "overflow:required-scoped-did-not-fit" }]);
+    expect(out.bytes).toBe(bytes(out.text));
+    expect(out.bytes).toBeLessThanOrEqual(1800);
   });
 
   it("3. required explicit-path rule overflow: marker reservation and fail-loud unchanged", () => {
@@ -278,11 +283,41 @@ describe("assembleContext — turn-scoped rule delivery (§7 P3: required reserv
     expect(out.omitted).toEqual([{ ruleId: "s_req", reason: "overflow:required-scoped-did-not-fit" }]);
   });
 
-  it("4. required + best-effort turn together: reserve+pack the required, omit the turn rule when necessary", () => {
-    // Both a required explicit-path MUST (small, fits) and a matched turn rule (huge, cannot fit)
-    // are present. The required rule reserves marker room, is packed first, and rides as
-    // scoped-required; the matched turn rule is audit-dropped best-effort. Nothing throws, overflow
-    // stays false (the required rule DID fit), and the two coexist with correct tiers.
+  it("4. matched turn MUST + explicit MUST both fit: BOTH delivered scoped-required (turn MUST is now mandatory, §7.1)", () => {
+    // §7 INVERSION of the old behavior where the turn rule was best-effort and dropped while the
+    // explicit-path MUST rode. Now a matched turn MUST joins the SAME mandatory set as the
+    // explicit-path MUST. Both are small and both fit, so both are delivered as scoped-required,
+    // ordered ahead of any SHOULD. Overflow stays false because the whole mandatory set fit.
+    const out = assembleContext(
+      input({
+        floorRules: [floor()],
+        scopedRules: [
+          scoped({ ruleId: "s_req", text: "guard the outbox on every write", globs: ["apps/control/**"] }),
+          turnRule({ text: "include a Mermaid diagram in the design doc" }),
+        ],
+        explicitPaths: ["apps/control/x.ts"],
+        prompt: "update the design doc and the outbox",
+        safeTotal: 1800,
+      }),
+    );
+    expect(out.overflow).toBe(false);
+    expect(out.text).toContain("guard the outbox on every write");
+    expect(out.text).toContain("include a Mermaid diagram in the design doc");
+    expect(out.delivered).toContainEqual({ ruleId: "fm1", tier: "floor-must" });
+    expect(out.delivered).toContainEqual({ ruleId: "s_req", tier: "scoped-required" });
+    expect(out.delivered).toContainEqual({ ruleId: "s_turn", tier: "scoped-required" });
+    // No mandatory rule was dropped, so nothing is omitted.
+    expect(out.omitted).toEqual([]);
+    expect(out.bytes).toBe(bytes(out.text));
+    expect(out.bytes).toBeLessThanOrEqual(1800);
+  });
+
+  it("4b. matched turn MUST overflows: the WHOLE mandatory set fails loud, taking down even the deliverable explicit MUST (no partial subset, §7.5)", () => {
+    // The mandatory set is all-or-nothing. Here a small explicit-path MUST (s_req) WOULD fit on its
+    // own, but a huge matched turn MUST (s_turn) cannot. Because both are mandatory and there is no
+    // partial-subset delivery, the assembler drops the entire mandatory set and fails loud: overflow
+    // true, floor preserved, and BOTH mandatory ids audited with the overflow reason. This is the
+    // safety property — a mandatory rule is never silently traded away to squeeze in another.
     const out = assembleContext(
       input({
         floorRules: [floor()],
@@ -295,12 +330,16 @@ describe("assembleContext — turn-scoped rule delivery (§7 P3: required reserv
         safeTotal: 1800,
       }),
     );
-    expect(out.overflow).toBe(false);
-    expect(out.text).toContain("guard the outbox on every write");
-    expect(out.delivered).toContainEqual({ ruleId: "fm1", tier: "floor-must" });
-    expect(out.delivered).toContainEqual({ ruleId: "s_req", tier: "scoped-required" });
-    expect(out.delivered.some((d) => d.ruleId === "s_turn")).toBe(false);
-    expect(out.omitted).toContainEqual({ ruleId: "s_turn", reason: "best-effort:did-not-fit" });
+    expect(out.overflow).toBe(true);
+    expect(out.text).toContain(OVERFLOW_MARKER_TEXT);
+    expect(out.text).toContain("never push without explicit consent");
+    expect(out.text).not.toContain("guard the outbox on every write");
+    expect(out.text).not.toContain("dddd");
+    expect(out.delivered).toEqual([{ ruleId: "fm1", tier: "floor-must" }]);
+    expect(out.omitted).toEqual([
+      { ruleId: "s_req", reason: "overflow:required-scoped-did-not-fit" },
+      { ruleId: "s_turn", reason: "overflow:required-scoped-did-not-fit" },
+    ]);
     expect(out.bytes).toBe(bytes(out.text));
     expect(out.bytes).toBeLessThanOrEqual(1800);
   });
@@ -397,12 +436,33 @@ describe("assembleContext — byte-budget boundary (inclusive fill predicate)", 
   });
 });
 
-describe("assembleContext — contaminated working set never forces a required overflow", () => {
+describe("assembleContext — working-set-matched MUST is MANDATORY (§7.2), delivered or fails loud", () => {
   const noisyWorkingSet = Array.from({ length: 40 }, (_v, i) => `apps/other/mod-${i}/file.ts`);
 
-  it("keeps a working-set-only scoped MUST best-effort (droppable), not required", () => {
-    // The rule matches only via a large, noisy working set (plus one matching path). Under a tight
-    // budget it is dropped WITHOUT triggering the required-overflow marker: overflow stays false.
+  it("delivers a working-set-only scoped MUST that fits as scoped-required (mandatory, not best-effort)", () => {
+    // §7.2 INVERSION: an applicable MUST is mandatory regardless of match signal, so a rule matched
+    // ONLY via the working set (its glob hits a dirty file, no explicit path) is now scoped-required,
+    // ordered ahead of every SHOULD. Under a comfortable budget it rides; it is never a droppable tail.
+    const out = assembleContext(
+      input({
+        floorRules: [floor()],
+        scopedRules: [scoped({ ruleId: "s_ws", text: "guard the outbox on every write" })],
+        explicitPaths: [],
+        workingSetPaths: [...noisyWorkingSet, "apps/control/x.ts"],
+        safeTotal: 1800,
+      }),
+    );
+    expect(out.overflow).toBe(false);
+    expect(out.text).toContain("guard the outbox on every write");
+    expect(out.delivered).toContainEqual({ ruleId: "s_ws", tier: "scoped-required" });
+    expect(out.omitted).toEqual([]);
+  });
+
+  it("fails LOUD when a working-set-only scoped MUST cannot fit (§7.5 marker extended to working-set MUST)", () => {
+    // The same working-set MUST, now oversize. Under §7.5 the fail-loud marker is extended from the
+    // explicit-path required set to working-set MUST: the rule overflows loud (overflow true), the
+    // floor is preserved, and it is audited with the OVERFLOW reason, never dropped best-effort. This
+    // repeals the old "contaminated working set never forces a required overflow" invariant.
     const out = assembleContext(
       input({
         floorRules: [floor()],
@@ -412,14 +472,15 @@ describe("assembleContext — contaminated working set never forces a required o
         safeTotal: 1800,
       }),
     );
-    expect(out.overflow).toBe(false);
+    expect(out.overflow).toBe(true);
+    expect(out.text).toContain(OVERFLOW_MARKER_TEXT);
     expect(out.delivered).toEqual([{ ruleId: "fm1", tier: "floor-must" }]);
-    expect(out.omitted).toContainEqual({ ruleId: "s_ws", reason: "best-effort:did-not-fit" });
+    expect(out.omitted).toEqual([{ ruleId: "s_ws", reason: "overflow:required-scoped-did-not-fit" }]);
   });
 
-  it("still promotes an EXPLICIT-path scoped MUST to required under the same contaminated set", () => {
-    // The promotion boundary is the explicit path, independent of working-set noise: now the same
-    // rule is required, so an oversize one triggers the fail-loud marker (overflow true).
+  it("an oversize EXPLICIT-path scoped MUST fails loud identically (signal no longer changes mandatoriness)", () => {
+    // Under §7 the explicit-path vs working-set distinction no longer changes whether a MUST is
+    // mandatory: both are. An oversize explicit-path MUST fails loud exactly like the working-set one.
     const out = assembleContext(
       input({
         floorRules: [floor()],
@@ -470,7 +531,7 @@ describe("assembleContext — global SHOULD overflow (droppable tail, floor surv
 });
 
 describe("assembleContext — best-effort rank order and dedup", () => {
-  it("fills best-effort candidates in rank order: explicit SHOULD > working-set MUST > global SHOULD > working-set SHOULD", () => {
+  it("fills best-effort SHOULD candidates in rank order: explicit SHOULD > global SHOULD > working-set SHOULD (§7.2: the working-set MUST is mandatory, not a best-effort tail)", () => {
     const out = assembleContext(
       input({
         floorRules: [
@@ -487,8 +548,11 @@ describe("assembleContext — best-effort rank order and dedup", () => {
         safeTotal: 1800,
       }),
     );
+    // §7.2 INVERSION: a working-set-matched MUST is mandatory, delivered as scoped-required
+    // AHEAD of every SHOULD, never mixed into the best-effort ladder.
+    expect(out.delivered).toContainEqual({ ruleId: "ws_must", tier: "scoped-required" });
     const bestEffortOrder = out.delivered.filter((d) => d.tier === "best-effort").map((d) => d.ruleId);
-    expect(bestEffortOrder).toEqual(["explicit_should", "ws_must", "global_should", "ws_should"]);
+    expect(bestEffortOrder).toEqual(["explicit_should", "global_should", "ws_should"]);
   });
 
   it("dedupes a rule that appears twice in the scoped set by ruleId (delivered once)", () => {
@@ -551,5 +615,85 @@ describe("assembleContext — no model-facing bytes escape the assertion (centra
     // And the constituent renders are byte-for-byte the shared renderers' output (no re-wrapping).
     expect(out.text).toContain(renderFloorBlock([floor()]));
     expect(out.text).toContain(renderScopedBlock([{ text: scoped().text, strength: "MUST" }]));
+  });
+});
+
+describe("assembleContext — §7 delivery-correctness acceptance (INV-DELIVERY)", () => {
+  // These pin the numbered acceptance criteria from the proposal §11 that are expressible at the
+  // pure-assembler grain (27, 28, 32). 29 (canonical-equality representation) is a dedup property
+  // proven in render.spec.ts; 30/31 (hook block + real deliveryStatus) are proven in
+  // intercept-hook.spec.ts against the live subcommand. The invariant they jointly enforce:
+  // "A run cannot report successful delivery when any selected MUST was neither injected nor
+  // represented by an injected canonical equivalent."
+
+  it("27. under budget pressure a SHOULD is never delivered ahead of a MUST", () => {
+    // An oversize explicit-path MUST cannot fit; a small explicit-path SHOULD would fit on its own.
+    // Mandatory-first + fail-closed means the mandatory overflow returns BEFORE the best-effort
+    // ladder runs, so the SHOULD is never delivered in place of the undeliverable MUST. The SHOULD
+    // is not even reached (not in delivered, not audited best-effort): the run failed loud first.
+    const out = assembleContext(
+      input({
+        floorRules: [floor()],
+        scopedRules: [
+          scoped({ ruleId: "s_must", text: "m".repeat(3000), strength: "MUST", globs: ["apps/a/**"] }),
+          scoped({ ruleId: "s_should", text: "a tiny should", strength: "SHOULD", globs: ["apps/a/**"] }),
+        ],
+        explicitPaths: ["apps/a/x.ts"],
+        safeTotal: 1800,
+      }),
+    );
+    expect(out.overflow).toBe(true);
+    expect(out.text).not.toContain("a tiny should");
+    expect(out.delivered.some((d) => d.ruleId === "s_should")).toBe(false);
+    expect(out.delivered.every((d) => d.tier !== "best-effort")).toBe(true);
+  });
+
+  it("28. an applicable mandatory rule is always accounted for (delivered or omitted), never silently absent", () => {
+    // Every applicable MUST — matched by explicit path, turn trigger, OR working set — must appear in
+    // delivered ∪ omitted. It can never vanish (the assembler's analog of "cannot receive
+    // NOT_APPLICABLE": the assembler only sees applicable rules, so a mandatory one is either
+    // delivered or loudly omitted). Here three mandatory MUSTs (one per signal) all overflow.
+    const out = assembleContext(
+      input({
+        floorRules: [floor()],
+        scopedRules: [
+          scoped({ ruleId: "m_explicit", text: "e".repeat(1500), strength: "MUST", globs: ["apps/a/**"] }),
+          scoped({ ruleId: "m_turn", text: "t".repeat(1500), strength: "MUST", globs: [], trigger: { promptAny: ["design doc"] } }),
+          scoped({ ruleId: "m_ws", text: "w".repeat(1500), strength: "MUST", globs: ["apps/b/**"] }),
+        ],
+        explicitPaths: ["apps/a/x.ts"],
+        workingSetPaths: ["apps/b/y.ts"],
+        prompt: "draft the design doc",
+        safeTotal: 1800,
+      }),
+    );
+    const accounted = new Set([...out.delivered, ...out.omitted].map((r) => r.ruleId));
+    for (const id of ["m_explicit", "m_turn", "m_ws"]) {
+      expect(accounted.has(id)).toBe(true);
+    }
+    // And when overflow fires, each mandatory id is omitted with the loud reason — never absent.
+    expect(out.overflow).toBe(true);
+    for (const id of ["m_explicit", "m_turn", "m_ws"]) {
+      expect(out.omitted).toContainEqual({ ruleId: id, reason: "overflow:required-scoped-did-not-fit" });
+    }
+  });
+
+  it("32. a passing run (overflow false) may omit a SHOULD but NEVER a MUST", () => {
+    // The run-level INJECTED ⟺ overflow-false contract. A budget that holds the mandatory MUST but
+    // not a large global SHOULD: overflow stays false (INJECTED-eligible), the MUST is delivered, and
+    // the ONLY omission is a SHOULD. There is no MUST in omitted on any overflow-false run.
+    const out = assembleContext(
+      input({
+        floorRules: [floor(), { ruleId: "fs_big", versionId: "v1", text: "s".repeat(3000), strength: "SHOULD" }],
+        scopedRules: [scoped({ ruleId: "s_req", text: "guard the outbox on every write", globs: ["apps/control/**"] })],
+        explicitPaths: ["apps/control/x.ts"],
+        safeTotal: 1800,
+      }),
+    );
+    expect(out.overflow).toBe(false);
+    expect(out.delivered).toContainEqual({ ruleId: "s_req", tier: "scoped-required" });
+    expect(out.omitted).toContainEqual({ ruleId: "fs_big", reason: "best-effort:did-not-fit" });
+    // The load-bearing half of #32: no omission on a passing run carries the overflow (MUST) reason.
+    expect(out.omitted.every((o) => o.reason !== "overflow:required-scoped-did-not-fit")).toBe(true);
   });
 });

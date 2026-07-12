@@ -1,6 +1,6 @@
 {
   "name": "@meetless/mla",
-  "version": "0.2.14",
+  "version": "0.2.16",
   "license": "Apache-2.0",
   "private": false,
   "description": "Meetless CLI (mla): governed change-control and knowledge for AI coding agents.",
@@ -41,12 +41,14 @@
     "prepublishOnly": "node scripts/check-publish-gate.js"
   },
   "engines": {
-    "node": ">=18.18.0"
+    "node": ">=22"
   },
   "pkg": {
     "assets": [
       "dist/hooks-template/**/*",
       "dist/build-info.json",
+      "dist/assets/docs-corpus.json",
+      "dist/assets/docs-corpus.sha256",
       "dist/native/better_sqlite3.node"
     ],
     "scripts": [

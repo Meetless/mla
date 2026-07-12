@@ -13,10 +13,12 @@
 //   - The BASE (non-rule context + global MUST floor + reserved marker room) fits every turn.
 //     If it cannot, that is an impossible/misconfigured state (SAFE_TOTAL too small or the
 //     floor grew past it) -> throw BaseInvariantError; the caller falls back to last-known-good.
-//   - Explicit-path scoped MUST is REQUIRED: it fits, or we fail loud (§4.4) while PRESERVING
-//     the base (never replace the whole envelope with only a marker).
-//   - Everything else is BEST-EFFORT: it fills the remaining exact capacity in a fixed rank
-//     order, and every dropped rule is logged with its ruleId + reason.
+//   - EVERY applicable scoped MUST is MANDATORY (matched by explicit path, turn trigger, OR
+//     working set), ordered ahead of every SHOULD across ALL tiers (§7.1). The whole mandatory
+//     set fits, or we fail LOUD (§7.5) while PRESERVING the base (never replace the whole
+//     envelope with only a marker, never silently drop a MUST).
+//   - Only SHOULD rules are BEST-EFFORT: they fill the remaining exact capacity in a fixed rank
+//     order, and every dropped SHOULD is logged with its ruleId + reason.
 
 import { FloorRuleEntry, ScopedRuleEntry } from "./types";
 import type { TurnTrigger } from "../rules/types";
@@ -164,27 +166,51 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
   const floorBlock = renderFloorBlock(floorMust);
   const marker = renderOverflowMarker();
 
-  // REQUIRED: scoped MUST rules matched by an explicit prompt path. Computed BEFORE the base
-  // invariant because the marker reservation now gates on THIS set (§5.5, change 3), not on the
-  // mere existence of any scoped rule. Only a required explicit-path MUST can overflow into the
-  // fail-loud marker; a turn-triggered or working-set rule is best-effort and can only be
-  // audit-dropped, so it must never reserve failure capacity merely by being configured.
-  const scopedRequired = scopedRules.filter(
+  // MANDATORY: every scoped MUST that is applicable this turn, by ANY signal (§7.1/§7.2). The
+  // ratified contract inverts the old droppable-MUST behavior: an applicable MUST matched by a
+  // turn trigger or the working set is no longer best-effort. It is ordered ahead of every SHOULD
+  // across ALL tiers, and if the mandatory set cannot be delivered we fail LOUD (never audit-drop
+  // a MUST as `best-effort:did-not-fit`). Deduped by ruleId, ordered by match-signal strength:
+  // explicit prompt path first (the user named the file), then turn trigger (the user's words),
+  // then working set (dirty files, weakest signal). turnTierOrder is a stable id tiebreak here
+  // since every member is a MUST.
+  const explicitScopedMust = scopedRules.filter(
     (s) => s.strength === "MUST" && matchesAnyPath(s.globs, explicitPaths),
   );
+  const turnMatchedMust = scopedRules
+    .filter(
+      (s) =>
+        s.strength === "MUST" &&
+        s.trigger !== undefined &&
+        matchesTrigger(s.trigger, { prompt, explicitPaths }),
+    )
+    .sort(turnTierOrder);
+  const workingSetMust = scopedRules.filter(
+    (s) => s.strength === "MUST" && matchesAnyPath(s.globs, workingSetPaths),
+  );
+  const mandatoryScoped: ScopedRuleEntry[] = [];
+  const mandatorySeen = new Set<string>();
+  const pushMandatory = (arr: ScopedRuleEntry[]) => {
+    for (const s of arr) {
+      if (mandatorySeen.has(s.ruleId)) continue;
+      mandatorySeen.add(s.ruleId);
+      mandatoryScoped.push(s);
+    }
+  };
+  pushMandatory(explicitScopedMust);
+  pushMandatory(turnMatchedMust);
+  pushMandatory(workingSetMust);
 
   // Base invariant: the non-rule context + global MUST floor must always fit, plus room for the
   // fail-loud overflow marker WHEN that marker is reachable. The marker is emitted only in the
-  // §4.4 required-scoped-overflow branch below, which is reachable iff a required explicit-path
-  // scoped MUST exists this turn. With none (the common turn, including a heavy-base bug-fix turn
-  // that merely has a turn rule configured), reserving the marker's bytes would be dead weight AND
-  // would wrongly force the whole turn to the bash fallback; so a floor that fits base+floor but
-  // not base+floor+marker is delivered whole. With a required rule present we reserve
-  // conservatively, since it may overflow into the marker. Turn-triggered and working-set rules
-  // are best-effort: they are packed only if they fit and audit-dropped otherwise, so they never
-  // reserve marker capacity just by being configured (that was the every-turn marker tax §5.5
-  // change 3 removes).
-  const reserveMarker = scopedRequired.length > 0;
+  // §7.5 mandatory-overflow branch below, which is reachable iff at least one applicable scoped
+  // MUST exists this turn. With none (a turn that only has SHOULD rules configured), reserving the
+  // marker's bytes would be dead weight AND would wrongly force the whole turn to the bash
+  // fallback; so a floor that fits base+floor but not base+floor+marker is delivered whole. With a
+  // mandatory rule present we reserve conservatively, since it may overflow into the marker. SHOULD
+  // rules are best-effort: they are packed only if they fit and audit-dropped otherwise, so they
+  // never reserve marker capacity just by being configured.
+  const reserveMarker = mandatoryScoped.length > 0;
   const invariantHead = reserveMarker
     ? joinSegments([base, floorBlock, marker])
     : joinSegments([base, floorBlock]);
@@ -192,54 +218,49 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
     throw new BaseInvariantError(byteLength(joinSegments([base, floorBlock])), safeTotal);
   }
 
-  const requiredLines: ScopedLine[] = scopedRequired.map((s) => ({ text: s.text, strength: "MUST" }));
+  const mandatoryLines: ScopedLine[] = mandatoryScoped.map((s) => ({ text: s.text, strength: "MUST" }));
 
-  const withRequired = joinSegments([base, floorBlock, renderScopedBlock(requiredLines)]);
-  if (byteLength(withRequired) > safeTotal) {
-    // §4.4 base-preserving fail-loud: emit base + global MUST floor + instructive marker,
-    // route the exact required IDs to out-of-band audit, never emit an arbitrary subset.
+  const withMandatory = joinSegments([base, floorBlock, renderScopedBlock(mandatoryLines)]);
+  if (byteLength(withMandatory) > safeTotal) {
+    // §7.5 base-preserving fail-loud: emit base + global MUST floor + instructive marker, route the
+    // exact mandatory IDs to out-of-band audit, never emit an arbitrary subset. This is the signal
+    // the subcommand turns into a non-zero exit so the hook blocks (INV-DELIVERY): a run can never
+    // report INJECTED while an applicable MUST went undelivered.
     const text = joinSegments([base, floorBlock, marker]);
     return {
       text,
       bytes: byteLength(text),
       overflow: true,
       delivered: floorMust.map((f) => ({ ruleId: f.ruleId, tier: "floor-must" as const })),
-      omitted: scopedRequired.map((s) => ({
+      omitted: mandatoryScoped.map((s) => ({
         ruleId: s.ruleId,
         reason: "overflow:required-scoped-did-not-fit",
       })),
     };
   }
 
-  // BEST-EFFORT ladder (§4.3), in fixed rank order. A rule already required is excluded, and
-  // a rule appearing in several tiers is taken at its earliest (deduped by ruleId).
-  const requiredIds = new Set(scopedRequired.map((s) => s.ruleId));
+  // BEST-EFFORT ladder (§4.3), SHOULD-ONLY now that every applicable MUST is mandatory above. In
+  // fixed rank order; a rule appearing in several tiers is taken at its earliest (deduped by
+  // ruleId). No MUST can reach this ladder.
   const explicitScopedShould = scopedRules.filter(
     (s) => s.strength === "SHOULD" && matchesAnyPath(s.globs, explicitPaths),
   );
-  // Turn-matched best-effort (§5.5, change 4): rules whose TurnTrigger fired on this prompt /
-  // explicit paths, ordered MUST-then-SHOULD-then-stable-id. Ranked ABOVE every working-set tier
-  // and BELOW explicit-path-required (a keyword match must never force the fail-loud marker a
-  // user-named-path MUST is allowed to force). A turn-only rule has empty globs, so it never also
-  // appears in the glob-driven tiers; a rule carrying both a trigger and globs is deduped by
-  // ruleId at whichever tier reaches it first.
-  const turnMatched = scopedRules
-    .filter((s) => s.trigger !== undefined && matchesTrigger(s.trigger, { prompt, explicitPaths }))
+  // Turn-matched SHOULD: rules whose TurnTrigger fired on this prompt / explicit paths, ranked
+  // ABOVE working-set (the user's words beat dirty files) and BELOW explicit-path SHOULD. Stable
+  // id order via turnTierOrder (all SHOULD here, so it degenerates to the id tiebreak).
+  const turnMatchedShould = scopedRules
+    .filter(
+      (s) =>
+        s.strength === "SHOULD" &&
+        s.trigger !== undefined &&
+        matchesTrigger(s.trigger, { prompt, explicitPaths }),
+    )
     .sort(turnTierOrder);
-  const workingSetScopedMust = scopedRules.filter(
-    (s) =>
-      s.strength === "MUST" &&
-      !matchesAnyPath(s.globs, explicitPaths) &&
-      matchesAnyPath(s.globs, workingSetPaths),
-  );
   const workingSetScopedShould = scopedRules.filter(
-    (s) =>
-      s.strength === "SHOULD" &&
-      !matchesAnyPath(s.globs, explicitPaths) &&
-      matchesAnyPath(s.globs, workingSetPaths),
+    (s) => s.strength === "SHOULD" && matchesAnyPath(s.globs, workingSetPaths),
   );
 
-  const seen = new Set(requiredIds);
+  const seen = new Set(mandatorySeen);
   const candidates: Candidate[] = [];
   const pushScoped = (arr: ScopedRuleEntry[], strength: "MUST" | "SHOULD") => {
     for (const s of arr) {
@@ -250,32 +271,25 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
   };
   // 1. Explicit-path scoped SHOULD (a user-named path is a stronger signal than a keyword).
   pushScoped(explicitScopedShould, "SHOULD");
-  // 2. Turn-matched best-effort, above ALL working-set tiers. Each candidate keeps its own
-  //    strength label; the tier order (MUST-then-SHOULD-then-id) was fixed above by turnTierOrder.
-  for (const s of turnMatched) {
-    if (seen.has(s.ruleId)) continue;
-    seen.add(s.ruleId);
-    candidates.push({ channel: "scoped", ruleId: s.ruleId, line: { text: s.text, strength: s.strength } });
-  }
-  // 3. Working-set-only scoped MUST (keeps its MUST label; injection not mandatory).
-  pushScoped(workingSetScopedMust, "MUST");
-  // 4. Global SHOULD (the Tier-0 droppable tail).
+  // 2. Turn-matched SHOULD, above ALL working-set tiers.
+  pushScoped(turnMatchedShould, "SHOULD");
+  // 3. Global SHOULD (the Tier-0 droppable tail).
   for (const f of floorShould) {
     if (seen.has(f.ruleId)) continue;
     seen.add(f.ruleId);
     candidates.push({ channel: "floor-should", ruleId: f.ruleId, entry: f });
   }
-  // 5. Working-set-only scoped SHOULD.
+  // 4. Working-set-only scoped SHOULD.
   pushScoped(workingSetScopedShould, "SHOULD");
 
   // Greedy fill: try each candidate against the FULL re-rendered envelope; keep it iff the
   // whole thing still fits, else log the omission and continue (a smaller later candidate may
-  // still fit). Required content is never revisited, so nothing can push it out.
+  // still fit). Mandatory content is never revisited, so nothing can push it out.
   const acceptedFloorShould: FloorRuleEntry[] = [];
-  const acceptedScopedLines: ScopedLine[] = [...requiredLines];
+  const acceptedScopedLines: ScopedLine[] = [...mandatoryLines];
   const delivered: DeliveredRule[] = [
     ...floorMust.map((f) => ({ ruleId: f.ruleId, tier: "floor-must" as const })),
-    ...scopedRequired.map((s) => ({ ruleId: s.ruleId, tier: "scoped-required" as const })),
+    ...mandatoryScoped.map((s) => ({ ruleId: s.ruleId, tier: "scoped-required" as const })),
   ];
   const omitted: OmittedRule[] = [];
 

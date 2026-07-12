@@ -78,9 +78,17 @@ export function readProjectionReceipt(
   return readJson<PersistedProjectionReceipt>(projectionReceiptPath(workspaceId, home));
 }
 
-// The persisted assembler audit (§4.4). `state` names which cache-degradation row fired
+// The persisted assembler audit (§4.4, §7). `state` names which cache-degradation row fired
 // (or "normal"); `delivered`/`omitted` name rules by their durable identity; `overflow` is
-// true iff the required-scoped fail-loud marker replaced the scoped block.
+// true iff the mandatory-scoped fail-loud marker replaced the scoped block.
+//
+// `versionId` on a delivered/omitted row is the durable RuleVersion identity of that rule
+// (§7.4), enriched at the persistence boundary from the scan-cache floor/scoped arrays (the
+// pure assembler keeps its result minimal so its tests do not churn on identity plumbing).
+// `represents` on a delivered row lists the RuleVersions this injected rule canonically stands
+// in for after dedup (§7.3 REPRESENTED_BY_RULE_VERSION): an absorbed MUST is honestly reported
+// as delivered-by-equivalent, never as lost. Both are optional (absent when unknown / nothing
+// absorbed) so a row written by an older build still parses.
 export interface PersistedAssembleAudit {
   schemaVersion: 1;
   at: string;
@@ -90,8 +98,8 @@ export interface PersistedAssembleAudit {
   safeTotal: number;
   overflow: boolean;
   explicitPaths: string[];
-  delivered: Array<{ ruleId: string; tier: string }>;
-  omitted: Array<{ ruleId: string; reason: string }>;
+  delivered: Array<{ ruleId: string; tier: string; versionId?: string; represents?: string[] }>;
+  omitted: Array<{ ruleId: string; reason: string; versionId?: string }>;
 }
 export function writeAssembleAudit(
   home: string,

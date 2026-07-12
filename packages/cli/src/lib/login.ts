@@ -23,6 +23,7 @@ import { spawn } from "child_process";
 import * as crypto from "crypto";
 import * as http from "http";
 import * as os from "os";
+import { mlaUserAgent } from "./observability";
 
 // ---------------------------------------------------------------------------
 // Bundle shape returned by control's exchange endpoint (SessionResult, §4.1).
@@ -321,7 +322,9 @@ export async function exchangeGrant(
       method: "POST",
       // Content-Type only; explicitly NO Authorization header.
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, codeVerifier }),
+      // userAgent records the CLI version on the new session (Session.userAgent);
+      // the one-time code + PKCE verifier remain the sole proof-of-possession.
+      body: JSON.stringify({ code, codeVerifier, userAgent: mlaUserAgent() }),
       signal: controller.signal,
     });
     const text = await res.text();

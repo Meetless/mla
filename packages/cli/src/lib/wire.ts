@@ -1225,9 +1225,20 @@ export function printWireResult(r: WireResult, opts: { skillOnly?: boolean } = {
       console.log(`Meetless MCP server already registered in ${r.mcp.path}`);
     } else {
       console.log(`Meetless MCP server ${r.mcp.action} in ${r.mcp.path}`);
-      console.log(
-        "  Restart Claude Code to load the meetless tools (meetless__retrieve_knowledge, ...).",
-      );
+      // Session-aware: Claude Code loads MCP servers + scout agents only at session
+      // start, so a mid-session wire (in-session `mla rewire`/`init`) genuinely needs
+      // one restart, but a `curl | sh` install from a bare terminal does not: the tools
+      // just appear next time Claude Code opens. Do not scare the common install path
+      // with a "restart" it never needed.
+      if (process.env.CLAUDE_CODE_SESSION_ID) {
+        console.log(
+          "  Restart Claude Code once to load the meetless tools + scout agents (meetless__retrieve_knowledge, ...).",
+        );
+      } else {
+        console.log(
+          "  The meetless tools + scout agents load automatically the next time you open Claude Code.",
+        );
+      }
     }
   }
 }

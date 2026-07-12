@@ -1,8 +1,42 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { execSync } from "child_process";
 
-import { runInternalFinalize } from "../../src/commands/internal-finalize";
+// Folder = workspace (T1.1): finalize resolves the run's workspaceId by walking
+// up from the resolved repo path to the nearest `.meetless.json` marker. A clean
+// CI checkout has NO ambient up-tree marker (that only exists on a dogfooding
+// box), so pointing MEETLESS_REPO_PATH / the sidecar at the monorepo root would
+// throw NotActivatedError on CI. Build an ISOLATED git repo that carries its OWN
+// marker instead, so BOTH the git evidence (a real `.git`) and the workspace
+// resolution (its own marker) are self-contained and CI-hermetic. The marker may
+// stay untracked: resolveWorkspaceId reads the filesystem, and
+// `git rev-parse --show-toplevel` needs no commit.
+function makeIsolatedMarkedRepo(): string {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "mla-known-repo-"));
+  fs.writeFileSync(
+    path.join(repo, ".meetless.json"),
+    JSON.stringify({ workspaceId: "ws_test", activatedAt: "2026-06-04T00:00:00.000Z" }),
+  );
+  execSync("git init -q", { cwd: repo });
+  return repo;
+}
+
+// runInternalFinalize is loaded via resetModules+require (NOT a static import):
+// config.ts freezes CFG_PATH/QUEUE_DIR from MEETLESS_HOME at module-load time. A
+// static import freezes them to the real ~/.meetless BEFORE any beforeEach sets
+// MEETLESS_HOME, so on a clean runner (no ~/.meetless/cli-config.json)
+// readConfig() throws ConfigError. Requiring AFTER MEETLESS_HOME is set re-freezes
+// them onto the test's tmpHome. (Block 2 already relied on this; both blocks now
+// share the one loader.)
+type RunInternalFinalize =
+  typeof import("../../src/commands/internal-finalize").runInternalFinalize;
+function loadRunInternalFinalize(): RunInternalFinalize {
+  jest.resetModules();
+  return (
+    require("../../src/commands/internal-finalize") as typeof import("../../src/commands/internal-finalize")
+  ).runInternalFinalize;
+}
 
 // Behavioral lock for Decision 7 (note 20260528 §11): `mla _internal
 // finalize-session` ALWAYS POSTs finalize. Git is opportunistic corroboration,
@@ -83,6 +117,7 @@ describe("`mla _internal finalize-session` always POSTs (Decision 7)", () => {
     const okSpy = jest.spyOn(console, "log").mockImplementation(() => {});
     try {
       process.chdir(nonRepo);
+      const runInternalFinalize = loadRunInternalFinalize();
       const code = await runInternalFinalize(["test-session"]);
       // Decision 7: a non-repo cwd is a supported layout; finalize MUST proceed.
       expect(code).toBe(0);
@@ -101,16 +136,10 @@ describe("`mla _internal finalize-session` always POSTs (Decision 7)", () => {
   });
 
   it("honors MEETLESS_REPO_PATH over cwd and POSTs the env-var repo's git evidence", async () => {
-    // This monorepo IS a git repo; use its root as the known-good target.
-    // We walk up from __dirname until we find .git so the test is robust to
-    // future repo-layout moves.
-    let knownRepo = path.resolve(__dirname);
-    for (let i = 0; i < 12; i += 1) {
-      if (fs.existsSync(path.join(knownRepo, ".git"))) break;
-      const parent = path.dirname(knownRepo);
-      if (parent === knownRepo) throw new Error("could not locate .git root");
-      knownRepo = parent;
-    }
+    // Known-good target: an ISOLATED git repo carrying its own `.meetless.json`
+    // marker, so both the git evidence and the workspace resolution are
+    // self-contained (a clean CI checkout has no ambient up-tree marker).
+    const knownRepo = makeIsolatedMarkedRepo();
     expect(fs.existsSync(path.join(knownRepo, ".git"))).toBe(true);
 
     const nonRepo = fs.mkdtempSync(path.join(os.tmpdir(), "mla-nonrepo-"));
@@ -129,6 +158,7 @@ describe("`mla _internal finalize-session` always POSTs (Decision 7)", () => {
     try {
       process.chdir(nonRepo);
       process.env.MEETLESS_REPO_PATH = knownRepo;
+      const runInternalFinalize = loadRunInternalFinalize();
       const code = await runInternalFinalize(["test-session"]);
       expect(code).toBe(0);
       expect(capturedBody).not.toBeNull();
@@ -146,6 +176,7 @@ describe("`mla _internal finalize-session` always POSTs (Decision 7)", () => {
       errSpy.mockRestore();
       okSpy.mockRestore();
       fs.rmSync(nonRepo, { recursive: true, force: true });
+      fs.rmSync(knownRepo, { recursive: true, force: true });
     }
   });
 
@@ -197,15 +228,6 @@ describe("on-demand finalize recovers the repo from the <sid>.repoPath sidecar (
   let originalRepoPathEnv: string | undefined;
   let originalHomeEnv: string | undefined;
 
-  type RunInternalFinalize =
-    typeof import("../../src/commands/internal-finalize").runInternalFinalize;
-  function loadRunInternalFinalize(): RunInternalFinalize {
-    jest.resetModules();
-    return (
-      require("../../src/commands/internal-finalize") as typeof import("../../src/commands/internal-finalize")
-    ).runInternalFinalize;
-  }
-
   beforeEach(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "mla-finalize-sidecar-"));
     queueDir = path.join(tmpHome, "queue");
@@ -229,14 +251,11 @@ describe("on-demand finalize recovers the repo from the <sid>.repoPath sidecar (
       JSON.stringify({ workspaceId: "ws_test", activatedAt: "2026-06-04T00:00:00.000Z" }),
     );
 
-    // Known-good repo: walk up to the monorepo .git root (robust to layout moves).
-    knownRepo = path.resolve(__dirname);
-    for (let i = 0; i < 12; i += 1) {
-      if (fs.existsSync(path.join(knownRepo, ".git"))) break;
-      const parent = path.dirname(knownRepo);
-      if (parent === knownRepo) throw new Error("could not locate .git root");
-      knownRepo = parent;
-    }
+    // Known-good repo: an ISOLATED git repo carrying its own `.meetless.json`
+    // marker. The sidecar / env tests point repoPath here, so both the git
+    // evidence and the workspace resolution are self-contained and CI-hermetic
+    // (a clean checkout has no ambient up-tree marker).
+    knownRepo = makeIsolatedMarkedRepo();
 
     originalCwd = process.cwd();
     originalRepoPathEnv = process.env.MEETLESS_REPO_PATH;
@@ -254,6 +273,7 @@ describe("on-demand finalize recovers the repo from the <sid>.repoPath sidecar (
     global.fetch = fetchOriginal;
     fs.rmSync(tmpHome, { recursive: true, force: true });
     fs.rmSync(nonRepo, { recursive: true, force: true });
+    fs.rmSync(knownRepo, { recursive: true, force: true });
   });
 
   it("reads the <sid>.repoPath sidecar to locate the repo, NOT the invocation cwd", async () => {

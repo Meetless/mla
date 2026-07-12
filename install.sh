@@ -57,9 +57,10 @@ main() {
   say "  mla is installed at $INSTALL_DIR/$APP"
   say "  Restart your shell, or run:  . \"$INSTALL_DIR/env\""
   say ""
-  say "  Next, two steps:"
-  say "    mla login       sign in (opens your browser)"
-  say "    mla activate    bind a repo to a workspace (run inside the repo)"
+  say "  One step left. Open Claude Code in the repo you want governed and run:"
+  say "    /mla activate   signs you in (browser), binds this repo, and seeds its"
+  say "                    governed memory from your docs + git history. That's it."
+  say "  (Or run 'mla activate' here in the terminal to just sign in + bind now.)"
   say ""
 
   # WSL-under-Windows: mla runs natively here, but a coding agent on the Windows

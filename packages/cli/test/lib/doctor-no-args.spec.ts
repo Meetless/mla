@@ -1,4 +1,4 @@
-import { parseDoctorArgs } from "../../src/commands/doctor";
+import { parseDoctorArgs, runDoctor } from "../../src/commands/doctor";
 
 // Behavioral lock for `mla doctor` argument contract (Wedge v6 Epoch 49; extended
 // for Task 8's --fix flag).
@@ -27,20 +27,34 @@ import { parseDoctorArgs } from "../../src/commands/doctor";
 
 describe("parseDoctorArgs (mla doctor)", () => {
   it("accepts no args", () => {
-    expect(parseDoctorArgs([])).toEqual({ fix: false });
+    expect(parseDoctorArgs([])).toEqual({ fix: false, json: false });
   });
 
   it("accepts --fix", () => {
-    expect(parseDoctorArgs(["--fix"])).toEqual({ fix: true });
+    expect(parseDoctorArgs(["--fix"])).toEqual({ fix: true, json: false });
+  });
+
+  // Phase 3 (release-testing proposal §212): the integration harness asserts
+  // named checks off `doctor --json`, so the flag must parse into a plain
+  // read-only toggle (no positional, no value).
+  it("accepts --json", () => {
+    expect(parseDoctorArgs(["--json"])).toEqual({ fix: false, json: true });
+  });
+
+  it("accepts --fix and --json together", () => {
+    expect(parseDoctorArgs(["--fix", "--json"])).toEqual({
+      fix: true,
+      json: true,
+    });
   });
 
   it("still rejects the removed --gc flag with the no-op note", () => {
-    expect(() => parseDoctorArgs(["--gc"])).toThrow(/only the optional --fix flag/);
+    expect(() => parseDoctorArgs(["--gc"])).toThrow(/only the optional --fix and --json flags/);
     expect(() => parseDoctorArgs(["--gc"])).toThrow(/--gc flag was a no-op/);
   });
 
   it("rejects unknown flags and echoes the offender", () => {
-    expect(() => parseDoctorArgs(["--verbose"])).toThrow(/only the optional --fix flag/);
+    expect(() => parseDoctorArgs(["--verbose"])).toThrow(/only the optional --fix and --json flags/);
     expect(() => parseDoctorArgs(["--verbose"])).toThrow(/got: --verbose/);
   });
 
@@ -84,5 +98,54 @@ describe("doctor drift guards", () => {
   it("runDoctor still calls parseDoctorArgs (wiring is not silently removed)", () => {
     const src = readSource("../../src/commands/doctor.ts");
     expect(src).toMatch(/parseDoctorArgs\(argv\)/);
+  });
+});
+
+// F2 (mla first-run E2E harness): `mla doctor --<typo>` used to surface as
+// "MLA hit an internal error -> mla bug report". parseDoctorArgs throws a plain
+// Error on a bad flag; that throw escaped runDoctor to cli.ts's top-level catch,
+// where classifyOutcome buckets an unnamed throw as system_error, which
+// isReportableFault treats as a genuine fault on our side and fires the bug-report
+// nudge. runDoctor now catches the parse throw and returns exit 2 (the CLI's
+// usage-error convention, shared with "Unknown command" and every sub-dispatcher)
+// WITHOUT re-throwing, so the run classifies as user_error and the nudge is
+// structurally impossible on a typo. These lock the surfacing, not just the parse.
+describe("runDoctor usage errors (bad flag -> exit 2, no internal-error nudge)", () => {
+  function captureStderr(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const spy = jest
+      .spyOn(console, "error")
+      .mockImplementation((...a: unknown[]) => {
+        lines.push(a.map(String).join(" "));
+      });
+    return { lines, restore: () => spy.mockRestore() };
+  }
+
+  it("returns exit 2 and echoes the reason for an unknown flag, without throwing", async () => {
+    const { lines, restore } = captureStderr();
+    try {
+      const code = await runDoctor(["--frobnicate"]);
+      expect(code).toBe(2);
+      const out = lines.join("\n");
+      expect(out).toMatch(/only the optional --fix and --json flags/);
+      expect(out).toMatch(/got: --frobnicate/);
+      // The nudge is for genuine faults on our side; a typo must never trigger it.
+      expect(out).not.toMatch(/mla bug report/);
+    } finally {
+      restore();
+    }
+  });
+
+  it("returns exit 2 for the removed --gc flag with the no-op note (no nudge)", async () => {
+    const { lines, restore } = captureStderr();
+    try {
+      const code = await runDoctor(["--gc"]);
+      expect(code).toBe(2);
+      const out = lines.join("\n");
+      expect(out).toMatch(/--gc flag was a no-op/);
+      expect(out).not.toMatch(/mla bug report/);
+    } finally {
+      restore();
+    }
   });
 });

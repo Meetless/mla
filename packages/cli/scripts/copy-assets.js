@@ -13,7 +13,15 @@ const path = require("path");
 
 // Each entry is copied recursively from package-root-relative `from` to
 // dist-relative `to`. Add to this list when the CLI gains another shipped asset.
-const ASSETS = [{ from: "src/hooks-template", to: "hooks-template" }];
+// - hooks-template: the shell/jq hook templates installed at `mla init`/`mla rewire`.
+// - assets: the vendored docs corpus (docs-corpus.json + .sha256), the byte-identical
+//   copy of packages/utils/testdata/docs-corpus.json that powers the offline
+//   `mla docs`/`mla help` surface. Read at runtime via fs (src/lib/docs-corpus.ts) and
+//   embedded in the pkg binary via package.json "pkg.assets", mirroring build-info.json.
+const ASSETS = [
+  { from: "src/hooks-template", to: "hooks-template" },
+  { from: "src/assets", to: "assets" },
+];
 
 const pkgRoot = path.join(__dirname, "..");
 const distRoot = path.join(pkgRoot, "dist");

@@ -12,6 +12,7 @@ import {
 import { homedir } from "node:os";
 import { getBundle, type RuleBundle } from "../lib/rules/control-rule-client";
 import { writeRuleBundleCache } from "../lib/rules/bundle-cache";
+import { recordBundlePrincipal } from "../lib/rules/bundle-principal";
 import { readScanCache } from "../lib/scanner/cache";
 import { rescanAndCache, resolveScanRoot } from "./scan-context";
 
@@ -210,6 +211,12 @@ export async function runInternalSteerSync(argv: string[]): Promise<number> {
       if (bundle) {
         const write = writeRuleBundleCache(bundle);
         bundleRevision = write.storedRevision ?? -1;
+        // Learn the principal control stamped for THIS workspace so the offline readers
+        // (scanner injection + PreToolUse enforcement) key the bundle-cache read by the
+        // SAME id. For a marker bound to a NON-home workspace this differs from the home
+        // auth.user.id, and the client cannot re-derive it; recording it here is what lets
+        // a teammate's shared TEAM rules actually fold on a foreign workspace.
+        recordBundlePrincipal(bundle.workspaceId, bundle.principalUserId);
         // Bridge bundle -> scan cache. The scan cache (confirmedRulesXml) is what the
         // UserPromptSubmit hook injects; nothing else regenerates it on the live per-turn
         // path, so without this bridge a rule change never reaches a running/new session

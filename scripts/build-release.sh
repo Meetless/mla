@@ -170,28 +170,47 @@ if [ "$SIGN" = "1" ] && [ -n "${MLA_APPLE_SIGN_IDENTITY:-}" ]; then
   fi
 fi
 
-# 5. optional smoke gate (CI runs this on the native runner before upload).
-if [ "${MLA_SMOKE:-}" = "1" ]; then
-  say "smoke: mla --version / --help"
-  "$STAGE/$EXE" --version >/dev/null || err "smoke failed: --version"
-  "$STAGE/$EXE" --help    >/dev/null || err "smoke failed: --help"
-fi
-
-# 6. archive with the canonical name, executable at the archive root.
+# 5. archive with the canonical name, executable at the archive root.
 mkdir -p "$RELEASE_DIR"
 tar -czf "$RELEASE_DIR/$ARCHIVE" -C "$STAGE" "$EXE"
 
-# 7. enforce the archive-root contract that install.sh depends on.
+# 6. enforce the archive-root contract that install.sh depends on.
 tar -tzf "$RELEASE_DIR/$ARCHIVE" | grep -qx "$EXE" \
   || err "archive root does not contain exactly '$EXE' (release-layout bug)"
 
-# 8. per-asset checksum in install.sh's expected "<hex>  <filename>" format.
+# 7. per-asset checksum in install.sh's expected "<hex>  <filename>" format.
 (
   cd "$RELEASE_DIR"
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
   else err "no sha256 tool (need sha256sum or shasum)"; fi
 )
+
+# 8. extract-verify-smoke (CI runs this on the NATIVE runner, MLA_SMOKE=1). The
+#    prior gate ran --version on the STAGED binary; that proved nothing about the
+#    shipped archive, and neither the addon dlopen nor the MCP wiring. This one
+#    unpacks the REAL archive into a throwaway dir with NO chmod and asserts:
+#      (a) the archive root really is the `mla` executable, and
+#      (b) the extracted file is ALREADY executable (test -x) -- the exec bit is
+#          load-bearing for the Homebrew cask path (render-cask.sh never chmods),
+#          so we must NEVER chmod +x here to make a smoke pass.
+#    Then it drives the offline pkg-binary scenarios (storage/mcp/ask-core) against
+#    the extracted binary. Each scenario self-isolates HOME/MEETLESS_HOME/TMPDIR and
+#    cleans up on EXIT; the extracted dir is removed by this block's own trap. Only
+#    the native runner sets MLA_SMOKE=1 (a cross-compiled target can't execute here).
+if [ "${MLA_SMOKE:-}" = "1" ]; then
+  say "smoke: extract archive + drive packaged scenarios (no chmod)"
+  SMOKE_EXTRACT="$(mktemp -d)"
+  # shellcheck disable=SC2064  # expand SMOKE_EXTRACT now, on purpose.
+  trap 'rm -rf "$STAGE" "$SMOKE_EXTRACT"' EXIT
+  tar -xzf "$RELEASE_DIR/$ARCHIVE" -C "$SMOKE_EXTRACT"
+  [ -f "$SMOKE_EXTRACT/$EXE" ] || err "extract-smoke: archive did not yield $EXE at its root"
+  [ -x "$SMOKE_EXTRACT/$EXE" ] \
+    || err "extract-smoke: extracted $EXE is not executable (exec bit lost in the archive)"
+  bash "$SCRIPT_DIR/smoke/packaged.sh" "$SMOKE_EXTRACT/$EXE" \
+    || err "extract-smoke: packaged scenarios failed against the extracted binary"
+  say "smoke: OK (extracted binary is executable and all packaged scenarios passed)"
+fi
 
 say "done: $RELEASE_DIR/$ARCHIVE"
 say "      $(cut -d' ' -f1 < "$RELEASE_DIR/$ARCHIVE.sha256")  $ARCHIVE"

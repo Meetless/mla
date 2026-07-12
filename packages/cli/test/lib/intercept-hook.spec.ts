@@ -99,6 +99,7 @@ interface RunResult {
   queueContent: string | null; // raw capture spool (full-fidelity prompt lives here, not on the wire)
   coordState: any | null; // DUR: parsed coordination state file the producer wrote (null if none)
   govState: any | null; // A-0c: parsed per-session governance inject-state file (null if none)
+  stderr: string; // captured hook stderr (the §7.5 fail-closed block message rides here)
 }
 
 // A successful retrieval_only enrichment: status ok + starter markdown.
@@ -280,17 +281,20 @@ async function runHook(opts: RunOpts): Promise<RunResult> {
         },
       });
       let out = "";
+      let err = "";
       child.stdout.on("data", (d) => (out += d));
-      child.stderr.on("data", () => {});
+      child.stderr.on("data", (d) => (err += d));
       child.on("error", reject);
       child.on("close", (code) => {
         (runHook as any)._stdout = out;
+        (runHook as any)._stderr = err;
         resolve(code ?? -1);
       });
       child.stdin.write(input);
       child.stdin.end();
     });
     const stdout: string = (runHook as any)._stdout ?? "";
+    const stderr: string = (runHook as any)._stderr ?? "";
 
     // Trace + sidecar.
     const traceFile = path.join(home, "logs", "ask-traces.jsonl");
@@ -354,6 +358,7 @@ async function runHook(opts: RunOpts): Promise<RunResult> {
       queueContent,
       coordState,
       govState,
+      stderr,
     };
   } finally {
     await stub.close();
@@ -1591,6 +1596,58 @@ describe("push interception hook: governed-story v2 injection_trace producer", (
     expect(p.sourceSurface).toBe("HOOK");
     expect(p.schemaVersion).toBe(2);
     expect(p.deliveryStatus).toBe("INJECTED");
+  });
+
+  // A fake `mla` whose `_internal assemble-context` reproduces the §7.5 fail-closed
+  // signal: it prints a plausible head on stdout (base + floor + overflow marker),
+  // the undelivered RuleVersions on stderr, and exits 3. Every other subcommand
+  // (redact-capture, flush, reap) stays a no-op so the trace + flush still run.
+  function makeFailClosedStub(blockMsg: string): { path: string } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-failclosed-stub-"));
+    stubDirs.push(dir);
+    const p = path.join(dir, "mla");
+    fs.writeFileSync(
+      p,
+      `#!/usr/bin/env bash\n` +
+        `if [[ "$1 $2" == "_internal assemble-context" ]]; then\n` +
+        `  cat >/dev/null 2>&1 || true\n` +
+        `  printf '%s\\n' '<meetless-context kind="static">floor</meetless-context>'\n` +
+        `  printf '%s\\n' ${JSON.stringify(blockMsg)} >&2\n` +
+        `  exit 3\n` +
+        `fi\n` +
+        `cat >/dev/null 2>&1 || true\n` +
+        `exit 0\n`,
+    );
+    fs.chmodSync(p, 0o755);
+    return { path: p };
+  }
+
+  // §7.5 / INV-DELIVERY (acceptance tests 30-32): when assemble-context signals a
+  // fail-closed overflow (rc==3), an applicable MUST could NOT be delivered. The hook
+  // must BLOCK the prompt (exit 2, block message on stderr) and record an HONEST
+  // DELIVERY_FAILED trace -- never report the run as INJECTED.
+  it("fail-closed delivery (assemble-context rc==3): hook blocks (exit 2), stderr carries the block message, trace deliveryStatus DELIVERY_FAILED", async () => {
+    const blockMsg =
+      "mla: 2 required rule(s) could not be delivered within the context budget: rv_a, rv_b. Do not make file changes; narrow or split the task and retry.";
+    const r = await runHook({
+      mlaPath: makeFailClosedStub(blockMsg).path,
+      stub: { enrich: { body: enrichOk("## starter") } },
+    });
+    // The prompt is blocked, not delivered (Claude Code treats exit 2 as a hard block).
+    expect(r.status).toBe(2);
+    // The undelivered RuleVersions reach the user on stderr, not the model.
+    expect(r.stderr).toContain("could not be delivered");
+    expect(r.stderr).toContain("rv_a");
+    expect(r.stderr).toContain("rv_b");
+    // No injection JSON is emitted on stdout (the model never sees the head).
+    expect(r.injection).toBeNull();
+    // The governed-story trace is still recorded, and it tells the truth.
+    const traces = traceOf(r);
+    expect(traces).toHaveLength(1);
+    const p = traces[0].payload;
+    expect(p.sourceSurface).toBe("HOOK");
+    expect(p.schemaVersion).toBe(2);
+    expect(p.deliveryStatus).toBe("DELIVERY_FAILED");
   });
 
   it("shares one turnId across prompt_submitted and the injection_trace (identity join, not position)", async () => {

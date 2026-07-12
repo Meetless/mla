@@ -24,6 +24,8 @@ describe("Phase 0 canary: stays local (tests 7,40,41)", () => {
     const r = spawnSync("bash", [hook], {
       input: JSON.stringify({ session_id: "sess_1", tool_name: "Write", tool_input: { file_path: f }, cwd: repo }),
       encoding: "utf8",
+      // Activation gate walks up from the subprocess $PWD, not the stdin cwd field.
+      cwd: repo,
       env: { ...process.env, MEETLESS_HOME: home, HOME: home },
       timeout: 5000,
     });

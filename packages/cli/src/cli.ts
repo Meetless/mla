@@ -382,9 +382,11 @@ usage:
                     (reclaim orphaned queue files from dead sessions; previews
                      unless --yes. Unlike flush --gc it also reclaims non-empty
                      stranded tails, flushing them best-effort first)
-  mla doctor
+  mla doctor [--fix] [--json]
                     (health check; reports both lifecycles distinctly: workspace
-                     binding (activated / not) and session capture (active / muted))
+                     binding (activated / not) and session capture (active / muted).
+                     --fix reconciles legacy home-dir wiring; --json emits a
+                     machine-readable {status, checks:[{id,status,message}]} report)
   mla status
                     (show whether Meetless is active for this repo and print
                      scan-cache counts: confirmed rules injected, pending review

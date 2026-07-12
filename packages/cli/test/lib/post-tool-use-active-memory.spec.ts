@@ -17,9 +17,11 @@ function harness() {
   return { home, repo };
 }
 
-function runHook(input: object, env: Record<string, string>) {
+function runHook(input: { cwd?: string; [k: string]: unknown }, env: Record<string, string>) {
   const hook = join(__dirname, "../../src/hooks-template/post-tool-use.sh");
-  return spawnSync("bash", [hook], { input: JSON.stringify(input), encoding: "utf8", env: { ...process.env, ...env } });
+  // Activation gate walks up from the subprocess $PWD, not the stdin cwd field;
+  // run the hook in the edited file's repo so its marker resolves on a clean runner.
+  return spawnSync("bash", [hook], { input: JSON.stringify(input), encoding: "utf8", cwd: input.cwd, env: { ...process.env, ...env } });
 }
 
 describe("post-tool-use A2 capture (Phase 0)", () => {

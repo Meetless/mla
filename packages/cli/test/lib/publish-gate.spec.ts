@@ -1,17 +1,18 @@
-// Behavioral lock for the §0.01-clause-9 / §10.1 publish gate (proposal T34b).
-// `main()` exits non-zero iff `evaluatePublishGate(...).ok` is false, so locking
-// the pure decision core IS the lock on the publish-abort behavior. Both failure
-// modes the proposal names (a required command absent; the e2e flag unset) must
-// fail, and the message must name the missing piece. The .js gate script loads as
-// plain CommonJS (jest only transforms .ts), so require() exercises it directly.
+// Behavioral lock for the publish gate (proposal T34b, refined by the release-
+// testing proposal Phase 0.4). The gate now aborts a publish iff the BUILT CLI
+// is missing any of login/logout/whoami; the old AUTH_BROWSER_LOGIN_READY env
+// flag was removed once browser login shipped, so command registration is the
+// sole abort condition. `main()` exits non-zero iff `evaluatePublishGate(...).ok`
+// is false, so locking the pure decision core IS the lock on the publish-abort
+// behavior. The .js gate script loads as plain CommonJS (jest only transforms
+// .ts), so require() exercises it directly.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const gate = require("../../scripts/check-publish-gate.js") as {
-  evaluatePublishGate: (input: { helpText: string; ready: boolean }) => {
+  evaluatePublishGate: (input: { helpText: string }) => {
     ok: boolean;
     reason: string;
   };
   REQUIRED_COMMANDS: string[];
-  READY_FLAG: string;
 };
 
 // A faithful slice of the real `mla --help` USAGE block: the three command lines
@@ -31,23 +32,17 @@ usage:
 `;
 
 describe("evaluatePublishGate (T34b)", () => {
-  it("passes when all three commands are present and the e2e flag is set", () => {
-    const r = gate.evaluatePublishGate({ helpText: REAL_HELP, ready: true });
+  it("passes when all three required commands are registered", () => {
+    const r = gate.evaluatePublishGate({ helpText: REAL_HELP });
     expect(r.ok).toBe(true);
     expect(r.reason).toMatch(/publish gate OK/);
-  });
-
-  it("fails (and names the flag) when AUTH_BROWSER_LOGIN_READY is not set", () => {
-    const r = gate.evaluatePublishGate({ helpText: REAL_HELP, ready: false });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toMatch(/AUTH_BROWSER_LOGIN_READY/);
   });
 
   it("fails (and names the command) when whoami is missing from the built manifest", () => {
     const without = REAL_HELP.split("\n")
       .filter((l) => !/mla whoami/.test(l))
       .join("\n");
-    const r = gate.evaluatePublishGate({ helpText: without, ready: true });
+    const r = gate.evaluatePublishGate({ helpText: without });
     expect(r.ok).toBe(false);
     // The enumerated missing-list contains ONLY whoami (the prose tail may still
     // say "Browser login", so assert against the list, not the whole message).
@@ -56,16 +51,16 @@ describe("evaluatePublishGate (T34b)", () => {
 
   it("lists every missing command when none are registered", () => {
     const bare = "mla: Meetless Agent CLI\n\nusage:\n  mla init [...]\n  mla review\n";
-    const r = gate.evaluatePublishGate({ helpText: bare, ready: true });
+    const r = gate.evaluatePublishGate({ helpText: bare });
     expect(r.ok).toBe(false);
     for (const cmd of gate.REQUIRED_COMMANDS) {
       expect(r.reason).toMatch(new RegExp(cmd));
     }
   });
 
-  it("checks commands before the flag (a missing command wins the message)", () => {
+  it("fails when the login command line is absent (a missing command aborts)", () => {
     const without = REAL_HELP.replace(/  mla login.*\n/, "");
-    const r = gate.evaluatePublishGate({ helpText: without, ready: false });
+    const r = gate.evaluatePublishGate({ helpText: without });
     expect(r.ok).toBe(false);
     expect(r.reason).toMatch(/missing required command/);
     expect(r.reason).toMatch(/login/);
@@ -78,7 +73,7 @@ describe("evaluatePublishGate (T34b)", () => {
   mla whoami
                     (browser login flow described here, but no command line)
 `;
-    const r = gate.evaluatePublishGate({ helpText: proseOnly, ready: true });
+    const r = gate.evaluatePublishGate({ helpText: proseOnly });
     expect(r.ok).toBe(false);
     expect(r.reason).toMatch(/login/);
   });

@@ -61,6 +61,7 @@ export interface AssembleContextDeps {
   home?: string;
   now?: () => string;
   log?: (out: string) => void;
+  logErr?: (out: string) => void;
 }
 
 interface AssembleStdin {
@@ -128,14 +129,38 @@ interface AssembleCtx {
   writeAudit: (home: string, workspaceId: string, audit: PersistedAssembleAudit) => void;
 }
 
+// The result of a byte-budgeted assembly attempt. `head` is the exact model-facing envelope (or
+// null when nothing can be produced and the bash fallback must own the head). `overflow` is true
+// iff an applicable MUST could not be delivered (§7.5): the caller MUST turn this into a
+// fail-closed exit so the hook blocks the prompt (INV-DELIVERY). `blockedVersions` names the
+// undelivered mandatory RuleVersions so the block message can tell the user exactly what failed.
+interface AssembleResult {
+  head: string | null;
+  overflow: boolean;
+  blockedVersions: Array<{ versionId: string; text: string }>;
+}
+
 /**
  * Core: read the cache, branch on schemaVersion (§6 degradation table), and return the exact
- * head string (or null when nothing can be produced). Every branch writes an out-of-band audit.
+ * head plus the fail-closed signal. Every branch writes an out-of-band audit, enriched at THIS
+ * boundary with each rule's durable RuleVersion identity (§7.4) and dedup represent-edge (§7.3);
+ * the pure assembler stays minimal so its tests do not churn on identity plumbing.
  */
-function assemble(input: AssembleStdin, ctx: AssembleCtx): string | null {
+function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
   const cache = ctx.readCache(ctx.home, input.workspaceId);
   const explicitPaths = extractExplicitPaths(input.prompt, { repoRoot: input.repoRoot });
   const workingSetPaths = normalizeWorkingSet(input.workingSet);
+
+  // ruleId -> durable identity, unioned across floor + scoped cache arrays. Used only to enrich
+  // the out-of-band audit and the block message; empty when the cache is absent or pre-v2 (those
+  // branches deliver no identified rules anyway).
+  const identityByRuleId = new Map<string, { versionId: string; text: string; represents?: string[] }>();
+  for (const f of cache?.floorRules ?? []) {
+    identityByRuleId.set(f.ruleId, { versionId: f.versionId, text: f.text, represents: f.representedVersionIds });
+  }
+  for (const s of cache?.scopedRules ?? []) {
+    identityByRuleId.set(s.ruleId, { versionId: s.versionId, text: s.text, represents: s.representedVersionIds });
+  }
 
   const emitAudit = (
     state: PersistedAssembleAudit["state"],
@@ -154,8 +179,23 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): string | null {
       safeTotal: input.safeTotal,
       overflow,
       explicitPaths,
-      delivered,
-      omitted,
+      delivered: delivered.map((d) => {
+        const id = identityByRuleId.get(d.ruleId);
+        return {
+          ruleId: d.ruleId,
+          tier: d.tier,
+          ...(id?.versionId ? { versionId: id.versionId } : {}),
+          ...(id?.represents && id.represents.length ? { represents: id.represents } : {}),
+        };
+      }),
+      omitted: omitted.map((o) => {
+        const id = identityByRuleId.get(o.ruleId);
+        return {
+          ruleId: o.ruleId,
+          reason: o.reason,
+          ...(id?.versionId ? { versionId: id.versionId } : {}),
+        };
+      }),
     });
   };
 
@@ -163,7 +203,7 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): string | null {
   if (!cache) {
     const text = joinSegments([input.base, renderIncompleteDeliveryMarker()]);
     emitAudit("incomplete", text, false, [], []);
-    return text;
+    return { head: text, overflow: false, blockedVersions: [] };
   }
 
   // Rows 3/4: old schema. Post-activation, the bulk compat path is gone, so scoped rules cannot
@@ -180,7 +220,7 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): string | null {
   if ((cache.schemaVersion ?? 1) < SCAN_SCHEMA_VERSION) {
     const text = joinSegments([input.base, renderScopedUnavailableMarker(), cache.floorRulesXml ?? ""]);
     emitAudit("old-schema", text, false, [], []);
-    return text;
+    return { head: text, overflow: false, blockedVersions: [] };
   }
 
   // Rows 1/2: current schema. Real byte-budgeted assembly. A cache written by a scan that failed
@@ -199,7 +239,15 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): string | null {
       safeTotal: input.safeTotal,
     });
     emitAudit(out.overflow ? "overflow" : "normal", out.text, out.overflow, out.delivered, out.omitted, out.bytes);
-    return out.text;
+    // On overflow the omitted set is exactly the applicable MUST rules that did not fit (§7.5).
+    // Name them by durable RuleVersion so the fail-closed block message tells the user what failed.
+    const blockedVersions = out.overflow
+      ? out.omitted.map((o) => {
+          const id = identityByRuleId.get(o.ruleId);
+          return { versionId: id?.versionId ?? o.ruleId, text: id?.text ?? "" };
+        })
+      : [];
+    return { head: out.text, overflow: out.overflow, blockedVersions };
   } catch (e) {
     if (e instanceof BaseInvariantError) {
       // The universal floor no longer fits the budget (SAFE_TOTAL too small or the floor grew
@@ -212,13 +260,44 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): string | null {
       // the audit so the base-invariant is observable out-of-band. Return null -> subcommand prints
       // nothing -> bash fallback owns the head.
       emitAudit("base-invariant", "", false, [], [], 0);
-      return null;
+      return { head: null, overflow: false, blockedVersions: [] };
     }
     throw e;
   }
 }
 
-/** CLI entry: `mla _internal assemble-context`. Reads stdin, prints the head, writes the audit. */
+// Truncate a rule's text to a single readable line for the fail-closed block message. The full
+// text already rode in the assembler and the audit; here we only need enough to let the user
+// recognize which rule failed to fit.
+function oneLine(s: string, max = 140): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+// The user-facing block message printed to stderr when an applicable MUST could not be delivered
+// (§7.5, INV-DELIVERY). The hook cats this to its own stderr and blocks the prompt (exit 2), so
+// this text is what the operator sees. It names the undelivered RuleVersions and says what to do.
+function renderBlockMessage(blocked: Array<{ versionId: string; text: string }>): string {
+  const lines = blocked.map((b) => `  - ${b.versionId}: ${oneLine(b.text)}`);
+  return [
+    "mla: required rules could not be delivered within the context budget for this prompt.",
+    "The following MUST_FOLLOW rules did not fit and were NOT applied:",
+    ...lines,
+    "Do not make file changes. Narrow the task or split it into smaller prompts so the required rules fit, then retry.",
+    "",
+  ].join("\n");
+}
+
+/**
+ * CLI entry: `mla _internal assemble-context`. Reads stdin, prints the head, writes the audit.
+ *
+ * Exit codes are the hook's control channel:
+ *   2 — strict-parse error (unknown flag). Distinct from the fail-closed signal below.
+ *   3 — FAIL-CLOSED (§7.5): an applicable MUST could not be delivered. The head (base + floor +
+ *       marker) is still printed to stdout and the undelivered RuleVersions are named on stderr;
+ *       the hook turns rc==3 into a blocked prompt (exit 2) so the run is never reported INJECTED.
+ *   0 — normal delivery, a visible degraded state, or any fail-soft error (bash fallback owns it).
+ */
 export async function runAssembleContext(
   argv: string[],
   deps: AssembleContextDeps = {},
@@ -238,11 +317,18 @@ export async function runAssembleContext(
       writeAudit: deps.writeAudit ?? writeAssembleAudit,
     };
     const log = deps.log ?? ((out: string) => process.stdout.write(out));
+    const logErr = deps.logErr ?? ((out: string) => process.stderr.write(out));
 
     const input = parseInput(readStdin());
     if (!input) return 0; // fail-soft: bash fallback emits LAYER1 + floor
-    const head = assemble(input, ctx);
-    if (head) log(head);
+    const result = assemble(input, ctx);
+    if (result.head) log(result.head);
+    if (result.overflow) {
+      // Fail-closed: an applicable MUST did not fit. Name what failed on stderr and signal rc==3
+      // so the hook blocks the prompt. Never a silent INJECTED (INV-DELIVERY, acceptance test 30).
+      logErr(renderBlockMessage(result.blockedVersions));
+      return 3;
+    }
     return 0;
   } catch {
     return 0; // fail-soft on any unexpected failure

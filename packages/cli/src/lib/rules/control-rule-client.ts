@@ -145,6 +145,14 @@ export interface MintRuleBody {
    */
   canonicalPayloadHash?: string | null;
   requestIdempotencyKey?: string | null;
+  /**
+   * MOVE provenance: the origin RuleNode id this mint is a promote/demote copy of. Set only
+   * by the promote/demote flows (which mint the target-scope copy); omitted for native `add`.
+   * The backend stores it verbatim as RuleNode.movedFromRuleId; the timeline derives the
+   * move-kind from the two nodes' scopes. Not part of the hashed payload, so it never
+   * affects canonicalPayloadHash / bundle-verify.
+   */
+  movedFromRuleId?: string | null;
 }
 
 export interface EditRuleBody {

@@ -98,6 +98,10 @@ describe("onboardRecommendation", () => {
   it("recommends /mla onboard for a fresh workspace inside a session", () => {
     const out = onboardRecommendation({ inSession: true, justProvisioned: true });
     expect(out).not.toBeNull();
+    // Machine sentinel: the /mla skill greps stdout for this exact token and auto-
+    // invokes the mla-onboard skill, so a fresh workspace flows straight into
+    // onboarding with no second command. Must be on its own line, verbatim.
+    expect(out!.split("\n")).toContain("MLA_NEXT: onboard");
     expect(out!).toContain("/mla onboard");
     // Trust posture: candidates land born PENDING, never auto-accepted.
     expect(out!).toMatch(/born PENDING/);

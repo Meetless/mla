@@ -24,12 +24,27 @@ const sha = git("rev-parse --short HEAD");
 const branch = git("rev-parse --abbrev-ref HEAD");
 const dirty = !!git("status --porcelain");
 
+// builtAt is deterministic when SOURCE_DATE_EPOCH is exported (seconds since the
+// Unix epoch, the reproducible-builds convention). The npm release packs the tgz
+// once, smokes those exact bytes, and publishes them; pinning builtAt to the
+// commit time keeps the packed artifact byte-reproducible for the same source so
+// a re-pack (or a checksum audit) matches, instead of drifting on wall-clock.
+// Unset (local/dev) -> wall-clock now, unchanged. A malformed value falls back.
+function resolveBuiltAt() {
+  const raw = process.env.SOURCE_DATE_EPOCH;
+  if (raw && /^\d+$/.test(raw.trim())) {
+    const ms = Number(raw.trim()) * 1000;
+    if (Number.isFinite(ms)) return new Date(ms).toISOString();
+  }
+  return new Date().toISOString();
+}
+
 const info = {
   version: pkg.version ?? "0.0.0",
   sha: sha ?? "unknown",
   branch: branch ?? "unknown",
   dirty,
-  builtAt: new Date().toISOString(),
+  builtAt: resolveBuiltAt(),
   // Public Sentry DSN baked at build time. Public-by-design: client-side Sentry
   // ships its DSN to every browser/CLI. Production builds set SENTRY_DSN in CI
   // env so the binary auto-enables Sentry on install. Dev builds leave it empty

@@ -211,6 +211,8 @@ export function buildStructuredRules(dirs: Directive[]): {
       versionId: versionIdOf(d),
       text: d.text,
       strength: shortStrength(d),
+      // Copy-only threading of the dedup represent-edge (§7.3); undefined omits the key.
+      representedVersionIds: d.representedVersionIds,
     }));
   const scopedRules: ScopedRuleEntry[] = dirs
     .filter((d) => d.attestation === "human_attested" && (hasGlobs(d) || hasTrigger(d)))
@@ -224,6 +226,8 @@ export function buildStructuredRules(dirs: Directive[]): {
       globs: d.globs ?? [],
       // Present only for turn rules; undefined omits the key for pure glob rules.
       trigger: d.trigger,
+      // Copy-only threading of the dedup represent-edge (§7.3); undefined omits the key.
+      representedVersionIds: d.representedVersionIds,
     }));
   return { floorRules, scopedRules };
 }

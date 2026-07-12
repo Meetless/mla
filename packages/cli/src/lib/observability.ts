@@ -79,6 +79,17 @@ export function loadBuildInfo(): BuildInfo {
   return cachedBuildInfo;
 }
 
+// A conventional User-Agent-style client label, e.g. "mla/0.2.13 (darwin-arm64)".
+// Sent on the auth heartbeat (refresh + login exchange) so control can record the
+// exact CLI version each user is running (lands in Session.userAgent) and we can
+// see who is behind and nudge them. The version is not telemetry: it is a client
+// identifier attached to already-authenticated requests, so it flows regardless of
+// the analytics opt-out. Cheap: loadBuildInfo() is memoized.
+export function mlaUserAgent(): string {
+  const { version } = loadBuildInfo();
+  return `mla/${version} (${process.platform}-${process.arch})`;
+}
+
 export function mintTraceId(): string {
   return crypto.randomBytes(16).toString("hex");
 }

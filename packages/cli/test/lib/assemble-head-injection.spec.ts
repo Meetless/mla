@@ -67,7 +67,7 @@ interface PersistedAudit {
   safeTotal: number;
   overflow: boolean;
   explicitPaths: string[];
-  delivered: Array<{ ruleId: string; tier: string }>;
+  delivered: Array<{ ruleId: string; tier: string; versionId: string }>;
   omitted: Array<{ ruleId: string; reason: string }>;
 }
 
@@ -249,9 +249,11 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     expect(r.audit!.overflow).toBe(false);
     expect(r.audit!.bytes).toBeLessThanOrEqual(r.audit!.safeTotal);
     expect(r.audit!.explicitPaths).toContain("apps/control/outbox.ts");
+    // The manifest identifies each delivered rule by its immutable version (acceptance 29):
+    // version-scoped delivery accounting, not bare rule ids.
     expect(r.audit!.delivered).toEqual([
-      { ruleId: "fm_push", tier: "floor-must" },
-      { ruleId: "s_outbox", tier: "scoped-required" },
+      { ruleId: "fm_push", tier: "floor-must", versionId: "v1" },
+      { ruleId: "s_outbox", tier: "scoped-required", versionId: "v1" },
     ]);
     expect(r.audit!.omitted).toEqual([]);
 

@@ -226,7 +226,7 @@ describe("exchangeGrant (§4.1, §0.01 clause 1)", () => {
     global.fetch = realFetch;
   });
 
-  it("POSTs {code, codeVerifier} with NO Authorization header", async () => {
+  it("POSTs {code, codeVerifier, userAgent} with NO Authorization header", async () => {
     let captured: { url: string; init: RequestInit } | null = null;
     global.fetch = (async (url: string, init: RequestInit) => {
       captured = { url, init };
@@ -245,9 +245,12 @@ describe("exchangeGrant (§4.1, §0.01 clause 1)", () => {
     const headers = captured!.init.headers as Record<string, string>;
     expect(headers["Content-Type"]).toBe("application/json");
     expect(headers).not.toHaveProperty("Authorization");
+    // The exchange also carries the version heartbeat (userAgent) so control can
+    // record which mla build each user runs; the shape is mla/<semver> (<os>-<arch>).
     expect(JSON.parse(captured!.init.body as string)).toEqual({
       code: "grant_abc",
       codeVerifier: "verifier_xyz",
+      userAgent: expect.stringMatching(/^mla\/\d+\.\d+\.\d+ \(.+-.+\)$/),
     });
   });
 

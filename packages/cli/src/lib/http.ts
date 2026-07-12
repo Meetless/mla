@@ -15,6 +15,7 @@ import {
   getRunSessionId,
   getRunTraceId,
   getRunTracer,
+  mlaUserAgent,
   noteIntelEchoedTraceId,
   routeNameFromPath,
 } from "./observability";
@@ -414,7 +415,9 @@ async function callRefresh(
       res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refreshToken }),
+        // userAgent carries the CLI version so control records it on the rotated
+        // session (Session.userAgent); the refresh token stays the sole credential.
+        body: JSON.stringify({ refreshToken, userAgent: mlaUserAgent() }),
         signal: controller.signal,
       });
     } catch {

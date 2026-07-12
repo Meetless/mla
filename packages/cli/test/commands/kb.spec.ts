@@ -1,4 +1,4 @@
-import { isReviewListInvocation, pendingAliasArgs } from "../../src/commands/kb";
+import { isReviewListInvocation, pendingAliasArgs, runKbDocumentReviewRetired } from "../../src/commands/kb";
 import { parseKbPendingArgs } from "../../src/commands/kb_pending";
 
 describe("isReviewListInvocation", () => {
@@ -33,5 +33,27 @@ describe("pendingAliasArgs (back-compat)", () => {
   it("does not paper over a conflicting invocation", () => {
     expect(pendingAliasArgs(["--all", "--doc", "foo.md"])).toEqual(["--all", "--doc", "foo.md"]);
     expect(() => parseKbPendingArgs(pendingAliasArgs(["--all", "--doc", "foo.md"]))).toThrow(/at most one/i);
+  });
+});
+
+// §14 test 23 (CLI arm): the document-grain trust verdict is retired under Design A.
+// `mla kb accept` / `mla kb reject` no longer record a verdict; they exit non-zero
+// with a pointer to claim-grain review, and touch no workspace or network.
+describe("runKbDocumentReviewRetired (mla kb accept / reject retirement)", () => {
+  let errSpy: jest.SpyInstance;
+  beforeEach(() => {
+    errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+  });
+
+  it.each(["accept", "reject"])("`mla kb %s` exits 2 and points at claim review", (sub) => {
+    const code = runKbDocumentReviewRetired(sub);
+    expect(code).toBe(2);
+    const msg = errSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(msg).toContain(`\`mla kb ${sub}\` is retired`);
+    expect(msg).toContain("navigate + withdraw only");
+    expect(msg).toMatch(/claim/i);
   });
 });

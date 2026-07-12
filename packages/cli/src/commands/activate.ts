@@ -21,6 +21,7 @@ import {
   type WorkspaceCliConfig,
 } from "../lib/config";
 import { backfillSessionPrompts } from "../lib/transcript-prompts";
+import { runWire, type WireResult } from "../lib/wire";
 import { runLogin } from "./login";
 import { get, HttpError, post } from "../lib/http";
 import {
@@ -730,31 +731,37 @@ async function runRepair(cwd: string): Promise<number> {
   }
 }
 
-// One-time nudge toward `/mla onboard`, the agent-driven repo onboarding that seeds
-// the governed KB from the repo's docs and git history (the mla-onboard skill wired
-// by `mla init`/`rewire`). Pure: returns the text to print, or null to stay silent.
+// Fresh-workspace onboarding hand-off. `/mla activate` (via the /mla skill) greps
+// this function's output for the machine sentinel `MLA_NEXT: onboard` and, when it
+// finds it, auto-invokes the mla-onboard skill: a fresh workspace flows straight into
+// onboarding with no second command and no "want me to run it?" prompt. The trailing
+// prose is the human-readable version for anyone who ran `mla activate` from a bare
+// shell (where no skill is watching stdout). Pure: returns the text, or null to stay
+// silent.
 //
-// Shown only when BOTH hold:
-//   - inSession: there is a live Claude Code session, so the `/mla onboard` slash
-//     command is actually invokable (it is a no-op suggestion from a bare shell).
+// Emitted only when BOTH hold:
+//   - inSession: there is a live Claude Code session, so the mla-onboard skill is
+//     actually invokable (the sentinel is inert noise from a bare shell).
 //   - justProvisioned: this run created a brand-new workspace, whose governed KB is
 //     empty: exactly the moment onboarding pays off. Re-running `mla activate` on an
-//     already-bound folder takes the bind path (no provision), so the nudge is
-//     naturally one-time per workspace without any sentinel state.
+//     already-bound folder takes the bind path (no provision), so the hand-off is
+//     naturally one-time per workspace without any persisted sentinel state.
 export function onboardRecommendation(opts: {
   inSession: boolean;
   justProvisioned: boolean;
 }): string | null {
   if (!opts.inSession || !opts.justProvisioned) return null;
   return [
-    "Next: seed this workspace's governed memory from the repo.",
-    "  Run `/mla onboard` to dispatch two read-only scouts over your docs and git",
-    "  history. They surface constraints, decisions, conventions, boundaries, and",
-    "  deprecations as candidates born PENDING for you to review; nothing is accepted",
-    "  automatically. You can run it now or any time later.",
-    "  First run only: the scout agents were just installed, and Claude Code loads",
-    "  agents at session start. If `/mla onboard` reports a scout agent is not found,",
-    "  restart Claude Code (or open a new session) and run it again.",
+    // Machine sentinel (rule 6 of the /mla skill): its own line so a stdout scan can
+    // match it unambiguously even when other text surrounds it. Do NOT reword.
+    "MLA_NEXT: onboard",
+    "Next: seeding this workspace's governed memory from the repo (onboarding).",
+    "  Two read-only scouts read your docs and git history and surface constraints,",
+    "  decisions, conventions, boundaries, and deprecations as candidates born PENDING",
+    "  for you to review; nothing is accepted automatically. This runs via `/mla onboard`.",
+    "  First run only: the scout agents were just installed, and Claude Code loads agents",
+    "  at session start. If onboarding reports a scout agent is not found, restart Claude",
+    "  Code (or open a new session) and run `/mla onboard` again. Nothing is lost.",
   ].join("\n");
 }
 
@@ -888,6 +895,47 @@ function finishActivate(
     // scary detail.
     if (boot.sessionId) {
       console.log(`  (current session not bootstrapped: ${boot.detail})`);
+    }
+  }
+
+  // Self-heal global wiring so `mla activate` ALONE leaves the user fully wired, no
+  // matter how they installed. A curl install already ran `mla init`, and the Meetless
+  // plugin OWNS the wiring; but an `npm i -g @meetless/mla` user (npm runs no
+  // postinstall) or anyone who skipped `mla init` would otherwise reach activate with
+  // no hooks, /mla skill, MCP, or scout agents. runWire is idempotent: an already-wired
+  // home returns "unchanged" (silent), a bare install gets everything installed now.
+  // Skipped entirely when a Meetless plugin owns the wiring (home must stay untouched)
+  // or in a headless/CI run (MLA_NO_WIRE), mirroring install.sh's opt-out. This is a
+  // separate concern from reconcileWiringBackstop below, which is remove-only (it tears
+  // out legacy wiring that shadows a plugin and NEVER installs).
+  let selfHealed: WireResult | null = null;
+  if (detectPluginOwnership().status !== "owned" && !process.env.MLA_NO_WIRE) {
+    try {
+      selfHealed = runWire({ noProjectRules: true });
+    } catch {
+      // Never fail activation on a wiring hiccup; the backstop + doctor still catch it.
+    }
+  }
+  if (selfHealed) {
+    // A fresh install cannot load into THIS running session (Claude Code reads hooks,
+    // MCP, and agents only at session start), so name the one honest restart, session-
+    // aware. Silent when nothing material changed (the idempotent re-wire of an already
+    // wired home), so a returning binary user sees no noise.
+    const freshMcp =
+      !!selfHealed.mcp &&
+      selfHealed.mcp.action !== "unchanged" &&
+      selfHealed.mcp.action !== "skipped";
+    if (selfHealed.hooksAdded.length > 0 || freshMcp) {
+      console.log("");
+      if (boot.sessionId) {
+        console.log(
+          "Installed the Meetless wiring (hooks, /mla skill, scout agents, MCP). Restart Claude Code once to load it into this session.",
+        );
+      } else {
+        console.log(
+          "Installed the Meetless wiring (hooks, /mla skill, scout agents, MCP). It loads automatically the next time you open Claude Code.",
+        );
+      }
     }
   }
 
