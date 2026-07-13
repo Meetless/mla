@@ -14,14 +14,13 @@ const path = require("path");
 // Each entry is copied recursively from package-root-relative `from` to
 // dist-relative `to`. Add to this list when the CLI gains another shipped asset.
 // - hooks-template: the shell/jq hook templates installed at `mla init`/`mla rewire`.
-// - assets: the vendored docs corpus (docs-corpus.json + .sha256), the byte-identical
-//   copy of packages/utils/testdata/docs-corpus.json that powers the offline
-//   `mla docs`/`mla help` surface. Read at runtime via fs (src/lib/docs-corpus.ts) and
-//   embedded in the pkg binary via package.json "pkg.assets", mirroring build-info.json.
-const ASSETS = [
-  { from: "src/hooks-template", to: "hooks-template" },
-  { from: "src/assets", to: "assets" },
-];
+//
+// The docs corpus is deliberately NOT here. It is vendored as a generated .ts module
+// (src/lib/docs-corpus.data.ts), so tsc compiles it into dist/lib/ and it ships with
+// the code. An asset would have needed three lists (files, this one, pkg.assets) to
+// stay in sync forever, and losing it would exit 1 in a user's terminal rather than
+// failing the build. See packages/utils/scripts/docs-corpus-artifacts.ts.
+const ASSETS = [{ from: "src/hooks-template", to: "hooks-template" }];
 
 const pkgRoot = path.join(__dirname, "..");
 const distRoot = path.join(pkgRoot, "dist");

@@ -131,6 +131,46 @@ describe("acquireOnboardingLock", () => {
     expect(res.ok).toBe(true);
     expect(readLock(home, WS).expiresAt).toBe(T0);
   });
+
+  // An ABANDONED run (agent crashed, human hit Ctrl-C mid-onboard) leaves a lock that is live
+  // by the clock, so the timestamp rule cannot free it: without an override, `/mla onboard` is
+  // blocked for the rest of budget + grace. `enrich plan --force` already means "onboard this
+  // repository again"; it takes the lock too, and reports what it displaced.
+  it("--force reclaims a LIVE lock and reports the run it displaced", () => {
+    expect(acquire({ runId: "run-a" }).ok).toBe(true);
+    const now = plusMs(T0, 1_000); // well inside run-a's ttl
+    const res = acquire({ runId: "run-b", now, force: true });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.reclaimedLive?.runId).toBe("run-a"); // displaced a run that had NOT expired
+      expect(res.lock.runId).toBe("run-b");
+    }
+    expect(readLock(home, WS).runId).toBe("run-b");
+  });
+
+  it("--force does not report reclaimedLive when the lock it took was already stale", () => {
+    expect(acquire({ runId: "run-a" }).ok).toBe(true);
+    const res = acquire({ runId: "run-b", now: plusMs(T0, TTL + 1), force: true });
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.reclaimedLive).toBeUndefined(); // expiry freed it; force displaced nothing
+  });
+
+  it("--force reclaims an unreadable lock (the fail-closed branch is what force overrides)", () => {
+    const path = onboardingLockPath(home, WS);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "{ not json", "utf8");
+    const res = acquire({ runId: "run-b", force: true });
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.reclaimedLive).toBeUndefined(); // nothing attributable was displaced
+    expect(readLock(home, WS).runId).toBe("run-b");
+  });
+
+  it("still claims a free lock under --force (no prior lock, nothing displaced)", () => {
+    const res = acquire({ runId: "run-a", force: true });
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.reclaimedLive).toBeUndefined();
+    expect(readLock(home, WS).runId).toBe("run-a");
+  });
 });
 
 describe("isLockStale", () => {

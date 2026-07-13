@@ -1,31 +1,39 @@
 import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { loadDocsCorpus, readDocsCorpusSidecar } from "../../src/lib/docs-corpus";
+import { loadDocsCorpus, vendoredDocsCorpusSha256 } from "../../src/lib/docs-corpus";
+import { DOCS_CORPUS_JSON } from "../../src/lib/docs-corpus.data";
 
 /**
  * Vendor-parity guard for the CLI's copy of the docs corpus. The corpus is generated
- * once in @meetless/utils and vendored here; `gen-docs-corpus --check` is the
- * cross-boundary byte-identity gate. This spec proves the CLI copy is INTERNALLY
- * consistent and that the runtime loader computes the compatibility hash Control's
- * corpus-hash gate expects: raw bytes -> sha256 -> equals the committed sidecar.
+ * once in @meetless/utils and vendored here AS CODE (src/lib/docs-corpus.data.ts);
+ * `gen-docs-corpus --check` is the cross-boundary byte-identity gate. This spec proves
+ * the CLI copy is INTERNALLY consistent and that the runtime loader computes the
+ * compatibility hash Control's corpus-hash gate expects: carried bytes -> sha256 ->
+ * equals the sha the generator pinned into the very same module.
  */
-const ASSETS = path.join(__dirname, "..", "..", "src", "assets");
-
 describe("vendored docs corpus", () => {
-  it("hashes to its committed sidecar (bare-hex, single trailing newline)", () => {
-    const raw = fs.readFileSync(path.join(ASSETS, "docs-corpus.json"), "utf8");
-    const expected = fs.readFileSync(path.join(ASSETS, "docs-corpus.sha256"), "utf8");
-    // Sidecar is exactly 64 hex chars + one newline (the corpus-sync contract).
-    expect(expected).toMatch(/^[0-9a-f]{64}\n$/);
-    const actual = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
-    expect(actual).toBe(expected.trim());
+  it("carries bytes that hash to its pinned sha (the compatibility token)", () => {
+    const pinned = vendoredDocsCorpusSha256();
+    expect(pinned).toMatch(/^[0-9a-f]{64}$/);
+    const actual = crypto
+      .createHash("sha256")
+      .update(Buffer.from(DOCS_CORPUS_JSON, "utf8"))
+      .digest("hex");
+    expect(actual).toBe(pinned);
   });
 
-  it("loader computes corpusHash equal to the sidecar", () => {
+  it("carries the canonical serialization verbatim (pretty JSON, one trailing newline)", () => {
+    // The generator writes JSON.stringify(corpus, null, 2) + "\n" and hashes exactly
+    // those bytes. If this module ever carried a RE-serialized object instead of the
+    // literal text, its sha would diverge from Control's and every ask would come back
+    // corpus_mismatch. Re-deriving the canonical form here is that guard.
+    const parsed = JSON.parse(DOCS_CORPUS_JSON) as unknown;
+    expect(JSON.stringify(parsed, null, 2) + "\n").toBe(DOCS_CORPUS_JSON);
+  });
+
+  it("loader computes corpusHash equal to the pinned sha", () => {
     const corpus = loadDocsCorpus();
     expect(corpus.corpusHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(corpus.corpusHash).toBe(readDocsCorpusSidecar());
+    expect(corpus.corpusHash).toBe(vendoredDocsCorpusSha256());
   });
 
   it("loads a non-empty, internally consistent corpus", () => {

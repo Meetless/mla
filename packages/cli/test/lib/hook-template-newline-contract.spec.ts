@@ -18,6 +18,9 @@ const EXPECTED_TEMPLATES = [
   "event-batch-filter.jq",
   "flush.sh",
   "post-tool-use.sh",
+  // Enforcement backstop (2026-07-11): reverts anything that appears under a
+  // governed forbidden root, whichever tool wrote it.
+  "posttool-sweep.sh",
   "pre-tool-use.sh",
   "session-start.sh",
   "stop.sh",
@@ -25,7 +28,7 @@ const EXPECTED_TEMPLATES = [
 ].sort();
 
 describe("hook-template newline source contract", () => {
-  it("ships exactly the 12 expected template files", () => {
+  it("ships exactly the 13 expected template files", () => {
     const actual = fs.readdirSync(TEMPLATE_DIR).sort();
     expect(actual).toEqual(EXPECTED_TEMPLATES);
   });

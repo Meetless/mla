@@ -26,17 +26,25 @@
 // Read/Grep turn spools nothing) is unchanged.
 export const POST_TOOL_USE_MATCHER = "";
 
-// PreToolUse matcher for the observe-only rule-interception pilot (R0). Unlike
-// PostToolUse (catch-all so the F3-B heartbeat fires on EVERY tool), this hook is
-// scoped to the file-writing tools the notes-location rule governs and nothing
-// else. The matcher is an EXACT match: "^(Write|Edit)$" fires only on Write and
-// Edit. An unanchored "Write|Edit" is a substring regex that would also match
-// MultiEdit and NotebookEdit; the empty catch-all would fire on Bash/Read/etc.
-// The pilot is intentionally narrow, and pre-tool-use.sh self-limits again by
-// tool name as a backstop. The hook is observe-only: it always emits the empty
-// `{}` pass-through body and can never change a Claude Code permission decision
-// (proven in internal-pretool-observe.spec.ts and wire-pretooluse-matcher.spec.ts).
-export const PRE_TOOL_USE_MATCHER = "^(Write|Edit)$";
+// PreToolUse matcher: every tool that can put bytes on disk.
+//
+// This was "^(Write|Edit)$" until 2026-07-11, when our own enforcement benchmark
+// caught the hole that narrowness left. A forbidden-root rule says "never create or
+// edit any file under <root>/" — a statement about a PATH — but a matcher scoped to
+// two tools silently turned it into "…using Write or Edit". An agent that was told
+// to route around a block did exactly that, in one step:
+//
+//     Write  notes/design.md        -> DENIED by the governed rule
+//     Bash   cat > notes/design.md  -> succeeded; this hook never fired
+//
+// So the block stopped a model that was going to comply anyway and failed to stop the
+// one that wasn't. The matcher now covers Bash (shell redirects, tee, cp/mv, sed -i)
+// and the two file tools the old anchored regex also exempted, MultiEdit and
+// NotebookEdit. It is still an EXACT alternation, NOT the empty catch-all: Read, Grep,
+// Glob and friends never spawn the subcommand. `deriveWriteTargets` then decides what a
+// call actually writes, and a read-only Bash command (`ls`, `grep`) derives no targets
+// and passes straight through.
+export const PRE_TOOL_USE_MATCHER = "^(Write|Edit|MultiEdit|NotebookEdit|Bash)$";
 
 // PostToolUse matcher for the CE0 evidence-consultation hook (ce0-post-tool-use.sh,
 // proposal §4.1). Unlike the load-bearing PostToolUse hook (catch-all so the F3-B
@@ -72,6 +80,11 @@ export const MANAGED_HOOK_SCRIPTS: ManagedHookScript[] = [
   { event: "Stop", script: "stop.sh" },
   { event: "PostToolUse", script: "post-tool-use.sh", matcher: POST_TOOL_USE_MATCHER },
   { event: "PreToolUse", script: "pre-tool-use.sh", matcher: PRE_TOOL_USE_MATCHER },
+  // Enforcement backstop (2026-07-11). Catch-all ON PURPOSE: it never inspects the tool
+  // name, only whether a file appeared under a governed forbidden root — so a shell
+  // redirect the PreToolUse parser cannot see is still reverted. This is the half of
+  // enforcement that does not depend on out-guessing a shell.
+  { event: "PostToolUse", script: "posttool-sweep.sh", matcher: "", timeout: 10 },
   // CE0 evidence-consultation hooks (RECORD_ONLY). No timeout: they mirror
   // pre-tool-use.sh (best-effort, fail-soft, always `{}` exit 0).
   { event: "UserPromptSubmit", script: "ce0-user-prompt-submit.sh" },

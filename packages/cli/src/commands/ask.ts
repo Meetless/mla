@@ -1,5 +1,6 @@
 import * as path from "path";
 import { pathToFileURL } from "url";
+import { renderPlain } from "../lib/ask-render";
 import { loadWorkspaceConfig } from "../lib/config";
 import { DEFAULT_INTEL_URL } from "../lib/http";
 import { parseAsOf } from "../lib/temporal";
@@ -161,53 +162,18 @@ async function loadAskCore(): Promise<AskCore> {
   }
 }
 
-// A citation field is "meaningful" only if it's a non-empty string that isn't
-// the "UNKNOWN" sentinel ask-core stamps when intel returns no value. Used to
-// keep noise (`[UNKNOWN]`) out of the --plain footer.
-function meaningful(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const t = v.trim();
-  if (!t || t.toUpperCase() === "UNKNOWN") return null;
-  return t;
-}
-
-// The bracketed metadata after a citation path: the doc KIND (docType, which
-// ask-core always sets -- defaulting to "note") and, when present, the
-// lifecycle STATUS (SHIPPED/PROPOSED/...). Before this, the footer rendered
-// r.status alone, so every grounded note printed a useless `[UNKNOWN]` (notes
-// carry a docType but no status) even though the inline `[NT:...]` citation
-// already knew the kind. Kind-first, status-when-real.
-function citationMeta(r: Record<string, unknown>): string {
-  const parts = [meaningful(r.docType), meaningful(r.status)].filter(
-    (x): x is string => x !== null,
-  );
-  return parts.length > 0 ? ` [${parts.join(", ")}]` : "";
-}
-
-function renderPlain(result: Record<string, unknown>): string {
-  const lines: string[] = [];
-  const answer = result.answer;
-  if (typeof answer === "string" && answer.trim()) {
-    lines.push(answer.trim());
-    lines.push("");
-  }
-  const results = Array.isArray(result.results) ? (result.results as Record<string, unknown>[]) : [];
-  if (results.length > 0) {
-    lines.push(`Citations (${results.length}):`);
-    for (const r of results) {
-      const p = r.path ?? r.title ?? "(unknown)";
-      lines.push(`  - ${String(p)}${citationMeta(r)}`);
-    }
-  }
-  const warnings = Array.isArray(result.warnings) ? (result.warnings as unknown[]) : [];
-  if (warnings.length > 0) {
-    lines.push("");
-    lines.push("Warnings:");
-    for (const w of warnings) lines.push(`  ! ${String(w)}`);
-  }
-  lines.push("");
-  lines.push(`(workspace: ${String(result.workspace ?? "")}, mode: ${String(result.mode ?? "")}, confidence: ${String(result.confidence ?? "")})`);
-  return lines.join("\n");
+// An answer with nothing under it. `mla ask` is grounded-or-silent: intel returns
+// prose ONLY when it found something in the workspace's governed memory to stand
+// on, so zero citations means the corpus had nothing to say. That is the exact
+// shape of the miss we can help with (§7.5): the most common reason the user's
+// governed memory cannot answer a question is that the question was never about
+// their memory; it was about mla itself, and mla's manual is a DIFFERENT corpus
+// behind a DIFFERENT command. A fixed hint on a fixed condition; deliberately not
+// a classifier, which would have to guess at the user's intent and would be wrong
+// in a way that costs trust.
+function isUngroundedAnswer(result: Record<string, unknown>): boolean {
+  const results = Array.isArray(result.results) ? result.results : [];
+  return results.length === 0;
 }
 
 // The ask-core loader is injectable so the glue (workspace resolution, mode
@@ -308,6 +274,14 @@ export async function runAsk(
     console.log(JSON.stringify(result, null, 2));
   } else {
     console.log(renderPlain(result));
+  }
+
+  // §7.5. On stderr, so it never contaminates the JSON on stdout that scripts and
+  // the hook parse. Not an error and not an exit-code change: the ask succeeded,
+  // the memory simply had nothing, and this is the one thing we know that the user
+  // might not.
+  if (isUngroundedAnswer(result)) {
+    console.error('Asking about mla itself? Try: mla docs ask "..."');
   }
   return 0;
 }

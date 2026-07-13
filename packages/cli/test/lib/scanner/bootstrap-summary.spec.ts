@@ -56,9 +56,16 @@ function result(over: Partial<ScanResult>): ScanResult {
   };
 }
 
+// Every case below exercises the bootstrapped-session path unless it says
+// otherwise; `injectedNow: false` (a plain `mla activate` in a shell, with no
+// session to inject into) has its own case at the bottom.
+function render(scan: ScanResult, injectedNow = true): string {
+  return renderBootstrapSummary(scan, { injectedNow });
+}
+
 describe("renderBootstrapSummary", () => {
   it("leads with the inventory headline", () => {
-    const out = renderBootstrapSummary(
+    const out = render(
       result({
         inventory: { instructionFiles: 3, decisionDocs: 8, legacyNotes: 71, staleSignals: 4, agentMemoryRules: 2 },
       }),
@@ -68,7 +75,7 @@ describe("renderBootstrapSummary", () => {
   });
 
   it("lists the high-confidence directives that will guide the session now, with source", () => {
-    const out = renderBootstrapSummary(
+    const out = render(
       result({
         directives: [
           directive({ text: "Never create feature branches", source: "CLAUDE.md", strength: "MUST_FOLLOW" }),
@@ -76,7 +83,7 @@ describe("renderBootstrapSummary", () => {
         ],
       }),
     );
-    expect(out).toMatch(/guid|active|in effect|apply/i);
+    expect(out).toMatch(/guiding this session now/i);
     expect(out).toContain("Never create feature branches");
     expect(out).toContain("CLAUDE.md");
     expect(out).toContain("Use make test-db for migrations");
@@ -84,7 +91,7 @@ describe("renderBootstrapSummary", () => {
   });
 
   it("orders MUST_FOLLOW directives ahead of SHOULD_FOLLOW", () => {
-    const out = renderBootstrapSummary(
+    const out = render(
       result({
         directives: [
           directive({ text: "Should rule", strength: "SHOULD_FOLLOW" }),
@@ -99,7 +106,7 @@ describe("renderBootstrapSummary", () => {
     const directives = Array.from({ length: 9 }, (_, i) =>
       directive({ id: `d${i}`, text: `Rule number ${i}`, strength: "MUST_FOLLOW" }),
     );
-    const out = renderBootstrapSummary(result({ directives }));
+    const out = render(result({ directives }));
     expect(out).toContain("Rule number 0");
     expect(out).toContain("Rule number 4");
     // 9 directives, cap 5 => 4 more not shown.
@@ -108,7 +115,7 @@ describe("renderBootstrapSummary", () => {
   });
 
   it("surfaces advisory candidates as awaiting review and points at `mla context advisory`", () => {
-    const out = renderBootstrapSummary(
+    const out = render(
       result({
         advisoryDirectives: [
           directive({ text: "Maybe a rule", attestation: "machine_inferred" }),
@@ -123,7 +130,7 @@ describe("renderBootstrapSummary", () => {
   });
 
   it("surfaces stale signals as needing a verdict and points at `mla context list`", () => {
-    const out = renderBootstrapSummary(
+    const out = render(
       result({
         staleSignals: [stale({ detail: "PRD marked superseded" }), stale({ id: "s2" })],
         inventory: { instructionFiles: 0, decisionDocs: 0, legacyNotes: 0, staleSignals: 2, agentMemoryRules: 0 },
@@ -134,15 +141,32 @@ describe("renderBootstrapSummary", () => {
   });
 
   it("omits the advisory and stale sections entirely when there are none", () => {
-    const out = renderBootstrapSummary(
+    const out = render(
       result({ directives: [directive({ text: "Only rule" })] }),
     );
     expect(out).not.toContain("mla context advisory");
     expect(out).not.toContain("mla context list");
   });
 
+  // The regression this exists to prevent: `mla activate` from a plain terminal has
+  // NO session to inject into (CLAUDE_CODE_SESSION_ID unset), and the card used to
+  // claim "Guiding this session now (injected)" anyway, four lines above activate's
+  // own "capture takes effect on the NEXT session". Never claim a live injection we
+  // did not perform.
+  it("never claims a live injection when the current session was not bootstrapped", () => {
+    const out = render(
+      result({ directives: [directive({ text: "Never create feature branches" })] }),
+      false,
+    );
+    expect(out).not.toMatch(/this session now/i);
+    expect(out).not.toMatch(/injected/i);
+    expect(out).toMatch(/next Claude Code session/i);
+    // The rules themselves are still worth showing: they WILL apply next session.
+    expect(out).toContain("Never create feature branches");
+  });
+
   it("handles an empty graph without claiming any instructions guide the session", () => {
-    const out = renderBootstrapSummary(result({}));
+    const out = render(result({}));
     // No directive bullets, but still a calm headline (no crash, no empty 'Guiding' header).
     expect(out).toMatch(/no .*instruction|nothing|first run|provisional/i);
     expect(out).not.toMatch(/•/);

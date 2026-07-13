@@ -58,6 +58,15 @@ if [[ -z "$INPUT" ]] || ! printf '%s' "$INPUT" | jq -e . >/dev/null 2>&1; then
   exit 0
 fi
 SESSION_ID="$(echo "$INPUT" | jq -r '.session_id // empty')"
+
+# Enforcement backstop (2026-07-11): snapshot the governed forbidden roots BEFORE the
+# agent can touch anything, so the PostToolUse sweep can tell a file the AGENT created
+# from one the repo already shipped — and never deletes a human's pre-existing file.
+# Keyed by THIS session_id, which is why it must run after the parse above.
+# Best-effort: never blocks session start.
+if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
+  printf '%s' "$INPUT" | "$MLA_PATH" _internal enforcement-baseline >/dev/null 2>&1 || true
+fi
 [[ -z "$SESSION_ID" ]] && exit 0
 # Per-session OFF override (`mla deactivate`). Silences this one session even in
 # an activated folder. See meetless_session_disabled in common.sh.

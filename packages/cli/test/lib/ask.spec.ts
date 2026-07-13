@@ -251,6 +251,27 @@ describe("mla ask: rendering", () => {
     expect(r.stdout).toMatch(/workspace: ws_test, mode: answer, confidence: high/);
   });
 
+  // §7.5 (proposal 20260711). `mla ask` reads the user's GOVERNED MEMORY; `mla docs
+  // ask` reads the mla MANUAL. They are two corpora that are never merged, so a
+  // question about mla itself lands in `mla ask` and finds nothing to stand on. An
+  // answer with zero citations is exactly that shape, and it is the only moment we
+  // can help without guessing: a fixed hint on a fixed condition, not a classifier.
+  it("nudges toward `mla docs ask` when the workspace memory had nothing to cite", async () => {
+    const r = await run(["what does mla doctor check?"], { resultsOverride: [] });
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('Asking about mla itself? Try: mla docs ask "..."');
+    // stderr, so a script piping `mla ask` stdout still parses clean JSON.
+    expect(() => JSON.parse(r.stdout)).not.toThrow();
+  });
+
+  it("does not nudge when the answer is grounded", async () => {
+    const r = await run(["what did we decide about pricing?"]);
+    expect(r.code).toBe(0);
+    // The hint is help when the ask missed. On a cited answer it would be noise on
+    // every single successful run.
+    expect(r.stderr).not.toContain("mla docs ask");
+  });
+
   // BUG (found dogfooding 2026-06-04): the --plain citation footer rendered
   // r.status only. ask-core defaults a retrieval row's status to "UNKNOWN"
   // (notes carry a docType but no lifecycle status), so every grounded note

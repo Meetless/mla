@@ -85,6 +85,74 @@ test("dispatchTool meetless__query/answer echoes the INJECTED workspace, not an 
   assert.equal(body.workspace, "ws_injected");
 });
 
+// ---------- Delivery key: minted at the TOOL-CALL boundary -------------------
+// An ask is a metered spend. Intel turns submission_id into Control's delivery key
+// `mcp:<id>:answer`, which is what makes a RE-delivered tool call collapse onto the
+// one money authorization it already opened instead of buying the run twice. The id
+// must therefore identify the DELIVERY (the tool call), not the execution, which is
+// why it is minted here and not down in the transport.
+
+test("dispatchTool mints one submission_id per tool call and hands it to the ask mode", async () => {
+  const seen = [];
+  const askModes = stubAskModes({
+    runAnswer: async (args) => {
+      seen.push(args.submission_id);
+      return { mode: "answer", answer: "a", results: [] };
+    },
+  });
+  const deps = baseDeps({ askModes, mintSubmissionId: () => "call-1" });
+
+  await dispatchTool("meetless__query", { mode: "answer", query: "q" }, deps);
+
+  assert.equal(seen[0], "call-1");
+});
+
+test("dispatchTool keys EVERY intel-calling mode (answer, search, canonical)", async () => {
+  // compare makes no intel call (pure INDEX.md), so it needs no key. The other
+  // three each make exactly ONE ask, which is why one id per tool call can never
+  // collide with itself under a different fingerprint.
+  for (const mode of ["answer", "search", "canonical"]) {
+    const seen = [];
+    const record = async (args) => {
+      seen.push(args.submission_id);
+      return { mode, results: [] };
+    };
+    const askModes = stubAskModes({
+      runAnswer: record,
+      runSearch: record,
+      runCanonical: record,
+    });
+    let n = 0;
+    const deps = baseDeps({ askModes, mintSubmissionId: () => `call-${++n}` });
+
+    await dispatchTool("meetless__query", { mode, query: "q" }, deps);
+
+    assert.equal(seen[0], "call-1", `${mode} mode did not carry a delivery key`);
+  }
+});
+
+test("dispatchTool mints a FRESH key per tool call (two calls are two deliveries)", async () => {
+  const seen = [];
+  const askModes = stubAskModes({
+    runAnswer: async (args) => {
+      seen.push(args.submission_id);
+      return { mode: "answer", answer: "a", results: [] };
+    },
+  });
+  const deps = baseDeps({ askModes });
+
+  await dispatchTool("meetless__query", { mode: "answer", query: "q" }, deps);
+  await dispatchTool("meetless__query", { mode: "answer", query: "q" }, deps);
+
+  // The real randomUUID default, not a stub: two distinct tool calls are two
+  // distinct user intents and must each buy their own authorization. Collapsing
+  // them would silently serve a cached run; sharing one id across different
+  // requests would be a delivery-id mismatch DENY.
+  assert.equal(typeof seen[0], "string");
+  assert.ok(seen[0].length > 0);
+  assert.notEqual(seen[1], seen[0]);
+});
+
 test("dispatchTool meetless__query/relationships uses injected intelFetch+ws and stamps review_policy", async () => {
   let sawPath;
   const askModes = stubAskModes();

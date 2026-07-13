@@ -155,11 +155,18 @@ function makeDeps(over: Partial<PretoolObserveDeps> = {}): { deps: PretoolObserv
 }
 
 // A bundle is armed for this read; everything else stays on the hermetic base.
+//
+// The ceiling is pinned to DENY here, EXPLICITLY. The suites below exercise the deny/ask
+// machinery (does a fresh forbidden write deny, does a stale one degrade to ask, is the
+// incident stamped), and that machinery only runs at a DENY ceiling. The shipped product
+// ships WARN (owner ruling, 2026-07-12), so leaving these on the default would silently
+// turn eight enforcement tests into eight advisory tests that assert nothing. What the
+// stock ceiling actually does to the same call is pinned separately, below.
 function bundleDeps(
   read: BundleCacheRead,
   over: Partial<PretoolObserveDeps> = {},
 ): { deps: PretoolObserveDeps; written: () => string } {
-  return makeDeps({ readBundle: () => read, ...over });
+  return makeDeps({ readBundle: () => read, resolveMaxEnforcement: () => "DENY", ...over });
 }
 
 describe("renderPreToolUseResponse: the pure seam-to-wire mapper", () => {
@@ -517,6 +524,24 @@ describe("runInternalPretoolObserve: faces the backend bundle (P1G / G4)", () =>
     expect(JSON.parse(written())).toEqual({});
   });
 
+  // Owner ruling (An, 2026-07-12): "We will only ship warn and never block." Same fresh
+  // bundle, same DENY-attested rule, same violating write as the first test in this block.
+  // The ONLY difference is that nobody set MEETLESS_ACTION_INTERCEPT_MAX, which is what a
+  // real install looks like. The write must survive.
+  it("at the SHIPPED ceiling, the same fresh-bundle forbidden write WARNS and is allowed", async () => {
+    const { deps, written } = bundleDeps(freshRead([bundleEntry()]), {
+      resolveMaxEnforcement: undefined, // fall through to the real default resolver
+    });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(written());
+    expect(parsed.hookSpecificOutput?.permissionDecision).not.toBe("deny");
+    expect(parsed.hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    // The agent is still TOLD it broke a governed rule. Warn is not silence.
+    const body = written();
+    expect(body).toContain("rn_notes");
+  });
+
   it("degrades a STALE-bundle forbidden DENY to an interactive ASK (§6.4), exit 0", async () => {
     const { deps, written } = bundleDeps(staleRead([bundleEntry()]));
     const code = await runInternalPretoolObserve([], deps);
@@ -662,18 +687,26 @@ describe("runInternalPretoolObserve: the WARN rung (non-blocking, INV-8)", () =>
   });
 });
 
-describe("parseMaxEnforcement: the MEETLESS_ACTION_INTERCEPT_MAX kill-switch parser", () => {
-  it("parses the three honored rungs case-insensitively", () => {
+describe("parseMaxEnforcement: the MEETLESS_ACTION_INTERCEPT_MAX ceiling parser", () => {
+  it("parses the honored rungs case-insensitively", () => {
+    expect(parseMaxEnforcement("observe")).toBe("OBSERVE");
     expect(parseMaxEnforcement("warn")).toBe("WARN");
     expect(parseMaxEnforcement("ASK")).toBe("ASK");
     expect(parseMaxEnforcement("  Deny  ")).toBe("DENY");
   });
 
-  it("defaults to DENY (uncapped) for unset, empty, or unrecognized values (preserves current behavior)", () => {
-    expect(parseMaxEnforcement(undefined)).toBe("DENY");
-    expect(parseMaxEnforcement("")).toBe("DENY");
-    expect(parseMaxEnforcement("observe")).toBe("DENY");
-    expect(parseMaxEnforcement("block")).toBe("DENY");
+  // Owner ruling (An, 2026-07-12): "We will only ship warn and never block." The default
+  // used to be DENY (uncapped), which meant a stock install could take a user's tool call
+  // away from them. WARN is now the shipped ceiling; DENY is an explicit opt-in.
+  it("defaults to WARN for unset or empty, so the shipped product never blocks", () => {
+    expect(parseMaxEnforcement(undefined)).toBe("WARN");
+    expect(parseMaxEnforcement("")).toBe("WARN");
+  });
+
+  it("never reads an unrecognized value as an escalation (a typo is not consent to block)", () => {
+    expect(parseMaxEnforcement("block")).toBe("WARN");
+    expect(parseMaxEnforcement("DENY!!")).toBe("WARN");
+    expect(parseMaxEnforcement("true")).toBe("WARN");
   });
 });
 

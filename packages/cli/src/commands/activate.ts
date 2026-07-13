@@ -18,6 +18,7 @@ import {
   QUEUE_DIR,
   readConfig,
   SESSION_GATE_DIR,
+  writeConfig,
   type WorkspaceCliConfig,
 } from "../lib/config";
 import { backfillSessionPrompts } from "../lib/transcript-prompts";
@@ -34,6 +35,7 @@ import {
   renderActivationCard,
   renderBootstrapSummary,
 } from "../lib/scanner/bootstrap-summary";
+import type { ScanResult } from "../lib/scanner/types";
 import {
   renderManualScoutMission,
   renderAgenticInvitation,
@@ -71,10 +73,11 @@ import {
 // `--create` (the non-Git override). The two flags are never overloaded.
 //
 // The marker is committable because it is strictly non-secret (it carries an
-// opaque workspaceId, never credentials, paths, or actor ids). It is no longer
-// auto-gitignored; if a stale `.meetless.json` entry survives in `.gitignore`
-// from the old auto-ignore behavior, activate removes it so the user is free to
-// commit the marker.
+// opaque workspaceId, never credentials, paths, or actor ids). activate no
+// longer writes it into `.gitignore`, and it does not remove it either: a repo
+// that ignores the marker is making a legitimate choice (one workspace per
+// clone), and `.gitignore` is the user's file, not ours. We only READ the
+// repo's answer (via `git check-ignore`) and tell the truth about it.
 //
 // Usage:
 //   mla activate [--name <name>] [--note <text>]   (provision-or-bind)
@@ -233,27 +236,53 @@ export function clearDeactivateSentinel(): string | null {
   return liveSid;
 }
 
-// Best-effort: undo the OLD auto-gitignore behavior. The marker is committable
-// and no longer force-ignored, so if a prior `mla activate` left a
-// `.meetless.json` entry (and its banner comment) in the local `.gitignore`,
-// strip it so the user is free to commit the marker. Returns a human message
-// when something changed, else null. Never creates a `.gitignore`.
-export function removeStaleGitignoreEntry(dir: string): string | null {
-  const gitignorePath = path.join(dir, ".gitignore");
-  if (!fs.existsSync(gitignorePath)) return null;
-  const body = fs.readFileSync(gitignorePath, "utf8");
-  const lines = body.split("\n");
-  const kept = lines.filter(
-    (l) =>
-      l.trim() !== ACTIVATION_FILENAME &&
-      !l.startsWith("# Meetless per-folder activation marker"),
-  );
-  if (kept.length === lines.length) return null;
-  fs.writeFileSync(gitignorePath, kept.join("\n"), "utf8");
-  return `removed stale ${ACTIVATION_FILENAME} entry from ${gitignorePath}`;
+// Report whether the repo ignores the marker. REPORT, never rewrite.
+//
+// This used to DELETE the `.meetless.json` line out of the user's `.gitignore`,
+// on the theory that any such line was left over from the old auto-ignore
+// behavior. It cannot know that. A repo may ignore the marker on purpose (this
+// one did, with a hand-written banner explaining why), and activate silently
+// edited a TRACKED file to make its own "not gitignored" claim come true,
+// leaving a dirty tree and an orphaned comment behind. `.gitignore` is the
+// user's file: floor-projection-writer.ts already says so and writes to
+// `.git/info/exclude` instead. Same rule here, no exceptions.
+//
+// `git check-ignore` is the only correct oracle: ignore rules also come from
+// parent directories, `.git/info/exclude`, and the global excludesfile, none of
+// which a scan of the local `.gitignore` would ever see. Outside a Git repo (or
+// with no git on PATH) it exits non-zero, which is the right answer anyway.
+export function isMarkerGitignored(dir: string): boolean {
+  try {
+    execFileSync("git", ["check-ignore", "-q", "--", ACTIVATION_FILENAME], {
+      cwd: dir,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-interface BootstrapResult {
+// The commit-guidance block, told truthfully for THIS repo rather than asserted.
+export function commitGuidanceLines(dir: string): string[] {
+  if (isMarkerGitignored(dir)) {
+    return [
+      "Commit guidance:",
+      `  This repo's .gitignore ignores ${ACTIVATION_FILENAME}, so the binding stays`,
+      "  local to your clone. That is a valid choice and mla will not touch it.",
+      `  The marker holds no secrets (an opaque workspaceId, nothing else), so if you`,
+      "  want the team to share one workspace, drop that ignore line and commit it.",
+    ];
+  }
+  return [
+    "Commit guidance:",
+    `  ${ACTIVATION_FILENAME} is untracked and not gitignored; it holds no secrets.`,
+    "  Commit it to share this workspace binding with the team, or leave it",
+    "  uncommitted to keep the binding local to this clone.",
+  ];
+}
+
+export interface BootstrapResult {
   ok: boolean;
   sessionId?: string;
   detail: string;
@@ -311,6 +340,76 @@ export function resolveSessionStartHook(
     // emit the neutral install nudge rather than a false "wired" claim.
   }
   return null;
+}
+
+// Whether the self-heal installed anything Claude Code can only pick up at session
+// start (hook events it reads from settings.json, or an MCP server entry). Hooks that
+// were already on disk do not count: they are live in this session already.
+export function wiringNeedsRestart(wired: WireResult | null): boolean {
+  if (!wired) return false;
+  const mcp = wired.mcp;
+  const freshMcp =
+    !!mcp && mcp.action !== "unchanged" && mcp.action !== "skipped";
+  return wired.hooksAdded.length > 0 || freshMcp;
+}
+
+// The two facts printed at the end of `mla activate`: is capture running, and did we
+// just install wiring that only loads at session start. They MUST be rendered together.
+// Printed independently, they contradicted each other: capture claimed "no restart
+// needed" and, three lines later, the wiring line said "Restart Claude Code once". Both
+// were true (capture rides the hooks that were already live when the session started;
+// the tools and scout agents genuinely are not loaded yet), but the pair reads as a
+// flat self-negation and the operator cannot act on it. So: only promise "no restart
+// needed" when nothing is about to ask for one, and when a restart IS needed, name what
+// it is FOR and say what it does not disturb.
+export function renderCaptureAndWiringLines(opts: {
+  boot: BootstrapResult;
+  installedWiring: boolean;
+  inSession: boolean;
+}): string[] {
+  const { boot, installedWiring, inSession } = opts;
+  const lines: string[] = [];
+
+  if (boot.ok) {
+    const sid = (boot.sessionId ?? "").slice(0, 8);
+    lines.push(
+      installedWiring
+        ? `Capture is active NOW for this session (${sid}).`
+        : `Capture is active NOW for this session (${sid}); no restart needed.`,
+    );
+    lines.push(
+      "Run `mla review` inside this session to see the console URLs + captured review.",
+    );
+  } else {
+    lines.push(
+      "Capture takes effect on the NEXT Claude Code session started from this folder.",
+    );
+    // Only explain when we were inside a session but the bootstrap could not run (e.g.
+    // hooks not installed); a plain non-session invocation needs no scary detail.
+    if (boot.sessionId) {
+      lines.push(`  (current session not bootstrapped: ${boot.detail})`);
+    }
+  }
+
+  if (installedWiring) {
+    lines.push("");
+    if (inSession) {
+      lines.push(
+        "Installed the Meetless wiring (hooks, /mla skill, scout agents, MCP). Claude Code loads these at session start, so restart once to pick up the tools and scout agents.",
+      );
+      if (boot.ok) {
+        lines.push(
+          "  Capture for this session is already running; the restart does not interrupt it.",
+        );
+      }
+    } else {
+      lines.push(
+        "Installed the Meetless wiring (hooks, /mla skill, scout agents, MCP). It loads automatically the next time you open Claude Code.",
+      );
+    }
+  }
+
+  return lines;
 }
 
 export function bootstrapCurrentSession(dir: string): BootstrapResult {
@@ -582,6 +681,55 @@ function checkCreateGuard(
   return 2;
 }
 
+interface ProvisionResponse {
+  id: string;
+  name: string;
+  isNew: boolean;
+  // The OWNER membership (WorkspaceUser) minted for the caller in this workspace.
+  ownerUserId?: string;
+  // Control re-bound the caller's account-only session to this new workspace, so
+  // the identity we hold on disk (the ACCOUNT id, from an account-only login) is
+  // now stale. See healActorIdentityAfterRebind.
+  sessionRebound?: boolean;
+}
+
+// The account-only -> workspace-bound self-heal (Option B P4).
+//
+// After a fresh `mla login` with no workspace, the on-disk `auth.user.id` is the
+// ACCOUNT id: control had no membership to name, so the session projected the
+// account as a least-privilege placeholder. Provisioning re-binds that same
+// session to the new workspace server-side, which makes our copy wrong: readConfig
+// PINS `actorUserId` to `auth.user.id` under user-token mode, and refreshUserToken
+// deliberately preserves the stored identity across rotations. So nothing else in
+// the CLI will ever correct it. Left alone, every actor-keyed call would send an
+// account id as `X-Meetless-Actor` and read as a non-member of the workspace the
+// human just created.
+//
+// Re-read from disk instead of writing back the caller's snapshot: the provision
+// POST itself may have rotated tokens (http.post refreshes on 401), and writing a
+// stale `cfg` would clobber the fresh ones. Failure here is non-fatal; the
+// workspace exists either way and `mla login --force` re-derives the identity.
+function healActorIdentityAfterRebind(ownerUserId: string): boolean {
+  let fresh: CliConfig;
+  try {
+    fresh = readConfig();
+  } catch {
+    return false;
+  }
+  if (fresh.auth.mode !== "user-token") return false;
+  if (fresh.auth.user.id === ownerUserId) return false;
+  writeConfig({
+    ...fresh,
+    auth: {
+      ...fresh.auth,
+      // role is display-only (§4.6); control re-reads the live WorkspaceUser.role
+      // on every authorization decision. OWNER is simply the truth now.
+      user: { ...fresh.auth.user, id: ownerUserId, role: "OWNER" },
+    },
+  });
+  return true;
+}
+
 // Provision a fresh workspace server-side and write its id into the marker at
 // cwd. The owner is the authenticated caller (resolved server-side from the
 // actor identity), never the request body, so a caller cannot mint a workspace
@@ -596,9 +744,9 @@ async function runProvision(
 
   const name = (flags.name && flags.name.trim()) || path.basename(cwd);
 
-  let resp: { id: string; name: string; isNew: boolean };
+  let resp: ProvisionResponse;
   try {
-    resp = await post<{ id: string; name: string; isNew: boolean }>(
+    resp = await post<ProvisionResponse>(
       cfg,
       "/internal/v1/workspaces",
       { name },
@@ -621,6 +769,14 @@ async function runProvision(
     return 1;
   }
 
+  // Do this BEFORE anything else touches control: finishActivate goes on to run
+  // the onboarding/scan chain, and those calls are actor-keyed. If they fire with
+  // the stale account id they read as a non-member of the workspace we just made.
+  const healed =
+    resp.sessionRebound && resp.ownerUserId
+      ? healActorIdentityAfterRebind(resp.ownerUserId)
+      : false;
+
   const { markerPath } = writeActivationMarker(cwd, resp.id, {
     force: true,
     workspaceName: resp.name,
@@ -630,18 +786,9 @@ async function runProvision(
   console.log(`Provisioned workspace ${resp.id} (${resp.name}).`);
   console.log(`  marker:      ${markerPath}`);
   console.log(`  workspaceId: ${resp.id}`);
+  if (healed) console.log("  identity:    signed-in session bound to this workspace as OWNER.");
   console.log("");
-  console.log("Commit guidance:");
-  console.log(
-    `  ${ACTIVATION_FILENAME} is untracked and not gitignored; it holds no secrets.`,
-  );
-  console.log(
-    "  Commit it to share this workspace binding with the team, or leave it",
-  );
-  console.log("  uncommitted to keep the binding local to this clone.");
-
-  const giResult = removeStaleGitignoreEntry(cwd);
-  if (giResult) console.log(`  gitignore:   ${giResult}`);
+  for (const line of commitGuidanceLines(cwd)) console.log(line);
 
   // Fresh workspace = empty governed KB: invite onboarding (one-time per workspace).
   return finishActivate(cwd, resolveBootstrapTier(flags), true);
@@ -660,9 +807,6 @@ function runBind(
   console.log(
     "  Marker unchanged; this folder is already bound to a workspace.",
   );
-
-  const giResult = removeStaleGitignoreEntry(found.dir);
-  if (giResult) console.log(`  gitignore:   ${giResult}`);
 
   return finishActivate(cwd, tier);
 }
@@ -842,59 +986,48 @@ function finishActivate(
     );
   }
 
-  // Deterministic preview (Regime 1): scan + cache, then show the review bundle.
-  // Never block activation on the preview; it is reassurance, not a gate.
+  // Deterministic preview (Regime 1): scan + cache FIRST, because the session-start
+  // hook that bootstrapCurrentSession runs injects from that cache; then bootstrap;
+  // only then render. The render has to come last because the header it prints is a
+  // claim about the bootstrap ("guiding this session NOW" vs "the next session"), and
+  // we may not assert that before we know. Never block activation on the preview; it
+  // is reassurance, not a gate.
+  let scan: ScanResult | null = null;
   try {
     const scanWorkspaceId = tryResolveWorkspaceId(cwd); // existing resolver from ../lib/workspace
     if (scanWorkspaceId) {
-      const result = rescanAndCache({ cwd, workspaceId: scanWorkspaceId });
-      console.log("");
-      console.log(renderBootstrapSummary(result));
-
-      // The deprecated `agentic` tier still prints the static scout mission for the
-      // messy Tier-2 docs the deterministic pass could only count, but steers the
-      // operator to the consolidated `/mla onboard` flow first (Phase 2).
-      if (bootstrapTierEmitsMission(tier)) {
-        if (bootstrapTierIsDeprecated(tier)) {
-          console.log("");
-          console.log(agenticDeprecationNote());
-        }
-        console.log("");
-        console.log("Static scout mission (hand this to a coding agent):");
-        console.log("");
-        console.log(renderManualScoutMission(result));
-      } else {
-        // Fast tier: do not hide the deeper bootstrap. When deep docs went unread,
-        // nudge the operator toward `mla activate --bootstrap agentic`.
-        const invite = renderAgenticInvitation(result);
-        if (invite) {
-          console.log("");
-          console.log(invite);
-        }
-      }
+      scan = rescanAndCache({ cwd, workspaceId: scanWorkspaceId });
     }
   } catch {
     // swallow: the preview must never fail activation
   }
 
   const boot = bootstrapCurrentSession(cwd);
-  console.log("");
-  if (boot.ok) {
-    console.log(
-      `Capture is active NOW for this session (${boot.sessionId!.slice(0, 8)}); no restart needed.`,
-    );
-    console.log(
-      "Run `mla review` inside this session to see the console URLs + captured review.",
-    );
-  } else {
-    console.log(
-      "Capture takes effect on the NEXT Claude Code session started from this folder.",
-    );
-    // Only explain when we were inside a session but the bootstrap could not
-    // run (e.g. hooks not installed); a plain non-session invocation needs no
-    // scary detail.
-    if (boot.sessionId) {
-      console.log(`  (current session not bootstrapped: ${boot.detail})`);
+
+  if (scan) {
+    console.log("");
+    console.log(renderBootstrapSummary(scan, { injectedNow: boot.ok }));
+
+    // The deprecated `agentic` tier still prints the static scout mission for the
+    // messy Tier-2 docs the deterministic pass could only count, but steers the
+    // operator to the consolidated `/mla onboard` flow first (Phase 2).
+    if (bootstrapTierEmitsMission(tier)) {
+      if (bootstrapTierIsDeprecated(tier)) {
+        console.log("");
+        console.log(agenticDeprecationNote());
+      }
+      console.log("");
+      console.log("Static scout mission (hand this to a coding agent):");
+      console.log("");
+      console.log(renderManualScoutMission(scan));
+    } else {
+      // Fast tier: do not hide the deeper bootstrap. When deep docs went unread,
+      // nudge the operator toward `mla activate --bootstrap agentic`.
+      const invite = renderAgenticInvitation(scan);
+      if (invite) {
+        console.log("");
+        console.log(invite);
+      }
     }
   }
 
@@ -908,6 +1041,11 @@ function finishActivate(
   // or in a headless/CI run (MLA_NO_WIRE), mirroring install.sh's opt-out. This is a
   // separate concern from reconcileWiringBackstop below, which is remove-only (it tears
   // out legacy wiring that shadows a plugin and NEVER installs).
+  //
+  // This runs BEFORE the capture/wiring copy is printed, and must keep doing so: the
+  // capture line's "no restart needed" is only honest if we already know whether the
+  // self-heal is about to demand one. It has no other ordering dependency (the session
+  // was bootstrapped further up, against the hooks that were live at session start).
   let selfHealed: WireResult | null = null;
   if (detectPluginOwnership().status !== "owned" && !process.env.MLA_NO_WIRE) {
     try {
@@ -916,27 +1054,14 @@ function finishActivate(
       // Never fail activation on a wiring hiccup; the backstop + doctor still catch it.
     }
   }
-  if (selfHealed) {
-    // A fresh install cannot load into THIS running session (Claude Code reads hooks,
-    // MCP, and agents only at session start), so name the one honest restart, session-
-    // aware. Silent when nothing material changed (the idempotent re-wire of an already
-    // wired home), so a returning binary user sees no noise.
-    const freshMcp =
-      !!selfHealed.mcp &&
-      selfHealed.mcp.action !== "unchanged" &&
-      selfHealed.mcp.action !== "skipped";
-    if (selfHealed.hooksAdded.length > 0 || freshMcp) {
-      console.log("");
-      if (boot.sessionId) {
-        console.log(
-          "Installed the Meetless wiring (hooks, /mla skill, scout agents, MCP). Restart Claude Code once to load it into this session.",
-        );
-      } else {
-        console.log(
-          "Installed the Meetless wiring (hooks, /mla skill, scout agents, MCP). It loads automatically the next time you open Claude Code.",
-        );
-      }
-    }
+
+  console.log("");
+  for (const line of renderCaptureAndWiringLines({
+    boot,
+    installedWiring: wiringNeedsRestart(selfHealed),
+    inSession: !!boot.sessionId,
+  })) {
+    console.log(line);
   }
 
   const backstop = reconcileWiringBackstop();

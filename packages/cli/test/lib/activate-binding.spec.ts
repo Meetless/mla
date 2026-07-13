@@ -336,22 +336,30 @@ describe("mla activate provision-or-bind + repo-root guard (T2.1)", () => {
 
   // --- gitignore migration --------------------------------------------------
 
-  it("removes a stale .meetless.json entry from .gitignore on provision", async () => {
+  // `.gitignore` is the USER's file. activate used to delete the `.meetless.json`
+  // line out of it on the theory that any such line was leftover auto-ignore
+  // residue, which it cannot know: a repo may ignore the marker deliberately (this
+  // one does, with a hand-written banner saying why). Editing a tracked file to
+  // make our own "not gitignored" claim come true left a dirty tree and an orphaned
+  // comment behind. We now REPORT the state and touch nothing (activate.ts,
+  // isMarkerGitignored). This test asserted the old delete and had been red on main
+  // ever since; it now pins the contract that actually shipped.
+  it("never rewrites a .gitignore that ignores the marker; it reports and leaves it alone", async () => {
     const repo = mkRepo();
     gitInit(repo);
-    fs.writeFileSync(
-      path.join(repo, ".gitignore"),
-      "node_modules\n# Meetless per-folder activation marker (local opt-in; do not commit)\n.meetless.json\n",
-    );
+    const before =
+      "node_modules\n# Meetless per-folder activation marker (local opt-in; do not commit)\n.meetless.json\n";
+    fs.writeFileSync(path.join(repo, ".gitignore"), before);
 
     const r = await runActivateIn({ home, cwd: repo });
 
     expect(r.code).toBe(0);
-    const gi = fs.readFileSync(path.join(repo, ".gitignore"), "utf8");
-    expect(gi).toContain("node_modules");
-    expect(gi).not.toContain(".meetless.json");
-    expect(gi).not.toContain("Meetless per-folder activation marker");
-    expect(r.logs.join("\n")).toContain("removed stale");
+    // Byte-for-byte untouched, banner comment included.
+    expect(fs.readFileSync(path.join(repo, ".gitignore"), "utf8")).toBe(before);
+    // And the operator is told the truth about what that means for the binding.
+    const out = r.logs.join("\n");
+    expect(out).toContain("Commit guidance:");
+    expect(out).toContain("mla will not touch it");
   });
 
   // --- --repair (re-check only, never mints; An 2026-06-04) -----------------

@@ -39,8 +39,10 @@ export function onboardingLockPath(home: string, workspaceId: string): string {
 }
 
 export type AcquireResult =
-  // Acquired (newly created, or reclaimed from a provably stale prior lock).
-  | { ok: true; lock: OnboardingLock }
+  // Acquired (newly created, or reclaimed from a prior lock). `reclaimedLive` carries the
+  // lock we took from a run that had NOT yet expired: only --force can do that, and the
+  // caller says so out loud rather than silently displacing another run.
+  | { ok: true; lock: OnboardingLock; reclaimedLive?: OnboardingLock }
   // Rejected. `held` is the live lock when readable, or null when the existing lock is
   // unreadable (fail-closed: we refuse without being able to attribute the holder).
   | { ok: false; held: OnboardingLock | null };
@@ -61,6 +63,16 @@ export function acquireOnboardingLock(input: {
   repositoryRoot: string;
   now: string; // ISO 8601
   ttlMs: number; // lock lifetime; a dead run frees the lock once now passes createdAt + ttl
+  // `enrich plan --force`. A run that is abandoned rather than crashed (the agent died, the
+  // human hit Ctrl-C mid-onboard) leaves a lock that is LIVE by the clock, so the timestamp
+  // rule cannot free it and `/mla onboard` is blocked for the rest of the budget + grace: up
+  // to nine minutes of "wait, then retry" with no override. --force is already the "onboard
+  // this repository again, I mean it" switch, so it reclaims the lock too: treat a live lock
+  // as reclaimable. The unlink-then-exclusive-create retry is unchanged, so a genuinely
+  // concurrent acquirer that wins the race still beats us and we still reject. An unreadable
+  // lock is also reclaimed under force: that branch exists so we never clobber a run we cannot
+  // attribute, and force is the human saying they know there is no such run.
+  force?: boolean;
 }): AcquireResult {
   const path = onboardingLockPath(input.home, input.workspaceId);
   mkdirSync(dirname(path), { recursive: true });
@@ -90,24 +102,29 @@ export function acquireOnboardingLock(input: {
 
   if (tryCreate()) return { ok: true, lock };
 
-  // A lock already exists. Read it; only reclaim it if it is provably stale.
+  // A lock already exists. Read it; only reclaim it if it is provably stale (or forced).
   let held: OnboardingLock | null;
   try {
     held = JSON.parse(readFileSync(path, "utf8")) as OnboardingLock;
   } catch {
-    return { ok: false, held: null }; // unreadable/corrupt: fail closed
+    if (!input.force) return { ok: false, held: null }; // unreadable/corrupt: fail closed
+    held = null;
   }
 
-  if (!isLockStale(held, input.now)) return { ok: false, held };
+  if (!input.force && held && !isLockStale(held, input.now)) return { ok: false, held };
 
-  // Stale: reclaim exactly once. Unlink, then retry the exclusive create. If a concurrent
-  // acquirer slipped a fresh lock in between, the retry fails and we reject (no clobber).
+  // Stale (or forced): reclaim exactly once. Unlink, then retry the exclusive create. If a
+  // concurrent acquirer slipped a fresh lock in between, the retry fails and we reject (no
+  // clobber).
+  const displacedLive = !!(held && !isLockStale(held, input.now));
   try {
     unlinkSync(path);
   } catch {
     // already removed by someone else; fall through to the retry
   }
-  if (tryCreate()) return { ok: true, lock };
+  if (tryCreate()) {
+    return displacedLive && held ? { ok: true, lock, reclaimedLive: held } : { ok: true, lock };
+  }
 
   let raced: OnboardingLock | null = null;
   try {

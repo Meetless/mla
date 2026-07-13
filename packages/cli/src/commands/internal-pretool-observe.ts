@@ -46,6 +46,7 @@ import { readRuleBundleCache, type BundleCacheRead, type BundlePrincipal } from 
 import { HOME } from "../lib/config";
 import { decideBundleEnforcement } from "../lib/rules/bundle-enforce";
 import { type EligibleEnforcement } from "../lib/rules/deny-admission";
+import { resolveMaxEnforcement } from "../lib/rules/max-enforcement";
 import { type ToolCall } from "../lib/rules/evaluator";
 import { ulid } from "../lib/rules/ulid";
 
@@ -464,27 +465,13 @@ function defaultClock(): { now: number; createdAt: string } {
   return { now, createdAt: new Date(now).toISOString() };
 }
 
-/**
- * Pure. Parse the `MEETLESS_ACTION_INTERCEPT_MAX` kill-switch value into the session ceiling cap. Only
- * `warn` | `ask` | `deny` (case-insensitive) are honored; anything else (unset, empty, or unrecognized)
- * yields `DENY` (uncapped) so the default preserves the current, notes-location-DENY-fires behavior. A
- * WARN cap turns every would-be block into a non-blocking advisory; an ASK cap forbids only DENY.
- */
-export function parseMaxEnforcement(raw: string | undefined): EligibleEnforcement {
-  switch ((raw ?? "").trim().toLowerCase()) {
-    case "warn":
-      return "WARN";
-    case "ask":
-      return "ASK";
-    case "deny":
-      return "DENY";
-    default:
-      return "DENY";
-  }
-}
+// The session ceiling now lives in lib/rules/max-enforcement.ts, because the PostToolUse sweep has to
+// read the SAME lever this gate does (it did not, and that let a `warn` cap allow a write here and
+// then delete the file there). Re-exported so this module's public surface is unchanged.
+export { parseMaxEnforcement } from "../lib/rules/max-enforcement";
 
 function defaultResolveMaxEnforcement(): EligibleEnforcement {
-  return parseMaxEnforcement(process.env.MEETLESS_ACTION_INTERCEPT_MAX);
+  return resolveMaxEnforcement();
 }
 
 /** Principal resolver: bind the bundle read to the active workspace + project + login session

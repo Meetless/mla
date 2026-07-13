@@ -33,11 +33,20 @@ function preToolUse(p: string): any[] {
 }
 
 describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
-  it("scopes the PreToolUse matcher to Write|Edit only (exact match, not catch-all)", () => {
-    // "^(Write|Edit)$" matches ONLY the two pilot tools. An unanchored "Write|Edit"
-    // would also match MultiEdit/NotebookEdit (substring); the empty catch-all
-    // would fire on Bash/Read. The pilot is intentionally narrow.
-    expect(PRE_TOOL_USE_MATCHER).toBe("^(Write|Edit)$");
+  it("scopes the PreToolUse matcher to every WRITE-CAPABLE tool (exact match, not catch-all)", () => {
+    // WIDENED 2026-07-11. This test used to pin "^(Write|Edit)$", and it was RIGHT to go
+    // red when that changed — but the narrow contract it defended was the bug. A
+    // forbidden-root rule says "never create or edit any file under <root>/": a claim
+    // about a PATH. Gating it on two tool names quietly turned it into "...using Write or
+    // Edit", and our own enforcement benchmark watched an agent step around it in one
+    // move: Write -> DENIED, then `Bash: cat > notes/design.md` -> succeeded, because the
+    // hook never fired.
+    //
+    // Still an EXACT alternation, NOT the catch-all: Read/Grep/Glob must never spawn the
+    // subcommand. What a Bash call actually writes is decided by deriveWriteTargets, so a
+    // read-only command (`ls`, `grep`) derives no targets and passes straight through.
+    expect(PRE_TOOL_USE_MATCHER).toBe("^(Write|Edit|MultiEdit|NotebookEdit|Bash)$");
+    expect(PRE_TOOL_USE_MATCHER).not.toBe(""); // never the catch-all
   });
 
   it("registers PreToolUse with the narrow matcher and observe script on a fresh file", () => {
@@ -128,12 +137,12 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
     }
   });
 
-  it("drift guard: hook-contract.ts pins the narrow PreToolUse matcher constant and registers the observe script", () => {
+  it("drift guard: hook-contract.ts pins the write-capable PreToolUse matcher and registers the observe script", () => {
     const src = fs.readFileSync(
       path.resolve(__dirname, "../../src/connectors/claude-code/hook-contract.ts"),
       "utf8",
     );
-    expect(src).toMatch(/PRE_TOOL_USE_MATCHER\s*=\s*"\^\(Write\|Edit\)\$"/);
+    expect(src).toMatch(/PRE_TOOL_USE_MATCHER\s*=\s*"\^\(Write\|Edit\|MultiEdit\|NotebookEdit\|Bash\)\$"/);
     expect(src).toMatch(/pre-tool-use\.sh/);
   });
 });

@@ -27,6 +27,8 @@
  *      cost is acceptable for the fallback-ladder use of search.)
  */
 
+import { randomUUID } from "node:crypto";
+
 // ---------- Intel client -----------------------------------------------------
 
 /**
@@ -44,6 +46,7 @@ export function makeIntelAsk({ intelBaseUrl, apiKey, fetchImpl = fetch }) {
     maxResults = 8,
     minResults = 3,
     asOf,
+    submissionId,
   }) {
     const payload = {
       workspace_id: workspaceId,
@@ -57,6 +60,16 @@ export function makeIntelAsk({ intelBaseUrl, apiKey, fetchImpl = fetch }) {
       max_results: maxResults,
       min_results: minResults,
     };
+    // The delivery key. Intel turns it into `mcp:<submission_id>:answer` and hands
+    // it to Control, so a re-delivered request collapses onto the one money
+    // authorization it already opened instead of buying the run twice.
+    //
+    // The CALLER's key wins, because only the caller knows what a "delivery" is:
+    // `mla mcp` mints one per tool call, so a replayed tool call reuses it. The
+    // fallback mint covers callers that pass nothing (today: `mla ask`, where a
+    // process invocation IS the delivery). It never leaves the key empty: an ask
+    // with no key is a keyless spend, and Control denies those.
+    payload.submission_id = submissionId ?? randomUUID();
     // B9: a VALID-time point-in-time cutoff (intel AskRequest.as_of). The MLA
     // front-end (`mla ask --as-of T`) sets it; the MCP front-end never does, so
     // when absent the body stays byte-identical to today.
@@ -134,6 +147,7 @@ export function makeAskModes({
       maxResults: args.maxResults ?? 8,
       minResults: args.minResults ?? 3,
       asOf: args.as_of,
+      submissionId: args.submission_id,
     });
     const out = normalizeIntelResponse(raw, "answer");
     const fb = statusFallback(out.results, filters, args.minResults ?? 3);
@@ -153,6 +167,7 @@ export function makeAskModes({
       maxResults: args.maxResults ?? 8,
       minResults: args.minResults ?? 3,
       asOf: args.as_of,
+      submissionId: args.submission_id,
     });
     const out = normalizeIntelResponse(raw, "search");
     out.answer = null; // search is retrieval-only
@@ -175,6 +190,7 @@ export function makeAskModes({
         maxResults: args.maxResults ?? 8,
         minResults: args.minResults ?? 3,
         asOf: args.as_of,
+        submissionId: args.submission_id,
       });
       const out = normalizeIntelResponse(raw, "canonical");
       out.answer = null;
@@ -222,6 +238,7 @@ export function makeAskModes({
       maxResults: args.maxResults ?? 4,
       minResults: 1,
       asOf: args.as_of,
+      submissionId: args.submission_id,
     });
     const out = normalizeIntelResponse(raw, "canonical");
     // Guarantee the canonical winner is present, flagged canonical:true, and

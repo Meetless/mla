@@ -46,24 +46,51 @@ function directiveBullet(d: Directive): string {
   return `  • ${d.text}  (${d.source})`;
 }
 
+export interface BootstrapSummaryOptions {
+  /**
+   * Did the caller manage to bootstrap the CURRENT session (BootstrapResult.ok)?
+   *
+   * This is not cosmetic, and the caller must not guess it. `mla activate` run
+   * from a plain terminal has no session to inject into at all
+   * (CLAUDE_CODE_SESSION_ID is unset, bootstrapCurrentSession returns ok:false),
+   * and so does an activate inside a session whose capture hooks are not wired.
+   * In both cases the directives take effect on the NEXT session started here.
+   *
+   * Until 2026-07-12 this header claimed "Guiding this session now (injected)"
+   * unconditionally, printed BEFORE the bootstrap was even attempted, so a plain
+   * `mla activate` in a shell said the rules were live in a session that did not
+   * exist and then, four lines later, said capture starts next session. Both
+   * cannot be true. Pass the real result.
+   */
+  injectedNow: boolean;
+}
+
 /**
  * Render the full "Active agent instructions" bundle for `mla activate`. Leads with
  * the inventory headline, then (only when non-empty):
- *   - the high-confidence directives guiding the session now (capped, with an "and N
- *     more" tail), MUST_FOLLOW first;
+ *   - the high-confidence directives, stated as guiding THIS session only when the
+ *     current session was actually bootstrapped (capped, with an "and N more"
+ *     tail), MUST_FOLLOW first;
  *   - the count of machine_inferred advisory candidates awaiting review, with the
  *     `mla context advisory` pointer and an explicit "not injected" note;
  *   - the count of likely-stale signals needing a verdict, with `mla context list`.
  * An empty graph degrades to a calm "nothing high-confidence yet" line; it never
  * prints an empty section header or a stray bullet.
  */
-export function renderBootstrapSummary(scan: ScanResult): string {
+export function renderBootstrapSummary(
+  scan: ScanResult,
+  opts: BootstrapSummaryOptions,
+): string {
   const lines: string[] = [renderActivationCard(scan.inventory)];
 
   const directives = [...scan.directives].sort(byStrength);
   if (directives.length > 0) {
     lines.push("");
-    lines.push("Guiding this session now (high-confidence, injected):");
+    lines.push(
+      opts.injectedNow
+        ? "Guiding this session now (high-confidence, injected):"
+        : "Will guide the next Claude Code session started here (high-confidence):",
+    );
     const shown = directives.slice(0, MAX_DIRECTIVES_SHOWN);
     for (const d of shown) {
       lines.push(directiveBullet(d));

@@ -3,7 +3,9 @@
 // argv carrying a query, a path, an id, and a secret-shaped flag value must
 // normalize to a shape that contains NONE of those substrings.
 
+import { COMMANDS } from "../../src/cli";
 import {
+  KNOWN_COMMANDS,
   classifyOutcome,
   classifyScope,
   isReportableFault,
@@ -35,21 +37,23 @@ describe("normalizeCommand", () => {
     }
   });
 
-  it("recognizes EVERY command in the cli.ts dispatch switch (drift pin)", () => {
-    // This is the source-of-truth mirror of the `switch (cmd)` in cli.ts, in
-    // dispatch order. If cli.ts grows a case and this list (and KNOWN_COMMANDS)
-    // does not, the new command silently normalizes to "unknown" and vanishes
-    // from the funnel. Keep the three in lockstep; this test is the tripwire.
-    const DISPATCH = [
-      "init", "wire", "rewire", "login", "logout", "uninstall", "whoami",
-      "activate", "deactivate", "mute", "unmute", "workspace", "doctor",
-      "status", "scan", "context", "flush", "queue", "rules", "review",
-      "enforcement", "conflicts", "cases", "session", "ask", "kb",
-      "agent-memory", "enrich", "graph", "cg", "summary", "label", "stats",
-      "turn", "adoption", "debug", "bug", "evidence", "mcp", "upgrade",
-      "_internal",
-    ];
-    for (const cmd of DISPATCH) {
+  it("KNOWN_COMMANDS is a BIJECTION with the cli.ts command registry (drift pin)", () => {
+    // This used to be a hand-maintained list of 41 strings kept "in lockstep" with
+    // the dispatch switch by eye. The T6 registry made that unnecessary: COMMANDS
+    // IS the dispatch table, so the expectation is DERIVED from it and the drift
+    // it was written to catch is now impossible to introduce.
+    //
+    // Both directions matter. A dispatchable command missing from KNOWN_COMMANDS
+    // normalizes to "unknown" and erases its own dimension from every failure and
+    // retention view (the 2026-07-09 `rules` bug). A word in KNOWN_COMMANDS that
+    // NOTHING dispatches is a stale allowlist entry: harmless to privacy, but it
+    // means a removed command still looks live in the funnel.
+    const dispatchable = COMMANDS.flatMap((c) => [c.name, ...(c.aliases ?? [])]).sort();
+    expect([...KNOWN_COMMANDS].sort()).toEqual(dispatchable);
+
+    // ...and every one of them really does survive normalization (hidden entries
+    // like `cases` included: they still dispatch, so they must still be counted).
+    for (const cmd of dispatchable) {
       expect(normalizeCommand([cmd]).command).toBe(cmd);
     }
   });

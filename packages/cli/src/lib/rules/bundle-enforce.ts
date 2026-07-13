@@ -31,9 +31,11 @@ import type { RuleBundleEntry } from "./control-rule-client";
 import { type EligibleEnforcement, projectEligibleEnforcement } from "./deny-admission";
 import type { EvaluationTarget } from "./evaluation-input-hash";
 import { selectRule, type ToolCall } from "./evaluator";
+import { matchesGlob } from "./glob-match";
 import { classifyRuntimeTarget } from "./notes-path";
 import type { RulePayloadV1 } from "./types";
 import { versionBackedVerdict } from "./version-evaluation";
+import { deriveWriteTargets, isWriteCapableTool } from "./write-targets";
 
 /** The PreToolUse decision. DENY/ASK carry the deciding rule's node + version identity so the
  * caller can stamp deny telemetry; UNAVAILABLE carries the diagnostic reason; PASS carries nothing. */
@@ -188,10 +190,48 @@ async function evaluateEntry(
   // runtimeInject must never produce an action-time block; the safe direction is PASS (do not enforce).
   if (!Array.isArray(payload.deliveryChannels) || !payload.deliveryChannels.includes("preToolUse")) return null;
 
-  if (selectRule(call, app) === "NOT_APPLICABLE") return null;
+  // A forbidden-root rule is a statement about a PATH ("never create or edit any file
+  // under <root>/"), so it must hold against EVERY tool that can write that path — not
+  // only the two the attestation named. Gating on `applicability.tools` turned the rule
+  // into "…using Write or Edit", and on 2026-07-11 our own benchmark watched an agent
+  // step around it in one move: Write -> DENIED, then `Bash: cat > notes/design.md` ->
+  // succeeded, because the hook never fired. Enforcement that only stops the compliant
+  // is not enforcement.
+  //
+  // `selectRule` is still the authority for the ATTESTED tools (unchanged semantics for
+  // Write/Edit). Beyond them we admit any write-capable tool and derive its real write
+  // targets. Read-only tools derive nothing and fall out here.
+  const attested = selectRule(call, app) === "APPLIES";
+  if (!attested && !isWriteCapableTool(call.toolName)) return null;
 
-  const target = await classify(call.toolInput[app.matcher.field], runtimeProjectRoot);
-  const verdict = versionBackedVerdict(payload, target);
+  const rawTargets = deriveWriteTargets(call);
+  if (rawTargets.length === 0) return null;
+  // Honour an attested glob per candidate path, so a narrowed rule stays narrow.
+  const candidates =
+    app.matcher.glob === undefined
+      ? rawTargets
+      : rawTargets.filter((p) => matchesGlob(p, app.matcher.glob as string));
+  if (candidates.length === 0) return null;
+
+  // A single call can write several paths (`tee a b`, `cp x y z dir/`). One violating
+  // path is enough: take the first, so the reason names a concrete file.
+  let target: EvaluationTarget | null = null;
+  let verdict: ReturnType<typeof versionBackedVerdict> | null = null;
+  for (const raw of candidates) {
+    const t = await classify(raw, runtimeProjectRoot);
+    const v = versionBackedVerdict(payload, t);
+    if (v.result === "VIOLATION") {
+      target = t;
+      verdict = v;
+      break;
+    }
+    // Remember the first evaluated target so a non-violating call still reports coherently.
+    if (target === null) {
+      target = t;
+      verdict = v;
+    }
+  }
+  if (target === null || verdict === null) return null;
   // Clamp the attested ceiling to the session cap BEFORE branching, so a WARN-capped session never
   // reaches the DENY/ASK arms (a would-be block becomes the non-blocking advisory instead) and an
   // ASK-capped session never reaches DENY. The clamp only ever lowers, never escalates.

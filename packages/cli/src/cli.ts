@@ -42,6 +42,13 @@ import type { CliConfig } from "./lib/config";
 import { readConfig, HOME } from "./lib/config";
 import { tryResolveWorkspaceId } from "./lib/workspace";
 import type { Tracer } from "@meetless/trace-core";
+import {
+  type CommandSpec,
+  renderCommandHelp,
+  renderUsage,
+  resolveCommand,
+  wantsLeadingHelp,
+} from "./lib/command-registry";
 import { runInit } from "./commands/init";
 import { runLogin } from "./commands/login";
 import { runLogout } from "./commands/logout";
@@ -68,6 +75,7 @@ import {
 import { runInternalSteerSync } from "./commands/internal-steer-sync";
 import { runCaptureDecisions } from "./commands/internal-capture-decisions";
 import { runInternalPretoolObserve } from "./commands/internal-pretool-observe";
+import { runInternalEnforcementBaseline, runInternalPosttoolSweep } from "./commands/internal-enforcement-sweep";
 import { runInternalForwardEnforcement } from "./commands/internal-forward-enforcement";
 import { runInternalEnforcementCorrelate } from "./commands/internal-enforcement-correlate";
 import { runInternalRedactCapture } from "./commands/internal-redact-capture";
@@ -98,6 +106,7 @@ import { runSessionShow, runSessionReconcile } from "./commands/session";
 import { runWorkspace } from "./commands/workspace";
 import { runDebug } from "./commands/debug";
 import { runBug } from "./commands/bug";
+import { DOCS_SUBCOMMANDS, runDocs } from "./commands/docs";
 import { runMcp } from "./commands/mcp";
 import { runMcpSupervisor } from "./commands/mcp-supervisor";
 import { shouldSuperviseMcp } from "./lib/mcp-restart";
@@ -135,46 +144,94 @@ import {
 //   mla _internal finalize-session <sessionId>
 //   mla _internal auto-index [--session <sid>]
 
-const USAGE = `mla: Meetless Agent CLI
-
-usage:
-  mla init [--control-url <url>] [--control-token <token>] [--intel-url <url>]
+// The single command registry the dispatcher runs on AND `mla help` renders
+// from (proposal §6.3). Each entry pairs a VERBATIM usage block (the exact
+// lines that used to live in the hand-maintained help blob) with the handler
+// that used to be its `switch (cmd)` arm. There is no separate manifest kept
+// parallel to the switch: `renderUsage(COMMANDS)` IS the help screen and
+// `resolveCommand(COMMANDS, cmd)` IS the dispatch table, so "documented" and
+// "dispatchable" cannot drift. Subcommand routers recompute `[, sub, ...rest]`
+// from the full argv exactly as the old switch did. Entries render in array
+// order, so this order is the help-screen order; keep it stable.
+export const COMMANDS: CommandSpec[] = [
+  {
+    name: "init",
+    summary: "Machine setup and credential update. Defaults to logged-out; run `mla login` next.",
+    usage: `  mla init [--control-url <url>] [--control-token <token>] [--intel-url <url>]
           [--actor <id>] [--no-post-tool-use] [--skill-only]
           (machine setup + credential update. Defaults to logged-out (auth.mode
            none): run 'mla login' next to sign in. Pass --control-token only for a
            headless shared-key install. A tokenless re-run preserves a live login.
-           No workspace binding here; use 'mla activate' to bind a folder.)
-  mla wire [--no-post-tool-use] [--no-install-flock] [--skill-only]
+           No workspace binding here; use 'mla activate' to bind a folder.)`,
+    handler: (argv) => runInit(argv.slice(1)),
+  },
+  {
+    name: "wire",
+    summary: "Idempotent re-wiring after a binary upgrade. No token needed.",
+    // `rewire` is the original name, kept as a silent back-compat alias so
+    // already-printed operator hints and any muscle memory keep working.
+    aliases: ["rewire"],
+    usage: `  mla wire [--no-post-tool-use] [--no-install-flock] [--skill-only]
           (idempotent re-wiring after binary upgrade; no token needed.
-           alias: rewire)
-  mla upgrade [--check] [--force]
+           alias: rewire)`,
+    handler: (argv) => runRewire(argv.slice(1)),
+  },
+  {
+    name: "upgrade",
+    summary: "Self-upgrade to the latest signed release. `--check` reports without installing.",
+    usage: `  mla upgrade [--check] [--force]
           (self-upgrade to the latest signed release: verifies the release
            manifest's Ed25519 signature, enforces the downgrade guard, and
            atomically swaps the binary (curl installs only; brew/npm are
            redirected to their package manager). --check reports without
-           installing; --force allows a same-version or downgrade reinstall.)
-  mla login [--no-browser] [--console-url <url>] [--port <n>]
+           installing; --force allows a same-version or downgrade reinstall.)`,
+    handler: (argv) => runUpgrade({ argv: argv.slice(1) }),
+  },
+  {
+    name: "login",
+    summary: "Browser sign-in that captures an audited user session.",
+    usage: `  mla login [--no-browser] [--console-url <url>] [--port <n>]
                     (browser login: opens the Console authorize page, captures a
                      user session into cli-config.json. --no-browser prints the URL
                      for SSH/headless and REQUIRES --port (the forwarded loopback
                      port). No-op when already logged in with >24h of refresh
-                     runway; force re-login with 'mla logout && mla login'.)
-  mla logout
+                     runway; force re-login with 'mla logout && mla login'.)`,
+    handler: (argv) => runLogin(argv.slice(1)),
+  },
+  {
+    name: "logout",
+    summary: "Revoke the current user session and clear it locally.",
+    usage: `  mla logout
                     (revoke the current user session server-side and clear it from
                      cli-config.json (auth.mode -> none). A network failure still
-                     clears locally; NEVER restores a prior shared key. No --all.)
-  mla uninstall [--dry-run] [--yes]
+                     clears locally; NEVER restores a prior shared key. No --all.)`,
+    handler: (argv) => runLogout(argv.slice(1)),
+  },
+  {
+    name: "uninstall",
+    summary: "Remove the entire local Meetless footprint.",
+    usage: `  mla uninstall [--dry-run] [--yes]
                     (remove the entire local Meetless footprint: ~/.meetless,
                      the Claude hook + MCP entries, and the /mla skill. Prints
                      how to remove the binary. Local only; server data and other
-                     repos' .meetless.json markers are untouched.)
-  mla whoami [--json]
+                     repos' .meetless.json markers are untouched.)`,
+    handler: (argv) => runUninstall(argv.slice(1)),
+  },
+  {
+    name: "whoami",
+    summary: "Print the identity behind the current config.",
+    usage: `  mla whoami [--json]
                     (print the identity behind the current cli-config.json: a
                      user session resolves live via the control /auth/me endpoint;
                      a shared key prints its mode without a network call. Prints
                      the workspace CUID (for --workspace <id>); --json emits a
-                     parseable object. Exit 1 when not configured.)
-  mla activate [--name <name>] [--note <text>]
+                     parseable object. Exit 1 when not configured.)`,
+    handler: (argv) => runWhoami(argv.slice(1)),
+  },
+  {
+    name: "activate",
+    summary: "Provision or bind a workspace for this folder.",
+    usage: `  mla activate [--name <name>] [--note <text>]
                     (provision-or-bind a workspace for this folder: no marker in
                      the tree provisions a new one named after the dir; a marker
                      present binds to it)
@@ -192,19 +249,39 @@ usage:
                      the deterministic review bundle. agentic is DEPRECATED: it still
                      emits a static deep-read scout mission, but the consolidated
                      agent-driven onboarding is /mla onboard. The old full tier was
-                     removed; --bootstrap full now errors with a migration note.)
-  mla deactivate [--yes] [--from-root|--marker <path>]
+                     removed; --bootstrap full now errors with a migration note.)`,
+    handler: (argv) => runActivate(argv.slice(1)),
+  },
+  {
+    name: "deactivate",
+    summary: "Remove this folder's workspace binding.",
+    usage: `  mla deactivate [--yes] [--from-root|--marker <path>]
                     (REMOVE this folder's workspace binding: deletes the nearest
                      .meetless.json. Confirms first (--yes to skip); from a subdir
                      it refuses to delete a parent marker unless --from-root or
-                     --marker <path>. For per-session silencing use 'mla mute'.)
-  mla mute
+                     --marker <path>. For per-session silencing use 'mla mute'.)`,
+    handler: (argv) => runDeactivate(argv.slice(1)),
+  },
+  {
+    name: "mute",
+    summary: "Silence capture for the current session only.",
+    usage: `  mla mute
                     (per-session: silence capture + Push for the CURRENT Claude
-                     Code session only; does not touch .meetless.json)
-  mla unmute
+                     Code session only; does not touch .meetless.json)`,
+    handler: (argv) => runMute(argv.slice(1)),
+  },
+  {
+    name: "unmute",
+    summary: "Re-enable capture for the current session.",
+    usage: `  mla unmute
                     (per-session: re-enable capture for the CURRENT session;
-                     does not touch .meetless.json)
-  mla workspace [show]
+                     does not touch .meetless.json)`,
+    handler: (argv) => runUnmute(argv.slice(1)),
+  },
+  {
+    name: "workspace",
+    summary: "Show the workspace bound to this folder and manage its members.",
+    usage: `  mla workspace [show]
                     (print the workspace bound to this folder + its health)
   mla workspace invite <email> [--json] [--workspace <id>]
                     (add a teammate's email as a MEMBER so they can share this
@@ -212,10 +289,58 @@ usage:
   mla workspace members [--json] [--workspace <id>]
                     (list the workspace's active members)
   mla workspace remove <email> [--json] [--workspace <id>]
-                    (revoke a MEMBER's access by email; owner/admin)
-  mla review [--plain] [--no-flush]
-  mla review <id>
-  mla enforcement [--all] [--json]
+                    (revoke a MEMBER's access by email; owner/admin)`,
+    handler: (argv) => runWorkspace(argv.slice(1)),
+  },
+  {
+    name: "review",
+    summary: "Open the pending review inbox; `mla review <id>` for one item.",
+    // Owns its own `--help` (reviewUsage(), intercepted in the handler below).
+    ownHelp: true,
+    usage: `  mla review [--plain] [--no-flush]
+  mla review <id>`,
+    // `mla review`               -> current session, no positional, only flags.
+    // `mla review <id>`          -> deep-link emission, exactly one positional.
+    // Old `latest` / `by-session` are intentionally removed; surface a clear
+    // pointer instead of silently routing the operator to the wrong path.
+    //
+    // `--help`/`-h` is intercepted here, BEFORE either runReview's or
+    // runReviewById's strict parser runs. Both parsers throw on any unknown
+    // `--`/`-` token by design (to name stray flags), but help is not stray --
+    // throwing "Unknown flag: --help" reads as the tool being broken. Match it
+    // anywhere in the review args so `mla review -h`, `mla review <id> --help`,
+    // and `mla review --plain --help` all print usage and exit 0.
+    handler: (argv) => {
+      const [, sub, ...rest] = argv;
+      const reviewArgs = argv.slice(1);
+      if (reviewArgs.includes("--help") || reviewArgs.includes("-h")) {
+        console.log(reviewUsage());
+        return 0;
+      }
+      if (sub === undefined || sub.startsWith("--")) {
+        return runReview(argv.slice(1));
+      }
+      if (sub === "latest") {
+        console.error(
+          "`mla review latest` was removed. Run `mla review` inside a Claude Code " +
+            "session, or open the queues at /relationships and /cases in the console.",
+        );
+        return 2;
+      }
+      if (sub === "by-session") {
+        console.error(
+          "`mla review by-session <sid>` was removed. The current session is the only " +
+            "session `mla review` will surface; open the console queues to browse others.",
+        );
+        return 2;
+      }
+      return runReviewById([sub, ...rest]);
+    },
+  },
+  {
+    name: "enforcement",
+    summary: "Review and adjudicate governed-rule enforcement blocks.",
+    usage: `  mla enforcement [--all] [--json]
                     (review governed-rule enforcement blocks (PreToolUse denies):
                      lists this session's UNREVIEWED blocks with full evidence (rule
                      text + blocked path), then an interactive confirm/dismiss loop
@@ -224,8 +349,15 @@ usage:
   mla enforcement confirm <id> [--note <text>]
   mla enforcement dismiss <id> [--note <text>]
                     (adjudicate one block by id without the interactive loop:
-                     confirm = a real catch, dismiss = a false positive.)
-  mla conflicts [--global] [--session <sid>] [--json]
+                     confirm = a real catch, dismiss = a false positive.)`,
+    // All arg parsing (verbs, flags, --note) lives in runEnforcement so the
+    // dispatcher stays a thin pass-through of everything after the command word.
+    handler: (argv) => runEnforcement(argv.slice(1)),
+  },
+  {
+    name: "conflicts",
+    summary: "List and resolve open cross-session conflicts.",
+    usage: `  mla conflicts [--global] [--session <sid>] [--json]
                     (list open cross-session conflicts: a decision this session
                      captured that contradicts approved knowledge or another live
                      session. Defaults to THIS session; --global widens to the whole
@@ -238,22 +370,93 @@ usage:
                      human, via the same endpoint the console drives: closes the
                      case, audits the verdict, broadcasts a steer to the loser
                      session. dismiss = shorthand for --outcome dismiss. --rationale
-                     is required.)
-  mla session show [sessionId] [--json] [--last <N>]
+                     is required.)`,
+    // All verb + flag parsing lives in runConflicts so the dispatcher stays a
+    // thin pass-through of everything after the command word.
+    handler: (argv) => runConflicts(argv.slice(1)),
+  },
+  {
+    name: "cases",
+    // Removed command kept ONLY as a redirect stub so `mla cases` routes the
+    // operator to the replacement instead of the generic "Unknown command"
+    // error. Hidden: never printed on the help screen.
+    hidden: true,
+    usage: `  mla cases`,
+    handler: () => {
+      console.error(
+        "`mla cases` was removed. Open the cases queue in the console, run " +
+          "`mla conflicts` for open cross-session conflicts, or " +
+          "`mla review <id>` to get a deep link for a specific case.",
+      );
+      return 2;
+    },
+  },
+  {
+    name: "session",
+    summary: "Inspect a session; `reconcile` archives sessions whose transcript was deleted.",
+    usage: `  mla session show [sessionId] [--json] [--last <N>]
   mla session reconcile [--dry-run] [--json]
                     (archive sessions whose Claude Code transcript was deleted
-                     on disk; reversible, fail-safe, skips anything uncertain)
-  mla ask "<query>" [--mode answer|search|canonical|compare] [--workspace <id>]
+                     on disk; reversible, fail-safe, skips anything uncertain)`,
+    handler: (argv) => {
+      const [, sub, ...rest] = argv;
+      if (sub === "show") return runSessionShow(rest);
+      if (sub === "reconcile") return runSessionReconcile(rest);
+      // `distill` + `remember` were removed (dogfood scaffold; the learning
+      // loop captures agent output directly per turn). See
+      // notes/20260531-agent-review-retraction-and-pending-items-loop.md §2.
+      console.error(`Unknown session subcommand: ${sub ?? "(none)"}\n\n${renderUsage(COMMANDS)}`);
+      return 2;
+    },
+  },
+  {
+    name: "ask",
+    summary: "Answer from governed memory with citations.",
+    usage: `  mla ask "<query>" [--mode answer|search|canonical|compare] [--workspace <id>]
                     [--as-of <date>] [--max <n>] [--min <n>] [--plain]
                     (--as-of YYYY-MM-DD answers point-in-time: relations not yet
                      valid at that instant are excluded. The validity axis is
-                     SEPARATE from posture/relationship; see \`mla kb help\`.)
-  mla mcp
+                     SEPARATE from posture/relationship; see \`mla kb help\`.)`,
+    // `mla ask` loads @meetless/ask-core. ask-core is ESM-only, so it ships as
+    // a CJS bundle the binary loads via require() (scripts/bundle-esm.js);
+    // runAsk handles bundle-vs-source resolution. Works in the binary and from
+    // a source/npm install alike, so no binary gate here.
+    handler: (argv) => runAsk(argv.slice(1)),
+  },
+  {
+    name: "mcp",
+    summary: "Start the Meetless MCP server over stdio, authenticated as you.",
+    usage: `  mla mcp
                     (start the Meetless MCP server over stdio, authenticated as
                      the logged-in human (cli-config user-token) and scoped to
                      the marker workspace. No service key, no MEETLESS_WORKSPACE_ID
-                     pin. Wire it into an MCP client's config as the command.)
-  mla kb summary [--json]
+                     pin. Wire it into an MCP client's config as the command.)`,
+    // `mla mcp` boots the Meetless MCP server over stdio, authenticated as the
+    // logged-in human (cli-config user-token) and scoped to the marker
+    // workspace. Replaces the old standalone `meetless-mcp` service-key bin.
+    //
+    // Self-heal split (lib/mcp-restart.ts): a bare `mla mcp` runs the thin
+    // supervising parent, which respawns a `mla mcp --child` worker whenever a
+    // newer build lands on disk, so the long-lived daemon stops serving stale
+    // code (the "This operation was aborted" footgun) without an editor restart.
+    // The child (and the MEETLESS_MCP_SUPERVISOR=0 kill switch) run the worker
+    // directly.
+    //
+    // @meetless/mcp is ESM-only and ships as a CJS bundle the binary loads via
+    // require() (scripts/bundle-esm.js); runMcp/loadAndServe handle
+    // bundle-vs-source resolution. Works in the binary and from a source/npm
+    // install alike, so no binary gate here.
+    handler: (argv) =>
+      shouldSuperviseMcp(argv.slice(1), process.env)
+        ? runMcpSupervisor(argv.slice(1))
+        : runMcp(argv.slice(1)),
+  },
+  {
+    name: "kb",
+    summary: "Ingest, inspect, and govern knowledge-base documents.",
+    // Owns its own `--help` (KB_USAGE, the full subcommand catalog).
+    ownHelp: true,
+    usage: `  mla kb summary [--json]
   mla kb dump [--markdown] [--json]
   mla kb add <path> --mode file|corpus --provenance <kind>
                     [--workspace <id>] [--profile <p>] [--glob <g>]
@@ -303,8 +506,21 @@ usage:
   mla kb personal list | mla kb personal show <id>
                     (this actor's own SHADOW Personal-KB docs)
   mla kb help
-                    (full KB catalog + the posture-vs-relationship-review model)
-  mla graph review [scope] [--json] | mla graph review <id> --accept|--reject
+                    (full KB catalog + the posture-vs-relationship-review model)`,
+    handler: (argv) => runKb(argv.slice(1)),
+  },
+  {
+    name: "graph",
+    summary: "The coordination graph: review typed relationships between documents.",
+    // Owns its own `--help` (GRAPH_USAGE, the full subcommand catalog).
+    ownHelp: true,
+    // `mla graph` (alias `cg` = coordination graph) is the relationship axis's own
+    // home: `review`/`pending` route to the SAME handlers as `mla kb review`/`kb
+    // pending` (one implementation, two entry points). It exists so the coordination
+    // graph stops hiding under the storage noun `kb`. Document/posture verbs typed
+    // here are redirected back to `mla kb` rather than conflated. See commands/graph.ts.
+    aliases: ["cg"],
+    usage: `  mla graph review [scope] [--json] | mla graph review <id> --accept|--reject
   mla graph pending [scope]
   mla graph help    (alias: mla cg)
                     (the coordination graph: relationship review (typed edges
@@ -312,8 +528,13 @@ usage:
                      Same handlers as \`mla kb review\`/\`kb pending\`, given the
                      relationship axis its own home so it stops hiding under the
                      storage noun \`kb\`. Document ingestion + grounding (posture)
-                     stay under \`mla kb\`; doc verbs typed here redirect there.)
-  mla rules add "<statement>" [--personal|--team] [--must] [--applies-to <glob>]... [--source <s>]...
+                     stay under \`mla kb\`; doc verbs typed here redirect there.)`,
+    handler: (argv) => runGraph(argv.slice(1)),
+  },
+  {
+    name: "rules",
+    summary: "Add, inspect, and govern rules, including the enforcement ceilings.",
+    usage: `  mla rules add "<statement>" [--personal|--team] [--must] [--applies-to <glob>]... [--source <s>]...
                     (add an operator-dictated durable CONVENTION to the backend rule
                      store (the workspace source of truth), injected into every agent
                      prompt via the local scan cache; run \`mla scan\` to refresh this
@@ -340,8 +561,43 @@ usage:
                      TEAM copy (enforces workspace-wide), both mint-then-revoke; \`publish\`
                      projects the attested set to the console Rules page. attest /
                      revoke / demote / promote / publish are action-level DENY ceilings,
-                     NOT soft authoring conventions; those are added via \`mla rules add\`.)
-  mla enrich <plan|brief|ingest|materialize>
+                     NOT soft authoring conventions; those are added via \`mla rules add\`.)`,
+    // The rules verbs operate on the unified backend Rule API (rules-store-unification). `add` mints a
+    // RuleNode (PERSONAL by default, `--team` for workspace-wide), `edit` mints the next version
+    // carrying expectedCurrentVersionId, `revoke` is the
+    // compare-and-swap kill switch that disarms a LIVE rule, `attest` keeps the LOCAL observed-snapshot
+    // resolution but mints the DENY rule to the backend (fork #7), `demote` lowers a TEAM rule to a
+    // PERSONAL copy and `promote` raises a PERSONAL rule to a TEAM copy (both mint-then-revoke, since
+    // authorityScope is node-immutable), `list` reads the backend (matching
+    // the console) and falls back to the principal bundle offline, and `remove` is unsupported
+    // (`.meetless/rules.md` is no longer an authority). `activity` is the R2-LOCAL accountability
+    // projection (per LIVE rule: observed N, violated M, denied; proposal §2.6 / §3.7), `publish` is the
+    // deprecation stub kept for the old-client window, and `import` is the one-time migration that reads
+    // the local stores (CE0 + managed) for the active scope and POSTs them to the backend (additive,
+    // idempotent). The console and the CLI mutate the SAME store, so `revoke` truly disarms a LIVE rule.
+    handler: (argv) => {
+      const [, sub, ...rest] = argv;
+      if (sub === "add") return runRulesAddBackend(rest);
+      if (sub === "edit") return runRulesEditBackend(rest);
+      if (sub === "remove" || sub === "rm") return runRulesRemoveBackend(rest);
+      if (sub === "list") return runRulesListBackend(rest);
+      if (sub === "activity") return runRulesActivity(rest);
+      if (sub === "attest") return runRulesAttestBackend(rest);
+      if (sub === "revoke") return runRulesRevokeBackend(rest);
+      if (sub === "demote") return runRulesDemoteBackend(rest);
+      if (sub === "promote") return runRulesPromoteBackend(rest);
+      if (sub === "publish") return runRulesPublish(rest);
+      if (sub === "import") return runRulesImport(rest);
+      console.error(`Unknown rules subcommand: ${sub ?? "(none)"}\n\n${renderUsage(COMMANDS)}`);
+      return 2;
+    },
+  },
+  {
+    name: "enrich",
+    summary: "Agent-orchestrated onboarding enrichment; usually driven by the `/mla onboard` skill.",
+    // Owns its own `--help` (the full enrich subcommand catalog).
+    ownHelp: true,
+    usage: `  mla enrich <plan|brief|ingest|materialize>
                     (agent-orchestrated onboarding enrichment, usually driven by the
                      /mla onboard skill: \`plan\` scans the repo into an immutable run
                      record + prints the scout plan; \`brief\` re-prints a run's scout
@@ -349,55 +605,133 @@ usage:
                      PENDING in governed knowledge; \`materialize\` regenerates the
                      committed .meetless/rules.md mirror from the accepted rule set (a
                      human-readable projection for git visibility; the backend store +
-                     scan cache are the inject source, not this file).)
-  mla agent-memory <enable|disable|status|scan|push|report>
+                     scan cache are the inject source, not this file).)`,
+    // `mla enrich`: agent-orchestrated onboarding enrichment. `enrich plan` scans the
+    // repo into an immutable run record + prints the plan the agent reads; `enrich
+    // ingest` validates + persists the scouts' candidates born PENDING. The agent
+    // dispatches the read-only scouts in between. See commands/enrich.ts.
+    handler: (argv) => runEnrich(argv.slice(1)),
+  },
+  {
+    name: "agent-memory",
+    summary: "Operator surface for the agent-memory capture pipeline (dry-run only).",
+    usage: `  mla agent-memory <enable|disable|status|scan|push|report>
                     (operator surface for the agent-memory capture pipeline. Phase 1
                      is DRY-RUN ONLY: \`scan\` observes / classifies / secret-scans
                      project Claude auto-memory files and records metadata-only
                      decisions locally; it uploads nothing. Live ingestion is gated
-                     off upstream.)
-  mla summary [--last <n>] [--json] [--all]
-                    (defaults to the current session; --all for every session)
-  mla label [<trace_id>] [--useful] [--noisy] [--harmful]
+                     off upstream.)`,
+    handler: (argv) => runAgentMemory(argv.slice(1)),
+  },
+  {
+    name: "summary",
+    summary: "Recap the current session; `--all` for every session.",
+    usage: `  mla summary [--last <n>] [--json] [--all]
+                    (defaults to the current session; --all for every session)`,
+    handler: (argv) => runSummary(argv.slice(1)),
+  },
+  {
+    name: "label",
+    summary: "Mark an enrichment useful, noisy, harmful, or prevented-a-mistake.",
+    usage: `  mla label [<trace_id>] [--useful] [--noisy] [--harmful]
                     [--prevented-mistake] [--note <text>]
                     (mark an enrichment's operator_label; no trace_id labels the
-                     latest trace in the current session)
-  mla stats [evidence] [--window <Nd>] [--json] [--verbose] [--global]
+                     latest trace in the current session)`,
+    handler: (argv) => runLabel(argv.slice(1)),
+  },
+  {
+    name: "stats",
+    summary: "Usefulness dashboard from local events. `evidence` is the adoption join.",
+    usage: `  mla stats [evidence] [--window <Nd>] [--json] [--verbose] [--global]
                     (usefulness-first dashboard from local events.jsonl: evidence
                      followthrough, contradictions caught, coverage gaps. default
-                     window 30d. \`evidence\` is the focused adoption join below.)
-  mla turn [N] [--session <sid>] [--json]
+                     window 30d. \`evidence\` is the focused adoption join below.)`,
+    handler: (argv) => runStats(argv.slice(1)),
+  },
+  {
+    name: "turn",
+    summary: "Per-turn assist recap: did mla run this turn and did it help?",
+    usage: `  mla turn [N] [--session <sid>] [--json]
                     (per-turn assist recap: did mla run this turn and did it help?
                      no N recaps the latest completed turn of the current session;
                      N recaps turn N. The per-turn analog of \`mla stats\`; also
-                     reachable as \`mla stats --turn [N]\`.)
-  mla adoption [--last <n>] [--window <w>] [--json] [--all]
+                     reachable as \`mla stats --turn [N]\`.)`,
+    // `mla turn [N]` is the per-turn analog of `mla stats`; `mla stats --turn`
+    // routes to the SAME runTurn handler (one implementation, two entry points).
+    handler: (argv) => runTurn(argv.slice(1)),
+  },
+  {
+    name: "adoption",
+    summary: "Evidence follow-through: did the agent pull or cite what was injected?",
+    usage: `  mla adoption [--last <n>] [--window <w>] [--json] [--all]
                     (A1 evidence-followthrough: did the agent pull or cite the
                      evidence we injected? alias of \`mla stats evidence\`;
-                     defaults to the current session)
-  mla flush [--all|--session <sid>] [--quiet] [--gc|--reap-only]
+                     defaults to the current session)`,
+    // `mla adoption` is an alias for `mla stats evidence` (INV-ADOPTION-SOURCE-1):
+    // both route through the same runStats -> runAdoption code path, so the two
+    // entry points are byte-identical, not two implementations.
+    handler: (argv) => runStats(["evidence", ...argv.slice(1)]),
+  },
+  {
+    name: "flush",
+    summary: "Drain the local spool; `--gc` also reaps stale-session litter.",
+    usage: `  mla flush [--all|--session <sid>] [--quiet] [--gc|--reap-only]
                     (--gc drains the spool(s) then reaps stale-session litter;
-                     --reap-only reaps stale litter without draining)
-  mla queue prune [--yes] [--dry-run] [--no-flush] [--max-age-hours N] [--session SID]
+                     --reap-only reaps stale litter without draining)`,
+    handler: (argv) => runFlush(argv.slice(1)),
+  },
+  {
+    name: "queue",
+    summary: "Reclaim orphaned queue files from dead sessions.",
+    usage: `  mla queue prune [--yes] [--dry-run] [--no-flush] [--max-age-hours N] [--session SID]
                     (reclaim orphaned queue files from dead sessions; previews
                      unless --yes. Unlike flush --gc it also reclaims non-empty
-                     stranded tails, flushing them best-effort first)
-  mla doctor [--fix] [--json]
+                     stranded tails, flushing them best-effort first)`,
+    handler: (argv) => {
+      const [, sub, ...rest] = argv;
+      if (sub === "prune") return runQueuePrune(rest);
+      console.error(`Unknown queue subcommand: ${sub ?? "(none)"}\n\n${renderUsage(COMMANDS)}`);
+      return 2;
+    },
+  },
+  {
+    name: "doctor",
+    summary: "Health check; reports workspace binding and session capture state.",
+    usage: `  mla doctor [--fix] [--json]
                     (health check; reports both lifecycles distinctly: workspace
                      binding (activated / not) and session capture (active / muted).
                      --fix reconciles legacy home-dir wiring; --json emits a
-                     machine-readable {status, checks:[{id,status,message}]} report)
-  mla status
+                     machine-readable {status, checks:[{id,status,message}]} report)`,
+    handler: (argv) => runDoctor(argv.slice(1)),
+  },
+  {
+    name: "status",
+    summary: "Whether Meetless is active here, plus scan-cache counts.",
+    usage: `  mla status
                     (show whether Meetless is active for this repo and print
                      scan-cache counts: confirmed rules injected, pending review
-                     items, inventory)
-  mla scan
+                     items, inventory)`,
+    handler: (argv) => runStatus(argv.slice(1)),
+  },
+  {
+    name: "scan",
+    summary: "Rebuild this repo's local rule cache from the backend bundle.",
+    usage: `  mla scan
                     (rebuild this repo's local rule cache from the backend bundle +
                      instruction files: the refresh lever after \`mla rules add\` or a
                      binary upgrade. Reads the current schema, so it also clears the
                      stale/incomplete delivery markers. Same rescan \`mla activate\`
-                     runs.)
-  mla context <accept|dismiss> <id> | mla context list
+                     runs.)`,
+    // Operator-facing rescan lever: rebuild this repo's local rule cache from the
+    // backend bundle + instruction files. Same routine as `_internal scan-context`
+    // (and the rescan `mla activate` runs); named `scan` because that is the command
+    // the degraded-cache delivery markers tell the agent to run (scanner/render.ts).
+    handler: (argv) => runScanContext(argv.slice(1)),
+  },
+  {
+    name: "context",
+    summary: "Resolve stale-context review items; a rescan runs immediately.",
+    usage: `  mla context <accept|dismiss> <id> | mla context list
                     (accept or dismiss a stale-context review item; list shows all
                      pending items. Verdicts are local; a rescan runs immediately
                      so the next session's injected context reflects the change.)
@@ -405,8 +739,13 @@ usage:
                     (list the untracked agent-memory rules the cold-start scan
                      discovered. These are machine_inferred and NEVER auto-injected;
                      they ride a review-only worklist until a human attests them in a
-                     tracked instruction file. Read-only by design.)
-  mla debug bundle --trace-id <id> [--out <path>] [--no-backend]
+                     tracked instruction file. Read-only by design.)`,
+    handler: (argv) => runContext(argv.slice(1)),
+  },
+  {
+    name: "debug",
+    summary: "Write a local, inspectable zip for a trace. Nothing uploads.",
+    usage: `  mla debug bundle --trace-id <id> [--out <path>] [--no-backend]
                     [--include-prompts] [--include-diffs] [--yes|-y]
                     [--command <name>] [--run-id <id>] [--session-id <id>] [-q]
                     (write a local, inspectable .zip for a trace_id so you can
@@ -414,15 +753,28 @@ usage:
                      payloads (prompts, bodies, diffs) are EXCLUDED by default;
                      the include flags require an interactive confirm or --yes.
                      Manifest-first + mandatory redaction report; offline-capable.
-                     Default output: ~/.meetless/debug/<trace_id>.zip)
-  mla evidence ce0-export
+                     Default output: ~/.meetless/debug/<trace_id>.zip)`,
+    handler: (argv) => runDebug(argv.slice(1)),
+  },
+  {
+    name: "evidence",
+    summary: "The human-only CE0 evidence-consultation labeling workflow. Local only.",
+    usage: `  mla evidence ce0-export
   mla evidence ce0-import-labels <file>
                     (the human-only CE0 evidence-consultation labeling workflow:
                      ce0-export writes the JSONL of deadline-claimed obligations
                      with the deterministic machine baseline; ce0-import-labels
                      reads a labeled file back and CAS-finalizes each obligation
-                     with the human's terminal outcome. Local only, no egress.)
-  mla bug report [--trace-id <id> | --session <sid> | --last]
+                     with the human's terminal outcome. Local only, no egress.)`,
+    // `mla evidence` is the one human-only CE0 evidence-consultation labeling workflow
+    // (notes/20260617-evidence-consultation-forcing-function-proposal.md §2.3): ce0-export writes
+    // the JSONL a labeler audits, ce0-import-labels reads it back and CAS-finalizes. Local only.
+    handler: (argv) => runEvidence(argv.slice(1)),
+  },
+  {
+    name: "bug",
+    summary: "File a private, redacted diagnostic report to Meetless support and track it.",
+    usage: `  mla bug report [--trace-id <id> | --session <sid> | --last]
                  [--title <t>] [--message <m> | --message-file <f>]
                     (file a PRIVATE, redacted diagnostic report to Meetless
                      support and track it to resolution. Builds an allowlist-only
@@ -434,9 +786,67 @@ usage:
   mla bug list      (your filed reports + their status, newest first)
   mla bug status <BUG-ref>
                     (one report: status, metadata, and the staff resolution note
-                     once it is resolved)
-  mla help
-  mla _internal finalize-session <sessionId>
+                     once it is resolved)`,
+    // `mla bug report | list | status`
+    // (notes/20260705-mla-bug-report-command-proposal.md): file a private,
+    // redacted diagnostic report to Meetless and track it to resolution. The
+    // failure footer in runCliBootstrap points crashed runs straight at
+    // `mla bug report --trace-id <id>`.
+    handler: (argv) => runBug(argv.slice(1)),
+  },
+  {
+    name: "docs",
+    summary:
+      "Read the Meetless documentation in your terminal, offline; `docs ask` answers a question.",
+    usage: `  mla docs          (every documentation topic, with a one-line description)
+  mla docs <topic>  (read one page, e.g. 'mla docs onboarding' or
+                     'mla docs concepts/enforcement')
+  mla docs search "<terms>"
+                    (deterministic lexical search across every docs passage)
+  mla docs ask "<question>"
+                    (ask a question about mla itself and get a cited answer.
+                     Needs 'mla login'; answers only from the product docs, never
+                     from your workspace memory, and abstains rather than guess.)`,
+    // `mla docs` is the OFFLINE half of the self-documenting surface
+    // (notes/20260711-mla-self-documenting-cli-proposal.md §6): it renders the
+    // corpus vendored into the binary at build time from the SAME markdown the
+    // website is built from, so it works pre-auth, offline, and with zero config.
+    // `docs ask` (§7) is the authenticated AI half.
+    //
+    // ownHelp because this command's arguments are FREE TEXT and the dispatcher's
+    // generic scan matches a help flag ANYWHERE in them: `mla docs ask what does -h
+    // do` would print the help screen instead of answering, which is precisely the
+    // question a documentation surface exists to answer. `wantsLeadingHelp` stops
+    // scanning where the prose starts. The screen it prints is the SAME registry
+    // block the generic path would have printed, so this is not a second help view
+    // that can drift, only a narrower rule about where a help flag counts.
+    ownHelp: true,
+    handler: (argv) => {
+      const args = argv.slice(1);
+      if (wantsLeadingHelp(args, [...DOCS_SUBCOMMANDS])) {
+        console.log(renderCommandHelp(COMMANDS, "docs"));
+        return 0;
+      }
+      return runDocs(args);
+    },
+  },
+  {
+    name: "help",
+    summary: "The complete command list; `mla help <command>` narrows to one command.",
+    // `help` is a real registry entry so `  mla help` renders on the screen and
+    // `mla help help` resolves. Actual dispatch of `help` (and `mla help <cmd>`)
+    // is intercepted at the top of dispatch() before resolveCommand, so this
+    // handler is a defensive fallback that prints the full screen.
+    usage: `  mla help`,
+    handler: () => {
+      console.log(renderUsage(COMMANDS));
+      return 0;
+    },
+  },
+  {
+    name: "_internal",
+    summary: "Hook-invoked internal commands. The hooks call these for you; you never run them by hand.",
+    usage: `  mla _internal finalize-session <sessionId>
   mla _internal auto-index [--session <sid>]
                     (Zone 2: index this session's produced docs into the owner's
                      Personal KB as SHADOW; fired detached from the Stop hook)
@@ -494,8 +904,39 @@ usage:
   mla _internal update-check
                     (detached, throttled background version check; fetches the
                      latest release and caches it for the upgrade nag. Honors
-                     MLA_NO_UPDATE_NOTIFIER; always exits 0.)
-`;
+                     MLA_NO_UPDATE_NOTIFIER; always exits 0.)`,
+    handler: (argv) => {
+      const [, sub, ...rest] = argv;
+      if (sub === "finalize-session") return runInternalFinalize(rest);
+      if (sub === "active-review") return runInternalActiveReview(rest);
+      if (sub === "auto-index") return runInternalAutoIndex(rest);
+      if (sub === "evidence-inject") return runInternalEvidenceInject(rest);
+      if (sub === "evidence-correlate") return runInternalEvidenceCorrelate(rest);
+      if (sub === "evidence-turn-open") return runInternalEvidenceTurnOpen(rest);
+      if (sub === "evidence-capture") return runInternalEvidenceCapture(rest);
+      if (sub === "evidence-stop") return runInternalEvidenceStop(rest);
+      if (sub === "steer-sync") return runInternalSteerSync(rest);
+      if (sub === "capture-decisions") return runCaptureDecisions(rest);
+      if (sub === "pretool-observe") return runInternalPretoolObserve(rest);
+      // Enforcement backstop: baseline the forbidden roots at SessionStart, then revert
+      // anything that appears under them after ANY tool call (tool-agnostic; a shell
+      // redirect the PreToolUse parser missed is still undone here).
+      if (sub === "enforcement-baseline") return runInternalEnforcementBaseline(rest);
+      if (sub === "posttool-sweep") return runInternalPosttoolSweep(rest);
+      if (sub === "forward-enforcement") return runInternalForwardEnforcement(rest);
+      if (sub === "enforcement-correlate") return runInternalEnforcementCorrelate(rest);
+      if (sub === "redact-capture") return runInternalRedactCapture(rest);
+      if (sub === "turn-recap") return runInternalTurnRecap(rest);
+      if (sub === "refresh") return runInternalRefresh(rest);
+      if (sub === "session-nudge") return runInternalSessionNudge(rest);
+      if (sub === "update-check") return runInternalUpdateCheck();
+      if (sub === "scan-context") return runScanContext(rest);
+      if (sub === "assemble-context") return runAssembleContext(rest);
+      console.error(`Unknown _internal subcommand: ${sub ?? "(none)"}`);
+      return 2;
+    },
+  },
+];
 
 // Build-stamped version string. dist/build-info.json is generated by
 // scripts/gen-build-info.js as the second step of `pnpm build`, so the running
@@ -518,9 +959,20 @@ function versionString(): string {
 }
 
 export async function dispatch(argv: string[]): Promise<number> {
-  const [cmd, sub, ...rest] = argv;
+  const [cmd, sub] = argv;
+
+  // Help + version are intercepted before the registry lookup so that `mla`,
+  // `mla help`, `mla --help`, and `mla -h` all print the SAME screen the
+  // dispatcher is defined by (renderUsage over COMMANDS). `mla help <command>`
+  // narrows to that one command's block (alias-aware, so `mla help cg` shows
+  // the graph block); an unknown <command> falls back to the full screen
+  // because `help` must never error.
   if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
-    console.log(USAGE);
+    if (cmd === "help" && sub) {
+      console.log(renderCommandHelp(COMMANDS, sub) ?? renderUsage(COMMANDS));
+      return 0;
+    }
+    console.log(renderUsage(COMMANDS));
     return 0;
   }
   if (cmd === "--version" || cmd === "-v") {
@@ -528,264 +980,28 @@ export async function dispatch(argv: string[]): Promise<number> {
     return 0;
   }
 
-  switch (cmd) {
-    case "init":
-      return runInit(argv.slice(1));
-    case "wire":
-    // `rewire` is the original name, kept as a silent back-compat alias so
-    // already-printed operator hints and any muscle memory keep working.
-    case "rewire":
-      return runRewire(argv.slice(1));
-    case "login":
-      return runLogin(argv.slice(1));
-    case "logout":
-      return runLogout(argv.slice(1));
-    case "uninstall":
-      return runUninstall(argv.slice(1));
-    case "whoami":
-      return runWhoami(argv.slice(1));
-    case "activate":
-      return runActivate(argv.slice(1));
-    case "deactivate":
-      return runDeactivate(argv.slice(1));
-    case "mute":
-      return runMute(argv.slice(1));
-    case "unmute":
-      return runUnmute(argv.slice(1));
-    case "workspace":
-      return runWorkspace(argv.slice(1));
-    case "doctor":
-      return runDoctor(argv.slice(1));
-    case "status":
-      return runStatus(argv.slice(1));
-    case "scan":
-      // Operator-facing rescan lever: rebuild this repo's local rule cache from the
-      // backend bundle + instruction files. Same routine as `_internal scan-context`
-      // (and the rescan `mla activate` runs); named `scan` because that is the command
-      // the degraded-cache delivery markers tell the agent to run (scanner/render.ts).
-      return runScanContext(argv.slice(1));
-    case "context":
-      return runContext(argv.slice(1));
-    case "flush":
-      return runFlush(argv.slice(1));
-    case "queue": {
-      if (sub === "prune") return runQueuePrune(rest);
-      console.error(`Unknown queue subcommand: ${sub ?? "(none)"}\n\n${USAGE}`);
-      return 2;
+  // The registry IS the dispatch table: one lookup, alias-aware (so `rewire`
+  // and `cg` resolve), then hand the FULL argv to the handler that reproduces
+  // the command's original switch arm (subcommand routing included). Removed
+  // commands survive as hidden stubs (e.g. `cases`) whose handler redirects the
+  // operator; an unresolved word is the one genuine unknown-command error, and
+  // it prints the full screen plus the stale-command hint exactly as before.
+  const spec = resolveCommand(COMMANDS, cmd);
+  if (spec) {
+    // `mla <command> --help` is answered from the registry, so EVERY command has
+    // a --help without every command having to parse one (T11). The four commands
+    // that render a richer catalog of their own (kb, graph, enrich, review) opt
+    // out via `ownHelp` and answer it themselves; preempting them here would be a
+    // downgrade. Matched anywhere in the args, because `mla kb add x --help` and
+    // `mla review --plain -h` are both a plea for help, not a malformed call.
+    if (!spec.ownHelp && argv.slice(1).some((a) => a === "--help" || a === "-h")) {
+      console.log(renderCommandHelp(COMMANDS, cmd));
+      return 0;
     }
-    case "rules": {
-      // The rules verbs operate on the unified backend Rule API (rules-store-unification). `add` mints a
-      // RuleNode (PERSONAL by default, `--team` for workspace-wide), `edit` mints the next version
-      // carrying expectedCurrentVersionId, `revoke` is the
-      // compare-and-swap kill switch that disarms a LIVE rule, `attest` keeps the LOCAL observed-snapshot
-      // resolution but mints the DENY rule to the backend (fork #7), `demote` lowers a TEAM rule to a
-      // PERSONAL copy and `promote` raises a PERSONAL rule to a TEAM copy (both mint-then-revoke, since
-      // authorityScope is node-immutable), `list` reads the backend (matching
-      // the console) and falls back to the principal bundle offline, and `remove` is unsupported
-      // (`.meetless/rules.md` is no longer an authority). `activity` is the R2-LOCAL accountability
-      // projection (per LIVE rule: observed N, violated M, denied; proposal §2.6 / §3.7), `publish` is the
-      // deprecation stub kept for the old-client window, and `import` is the one-time migration that reads
-      // the local stores (CE0 + managed) for the active scope and POSTs them to the backend (additive,
-      // idempotent). The console and the CLI mutate the SAME store, so `revoke` truly disarms a LIVE rule.
-      if (sub === "add") return runRulesAddBackend(rest);
-      if (sub === "edit") return runRulesEditBackend(rest);
-      if (sub === "remove" || sub === "rm") return runRulesRemoveBackend(rest);
-      if (sub === "list") return runRulesListBackend(rest);
-      if (sub === "activity") return runRulesActivity(rest);
-      if (sub === "attest") return runRulesAttestBackend(rest);
-      if (sub === "revoke") return runRulesRevokeBackend(rest);
-      if (sub === "demote") return runRulesDemoteBackend(rest);
-      if (sub === "promote") return runRulesPromoteBackend(rest);
-      if (sub === "publish") return runRulesPublish(rest);
-      if (sub === "import") return runRulesImport(rest);
-      console.error(`Unknown rules subcommand: ${sub ?? "(none)"}\n\n${USAGE}`);
-      return 2;
-    }
-    case "review": {
-      // `mla review`               -> current session, no positional, only flags.
-      // `mla review <id>`          -> deep-link emission, exactly one positional.
-      // Old `latest` / `by-session` are intentionally removed; surface a clear
-      // pointer instead of silently routing the operator to the wrong path.
-      //
-      // `--help`/`-h` is intercepted here, BEFORE either runReview's or
-      // runReviewById's strict parser runs. Both parsers throw on any unknown
-      // `--`/`-` token by design (to name stray flags), but help is not stray --
-      // throwing "Unknown flag: --help" reads as the tool being broken. Match it
-      // anywhere in the review args so `mla review -h`, `mla review <id> --help`,
-      // and `mla review --plain --help` all print usage and exit 0.
-      const reviewArgs = argv.slice(1);
-      if (reviewArgs.includes("--help") || reviewArgs.includes("-h")) {
-        console.log(reviewUsage());
-        return 0;
-      }
-      if (sub === undefined || sub.startsWith("--")) {
-        return runReview(argv.slice(1));
-      }
-      if (sub === "latest") {
-        console.error(
-          "`mla review latest` was removed. Run `mla review` inside a Claude Code " +
-            "session, or open the queues at /relationships and /cases in the console.",
-        );
-        return 2;
-      }
-      if (sub === "by-session") {
-        console.error(
-          "`mla review by-session <sid>` was removed. The current session is the only " +
-            "session `mla review` will surface; open the console queues to browse others.",
-        );
-        return 2;
-      }
-      return runReviewById([sub, ...rest]);
-    }
-    case "enforcement": {
-      // `mla enforcement`                 -> this session's unreviewed blocks + loop.
-      // `mla enforcement --all|--json`    -> workspace-wide / machine-readable.
-      // `mla enforcement confirm|dismiss <id>` -> adjudicate one block by id.
-      // All arg parsing (verbs, flags, --note) lives in runEnforcement so the
-      // dispatcher stays a thin pass-through of everything after the command word.
-      return runEnforcement(argv.slice(1));
-    }
-    case "conflicts": {
-      // `mla conflicts`                     -> open cross-session conflicts touching
-      //                                        this session.
-      // `mla conflicts --global`            -> every open conflict in the workspace.
-      // `mla conflicts --session <sid>`     -> an explicit session's conflicts.
-      // `mla conflicts --json`              -> machine-readable mirror.
-      // `mla conflicts resolve <id> ...`    -> record one of the four D1 verdicts.
-      // `mla conflicts dismiss <id> ...`    -> shorthand for --outcome dismiss.
-      // All verb + flag parsing lives in runConflicts so the dispatcher stays a
-      // thin pass-through of everything after the command word.
-      return runConflicts(argv.slice(1));
-    }
-    case "cases": {
-      console.error(
-        "`mla cases` was removed. Open the cases queue in the console, run " +
-          "`mla conflicts` for open cross-session conflicts, or " +
-          "`mla review <id>` to get a deep link for a specific case.",
-      );
-      return 2;
-    }
-    case "session": {
-      if (sub === "show") return runSessionShow(rest);
-      if (sub === "reconcile") return runSessionReconcile(rest);
-      // `distill` + `remember` were removed (dogfood scaffold; the learning
-      // loop captures agent output directly per turn). See
-      // notes/20260531-agent-review-retraction-and-pending-items-loop.md §2.
-      console.error(`Unknown session subcommand: ${sub ?? "(none)"}\n\n${USAGE}`);
-      return 2;
-    }
-    case "ask":
-      // `mla ask` loads @meetless/ask-core. ask-core is ESM-only, so it ships as
-      // a CJS bundle the binary loads via require() (scripts/bundle-esm.js);
-      // runAsk handles bundle-vs-source resolution. Works in the binary and from
-      // a source/npm install alike, so no binary gate here.
-      return runAsk(argv.slice(1));
-    case "kb":
-      return runKb(argv.slice(1));
-    // `mla agent-memory <enable|disable|status|scan|report>`: operator surface for
-    // the agent-memory capture pipeline (notes/20260626-agent-memory-auto-capture-
-    // proposal.md). Phase 1 is DRY-RUN ONLY: `scan` observes/classifies/secret-scans
-    // project-type Claude auto-memory files and records metadata-only decisions
-    // locally; it uploads nothing. Live ingestion is blocked upstream by the missing
-    // cross-revision claim-grain idempotency and is intentionally not wired.
-    case "agent-memory":
-      return runAgentMemory(argv.slice(1));
-    // `mla enrich`: agent-orchestrated onboarding enrichment. `enrich plan` scans the
-    // repo into an immutable run record + prints the plan the agent reads; `enrich
-    // ingest` validates + persists the scouts' candidates born PENDING. The agent
-    // dispatches the read-only scouts in between. See commands/enrich.ts.
-    case "enrich":
-      return runEnrich(argv.slice(1));
-    // `mla graph` (alias `cg` = coordination graph) is the relationship axis's own
-    // home: `review`/`pending` route to the SAME handlers as `mla kb review`/`kb
-    // pending` (one implementation, two entry points). It exists so the coordination
-    // graph stops hiding under the storage noun `kb`. Document/posture verbs typed
-    // here are redirected back to `mla kb` rather than conflated. See commands/graph.ts.
-    case "graph":
-    case "cg":
-      return runGraph(argv.slice(1));
-    case "summary":
-      return runSummary(argv.slice(1));
-    case "label":
-      return runLabel(argv.slice(1));
-    case "stats":
-      return runStats(argv.slice(1));
-    // `mla turn [N]` is the per-turn analog of `mla stats`; `mla stats --turn`
-    // routes to the SAME runTurn handler (one implementation, two entry points).
-    case "turn":
-      return runTurn(argv.slice(1));
-    // `mla adoption` is an alias for `mla stats evidence` (INV-ADOPTION-SOURCE-1):
-    // both route through the same runStats -> runAdoption code path, so the two
-    // entry points are byte-identical, not two implementations.
-    case "adoption":
-      return runStats(["evidence", ...argv.slice(1)]);
-    case "debug":
-      return runDebug(argv.slice(1));
-    // `mla bug report | list | status`
-    // (notes/20260705-mla-bug-report-command-proposal.md): file a private,
-    // redacted diagnostic report to Meetless and track it to resolution. The
-    // failure footer in runCliBootstrap points crashed runs straight at
-    // `mla bug report --trace-id <id>`.
-    case "bug":
-      return runBug(argv.slice(1));
-    // `mla evidence` is the one human-only CE0 evidence-consultation labeling workflow
-    // (notes/20260617-evidence-consultation-forcing-function-proposal.md §2.3): ce0-export writes
-    // the JSONL a labeler audits, ce0-import-labels reads it back and CAS-finalizes. Local only.
-    case "evidence":
-      return runEvidence(argv.slice(1));
-    // `mla mcp` boots the Meetless MCP server over stdio, authenticated as the
-    // logged-in human (cli-config user-token) and scoped to the marker
-    // workspace. Replaces the old standalone `meetless-mcp` service-key bin.
-    //
-    // Self-heal split (lib/mcp-restart.ts): a bare `mla mcp` runs the thin
-    // supervising parent, which respawns a `mla mcp --child` worker whenever a
-    // newer build lands on disk, so the long-lived daemon stops serving stale
-    // code (the "This operation was aborted" footgun) without an editor restart.
-    // The child (and the MEETLESS_MCP_SUPERVISOR=0 kill switch) run the worker
-    // directly.
-    case "mcp":
-      // @meetless/mcp is ESM-only and ships as a CJS bundle the binary loads via
-      // require() (scripts/bundle-esm.js); runMcp/loadAndServe handle
-      // bundle-vs-source resolution. Works in the binary and from a source/npm
-      // install alike, so no binary gate here.
-      return shouldSuperviseMcp(argv.slice(1), process.env)
-        ? runMcpSupervisor(argv.slice(1))
-        : runMcp(argv.slice(1));
-    // `mla upgrade` [--check] [--force]: explicit, foreground self-upgrade. Fetches
-    // and Ed25519-verifies the signed release manifest, enforces the downgrade
-    // guard, and atomically swaps the binary in place (curl installs only; brew/
-    // npm/unknown are redirected to their package manager). The silent background
-    // path (stage + apply-on-launch) is separate; this is the user-driven command.
-    case "upgrade":
-      return runUpgrade({ argv: argv.slice(1) });
-    case "_internal": {
-      if (sub === "finalize-session") return runInternalFinalize(rest);
-      if (sub === "active-review") return runInternalActiveReview(rest);
-      if (sub === "auto-index") return runInternalAutoIndex(rest);
-      if (sub === "evidence-inject") return runInternalEvidenceInject(rest);
-      if (sub === "evidence-correlate") return runInternalEvidenceCorrelate(rest);
-      if (sub === "evidence-turn-open") return runInternalEvidenceTurnOpen(rest);
-      if (sub === "evidence-capture") return runInternalEvidenceCapture(rest);
-      if (sub === "evidence-stop") return runInternalEvidenceStop(rest);
-      if (sub === "steer-sync") return runInternalSteerSync(rest);
-      if (sub === "capture-decisions") return runCaptureDecisions(rest);
-      if (sub === "pretool-observe") return runInternalPretoolObserve(rest);
-      if (sub === "forward-enforcement") return runInternalForwardEnforcement(rest);
-      if (sub === "enforcement-correlate") return runInternalEnforcementCorrelate(rest);
-      if (sub === "redact-capture") return runInternalRedactCapture(rest);
-      if (sub === "turn-recap") return runInternalTurnRecap(rest);
-      if (sub === "refresh") return runInternalRefresh(rest);
-      if (sub === "session-nudge") return runInternalSessionNudge(rest);
-      if (sub === "update-check") return runInternalUpdateCheck();
-      if (sub === "scan-context") return runScanContext(rest);
-      if (sub === "assemble-context") return runAssembleContext(rest);
-      console.error(`Unknown _internal subcommand: ${sub ?? "(none)"}`);
-      return 2;
-    }
-    default:
-      console.error(`Unknown command: ${cmd}\n\n${USAGE}${staleCommandHint()}`);
-      return 2;
+    return spec.handler(argv);
   }
+  console.error(`Unknown command: ${cmd}\n\n${renderUsage(COMMANDS)}${staleCommandHint()}`);
+  return 2;
 }
 
 // Observability bootstrap: Sentry init MUST run BEFORE any other work so

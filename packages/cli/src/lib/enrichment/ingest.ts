@@ -262,6 +262,25 @@ function verifyFileEvidence(
   }
 }
 
+// How much of a rejected statement to echo back. Long enough to identify the claim and
+// retype it from the source, short enough that a scout that sent garbage cannot flood the
+// terminal with it.
+const REJECT_EXCERPT_CHARS = 160;
+
+// Pulls a human-identifiable excerpt out of an UNVALIDATED candidate: this runs on raw
+// scout output, so `raw` may be any shape at all (that is precisely what is being rejected)
+// and every access has to survive it. Returns undefined when there is no usable statement,
+// in which case the reject prints its code alone, as it always did.
+export function statementExcerpt(raw: unknown): string | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const statement = (raw as { statement?: unknown }).statement;
+  if (typeof statement !== "string") return undefined;
+  const collapsed = statement.replace(/\s+/g, " ").trim();
+  if (collapsed.length === 0) return undefined;
+  if (collapsed.length <= REJECT_EXCERPT_CHARS) return collapsed;
+  return `${collapsed.slice(0, REJECT_EXCERPT_CHARS)}...`;
+}
+
 // Verifies a single shape-valid candidate against the filesystem + commit allowlist.
 // Rejects the whole candidate if ANY anchor fails (a citation is only as trustworthy as
 // its weakest anchor). Returns all errors for reporting.
@@ -628,8 +647,18 @@ export async function ingestRun(input: {
     const errors: CandidateValidationError[] = [];
     const scoutBudget = budget.get(scout) ?? 0;
     result.candidates.forEach((raw, i) => {
+      // Every reject raised in this iteration is about THIS candidate, so stamp them all with
+      // its statement excerpt. A reject drops the claim for good; without the excerpt the
+      // operator is told only a code and a slot number in a scout array that no longer exists
+      // anywhere, so a claim lost to a one-character overrun could not even be identified,
+      // let alone re-entered by hand.
+      const excerpt = statementExcerpt(raw);
+      const reject = (...raised: CandidateValidationError[]): void => {
+        for (const e of raised) errors.push(excerpt ? { ...e, excerpt } : e);
+      };
+
       if (accepted.length >= scoutBudget) {
-        errors.push({
+        reject({
           index: i,
           code: "candidate_cap_exceeded",
           message: `per-scout candidate cap reached; this scout's cap was ${scoutBudget} (per-scout ${perScoutCap}, run total ${totalCap})`,
@@ -638,12 +667,12 @@ export async function ingestRun(input: {
       }
       const shapeRes = validateCandidateShape(raw, i);
       if (!shapeRes.ok) {
-        errors.push(...shapeRes.errors);
+        reject(...shapeRes.errors);
         return;
       }
       const verifyErrors = verifyCandidate(shapeRes.candidate, run, probe, i);
       if (verifyErrors.length > 0) {
-        errors.push(...verifyErrors);
+        reject(...verifyErrors);
         return;
       }
       accepted.push(shapeRes.candidate);

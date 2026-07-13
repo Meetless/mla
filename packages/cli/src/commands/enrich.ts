@@ -65,7 +65,9 @@ const USAGE = `mla enrich: agent-orchestrated onboarding enrichment.
       output is what you pass back to \`enrich ingest\`. If the repository is
       unchanged since a completed onboarding run (same plan digest), the command
       short-circuits to a no-op (\`gated\` in --json) so a re-run adds no duplicate
-      candidates; --force overrides and onboards again.
+      candidates; --force overrides and onboards again. --force also takes the
+      active-run lock from an abandoned run (one whose agent crashed or was
+      interrupted), which otherwise blocks a re-run until it expires.
 
   mla enrich brief --run-id <id> --role <documentation|history> [--workspace <id>]
       Print the exact subagent brief for one scout role, rendered from the run
@@ -110,6 +112,16 @@ function ingestTimeoutMs(docCount: number): number {
 // The git toplevel is the enrichment repository root: `git ls-files` / `git log` must
 // run from it so the paths the scouts cite are repo-root-relative and the realpath
 // containment check has the right base. Throws a clean error outside a git repo.
+//
+// Resolve it from where the HUMAN IS STANDING (process.cwd()), never from the activation
+// marker's directory. The marker is the WORKSPACE scope, and it does not have to be a git
+// repo: activating an umbrella folder that holds several sibling repos (the meetless tree
+// is exactly this: `meetless/`, `intel/`, `notes/`, `gtm/` under one marker) is a supported
+// binding, and it is the whole point of one workspace spanning repos. Starting the git walk
+// at the marker made `enrich plan` and `enrich brief` hard-fail there with "not a git
+// repository" while `enrich accept`, which already started from cwd, worked fine: the same
+// command family answered the same question two different ways. Marker in a repo SUBDIR is
+// unaffected: git walks up from cwd to the same toplevel either way.
 function resolveRepositoryRoot(startDir: string): string {
   try {
     return execFileSync("git", ["rev-parse", "--show-toplevel"], {
@@ -271,8 +283,10 @@ async function runEnrichPlan(argv: string[]): Promise<number> {
 
   let repositoryRoot: string;
   try {
-    const ctx = resolveWorkspaceContext();
-    repositoryRoot = resolveRepositoryRoot(ctx.markerDir);
+    // Call for its side effect: it throws unless this folder is activated. The marker it
+    // finds is the workspace scope, NOT the enrichment target; see resolveRepositoryRoot.
+    resolveWorkspaceContext();
+    repositoryRoot = resolveRepositoryRoot(process.cwd());
   } catch (e) {
     console.error((e as Error).message);
     return 2;
@@ -295,15 +309,22 @@ async function runEnrichPlan(argv: string[]): Promise<number> {
     repositoryRoot,
     now: new Date().toISOString(),
     ttlMs,
+    force: flags.force,
   });
   if (!lock.ok) {
     const held = lock.held;
     console.error(
       held
-        ? `An onboarding run is already active for this workspace (run ${held.runId}, started ${held.createdAt}; the lock frees at ${held.expiresAt}). Wait for it to finish, or retry after it expires.`
-        : `An onboarding-run lock exists for this workspace but could not be read; refusing to start a second run. If no run is active, remove ${onboardingLockPath(HOME, cfg.workspaceId)} and retry.`,
+        ? `An onboarding run is already active for this workspace (run ${held.runId}, started ${held.createdAt}; the lock frees at ${held.expiresAt}). Wait for it to finish, or re-run with \`--force\` if that run was abandoned.`
+        : `An onboarding-run lock exists for this workspace but could not be read; refusing to start a second run. If no run is active, re-run with \`--force\`, or remove ${onboardingLockPath(HOME, cfg.workspaceId)} and retry.`,
     );
     return 2;
+  }
+  // Displacing a run that had not expired is a real consequence of --force; say it out loud.
+  if (lock.reclaimedLive) {
+    console.error(
+      `--force: took the onboarding lock from run ${lock.reclaimedLive.runId} (started ${lock.reclaimedLive.createdAt}, not yet expired). This run supersedes it.`,
+    );
   }
 
   // Build the plan in memory first (no fs writes) so we can compute the deterministic
@@ -535,9 +556,19 @@ export function renderIngestSummary(
       breakdown = newCount > 0 ? ` (${newCount} new, ${o.deduped} already present)` : ` (all ${o.deduped} already present)`;
     }
     lines.push(`  ${o.scout}: ${o.accepted} accepted, ${o.rejected} rejected, ${o.persisted} persisted${breakdown} (received ${o.received})`);
+    // `index` is the 0-based position in the scout's array; a human counting down a list of
+    // candidates starts at 1, and printing the raw index sent them to the wrong one. Render the
+    // ordinal, and echo the statement that was dropped: a rejected candidate is gone, so this
+    // line is the operator's ONLY record of the claim they just lost. Print the excerpt once
+    // per candidate, not once per error, so a candidate failing four checks says it once.
+    let excerptShownFor = -1;
     for (const e of o.errors) {
-      const where = e.index >= 0 ? `candidate ${e.index}` : "scout";
+      const where = e.index >= 0 ? `candidate ${e.index + 1}` : "scout";
       lines.push(`      - ${where}: ${e.code} (${e.message})`);
+      if (e.excerpt && e.index !== excerptShownFor) {
+        lines.push(`        dropped: "${e.excerpt}"`);
+        excerptShownFor = e.index;
+      }
     }
   }
 
@@ -590,8 +621,10 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
 
   let repositoryRoot: string;
   try {
-    const ctx = resolveWorkspaceContext();
-    repositoryRoot = resolveRepositoryRoot(ctx.markerDir);
+    // Call for its side effect: it throws unless this folder is activated. The marker it
+    // finds is the workspace scope, NOT the enrichment target; see resolveRepositoryRoot.
+    resolveWorkspaceContext();
+    repositoryRoot = resolveRepositoryRoot(process.cwd());
   } catch (e) {
     console.error((e as Error).message);
     return 2;
@@ -767,7 +800,17 @@ function runEnrichBrief(argv: string[]): number {
     return 2;
   }
 
-  console.log(buildScoutPrompt(run, flags.role!));
+  // Re-anchor the scout's deadline to NOW plus the run's budget, rather than handing it the
+  // run's frozen plan-time deadline. The brief is rendered immediately before the agent
+  // dispatches the scout, so now is the closest we can get to when the scout actually starts.
+  // Anchoring at plan time silently charged the scout for the orchestration in between: two
+  // `enrich brief` calls, plus the agent relaying the brief verbatim into the Task prompt
+  // (the history brief is tens of KB of git evidence, emitted token by token). On the real
+  // repo that gap alone consumed most of the four-minute default, and a slow relay hands the
+  // scout a deadline already in the past, which the brief reads as "return timed_out
+  // immediately". The budget is meant to bound the scout's work, not the orchestrator's.
+  const deadlineAt = new Date(Date.now() + run.limits.budgetMs).toISOString();
+  console.log(buildScoutPrompt(run, flags.role!, deadlineAt));
   return 0;
 }
 

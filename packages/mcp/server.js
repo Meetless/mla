@@ -42,6 +42,7 @@ import {
   runRelationships,
   runVerdict,
 } from "./relationship_actions.js";
+import { randomUUID } from "node:crypto";
 import { makeIntelFetch, runKbDocDetail } from "./kb_actions.js";
 import { runRetrieveKnowledge } from "./evidence_actions.js";
 import { TOOLS, assertReadOnlyManifest } from "./tool_manifest.js";
@@ -67,6 +68,7 @@ const __dirname = path.dirname(__filename);
 //   askModes: { runAnswer, runSearch, runCanonical, runCompare },
 //   defaultWorkspaceId,                            // the effective workspace
 //   operatorUserId,                                // verdict actorUserId default
+//   mintSubmissionId,                              // per-tool-call delivery key (injectable)
 // }
 export async function dispatchTool(name, args, deps) {
   const {
@@ -75,6 +77,7 @@ export async function dispatchTool(name, args, deps) {
     askModes,
     defaultWorkspaceId,
     operatorUserId = null,
+    mintSubmissionId = randomUUID,
   } = deps;
 
   if (name === "meetless__kb_doc_detail") {
@@ -166,12 +169,21 @@ export async function dispatchTool(name, args, deps) {
   }
 
   const mode = args?.mode || "answer";
+  // The tool-call boundary is where a metered Ask acquires its money identity.
+  // One id per tool call: intel turns it into the delivery key `mcp:<id>:answer`,
+  // so if this exact call is re-delivered (a supervised worker respawn replaying
+  // the request, a client-side resend) the second delivery collapses onto the
+  // first authorization instead of buying the run a second time. A genuinely new
+  // tool call is a new user intent and correctly mints a new id. Every mode makes
+  // at most ONE ask (compare is pure INDEX.md), so one id per call never collides
+  // with itself.
+  const askArgs = { ...(args || {}), submission_id: mintSubmissionId() };
   try {
     let result;
-    if (mode === "answer") result = await askModes.runAnswer(args);
-    else if (mode === "search") result = await askModes.runSearch(args);
-    else if (mode === "canonical") result = await askModes.runCanonical(args);
-    else if (mode === "compare") result = await askModes.runCompare(args);
+    if (mode === "answer") result = await askModes.runAnswer(askArgs);
+    else if (mode === "search") result = await askModes.runSearch(askArgs);
+    else if (mode === "canonical") result = await askModes.runCanonical(askArgs);
+    else if (mode === "compare") result = await askModes.runCompare(askArgs);
     else if (mode === "relationships")
       result = await runRelationships(args, {
         intelFetch,

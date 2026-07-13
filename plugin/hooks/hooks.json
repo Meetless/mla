@@ -73,6 +73,16 @@
         ]
       },
       {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/posttool-sweep.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "mcp__meetless__",
         "hooks": [
           {
@@ -84,7 +94,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(Write|Edit)$",
+        "matcher": "^(Write|Edit|MultiEdit|NotebookEdit|Bash)$",
         "hooks": [
           {
             "type": "command",

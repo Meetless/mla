@@ -57,7 +57,12 @@ export interface TokenBundle {
   accessExpiresAt: string; // ISO 8601
   refreshExpiresAt: string; // ISO 8601
   user: LoginUser;
-  workspace: LoginWorkspace;
+  // NULL for an account-only session: the human just signed in on a fresh machine
+  // and belongs to no workspace yet. Login creates an Account and NOTHING else
+  // (Option B, INV-ACC-3), so `mla login` legitimately returns no workspace and
+  // `mla activate` is what creates the first one (and re-binds this same session
+  // to it). Treat a missing workspace as a normal outcome, never an error.
+  workspace: LoginWorkspace | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +353,11 @@ export async function exchangeGrant(
 }
 
 // Minimal structural validation so we never persist a corrupt user-token config.
+//
+// The workspace is deliberately NOT required: an account-only session (first login
+// on a fresh machine, no workspace yet) carries `workspace: null` by design. We
+// still reject a workspace that is PRESENT but malformed, so a garbled payload
+// cannot slip through as if it were the legitimate no-workspace case.
 function assertTokenBundle(value: unknown): TokenBundle {
   const b = value as Partial<TokenBundle> | null;
   if (
@@ -359,12 +369,11 @@ function assertTokenBundle(value: unknown): TokenBundle {
     typeof b.sessionId !== "string" ||
     !b.user ||
     typeof (b.user as LoginUser).id !== "string" ||
-    !b.workspace ||
-    typeof (b.workspace as LoginWorkspace).id !== "string"
+    (b.workspace != null && typeof (b.workspace as LoginWorkspace).id !== "string")
   ) {
     throw new Error("Grant exchange response was missing required token/identity fields.");
   }
-  return b as TokenBundle;
+  return { ...b, workspace: b.workspace ?? null } as TokenBundle;
 }
 
 // ---------------------------------------------------------------------------

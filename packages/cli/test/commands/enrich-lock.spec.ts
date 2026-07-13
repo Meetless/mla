@@ -137,7 +137,39 @@ describe("mla enrich plan: active-run guard wiring", () => {
     // Disambiguate from the other exit-2 paths (bad flags, missing config, no git repo):
     // this 2 must come from the active-run guard specifically.
     expect(err.join("\n")).toMatch(/already active/i);
+    // The reject must name the way out. An ABANDONED run (the agent crashed, the human hit
+    // Ctrl-C mid-`/mla onboard`) holds a lock that is LIVE by the clock, so staleness cannot
+    // free it: told only to "wait", the operator is blocked for the rest of budget + grace.
+    expect(err.join("\n")).toContain("--force");
     // The loser never overwrote the winner: same run still owns the lock.
     expect(readLock().runId).toBe("run-existing");
+  });
+
+  it("--force takes the lock from an abandoned run and names what it displaced", async () => {
+    const held = acquireOnboardingLock({
+      home: HOME,
+      workspaceId: WS,
+      runId: "run-abandoned",
+      repositoryRoot: repoDir,
+      now: new Date().toISOString(),
+      ttlMs: 10 * 60_000, // unambiguously live: only --force can take this
+    });
+    expect(held.ok).toBe(true);
+
+    const rc = await runEnrich(["plan", "--json", "--force"]);
+    expect(rc).toBe(0);
+
+    const plan = JSON.parse(out.join("\n")) as { runId: string };
+    expect(plan.runId).not.toBe("run-abandoned");
+    expect(readLock().runId).toBe(plan.runId); // the new run owns the lock now
+    // Displacing a run that had not expired is a real consequence of --force; it is reported,
+    // never silent.
+    expect(err.join("\n")).toContain("took the onboarding lock from run run-abandoned");
+  });
+
+  it("--force on a free lock displaces nothing and says nothing about it", async () => {
+    const rc = await runEnrich(["plan", "--json", "--force"]);
+    expect(rc).toBe(0);
+    expect(err.join("\n")).not.toContain("took the onboarding lock");
   });
 });

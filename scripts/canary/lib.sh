@@ -27,7 +27,13 @@ canary_die()  { printf 'canary[%s]: FAIL: %s\n' "$CANARY_NAME" "$*" >&2; exit 1;
 # next one (mirrors smoke_init, minus the pre-existing-binary assertion).
 canary_init() {
   CANARY_NAME="${1:?canary_init: name required}"
-  CANARY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mla-canary-${CANARY_NAME}.XXXXXX")"
+  # Resolve the sandbox to its realpath. On macOS, mktemp -d hands back a
+  # /var/folders/... path that is really /private/var/folders/..., so an unresolved
+  # $HOME is spelled differently from the realpath'd process.execPath the binary
+  # sees. That is not an environment any real user has, and a canary must not fail
+  # (or pass) on an artifact of its own sandbox. See detectInstallMethod, which now
+  # canonicalizes both sides too.
+  CANARY_ROOT="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/mla-canary-${CANARY_NAME}.XXXXXX")" && pwd -P)"
   # shellcheck disable=SC2064  # expand CANARY_ROOT now, on purpose.
   trap "rm -rf '$CANARY_ROOT'" EXIT
 

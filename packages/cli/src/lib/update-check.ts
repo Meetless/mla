@@ -13,6 +13,7 @@
 // write the cache) live in update-notifier.ts so this stays unit-testable.
 import * as path from "path";
 import * as os from "os";
+import * as fs from "fs";
 import * as crypto from "crypto";
 
 export type InstallMethod = "homebrew" | "curl" | "npm" | "unknown";
@@ -364,9 +365,23 @@ export function detectInstallMethod(opts: {
     return override;
   }
 
-  const home = opts.home ?? os.homedir();
-  const brewPrefixes = opts.brewPrefixes ?? ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
-  const candidates = [execPath, scriptPath].filter((p): p is string => Boolean(p));
+  // Canonicalize both sides before comparing. Node realpaths `process.execPath` but
+  // NOT `os.homedir()`, so on any box whose home reaches through a symlink the two
+  // are spelled differently and containment silently fails -> "unknown" -> `mla
+  // upgrade` refuses to run. macOS makes this routine: a $HOME under TMPDIR is
+  // /var/folders/... which is really /private/var/folders/.... Non-existent paths
+  // (the test seam passes fabricated ones) realpath-throw; fall back to the literal.
+  const canon = (p: string): string => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return p;
+    }
+  };
+
+  const home = canon(opts.home ?? os.homedir());
+  const brewPrefixes = (opts.brewPrefixes ?? ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"]).map(canon);
+  const candidates = [execPath, scriptPath].filter((p): p is string => Boolean(p)).map(canon);
 
   const within = (child: string, parent: string): boolean => {
     const rel = path.relative(parent, child);

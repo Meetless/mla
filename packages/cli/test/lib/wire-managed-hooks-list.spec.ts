@@ -1,7 +1,7 @@
 import { MANAGED_HOOK_SCRIPTS } from "../../src/lib/wire";
 
 describe("MANAGED_HOOK_SCRIPTS", () => {
-  it("lists exactly the nine managed (event, script) pairs install can wire", () => {
+  it("lists exactly the ten managed (event, script) pairs install can wire", () => {
     // Five load-bearing capture hooks plus the four CE0 evidence hooks. Three ride
     // the EXISTING UserPromptSubmit/PostToolUse/Stop events as second managed entries;
     // the fourth (ce0-session-start.sh) rides SessionStart and projects the CE0 store's
@@ -12,6 +12,10 @@ describe("MANAGED_HOOK_SCRIPTS", () => {
     expect(pairs).toEqual(
       [
         "PostToolUse:post-tool-use.sh",
+        // Enforcement backstop (2026-07-11): reverts anything that appears under a
+        // governed forbidden root, whichever tool wrote it -- the half of enforcement
+        // that does not depend on out-guessing a shell.
+        "PostToolUse:posttool-sweep.sh",
         "PreToolUse:pre-tool-use.sh",
         "SessionStart:session-start.sh",
         "Stop:stop.sh",
@@ -34,7 +38,7 @@ describe("MANAGED_HOOK_SCRIPTS", () => {
     // hook must not fire on Bash/Read/etc., so it carries a narrow exact-match
     // matcher rather than the empty catch-all.
     const pre = MANAGED_HOOK_SCRIPTS.find((h) => h.script === "pre-tool-use.sh");
-    expect(pre?.matcher).toBe("^(Write|Edit)$");
+    expect(pre?.matcher).toBe("^(Write|Edit|MultiEdit|NotebookEdit|Bash)$");
   });
 
   it("scopes the CE0 PostToolUse hook to the meetless MCP tools (narrow, not the catch-all)", () => {

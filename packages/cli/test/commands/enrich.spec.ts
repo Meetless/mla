@@ -196,6 +196,72 @@ describe("renderIngestSummary", () => {
     expect(out).not.toMatch(/show more/i);
   });
 
+  // A reject DROPS the claim. By the time the operator reads this summary the scout is gone
+  // and the results file was a temp file, so these two lines are the only surviving record of
+  // what was lost. Both halves were wrong: the index was printed 0-based to a human counting
+  // from 1 (pointing them at the innocent neighbour), and the statement was never echoed at
+  // all. Live on this repo, that silently binned the doc scout's best finding for being 7
+  // characters over the limit.
+  it("names the rejected candidate by its 1-based ordinal and echoes what was dropped", () => {
+    const out = renderIngestSummary(
+      [
+        outcome({
+          received: 5,
+          accepted: 4,
+          rejected: 1,
+          persisted: 4,
+          errors: [
+            {
+              index: 4, // 0-based: the FIFTH candidate
+              code: "statement_too_long",
+              message: "statement exceeds 500 chars",
+              field: "statement",
+              excerpt: "apps/control/CLAUDE.md contradicts itself on the Prisma source of truth...",
+            },
+          ],
+        }),
+      ],
+      "ENRICHED",
+      CONSOLE_KB,
+    );
+    expect(out).toMatch(/candidate 5: statement_too_long \(statement exceeds 500 chars\)/);
+    expect(out).not.toMatch(/candidate 4:/); // the 0-based index must never reach a human
+    expect(out).toContain('dropped: "apps/control/CLAUDE.md contradicts itself on the Prisma source of truth..."');
+  });
+
+  // One candidate can fail several checks at once (verifyCandidate collects them all). The
+  // claim is still ONE claim, so it is echoed once: repeating it per error would bury the
+  // distinct failure codes, which are the actionable part.
+  it("echoes the dropped statement once per candidate, not once per error", () => {
+    const err = (code: string): ScoutIngestOutcome["errors"][number] => ({
+      index: 0,
+      code,
+      message: `${code} detail`,
+      excerpt: "control is the system of record",
+    });
+    const out = renderIngestSummary(
+      [outcome({ received: 1, rejected: 1, errors: [err("file_not_at_head"), err("bad_line_range")] })],
+      "ENRICHED",
+      CONSOLE_KB,
+    );
+    expect(out).toMatch(/candidate 1: file_not_at_head/);
+    expect(out).toMatch(/candidate 1: bad_line_range/);
+    expect(out.match(/dropped: "control is the system of record"/g)).toHaveLength(1);
+  });
+
+  // Envelope-level failures (index -1) are about the scout, not a candidate, so they carry no
+  // excerpt and must not be renumbered into a phantom "candidate 0".
+  it("keeps envelope-level errors attributed to the scout, not to a candidate", () => {
+    const out = renderIngestSummary(
+      [outcome({ errors: [{ index: -1, code: "malformed_envelope", message: "not an object" }] })],
+      "ENRICHED",
+      CONSOLE_KB,
+    );
+    expect(out).toMatch(/- scout: malformed_envelope \(not an object\)/);
+    expect(out).not.toMatch(/candidate 0/);
+    expect(out).not.toMatch(/dropped:/);
+  });
+
   // The handoff is a single plain pointer regardless of count: no batch / "show more"
   // framing (that was the relationship-queue convention, irrelevant to the console KB tab).
   it("emits one plain pointer even for a large persisted set across scouts", () => {

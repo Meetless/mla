@@ -6,13 +6,19 @@
 # that gap: it installs the EXACT .tgz `pnpm pack` produced (the same file the
 # release then hands to `npm publish <tgz>`) into a throwaway prefix, which forces
 # better-sqlite3 to build/fetch its own addon (the npm package embeds no
-# /snapshot addon), then drives two offline scenarios against the installed bin:
+# /snapshot addon), then drives three offline scenarios against the installed bin:
 #   ce0-export  the freshly-built better-sqlite3 addon dlopens and backs a real
 #               CE0 SQLite store (the npm storage proof; the pkg `storage` scenario
 #               asserts /snapshot materialization, which does not apply here).
 #   mcp         `mla init` wires a real executable MCP command (resolveMlaPath
 #               realpath-resolves the .bin/mla symlink to dist/cli.js) with args
 #               [mcp], and `mla mcp` completes the JSON-RPC handshake.
+#   docs        the bundled docs corpus renders offline, with no login and no
+#               workspace. This one is npm-specific in a way worth naming: the
+#               corpus ships as a plain dist ASSET, so here it is gated by the
+#               `files` list in package.json rather than by pkg embedding. A `files`
+#               regression drops it from the tarball ONLY, leaving the native archive
+#               green (self-documenting-CLI proposal 20260711 §11 test 26).
 #
 # Usage: npm-tarball.sh <path-to-.tgz>
 set -euo pipefail
@@ -41,8 +47,8 @@ npm install --prefix "$ROOT/inst" --no-audit --no-fund --loglevel=error "$TGZ" \
 BIN="$ROOT/inst/node_modules/.bin/mla"
 [ -x "$BIN" ] || { printf 'npm-tarball: FAIL: installed mla bin not executable: %s\n' "$BIN" >&2; exit 1; }
 
-printf 'npm-tarball: driving ce0-export + mcp against the installed bin\n'
-bash "$DIR/packaged.sh" "$BIN" ce0-export mcp \
+printf 'npm-tarball: driving ce0-export + mcp + docs against the installed bin\n'
+bash "$DIR/packaged.sh" "$BIN" ce0-export mcp docs \
   || { printf 'npm-tarball: FAIL: packaged scenarios failed against the installed tarball\n' >&2; exit 1; }
 
-printf 'npm-tarball: OK: installed tarball passes ce0-export + mcp\n'
+printf 'npm-tarball: OK: installed tarball passes ce0-export + mcp + docs\n'

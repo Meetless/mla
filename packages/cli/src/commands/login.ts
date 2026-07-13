@@ -375,11 +375,23 @@ export async function runLogin(argv: string[], deps: LoginDeps = {}): Promise<nu
   const accessRunway = formatRemaining(bundle.accessExpiresAt);
   const refreshRunway = formatRemaining(bundle.refreshExpiresAt);
   console.log(`Logged in as ${bundle.user.displayName}${email}.`);
-  console.log(`  Workspace: ${bundle.workspace.name} (${bundle.workspace.slug})`);
-  console.log(`  Role:      ${bundle.user.role}`);
+  // An account-only login (no workspace yet) is the NORMAL first-run outcome, not
+  // a failure: login creates an Account and nothing else (INV-ACC-3). Say so, and
+  // point at the one command that resolves it. `mla whoami` would be a dead end
+  // here (nothing workspace-scoped to report), so the next step is `mla activate`.
+  if (bundle.workspace) {
+    console.log(`  Workspace: ${bundle.workspace.name} (${bundle.workspace.slug})`);
+    console.log(`  Role:      ${bundle.user.role}`);
+  } else {
+    console.log("  Workspace: none yet.");
+  }
   console.log(
     `  Access token expires ${accessRunway ?? "soon"}; refresh token ${refreshRunway ?? "soon"}.`,
   );
-  console.log("Next: mla whoami");
+  console.log(
+    bundle.workspace
+      ? "Next: mla whoami"
+      : "Next: run `mla activate` in your repo to create your first workspace.",
+  );
   return 0;
 }

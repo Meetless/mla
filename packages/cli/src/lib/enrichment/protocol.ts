@@ -251,10 +251,16 @@ export interface OnboardingCandidatesSidecar {
 }
 
 export interface CandidateValidationError {
-  index: number; // position in the scout's candidates[]
+  index: number; // position in the scout's candidates[] (0-based; render it 1-based)
   code: string; // machine code, e.g. "unknown_field", "bad_kind"
   message: string;
   field?: string;
+  // A short, whitespace-collapsed excerpt of the statement this error rejected. A rejected
+  // candidate is DROPPED, and by the time the operator reads the summary the scout is gone and
+  // the results file was a temp file: a bare code plus an index into that vanished array names
+  // nothing they can act on. The excerpt is what makes a dropped claim recoverable by hand.
+  // Stamped by ingest (which holds the raw candidate), not by the pure shape validator.
+  excerpt?: string;
 }
 
 export interface ScoutIngestOutcome {

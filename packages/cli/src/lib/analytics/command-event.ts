@@ -17,14 +17,18 @@ import {
 // this set is normalized to "unknown" so a typo'd path or secret pasted as
 // argv[0] never reaches the wire.
 //
-// This MUST mirror the `switch (cmd)` dispatch in cli.ts (runDispatch). It is
-// ordered to match that switch top-to-bottom so a reviewer can diff the two by
-// eye and catch drift: when the switch grows a case, this set grows the same
-// line. Drift here is not benign; a dispatched command absent from this set
-// collapses to command="unknown" in the funnel and erases its own dimension
-// from every failure and retention view (the exact bug the 2026-07-09 cohort
-// forensics surfaced, where `rules` failures were invisible). The spec test
-// "mirrors the cli.ts dispatch set" pins this invariant.
+// This MUST mirror the COMMANDS registry in cli.ts (every `name` plus every
+// `alias`), which since the T6 registry landed IS the dispatch table; there is
+// no `switch (cmd)` to eyeball any more. Drift here is not benign: a dispatched
+// command absent from this set collapses to command="unknown" in the funnel and
+// erases its own dimension from every failure and retention view (the exact bug
+// the 2026-07-09 cohort forensics surfaced, where `rules` failures were
+// invisible). The spec test "is a BIJECTION with the cli.ts command registry"
+// derives its expectation from COMMANDS itself, so a new command that forgets
+// this set fails CI instead of quietly vanishing from analytics.
+//
+// This set is a privacy allowlist, not a mirror maintained for its own sake:
+// keep it a literal, so what can reach the wire stays readable at a glance.
 export const KNOWN_COMMANDS = new Set<string>([
   "init",
   "wire",
@@ -66,6 +70,8 @@ export const KNOWN_COMMANDS = new Set<string>([
   "evidence",
   "mcp",
   "upgrade",
+  "docs",
+  "help",
   "_internal",
 ]);
 
@@ -126,6 +132,9 @@ export const KNOWN_SUBCOMMANDS: Record<string, Set<string>> = {
     "report",
   ]),
   evidence: new Set(["ce0-export", "ce0-import-labels", "ce0-emit-telemetry"]),
+  // `mla docs <topic>` is a POSITIONAL (the slug), so only the two reserved
+  // subcommand keywords are emitted; a topic slug never reaches the wire.
+  docs: new Set(["search", "ask"]),
   stats: new Set(["evidence"]),
   _internal: new Set(["finalize-session", "active-review", "auto-index"]),
 };

@@ -9,6 +9,14 @@
 # AND reports exactly this release and runs (exit 0, not 137). Unlike the curl
 # surface, brew really quarantines, so this is where the strip is actually exercised.
 #
+# Tap-Trust (docs.brew.sh/Tap-Trust): Homebrew is making explicit trust MANDATORY
+# for third-party taps. A default brew today only warns ("will be removed in a
+# later release") and still installs; CI runner images already set
+# HOMEBREW_REQUIRE_TAP_TRUST, so there an untrusted tap hard-refuses to load. The
+# enforced path is where every user lands eventually, so that is the one this
+# canary drives: trust the tap, then install. Untrust on the way out, or a machine
+# that already trusts us would let this pass for the wrong reason.
+#
 # Usage: canary/homebrew.sh <version>
 #   MLA_CANARY_TAP  tap to install from (default: meetless/tap)
 set -euo pipefail
@@ -30,6 +38,7 @@ canary_init "homebrew"
 # clean both up on exit. Overrides canary_init's trap; still removes the sandbox.
 cleanup_brew() {
   brew uninstall --cask mla >/dev/null 2>&1 || true
+  brew untrust "$TAP" >/dev/null 2>&1 || true
   brew untap "$TAP" >/dev/null 2>&1 || true
   rm -rf "$CANARY_ROOT"
 }
@@ -37,6 +46,15 @@ trap cleanup_brew EXIT
 
 canary_ok "brew tap $TAP"
 brew tap "$TAP" || canary_die "brew tap $TAP failed"
+
+# Older brews have no `trust` subcommand and no enforcement to satisfy; skip it
+# there rather than fail the surface over a command that cannot exist.
+if brew trust --help >/dev/null 2>&1; then
+  canary_ok "brew trust $TAP (Tap-Trust enforcement)"
+  brew trust "$TAP" || canary_die "brew trust $TAP failed"
+else
+  canary_ok "brew has no 'trust' subcommand; skipping (pre-Tap-Trust homebrew)"
+fi
 
 canary_ok "brew install --cask mla ($VERSION)"
 brew install --cask mla || canary_die "brew install --cask mla failed"

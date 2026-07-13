@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import { COMMANDS } from "../../src/cli";
 import {
   computeFollowthrough,
   buildAdoption,
@@ -11,6 +12,7 @@ import {
   type McpCall,
   type ReportCitation,
 } from "../../src/commands/adoption";
+import { renderUsage, resolveCommand } from "../../src/lib/command-registry";
 
 // A1 evidence-followthrough reader (notes/20260603-mla-kb-agent-proxy §3 A1,
 // §7.2 backlog "A1", §7.4 acceptance). A1 joins three LOCAL trace files by
@@ -394,10 +396,19 @@ describe("runAdoption: end-to-end over the three local files", () => {
 });
 
 describe("drift guard: adoption command is wired", () => {
-  it("cli.ts dispatches 'adoption' and USAGE documents it", () => {
-    const cli = fs.readFileSync(path.resolve(__dirname, "../../src/cli.ts"), "utf8");
-    expect(cli).toMatch(/case "adoption"/);
-    expect(cli).toMatch(/runAdoption/);
-    expect(cli).toMatch(/mla adoption/);
+  // The registry is BOTH the dispatch table and the help screen, so this guard
+  // asserts the live objects rather than scraping cli.ts for a `case "adoption"`
+  // arm (which no longer exists). If `adoption` were dropped from COMMANDS it
+  // would become simultaneously undispatchable and undocumented, and both halves
+  // below would fail.
+  it("the registry dispatches 'adoption' and documents it on the help screen", () => {
+    expect(resolveCommand(COMMANDS, "adoption")).toBeDefined();
+    expect(renderUsage(COMMANDS)).toContain("mla adoption");
+  });
+
+  it("'adoption' routes through the same runStats -> runAdoption path as `stats evidence`", () => {
+    const spec = resolveCommand(COMMANDS, "adoption");
+    // INV-ADOPTION-SOURCE-1: one implementation, two entry points.
+    expect(String(spec?.handler)).toContain("evidence");
   });
 });

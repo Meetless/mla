@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.17 (2026-07-12)
+
+The self-documenting CLI. `mla docs` now answers out of a corpus compiled into the
+binary, and `mla docs ask "<question>"` routes a real question through Control.
+
+- feat(cli): T6 command registry as the single source for dispatch, help, and the docs command index
+- feat(cli): offline docs surface (mla docs / <topic> / search) + registry-driven --help (T8-T12)
+- feat(cli): wire `mla docs ask` to Control, share the ask presenter (T21-T25)
+- feat(utils): make the docs-corpus drift gate testable, regenerate the corpus (T26)
+- feat(mla): mint an ask delivery key at the MCP tool-call boundary
+- feat(cli,control): survive an account-only login and self-heal the actor on activate
+- fix(docs-cli): compile the corpus into the CLI instead of shipping it as an fs asset
+- fix(docs-ask): the abstention sentence is ours, and pin the edge to the one route
+- fix(docs): stop shredding Vietnamese, and tell the truth about docs_answer cost
+- fix(docs): stopword filter, corpus-budget tripwire, measured cost model
+- fix(docs): document the docs surface, unbreak the mirror's suite, let the smoke gate speak
+- fix(docs): close the code-review findings on the self-documenting CLI
+- fix(cli): a help flag inside a docs question is part of the question
+- fix(cli): ship WARN as the enforcement ceiling, and make the sweep obey it
+- fix(enforce): a rule about a PATH must hold against every tool that writes it
+- fix(cli): extract rules at sentence grain, not line grain
+- fix(cli): let `enrich plan --force` reclaim an abandoned onboarding lock
+- fix(cli): resolve the enrich git root from cwd, not the activation marker
+- fix(cli): a rejected onboarding candidate must say what it dropped
+- fix(cli): re-anchor the scout deadline at brief time, not plan time
+- fix(cli): activate must not claim a live injection it never performed
+- fix(cli): activate must never rewrite the user's .gitignore
+- fix(cli): activate told you to restart and not to restart, in one breath
+- fix(cli,ci): publish only from the release tag; detect a symlinked-HOME install
+- fix(cli): drive the Homebrew canary through Tap-Trust, and tell users about it
+- test(cli): gate the bundled docs corpus in both shipped artifacts
+- test(mla): pin the analytics command allowlist to the dispatch registry
+- test(enforce): register posttool-sweep.sh in the hook-template manifest
+- ci(release): gate the CLI build on a live prod-edge allowlist probe (no silent 404s)
+
 ## 0.2.16 (2026-07-12)
 
 Supersedes 0.2.15, which failed its release gate and never published to any surface.

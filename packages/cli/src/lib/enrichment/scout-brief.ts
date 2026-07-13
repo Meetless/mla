@@ -172,12 +172,23 @@ function renderOutputContract(run: OnboardingRun, role: ScoutName): string[] {
 
 /**
  * Render the brief for one scout role from the authoritative run record. Pure: the
- * same (run, role) always yields the same string. The documentation brief lists the
- * exact ranked document targets and grants Read; the history brief inlines the
+ * same (run, role, deadlineAt) always yields the same string. The documentation brief
+ * lists the exact ranked document targets and grants Read; the history brief inlines the
  * bounded git evidence and grants no tools. Both state the shared scout policy and
  * the JSON output contract `enrich ingest` expects.
+ *
+ * `deadlineAt` overrides the run's frozen deadline. `enrich brief` passes one, because
+ * run.deadlineAt is anchored to PLAN time and the scout does not start at plan time: the
+ * agent runs two `enrich brief` calls and then relays the brief verbatim into the Task
+ * prompt, and the history brief is tens of kilobytes of git evidence that the orchestrator
+ * must emit token by token. That relay alone can burn minutes. Handing the scout a deadline
+ * that is already spent (or already past, at which point the brief orders it to return
+ * `timed_out` having read nothing) makes the budget a trap rather than a bound. The brief is
+ * rendered immediately before dispatch, so brief-time is the closest honest anchor for a
+ * budget that is meant to bound the SCOUT's work. The run record keeps its own deadlineAt
+ * for audit and lock math; only the sentence the scout reads moves.
  */
-export function buildScoutPrompt(run: OnboardingRun, role: ScoutName): string {
+export function buildScoutPrompt(run: OnboardingRun, role: ScoutName, deadlineAt?: string): string {
   const policy = buildScoutPolicy();
   const head = [
     `Onboarding scout: ${role} (run ${run.runId}).`,
@@ -194,7 +205,7 @@ export function buildScoutPrompt(run: OnboardingRun, role: ScoutName): string {
     ...policy.nonAuthoritative,
     "",
     toolLine(role),
-    `Wall-clock deadline: ${run.deadlineAt}. If you approach it, stop and return what you`,
+    `Wall-clock deadline: ${deadlineAt ?? run.deadlineAt}. If you approach it, stop and return what you`,
     'have so far with status "timed_out" rather than working past the deadline.',
     "",
   ];

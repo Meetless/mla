@@ -277,6 +277,79 @@ test("makeIntelAsk omits as_of from the body when not provided (byte-identical M
   assert.ok(!("as_of" in body), "as_of must be absent from the body when not requested");
 });
 
+// ---------- Delivery key: every ask is a metered spend ----------------------
+// Intel turns submission_id into the Control delivery key `mcp:<id>:answer`. That
+// key is what collapses a RE-delivered request onto the one money authorization it
+// already opened, instead of buying the run a second time. Control admits a spend
+// only against a delivery key, so an ask that posts none is denied outright: the
+// key is mandatory on this path, never best-effort.
+
+test("makeIntelAsk always sends a submission_id, even when the caller mints none", async () => {
+  const bodies = [];
+  const fetchImpl = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ answer: "ok", citations: [] }) };
+  };
+  const intelAsk = makeIntelAsk({ intelBaseUrl: "http://intel.test", apiKey: "K", fetchImpl });
+
+  await intelAsk({ question: "q", workspaceId: "ws", mode: "answer" });
+  await intelAsk({ question: "q", workspaceId: "ws", mode: "answer" });
+
+  assert.equal(typeof bodies[0].submission_id, "string");
+  assert.ok(bodies[0].submission_id.length > 0);
+  // Two separate calls are two separate deliveries: each buys its own
+  // authorization. Reusing one key would collide two executions under one id.
+  assert.notEqual(bodies[1].submission_id, bodies[0].submission_id);
+});
+
+test("makeIntelAsk prefers the caller's submissionId over minting one", async () => {
+  let captured = null;
+  const fetchImpl = async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ answer: "ok", citations: [] }) };
+  };
+  const intelAsk = makeIntelAsk({ intelBaseUrl: "http://intel.test", apiKey: "K", fetchImpl });
+
+  await intelAsk({
+    question: "q",
+    workspaceId: "ws",
+    mode: "answer",
+    submissionId: "tool-call-abc",
+  });
+
+  // `mla mcp` mints one id per TOOL CALL and passes it down, so a replayed tool
+  // call reuses the key and collapses. Only the caller knows what a delivery is.
+  assert.equal(captured.submission_id, "tool-call-abc");
+});
+
+test("every ask mode forwards args.submission_id to intel", async () => {
+  // The mode handlers are the seam between the MCP tool boundary (which mints the
+  // per-tool-call key) and the transport. A mode that drops the key silently
+  // downgrades a replay from "collapse" to "buy it twice".
+  for (const [name, args] of [
+    ["runAnswer", { query: "q", submission_id: "sid-1" }],
+    ["runSearch", { query: "q", submission_id: "sid-2" }],
+    ["runCanonical", { query: "q", submission_id: "sid-3" }], // no INDEX match -> retrieval fallback
+  ]) {
+    const { modes, calls } = harness();
+    await modes[name](args);
+    assert.equal(calls.length, 1, `${name} must make exactly one intel call`);
+    assert.equal(calls[0].submissionId, args.submission_id, `${name} dropped the delivery key`);
+  }
+});
+
+test("runCanonical forwards the delivery key on the unique-INDEX-match path", async () => {
+  const { modes, calls } = harness({
+    matchCanonical: () => ({
+      matches: [{ path: "notes/x.md", topic: "X", status: "SHIPPED", lastReviewed: "2026-01-01" }],
+      reason: "exact topic",
+    }),
+  });
+  await modes.runCanonical({ query: "q", submission_id: "sid-4" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].submissionId, "sid-4");
+});
+
 test("runAnswer threads args.as_of into the intel call", async () => {
   const { modes, calls } = harness();
   await modes.runAnswer({ query: "q", as_of: "2026-04-10T00:00:00.000Z" });

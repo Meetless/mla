@@ -1025,3 +1025,86 @@ describe("ingestRun writes the candidates sidecar", () => {
     expect(loaded?.repositoryRoot).toBe("/repo");
   });
 });
+
+// A reject is a DELETION: the candidate never reaches the KB, the scout that produced it is
+// gone, and the results file was a temp file. So the error is the only surviving trace of the
+// claim, and a bare code plus an array index traces nothing. On the real repo this quietly
+// binned the doc scout's sharpest finding (a self-contradiction in apps/control/CLAUDE.md over
+// which path owns the Prisma schema) for being seven characters over the 500-char limit, and
+// the summary said only "candidate 4: statement_too_long".
+describe("a rejected candidate reports WHAT it dropped", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "mla-ingest-excerpt-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const scoutResult = (candidates: unknown[]) => ({
+    scout: "documentation",
+    status: "complete",
+    candidates,
+  });
+
+  it("stamps the statement excerpt on a shape reject (statement_too_long)", async () => {
+    seedRun(home);
+    const tooLong = docCandidate({ statement: `Control is the system of record. ${"x".repeat(600)}` });
+
+    const res = await ingestRun(ingestArgs(home, "run-1", [scoutResult([tooLong])]));
+
+    expect(res.ok).toBe(true);
+    const err = res.outcomes![0].errors.find((e) => e.code === "statement_too_long");
+    expect(err).toBeDefined();
+    // Identifies the claim well enough to retype it from the source.
+    expect(err!.excerpt).toContain("Control is the system of record.");
+    // Bounded: a scout that sends a megabyte of prose cannot flood the terminal with it.
+    expect(err!.excerpt!.length).toBeLessThanOrEqual(163); // 160 + the "..." marker
+    expect(err!.excerpt!.endsWith("...")).toBe(true);
+  });
+
+  it("stamps the excerpt on an anchor reject too (the claim is lost the same way)", async () => {
+    seedRun(home, { documentationTargets: [] });
+    const badAnchor = docCandidate({
+      statement: "Never mock internal services.",
+      evidence: [{ type: "file", path: "CLAUDE.md", startLine: 10, endLine: 20 }],
+    });
+
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [scoutResult([badAnchor])], makeProbe({ isTracked: () => false })),
+    );
+
+    expect(res.ok).toBe(true);
+    const errors = res.outcomes![0].errors;
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors[0].excerpt).toBe("Never mock internal services.");
+  });
+
+  it("survives a candidate with no usable statement (the reject still lands, without an excerpt)", async () => {
+    seedRun(home);
+
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [scoutResult([{ kind: "convention", statement: 42, evidence: [] }, null])]),
+    );
+
+    expect(res.ok).toBe(true);
+    const errors = res.outcomes![0].errors;
+    expect(errors.length).toBeGreaterThan(0);
+    // No statement to quote, so no excerpt: the code alone stands, exactly as before.
+    expect(errors.every((e) => e.excerpt === undefined)).toBe(true);
+    expect(res.outcomes![0].accepted).toBe(0);
+  });
+
+  it("collapses whitespace so a multi-line statement stays one readable line", async () => {
+    seedRun(home);
+    const wrapped = docCandidate({
+      statement: `Prisma rules:\n  - no enums\n\n  - no hand-rolled migrations\n${"y".repeat(600)}`,
+    });
+
+    const res = await ingestRun(ingestArgs(home, "run-1", [scoutResult([wrapped])]));
+
+    const err = res.outcomes![0].errors.find((e) => e.code === "statement_too_long")!;
+    expect(err.excerpt).toContain("Prisma rules: - no enums - no hand-rolled migrations");
+    expect(err.excerpt).not.toContain("\n");
+  });
+});

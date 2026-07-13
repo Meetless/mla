@@ -13,6 +13,9 @@ import {
   UPDATE_CHECK_INTERVAL_MS,
   type UpdateState,
 } from "../../src/lib/update-check";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 
 const env = (o: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => o as NodeJS.ProcessEnv;
 
@@ -138,6 +141,38 @@ describe("detectInstallMethod", () => {
     expect(
       detectInstallMethod({ execPath: "/Users/x/.meetless/queue/mla", scriptPath: undefined, home, env: env({}) }),
     ).not.toBe("curl");
+  });
+
+  // Regression: every case above passes fabricated paths, so none of them can see
+  // the bug that actually shipped. `process.execPath` is realpath'd by Node but
+  // `os.homedir()` is not, so a HOME reached through a symlink is spelled
+  // differently from the binary's own path and containment silently fails ->
+  // "unknown" -> `mla upgrade` refuses to run. macOS makes this routine (a $HOME
+  // under TMPDIR is /var/folders/..., really /private/var/folders/...). Needs a
+  // real symlink on a real filesystem to reproduce.
+  it("detects a curl install when HOME reaches through a symlink", () => {
+    const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "mla-detect-")));
+    const realHome = path.join(tmp, "real-home");
+    const linkedHome = path.join(tmp, "linked-home");
+    const binDir = path.join(realHome, ".meetless", "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(binDir, "mla"), "");
+    fs.symlinkSync(realHome, linkedHome);
+
+    try {
+      expect(
+        detectInstallMethod({
+          // what process.execPath gives us: already resolved
+          execPath: path.join(realHome, ".meetless", "bin", "mla"),
+          scriptPath: undefined,
+          // what os.homedir() gives us: the symlink, unresolved
+          home: linkedHome,
+          env: env(),
+        }),
+      ).toBe("curl");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 

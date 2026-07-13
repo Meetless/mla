@@ -250,9 +250,76 @@ describe("mcp-fetchers — intelAsk adapter", () => {
       filters: {},
       max_results: 8,
       min_results: 3,
+      // The delivery key. Minted here because this caller passed none; asserted
+      // in its own test below.
+      submission_id: expect.any(String),
     });
     // as_of is omitted entirely when not supplied (byte-identical to today).
     expect(Object.prototype.hasOwnProperty.call(calls[0][1], "as_of")).toBe(false);
+  });
+
+  // An ask is a metered spend, and Control admits a spend only against a delivery
+  // key: the key is what makes a re-delivered request collapse onto the ONE money
+  // authorization it already opened instead of buying the run a second time. A
+  // keyless ask is denied, so the key can never be optional on this path.
+  it("always posts a submission_id, even when the caller mints none (a keyless ask is a denied spend)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      return {};
+    };
+    const cfg = userTokenConfig();
+    const intelAsk = makeIntelAskFromCli(cfg, intelPostFn);
+
+    await intelAsk({ question: "q", workspaceId: "ws_1" });
+    await intelAsk({ question: "q", workspaceId: "ws_1" });
+
+    expect(typeof bodies[0].submission_id).toBe("string");
+    expect(bodies[0].submission_id).not.toBe("");
+    // Two genuinely separate calls are two separate deliveries: each buys its own
+    // authorization. Reusing one key here would collide two different executions
+    // under one delivery id.
+    expect(bodies[1].submission_id).not.toBe(bodies[0].submission_id);
+  });
+
+  it("prefers the caller's submissionId over minting one (mla mcp mints per tool call)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      return {};
+    };
+    const cfg = userTokenConfig();
+    const intelAsk = makeIntelAskFromCli(cfg, intelPostFn);
+
+    await intelAsk({
+      question: "q",
+      workspaceId: "ws_1",
+      submissionId: "tool-call-abc",
+    });
+
+    expect(bodies[0].submission_id).toBe("tool-call-abc");
+  });
+
+  it("reuses the same submission_id across the 401 refresh retry (one delivery, one authorization)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      attempt += 1;
+      if (attempt === 1) throw http401();
+      return { answer: "ok" };
+    };
+    const refresh = jest.fn(async () => "refreshed" as const);
+    const cfg = userTokenConfig();
+    const intelAsk = makeIntelAskFromCli(cfg, intelPostFn, refresh);
+
+    await intelAsk({ question: "q", workspaceId: "ws_1" });
+
+    // The refresh re-posts the SAME logical request. If the retry minted a fresh
+    // key, Control would see a brand-new delivery and open (and hold funds for) a
+    // second authorization for one user-visible ask.
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1].submission_id).toBe(bodies[0].submission_id);
   });
 
   it("posts /v1/ask with a synthesis timeout larger than intelPost's 15s default", async () => {

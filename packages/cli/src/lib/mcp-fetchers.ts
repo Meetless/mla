@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { CliConfig } from "./config";
 import type { HttpError, RefreshOutcome } from "./http";
 import {
@@ -172,6 +173,13 @@ export interface IntelAskParams {
   threadText?: string | null;
   language?: string;
   surface?: string;
+  /**
+   * Per-tool-call delivery key. `mla mcp` mints one at the tool-call boundary and
+   * passes it here; a direct CLI caller that mints nothing gets one minted below,
+   * so a metered ask NEVER reaches admission without a key (Control requires the
+   * delivery triple and denies a keyless spend).
+   */
+  submissionId?: string;
 }
 
 /**
@@ -197,6 +205,10 @@ export function makeIntelAskFromCli(
       filters: params.filters ?? {},
       max_results: params.maxResults ?? 8,
       min_results: params.minResults ?? 3,
+      // Minted once per closure CALL, outside the retry below on purpose: a 401
+      // refresh re-posts the SAME body, so both attempts carry one key and collapse
+      // onto one money authorization instead of buying the run twice.
+      submission_id: params.submissionId ?? randomUUID(),
     };
     // Keep the body byte-identical to today when no cutoff is supplied.
     if (params.asOf !== undefined && params.asOf !== null) {

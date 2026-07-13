@@ -11,9 +11,23 @@ import { resolveWorkspaceId } from "./workspace";
 // them. config.ts is the single chokepoint for config/auth loading, so stamping
 // the marker here covers the whole surface at its source rather than per command.
 export class ConfigError extends Error {
-  constructor(message: string) {
+  /**
+   * `NO_CONFIG` means literally nothing on disk: the user has never run `mla init`
+   * or `mla login`. It is the ONE config failure a command may translate into its
+   * own words ("sign in first"), because there is no operator message to lose.
+   *
+   * Every OTHER ConfigError already carries the exact remediation in `message`
+   * (unset this env var, run `mla logout`, fix this JSON), so a command that
+   * catches one and substitutes generic advice actively misleads: telling a user
+   * whose MEETLESS_CONTROL_TOKEN collides with their login to "run `mla login`"
+   * sends them around the same loop forever. Print `message`, or rethrow.
+   */
+  readonly code?: "NO_CONFIG";
+
+  constructor(message: string, code?: "NO_CONFIG") {
     super(message);
     this.name = "ConfigError";
+    this.code = code;
   }
 }
 
@@ -320,6 +334,7 @@ export function readConfig(): CliConfig {
   if (!fs.existsSync(CFG_PATH)) {
     throw new ConfigError(
       `cli-config.json not found at ${CFG_PATH}. Run 'mla init' first.`,
+      "NO_CONFIG",
     );
   }
   const raw = fs.readFileSync(CFG_PATH, "utf8");

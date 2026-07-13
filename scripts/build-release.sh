@@ -194,8 +194,10 @@ tar -tzf "$RELEASE_DIR/$ARCHIVE" | grep -qx "$EXE" \
 #      (b) the extracted file is ALREADY executable (test -x) -- the exec bit is
 #          load-bearing for the Homebrew cask path (render-cask.sh never chmods),
 #          so we must NEVER chmod +x here to make a smoke pass.
-#    Then it drives the offline pkg-binary scenarios (storage/mcp/ask-core) against
-#    the extracted binary. Each scenario self-isolates HOME/MEETLESS_HOME/TMPDIR and
+#    Then it drives the offline pkg-binary scenarios (storage/mcp/ask-core/docs)
+#    against the extracted binary; `docs` is the one that proves the compiled-in
+#    documentation corpus survived pkg (the pre-auth surface: no login, no workspace,
+#    no network). Each scenario self-isolates HOME/MEETLESS_HOME/TMPDIR and
 #    cleans up on EXIT; the extracted dir is removed by this block's own trap. Only
 #    the native runner sets MLA_SMOKE=1 (a cross-compiled target can't execute here).
 if [ "${MLA_SMOKE:-}" = "1" ]; then

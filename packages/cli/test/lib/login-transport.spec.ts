@@ -254,6 +254,41 @@ describe("exchangeGrant (§4.1, §0.01 clause 1)", () => {
     });
   });
 
+  // Option B P4 (INV-ACC-3): login creates an Account and NOTHING else, so a human
+  // signing in on a fresh machine legitimately has no workspace. The bundle must
+  // survive with `workspace: null` rather than being rejected as corrupt; `mla
+  // activate` is what creates the first workspace and binds this same session.
+  it("accepts an account-only bundle (no workspace) and normalizes it to null", async () => {
+    global.fetch = (async () => {
+      const { workspace: _omitted, ...accountOnly } = sampleBundle();
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ...accountOnly, workspace: null }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const bundle = await exchangeGrant("http://127.0.0.1:3006", "grant_abc", "verifier_xyz");
+    expect(bundle.workspace).toBeNull();
+    expect(bundle.accessToken).toBe("at_secret");
+    expect(bundle.user.id).toBe("u_1");
+  });
+
+  // A workspace that is PRESENT but malformed is still a corrupt payload. It must
+  // not slip through by masquerading as the legitimate account-only case above.
+  it("rejects a present-but-malformed workspace", async () => {
+    global.fetch = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ ...sampleBundle(), workspace: { name: "Acme" } }),
+      }) as unknown as Response) as unknown as typeof fetch;
+
+    await expect(
+      exchangeGrant("http://127.0.0.1:3006", "grant_abc", "verifier_xyz"),
+    ).rejects.toThrow(/missing required token\/identity fields/);
+  });
+
   it("surfaces a non-2xx without echoing the secret verifier", async () => {
     global.fetch = (async () =>
       ({

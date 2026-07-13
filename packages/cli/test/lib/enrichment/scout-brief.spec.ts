@@ -101,6 +101,28 @@ describe("SCOUT_AGENT_NAME (role -> Claude Code subagent name)", () => {
   });
 });
 
+describe("buildScoutPrompt: the scout's deadline can be re-anchored at dispatch time", () => {
+  // run.deadlineAt is frozen at PLAN time, but the scout does not start at plan time: the
+  // agent runs `enrich brief` for both roles and then relays each brief verbatim into a Task
+  // prompt (the history brief is tens of KB of git evidence, emitted token by token). Charging
+  // the scout for that orchestration makes the budget a trap: on a slow relay the deadline is
+  // already past when the scout starts, and the brief tells it to return `timed_out` having
+  // read nothing. `enrich brief` therefore passes now + budget. The record is untouched.
+  for (const role of SCOUT_NAMES) {
+    it(`the ${role} brief prints the override deadline, not the run's frozen one`, () => {
+      const r = run();
+      const out = buildScoutPrompt(r, role, "2026-06-26T09:30:00.000Z");
+      expect(out).toContain("Wall-clock deadline: 2026-06-26T09:30:00.000Z");
+      expect(out).not.toContain(r.deadlineAt); // the stale plan-time deadline is gone
+    });
+
+    it(`the ${role} brief falls back to the run's deadline when no override is given`, () => {
+      const out = buildScoutPrompt(run(), role);
+      expect(out).toContain("Wall-clock deadline: 2026-06-26T00:04:00.000Z");
+    });
+  }
+});
+
 describe("buildScoutPrompt (shared policy atoms, both roles)", () => {
   for (const role of SCOUT_NAMES) {
     it(`states the scout policy for the ${role} scout`, () => {
