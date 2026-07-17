@@ -6,7 +6,7 @@ import * as path from "path";
 const TEMPLATE_DIR = path.resolve(__dirname, "../../src/hooks-template");
 
 // The exact inventory the generator ships: 9 registered scripts (5 core + 4 ce0)
-// + 3 support files. Hardcoded on purpose so a NEW or REMOVED template is a
+// + 4 support files. Hardcoded on purpose so a NEW or REMOVED template is a
 // deliberate edit here, mirroring the generator's explicit allowlist (never a
 // readdir). Kept sorted to compare against a sorted readdir directly.
 const EXPECTED_TEMPLATES = [
@@ -17,6 +17,10 @@ const EXPECTED_TEMPLATES = [
   "common.sh",
   "event-batch-filter.jq",
   "flush.sh",
+  // The shell-side $HOME repair (2026-07-13). Sourced by common.sh and, directly,
+  // by every self-contained hook: they run in the launcher's environment, before
+  // any mla process exists, so the Node-side repair cannot reach them.
+  "home.sh",
   "post-tool-use.sh",
   // Enforcement backstop (2026-07-11): reverts anything that appears under a
   // governed forbidden root, whichever tool wrote it.

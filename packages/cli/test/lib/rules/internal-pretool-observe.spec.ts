@@ -615,10 +615,54 @@ describe("runInternalPretoolObserve: faces the backend bundle (P1G / G4)", () =>
   });
 });
 
+// WIRING PROOF (Option A, per-checkout PERSONAL isolation): the enforce-time scope gate lives in
+// bundle-enforce, but it is only load-bearing if the CURRENT checkout's runtime scope actually
+// threads from resolveScope() -> decideBundleEnforcement({ runtimeScopeId }) -> the gate. A PERSONAL
+// rule is minted projectId:null and syncs into every checkout of its owner's workspace; without the
+// gate a personal deny attested in checkout A would fire in sibling checkout B. These two drive the
+// REAL runInternalPretoolObserve entry (not the pure decider) so the plumbing is what is under test:
+// a PERSONAL rule attested at PILOT_SCOPE must deny only when the live checkout IS PILOT_SCOPE.
+describe("runInternalPretoolObserve: PERSONAL rules are per-checkout (Option A wiring)", () => {
+  const SIBLING_SCOPE = "/work/intel"; // a different checkout of the SAME workspace (projectId:null)
+  const personalEntry = () => bundleEntry({ authorityScope: "PERSONAL", ownerUserId: "user_an" });
+
+  it("ENFORCES a PERSONAL deny when the live checkout matches its attested scope (deny)", async () => {
+    // resolveScope defaults to PILOT_SCOPE, the same scope pilotPayload stamped. Gate lets it through.
+    const { deps, written } = bundleDeps(freshRead([personalEntry()]));
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(written());
+    expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("rn_notes");
+  });
+
+  it("does NOT enforce a PERSONAL deny in a SIBLING checkout of the same workspace (pass-through)", async () => {
+    // Same principal, same workspace bundle, same violating write. Only the live checkout differs.
+    const { deps, written } = bundleDeps(freshRead([personalEntry()]), {
+      resolveScope: () => ({ runtimeScopeId: SIBLING_SCOPE, runtimeProjectRoot: RUNTIME_ROOT }),
+    });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    // The personal deny belongs to PILOT_SCOPE's checkout; here it is invisible, so the write survives.
+    expect(JSON.parse(written())).toEqual({});
+  });
+
+  it("keeps a WORKSPACE rule enforcing across checkouts (the gate is PERSONAL-only)", async () => {
+    // Default bundleEntry() is authorityScope WORKSPACE: a sibling checkout must STILL be denied.
+    const { deps, written } = bundleDeps(freshRead([bundleEntry()]), {
+      resolveScope: () => ({ runtimeScopeId: SIBLING_SCOPE, runtimeProjectRoot: RUNTIME_ROOT }),
+    });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    expect(JSON.parse(written()).hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+});
+
 // INV-8: the non-blocking WARN rung. A VIOLATION whose attested ceiling is WARN (or a DENY clamped to
 // WARN by the MEETLESS_ACTION_INTERCEPT_MAX kill switch) surfaces the rule's concern to both the operator
-// and the model, but NEVER a permissionDecision, so it can never false-positive-block. It also never
-// emits a deny tile (a WARN is not a deny).
+// and the model, but NEVER a permissionDecision, so it can never false-positive-block. It DOES persist an
+// enforcement-incident per warned rule (decision:"warn") so the console review queue surfaces WARN
+// violations, not only hard DENY blocks; the incident is a WARN, never a deny (input.decision === "warn").
 describe("runInternalPretoolObserve: the WARN rung (non-blocking, INV-8)", () => {
   it("surfaces a fresh WARN-ceiling forbidden write as a non-blocking advisory (no permissionDecision), exit 0", async () => {
     const warnPayload = pilotPayload({ enforcementCeiling: "WARN" });
@@ -635,13 +679,81 @@ describe("runInternalPretoolObserve: the WARN rung (non-blocking, INV-8)", () =>
     expect(parsed.hookSpecificOutput.additionalContext).toContain("standalone vault");
   });
 
-  it("does NOT emit a deny tile on a WARN (a warning is not a deny)", async () => {
-    const emitIncident = jest.fn();
+  it("emits ONE warn incident (decision:\"warn\", a warning is not a deny) stamping the rule + PII-safe facts", async () => {
+    const calls: Array<{ input: EnforcementIncidentInput; coords: EnforcementIncidentCoords }> = [];
     const warnPayload = pilotPayload({ enforcementCeiling: "WARN" });
-    const { deps } = bundleDeps(freshRead([bundleEntry({ payload: warnPayload })]), { emitIncident });
+    const { deps } = bundleDeps(freshRead([bundleEntry({ payload: warnPayload })]), {
+      emitIncident: (input, coords) => {
+        calls.push({ input, coords });
+      },
+    });
     const code = await runInternalPretoolObserve([], deps);
     expect(code).toBe(0);
-    expect(emitIncident).not.toHaveBeenCalled();
+    // The bug this fixes: a WARN used to persist NOTHING, so the review queue only ever saw hard DENY
+    // blocks. Now the warned rule becomes its own review-queue record.
+    expect(calls).toHaveLength(1);
+    const { input, coords } = calls[0];
+    // It is a WARN, never a deny. This is the spirit of the old "a warning is not a deny" assertion,
+    // preserved as a field check instead of "emits nothing".
+    expect(input.decision).toBe("warn");
+    // A fresh synthetic incident id (a ULID), never empty.
+    expect(typeof input.incidentId).toBe("string");
+    expect(input.incidentId.length).toBeGreaterThan(0);
+    expect(input.tool).toBe("Write");
+    // The raw path is reduced to a PII-safe surface enum for telemetry (.md => docs)...
+    expect(input.touchedSurface).toBe("docs");
+    // ...and the runtime-relative warned path rides along as the review-queue evidence.
+    expect(input.blockedPath).toBe("notes/scratch.md");
+    // The deciding rule's version + cutover-stable node id + verbatim statement, snapshotted at warn time.
+    expect(input.ruleVersionId).toBe("rv_notes_1");
+    expect(input.ruleNodeId).toBe("rn_notes");
+    expect(input.ruleText).toBe(
+      "Notes and design docs MUST go in the standalone vault, never the repo notes directory.",
+    );
+    expect(coords.sessionId).toBe("sess_1");
+    expect(coords.nowMs).toBe(1718700000000);
+  });
+
+  it("emits one warn incident PER co-firing warned rule, each with a distinct incident id", async () => {
+    const calls: Array<{ input: EnforcementIncidentInput; coords: EnforcementIncidentCoords }> = [];
+    const warnPayload = pilotPayload({ enforcementCeiling: "WARN" });
+    // Two DISTINCT warned rules select the same violating write (different node ids so both survive the
+    // bundle fold). Each must become its own review-queue record; neither may be silently dropped.
+    const { deps } = bundleDeps(
+      freshRead([
+        bundleEntry({ ruleNodeId: "rn_notes", ruleVersionId: "rv_notes_1", payload: warnPayload }),
+        bundleEntry({ ruleNodeId: "rn_docs", ruleVersionId: "rv_docs_1", payload: warnPayload }),
+      ]),
+      {
+        emitIncident: (input, coords) => {
+          calls.push({ input, coords });
+        },
+      },
+    );
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    expect(calls).toHaveLength(2);
+    expect(calls.every((c) => c.input.decision === "warn")).toBe(true);
+    // Both warned rules are represented (bundle folds in ruleNodeId order).
+    expect(calls.map((c) => c.input.ruleNodeId).sort()).toEqual(["rn_docs", "rn_notes"]);
+    // Distinct incident ids: co-firing warns are never dedup-collapsed onto one id.
+    const ids = calls.map((c) => c.input.incidentId);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("is fail-soft: a throwing warn emitter still renders the advisory (never a block), exit 0", async () => {
+    const warnPayload = pilotPayload({ enforcementCeiling: "WARN" });
+    const { deps, written } = bundleDeps(freshRead([bundleEntry({ payload: warnPayload })]), {
+      emitIncident: () => {
+        throw new Error("telemetry spool down");
+      },
+    });
+    const code = await runInternalPretoolObserve([], deps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(written());
+    // The advisory still lands; a telemetry fault never escalates the non-blocking WARN into a block.
+    expect(parsed.hookSpecificOutput).not.toHaveProperty("permissionDecision");
+    expect(parsed.systemMessage).toContain("advisory");
   });
 
   it("concatenates the governed-rule WARN and an open cross-session conflict into one advisory (both ride additionalContext)", async () => {
@@ -661,19 +773,27 @@ describe("runInternalPretoolObserve: the WARN rung (non-blocking, INV-8)", () =>
     expect(parsed.hookSpecificOutput.additionalContext).toContain("case_42");
   });
 
-  it("MEETLESS_ACTION_INTERCEPT_MAX=warn clamps a would-be DENY into a non-blocking advisory (kill switch), no deny tile", async () => {
-    const emitIncident = jest.fn();
+  it("MEETLESS_ACTION_INTERCEPT_MAX=warn clamps a would-be DENY into a non-blocking advisory (kill switch) and emits a WARN incident, not a deny tile", async () => {
+    const calls: Array<{ input: EnforcementIncidentInput; coords: EnforcementIncidentCoords }> = [];
     // A DENY-ceiling rule on a forbidden path would normally hard-block; the session cap turns it into a WARN.
+    // This is the exact case An hit: the shipped WARN ceiling clamps every DENY, so before this fix the
+    // review queue saw nothing at all. The clamped violation must now persist as a WARN incident.
     const { deps, written } = bundleDeps(freshRead([bundleEntry()]), {
       resolveMaxEnforcement: () => "WARN",
-      emitIncident,
+      emitIncident: (input, coords) => {
+        calls.push({ input, coords });
+      },
     });
     const code = await runInternalPretoolObserve([], deps);
     expect(code).toBe(0);
     const parsed = JSON.parse(written());
     expect(parsed.hookSpecificOutput).not.toHaveProperty("permissionDecision");
     expect(parsed.systemMessage).toContain("advisory");
-    expect(emitIncident).not.toHaveBeenCalled();
+    // Emitted as a WARN (clamped), never a deny.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input.decision).toBe("warn");
+    expect(calls[0].input.ruleNodeId).toBe("rn_notes");
+    expect(calls[0].input.blockedPath).toBe("notes/scratch.md");
   });
 
   it("MEETLESS_ACTION_INTERCEPT_MAX=ask clamps a would-be DENY into an interactive ASK (not a block)", async () => {

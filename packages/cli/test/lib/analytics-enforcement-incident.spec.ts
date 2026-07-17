@@ -154,14 +154,14 @@ describe("emitEnforcementIncident", () => {
 
   it("snapshots the deciding rule node id + statement onto the payload when supplied (capture-time evidence)", () => {
     emit.emitEnforcementIncident(
-      input({ ruleNodeId: "cmqyapibi01l3w2lm01csa216", ruleText: "Notes live under notes/, never docs/." }),
+      input({ ruleNodeId: "cmexamplerulenodeid000000", ruleText: "Notes live under notes/, never docs/." }),
       { workspaceId: "ws_1", sessionId: "sess_1", nowMs: NOW },
       { runId: "run_test", traceId: "0123456789abcdef0123456789abcdef", machineId: () => "m_test", readCfg: () => null },
     );
     const ev = store.readEvents()[0] as unknown as Record<string, unknown>;
     // The node id (cutover-stable) and the verbatim rule statement travel with the deny, so the
     // review queue never depends on a version-id join that can rot.
-    expect(ev.rule_node_id).toBe("cmqyapibi01l3w2lm01csa216");
+    expect(ev.rule_node_id).toBe("cmexamplerulenodeid000000");
     expect(ev.rule_text).toBe("Notes live under notes/, never docs/.");
   });
 

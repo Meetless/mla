@@ -103,7 +103,9 @@ const classifyRuntime = async (rawFilePath: unknown): Promise<EvaluationTarget> 
 });
 
 function decide(read: BundleCacheRead, call: ToolCall) {
-  return decideBundleEnforcement({ call, read, runtimeProjectRoot: "/runtime/root", classifyRuntime });
+  // runtimeScopeId matches the pilot payload's scope, so the PERSONAL per-checkout gate is a no-op here
+  // (the default entry is WORKSPACE-scoped anyway); the dedicated block below drives the gate itself.
+  return decideBundleEnforcement({ call, read, runtimeProjectRoot: "/runtime/root", runtimeScopeId: PILOT_SCOPE, classifyRuntime });
 }
 
 describe("decideBundleEnforcement: no usable bundle (§6.3, acceptance 15)", () => {
@@ -165,6 +167,7 @@ describe("decideBundleEnforcement: fresh bundle DENY (the hard block)", () => {
       call: writeMd("/Users/an/private/notes/x.md"),
       read: fresh([entry("node_a", pilotPayload())]),
       runtimeProjectRoot: "/runtime/root",
+      runtimeScopeId: PILOT_SCOPE,
       classifyRuntime: outsideScope,
     });
     expect(res.kind).toBe("PASS");
@@ -206,7 +209,7 @@ describe("decideBundleEnforcement: native ASK ceiling", () => {
 // clamps every rule's eligible enforcement DOWN to `max` before the branch, so a would-be DENY becomes a
 // non-blocking WARN when the operator caps the session at warn. Default (no cap) is DENY (uncapped).
 function decideCapped(read: BundleCacheRead, call: ToolCall, maxEnforcement: EligibleEnforcement) {
-  return decideBundleEnforcement({ call, read, runtimeProjectRoot: "/runtime/root", classifyRuntime, maxEnforcement });
+  return decideBundleEnforcement({ call, read, runtimeProjectRoot: "/runtime/root", runtimeScopeId: PILOT_SCOPE, classifyRuntime, maxEnforcement });
 }
 
 describe("decideBundleEnforcement: WARN rung (non-blocking middle rung, INV-8)", () => {
@@ -262,6 +265,36 @@ describe("decideBundleEnforcement: WARN rung (non-blocking middle rung, INV-8)",
       expect(res.reason).toContain("node_c");
       expect(res.reason).not.toContain("node_d");
       expect(res.reason).toContain("and 1 more");
+    }
+  });
+
+  it("carries UNCAPPED per-rule warn evidence: every warned rule (even the ones the display cap hides) rides `warnings`", async () => {
+    // The display cap (WARN_AGGREGATE_CAP) only trims the human advisory TEXT. The review-queue evidence
+    // must never be trimmed: all four warned rules have to become their own incident, or node_d's warn is
+    // silently lost from the queue. `warnings` is that uncapped carrier, one entry per warned rule.
+    const read = fresh([
+      entry("node_a", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_b", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_c", pilotPayload({ enforcementCeiling: "WARN" })),
+      entry("node_d", pilotPayload({ enforcementCeiling: "WARN" })),
+    ]);
+    const res = await decide(read, writeMd("notes/x.md"));
+    expect(res.kind).toBe("WARN");
+    if (res.kind === "WARN") {
+      // All four, not the capped three: the evidence layer is independent of the display cap.
+      expect(res.warnings).toHaveLength(4);
+      expect(res.warnings.map((w) => w.ruleNodeId).sort()).toEqual([
+        "node_a",
+        "node_b",
+        "node_c",
+        "node_d",
+      ]);
+      // node_d survives into the evidence even though its reason text was suppressed from `reason`.
+      const nodeD = res.warnings.find((w) => w.ruleNodeId === "node_d");
+      expect(nodeD?.ruleVersionId).toBe("node_d_v1"); // entry() stamps versionId == `${nodeId}_v1`
+      expect(nodeD?.targetPath).toBe("notes/x.md");
+      expect(typeof nodeD?.ruleText).toBe("string");
+      expect((nodeD?.ruleText.length ?? 0)).toBeGreaterThan(0);
     }
   });
 
@@ -393,5 +426,90 @@ describe("decideBundleEnforcement: deterministic collapse across entries", () =>
 
   it("PASSES an empty bundle (a usable bundle with no rules)", async () => {
     expect((await decide(fresh([]), writeMd("notes/x.md"))).kind).toBe("PASS");
+  });
+});
+
+// A forbidden root spelled the way a human names a directory ("notes/", "./notes/") used to mint a rule
+// that could never match anything: the evaluator's prefix test became `startsWith("notes//")`. The rule
+// was ACTIVE, carried its attested ceiling, synced into the bundle, and enforced NOTHING. Payloads are
+// immutable, so the evaluator normalizes and every such rule already in the field starts enforcing what
+// its author meant. `rules attest` pins the same spelling at mint time so no new rule is born inert.
+describe("decideBundleEnforcement: a forbidden root spelled with a trailing slash still enforces", () => {
+  function rootedPayload(root: string, over: Partial<RulePayloadV1> = {}): RulePayloadV1 {
+    const base = pilotPayload(over);
+    return { ...base, compliance: { ...base.compliance, config: { forbiddenRootRelativePath: root } } };
+  }
+
+  it.each(["notes/", "notes//", "./notes", "./notes/", " notes/ "])(
+    "DENIES a write under a root stored as %p, exactly as it does for the canonical spelling",
+    async (root) => {
+      const res = await decide(fresh([entry("node_a", rootedPayload(root))]), writeMd("notes/x.md"));
+      expect(res.kind).toBe("DENY");
+    },
+  );
+
+  it("WARNS on a trailing-slash root whose attested ceiling is WARN, rather than silently passing", async () => {
+    const read = fresh([entry("node_a", rootedPayload("notes/", { enforcementCeiling: "WARN" }))]);
+    const res = await decide(read, writeMd("notes/x.md"));
+    expect(res.kind).toBe("WARN");
+  });
+
+  it("keeps the boundary honest: a sibling of the root is still COMPLIANT", async () => {
+    const read = fresh([entry("node_a", rootedPayload("notes/"))]);
+    expect((await decide(read, writeMd("notes-archive/x.md"))).kind).toBe("PASS");
+  });
+
+  // The reason string is the only part of this the operator ever reads. If it renders the raw stored
+  // root it prints `"notes//"`, naming a root that is not the one they were judged against.
+  it.each(["DENY", "WARN"] as const)("names the root the way it was matched, not the way it was stored (%s)", async (ceiling) => {
+    const over = ceiling === "WARN" ? { enforcementCeiling: "WARN" as const } : {};
+    const res = await decide(fresh([entry("node_a", rootedPayload("notes/", over))]), writeMd("notes/x.md"));
+    const reason = "reason" in res ? res.reason : "";
+    expect(reason).toContain('"notes/"');
+    expect(reason).not.toContain("//");
+  });
+});
+
+// The PERSONAL per-checkout scope gate. A PERSONAL rule is a per-checkout preference: it binds to the ONE
+// checkout it was attested from (payload.runtimeScopeId), so it enforces there and nowhere else. The bundle
+// is principal-bound (only the owner ever sees it), but one owner has MANY checkouts of one workspace;
+// pre-cutover the local CE0 store keyed enforcement by runtimeScopeId, and the bundle path silently dropped
+// that gate, widening a per-checkout personal deny into an all-checkouts deny. TEAM/ORGANIZATION rules stay
+// workspace-wide (their attestor's realpath can never match another member's machine), so are never gated.
+describe("decideBundleEnforcement: PERSONAL rules are gated to their attested checkout scope", () => {
+  const CHECKOUT_A = PILOT_SCOPE; // where the rule was attested (pilotPayload().runtimeScopeId)
+  const CHECKOUT_B = "/work/intel"; // a sibling checkout of the SAME workspace, a different realpath
+
+  // Enforce with an explicit current-checkout scope, so a test can stand in either checkout.
+  function decideAt(read: BundleCacheRead, call: ToolCall, currentScope: string) {
+    return decideBundleEnforcement({ call, read, runtimeProjectRoot: "/runtime/root", runtimeScopeId: currentScope, classifyRuntime });
+  }
+
+  function personal(over: Partial<RulePayloadV1> = {}) {
+    return entry("node_a", pilotPayload(over), { authorityScope: "PERSONAL", ownerUserId: "user_an" });
+  }
+
+  it("ENFORCES a PERSONAL deny in the checkout it was attested from (scope matches)", async () => {
+    expect((await decideAt(fresh([personal()]), writeMd("notes/x.md"), CHECKOUT_A)).kind).toBe("DENY");
+  });
+
+  it("does NOT enforce a PERSONAL deny in a SIBLING checkout of the same workspace (scope mismatch)", async () => {
+    // Same owner, same principal-bound bundle, different checkout: the per-checkout personal deny must not fire.
+    expect((await decideAt(fresh([personal()]), writeMd("notes/x.md"), CHECKOUT_B)).kind).toBe("PASS");
+  });
+
+  it("keeps a TEAM rule workspace-wide: it enforces in a checkout other than the attestor's", async () => {
+    const teamRule = entry("node_a", pilotPayload(), { authorityScope: "TEAM", ownerUserId: null });
+    expect((await decideAt(fresh([teamRule]), writeMd("notes/x.md"), CHECKOUT_B)).kind).toBe("DENY");
+  });
+
+  it("trusts a PERSONAL rule with an empty runtimeScopeId (legacy), enforcing rather than silently skipping", async () => {
+    // Scan-cache guard doctrine: only a PRESENT, mismatching stamp is skipped; a missing/empty stamp is
+    // trusted so a legacy payload never regresses to un-enforced.
+    expect((await decideAt(fresh([personal({ runtimeScopeId: "" })]), writeMd("notes/x.md"), CHECKOUT_B)).kind).toBe("DENY");
+  });
+
+  it("gates BEFORE the stale-degrade: a foreign-scope PERSONAL deny PASSes even on a stale bundle (never an ASK)", async () => {
+    expect((await decideAt(stale([personal()]), writeMd("notes/x.md"), CHECKOUT_B)).kind).toBe("PASS");
   });
 });

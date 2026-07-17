@@ -20,6 +20,7 @@ import {
   SESSION_GATE_DIR,
   writeConfig,
   type WorkspaceCliConfig,
+  userHomeDir,
 } from "../lib/config";
 import { backfillSessionPrompts } from "../lib/transcript-prompts";
 import { runWire, type WireResult } from "../lib/wire";
@@ -55,6 +56,13 @@ import {
   type ReconcileIO,
   type ReconcileAction,
 } from "../connectors/claude-code/plugin-migrate";
+import {
+  emitEnvelope,
+  failInMode,
+  getMachineCommand,
+  isMachineMode,
+  successEnvelope,
+} from "../lib/machine-output";
 
 // `mla activate` (folder = workspace, T2.1,
 // notes/20260604-folder-equals-workspace-binding-design.md)
@@ -282,6 +290,29 @@ export function commitGuidanceLines(dir: string): string[] {
   ];
 }
 
+// A plain-language "what did I just run, and why" for the fresh-provision path.
+// Interview finding: a first-time user runs `mla activate`, sees "Provisioned
+// workspace ...", and has no idea what a workspace is or why they needed one. This
+// says it once, in their words, at the exact moment a workspace is born. It stays
+// OFF the re-run (bind) path, which already prints "already bound" and needs no
+// re-explanation. Pure: returns the lines to print.
+export function activateExplainerLines(): string[] {
+  return [
+    "What this did:",
+    "  `mla activate` bound this folder to a Meetless workspace: the governed memory",
+    "  your coding agents read before they work and write to as they learn. The",
+    "  decisions, constraints, conventions, and boundaries of this repo live here, so",
+    "  agents stop shipping against stale assumptions and stop asking you the same",
+    "  questions. One workspace per folder.",
+    "",
+    "Why you ran it:",
+    "  It is the one-time setup that turns this repo into a governed workspace, and it",
+    "  wired Claude Code (the capture hooks, the /mla skill, MCP, and the onboarding",
+    "  scouts) so capture starts on its own. You do not run it again for this folder;",
+    "  re-running only re-checks the binding and repairs the wiring if it drifted.",
+  ];
+}
+
 export interface BootstrapResult {
   ok: boolean;
   sessionId?: string;
@@ -468,7 +499,7 @@ export function bootstrapCurrentSession(dir: string): BootstrapResult {
 function claudeConfigDir(): string {
   const override = process.env.CLAUDE_CONFIG_DIR;
   if (override && override.trim()) return override.trim();
-  return path.join(os.homedir(), ".claude");
+  return path.join(userHomeDir(), ".claude");
 }
 
 // The back-fill cutoff: only prompts strictly before this instant were dropped
@@ -541,27 +572,33 @@ function sameDir(a: string, b: string): boolean {
 // cli-config.json. cli-config no longer carries the workspaceId (T1.1); this
 // only fetches the creds the provision POST / repair probe need.
 function loadCfgOrExplain(): CliConfig | number {
+  const command = getMachineCommand() ?? "activate";
   if (!configExists()) {
-    console.error(
+    return failInMode(
+      command,
+      "config_error",
       `cli-config.json not found at ${CFG_PATH}. Run 'mla init --control-token <token>' first.`,
+      2,
     );
-    return 2;
   }
   try {
     return readConfig();
   } catch (e) {
-    console.error((e as Error).message);
-    return 2;
+    return failInMode(command, "config_error", (e as Error).message, 2);
   }
 }
 
 export async function runActivate(argv: string[]): Promise<number> {
+  // Machine mode is armed only for the plain `activate` operation; `--repair`
+  // resolves to `activate.repair` (unsupported in Phase 1) and never reaches
+  // this handler in machine mode, so the repair path below stays human-only.
+  const command = getMachineCommand() ?? "activate";
+
   let flags: ActivateFlags;
   try {
     flags = parseActivateArgs(argv);
   } catch (e) {
-    console.error((e as Error).message);
-    return 2;
+    return failInMode(command, "usage_error", (e as Error).message, 2);
   }
 
   const cwd = process.cwd();
@@ -584,11 +621,13 @@ export async function runActivate(argv: string[]): Promise<number> {
   // distinct flags, never overloaded (INV-FLAGS-1). Passing both is a category
   // error, refused before any side effect.
   if (flags.here && flags.create) {
-    console.error(
+    return failInMode(
+      command,
+      "usage_error",
       "`--here` and `--create` cannot be combined: --here is the in-Git subdir " +
         "override, --create is the non-Git override.",
+      2,
     );
-    return 2;
   }
 
   // Create-vs-bind keys on marker PRESENCE. Under `--here` the resolution is
@@ -607,15 +646,18 @@ export async function runActivate(argv: string[]): Promise<number> {
   }
 
   const git = gitInfo(cwd);
-  const guard = checkCreateGuard(flags, git, cwd);
+  const guard = checkCreateGuard(command, flags, git, cwd);
   if (guard !== 0) return guard;
 
   return runProvision(cwd, flags);
 }
 
 // Repo-root guard (INV-FLAGS-1). Returns 0 to allow provisioning, or a non-zero
-// exit code after printing the refusal. Called only when no marker resolves.
+// exit code after reporting the refusal. Called only when no marker resolves. Each
+// refusal is one failInMode call: human mode prints the (newline-joined) message to
+// stderr exactly as before; machine mode emits a single guard error envelope.
 function checkCreateGuard(
+  command: string,
   flags: ActivateFlags,
   git: { insideWorkTree: boolean; root?: string },
   cwd: string,
@@ -623,12 +665,14 @@ function checkCreateGuard(
   if (flags.here) {
     // --here is the in-Git subdir override; it only applies inside a Git tree.
     if (!git.insideWorkTree) {
-      console.error("`--here` only applies inside a Git repository.");
-      console.error(
-        "This directory is not inside a Git repository. To create a workspace " +
+      return failInMode(
+        command,
+        "activate_guard",
+        "`--here` only applies inside a Git repository.\n" +
+          "This directory is not inside a Git repository. To create a workspace " +
           "here anyway, use `mla activate --create`.",
+        2,
       );
-      return 2;
     }
     return 0;
   }
@@ -638,47 +682,52 @@ function checkCreateGuard(
     // the safe paths are the repo root (no flag) or a subdir (`--here`).
     if (git.insideWorkTree) {
       const atRoot = git.root ? sameDir(cwd, git.root) : false;
-      console.error(
-        "`--create` is for directories that are NOT inside a Git repository.",
+      const where = atRoot
+        ? "You are at a Git repo root; run `mla activate` (no flag) to provision here."
+        : "You are in a Git subdir; run `mla activate --here` to bind this subdir, " +
+          "or cd to the repo root and run `mla activate`.";
+      return failInMode(
+        command,
+        "activate_guard",
+        "`--create` is for directories that are NOT inside a Git repository.\n" +
+          where,
+        2,
       );
-      if (atRoot) {
-        console.error(
-          "You are at a Git repo root; run `mla activate` (no flag) to provision here.",
-        );
-      } else {
-        console.error(
-          "You are in a Git subdir; run `mla activate --here` to bind this subdir, " +
-            "or cd to the repo root and run `mla activate`.",
-        );
-      }
-      return 2;
     }
     return 0;
   }
 
   // No override flag. Outside Git, refuse and point at --create.
   if (!git.insideWorkTree) {
-    console.error(
-      "No Meetless workspace is bound here, and this directory is not inside a Git repository.",
+    return failInMode(
+      command,
+      "activate_guard",
+      "No Meetless workspace is bound here, and this directory is not inside a Git repository.\n" +
+        "To create a workspace here, run `mla activate --create`.",
+      2,
     );
-    console.error("To create a workspace here, run `mla activate --create`.");
-    return 2;
   }
 
   // Inside Git with no flag: auto-create only at the repo root.
   const atRoot = git.root ? sameDir(cwd, git.root) : false;
   if (atRoot) return 0;
 
-  console.error("No Meetless workspace is bound here.");
-  console.error("");
-  console.error("You are inside a Git repository but not at its root:");
-  console.error(`  repo root: ${git.root}`);
-  console.error(`  cwd:       ${cwd}`);
-  console.error("");
-  console.error("Run one of:");
-  console.error(`  cd ${git.root} && mla activate`);
-  console.error("  mla activate --here");
-  return 2;
+  return failInMode(
+    command,
+    "activate_guard",
+    [
+      "No Meetless workspace is bound here.",
+      "",
+      "You are inside a Git repository but not at its root:",
+      `  repo root: ${git.root}`,
+      `  cwd:       ${cwd}`,
+      "",
+      "Run one of:",
+      `  cd ${git.root} && mla activate`,
+      "  mla activate --here",
+    ].join("\n"),
+    2,
+  );
 }
 
 interface ProvisionResponse {
@@ -738,6 +787,7 @@ async function runProvision(
   cwd: string,
   flags: ActivateFlags,
 ): Promise<number> {
+  const command = getMachineCommand() ?? "activate";
   const loaded = loadCfgOrExplain();
   if (typeof loaded === "number") return loaded;
   const cfg = loaded;
@@ -753,20 +803,17 @@ async function runProvision(
     );
   } catch (e) {
     const err = e as HttpError;
+    let msg: string;
     if (err.status === 401 || err.status === 403) {
-      console.error(
-        "Control rejected the provision request (not authorized). Check `mla doctor` and your token.",
-      );
+      msg =
+        "Control rejected the provision request (not authorized). Check `mla doctor` and your token.";
     } else if (err.status !== undefined) {
-      console.error(
-        `Control could not provision the workspace (HTTP ${err.status}).`,
-      );
+      msg = `Control could not provision the workspace (HTTP ${err.status}).`;
     } else {
-      console.error(
-        "Could not reach control to provision the workspace. Is it running? (`mla doctor`)",
-      );
+      msg =
+        "Could not reach control to provision the workspace. Is it running? (`mla doctor`)";
     }
-    return 1;
+    return failInMode(command, "provision_failed", msg, 1);
   }
 
   // Do this BEFORE anything else touches control: finishActivate goes on to run
@@ -783,12 +830,16 @@ async function runProvision(
     note: flags.note,
   });
 
-  console.log(`Provisioned workspace ${resp.id} (${resp.name}).`);
-  console.log(`  marker:      ${markerPath}`);
-  console.log(`  workspaceId: ${resp.id}`);
-  if (healed) console.log("  identity:    signed-in session bound to this workspace as OWNER.");
-  console.log("");
-  for (const line of commitGuidanceLines(cwd)) console.log(line);
+  if (!isMachineMode()) {
+    console.log(`Provisioned workspace ${resp.id} (${resp.name}).`);
+    console.log(`  marker:      ${markerPath}`);
+    console.log(`  workspaceId: ${resp.id}`);
+    if (healed) console.log("  identity:    signed-in session bound to this workspace as OWNER.");
+    console.log("");
+    for (const line of activateExplainerLines()) console.log(line);
+    console.log("");
+    for (const line of commitGuidanceLines(cwd)) console.log(line);
+  }
 
   // Fresh workspace = empty governed KB: invite onboarding (one-time per workspace).
   return finishActivate(cwd, resolveBootstrapTier(flags), true);
@@ -801,12 +852,14 @@ function runBind(
   cwd: string,
   tier: BootstrapTier,
 ): number {
-  const nameSuffix = found.workspaceName ? ` (${found.workspaceName})` : "";
-  const id = found.workspaceId ?? "(no workspaceId in marker)";
-  console.log(`Already activated: ${found.path} -> ${id}${nameSuffix}`);
-  console.log(
-    "  Marker unchanged; this folder is already bound to a workspace.",
-  );
+  if (!isMachineMode()) {
+    const nameSuffix = found.workspaceName ? ` (${found.workspaceName})` : "";
+    const id = found.workspaceId ?? "(no workspaceId in marker)";
+    console.log(`Already activated: ${found.path} -> ${id}${nameSuffix}`);
+    console.log(
+      "  Marker unchanged; this folder is already bound to a workspace.",
+    );
+  }
 
   return finishActivate(cwd, tier);
 }
@@ -979,7 +1032,7 @@ function finishActivate(
   // (and every subsequent hook) is no longer short-circuited by
   // meetless_session_disabled.
   const clearedSid = clearDeactivateSentinel();
-  if (clearedSid) {
+  if (clearedSid && !isMachineMode()) {
     console.log("");
     console.log(
       `Cleared a prior \`mla mute\` for this session (${clearedSid.slice(0, 8)}); capture is back ON.`,
@@ -993,10 +1046,14 @@ function finishActivate(
   // we may not assert that before we know. Never block activation on the preview; it
   // is reassurance, not a gate.
   let scan: ScanResult | null = null;
+  // Hoisted so the machine envelope tail can report which workspace was activated.
+  // The assignment happens before any throwing call (rescanAndCache), so a scan
+  // failure still leaves the resolved id in hand.
+  let workspaceId: string | null = null;
   try {
-    const scanWorkspaceId = tryResolveWorkspaceId(cwd); // existing resolver from ../lib/workspace
-    if (scanWorkspaceId) {
-      scan = rescanAndCache({ cwd, workspaceId: scanWorkspaceId });
+    workspaceId = tryResolveWorkspaceId(cwd); // existing resolver from ../lib/workspace
+    if (workspaceId) {
+      scan = rescanAndCache({ cwd, workspaceId });
     }
   } catch {
     // swallow: the preview must never fail activation
@@ -1004,7 +1061,7 @@ function finishActivate(
 
   const boot = bootstrapCurrentSession(cwd);
 
-  if (scan) {
+  if (scan && !isMachineMode()) {
     console.log("");
     console.log(renderBootstrapSummary(scan, { injectedNow: boot.ok }));
 
@@ -1055,35 +1112,41 @@ function finishActivate(
     }
   }
 
-  console.log("");
-  for (const line of renderCaptureAndWiringLines({
-    boot,
-    installedWiring: wiringNeedsRestart(selfHealed),
-    inSession: !!boot.sessionId,
-  })) {
-    console.log(line);
+  if (!isMachineMode()) {
+    console.log("");
+    for (const line of renderCaptureAndWiringLines({
+      boot,
+      installedWiring: wiringNeedsRestart(selfHealed),
+      inSession: !!boot.sessionId,
+    })) {
+      console.log(line);
+    }
   }
 
+  // reconcileWiringBackstop APPLIES wiring changes, so it must run in every mode;
+  // only its human advisories are suppressed under machine output.
   const backstop = reconcileWiringBackstop();
-  if (backstop.failed) {
-    // Fail-safe warning (An's exact copy, design §6.7): activate succeeded, but we
-    // could not verify or repair the global wiring, so point the user at the primary
-    // fix path rather than pretending everything is wired.
-    console.warn(
-      "Repository activated, but MLA could not verify or repair global wiring. Run `mla doctor --fix`.",
-    );
-  } else if (backstop.changed && backstop.restartRequired) {
-    console.log(
-      `Wiring updated (${backstop.action}). Restart Claude Code so the change takes effect.`,
-    );
-  }
-  // Blocker 3: surface the planner's advisory even on a noop plan. A non-global install
-  // reconciles to noop (nothing changed, nothing failed), so without this the user would
-  // never learn from `mla activate` that their plugin is project-scoped. Independent of
-  // the failed/changed branches above; `warn` is only set on the success path, so it
-  // never doubles up with the fail-safe copy (the catch path returns no `warn`).
-  if (backstop.warn) {
-    console.warn(backstop.warn);
+  if (!isMachineMode()) {
+    if (backstop.failed) {
+      // Fail-safe warning (An's exact copy, design §6.7): activate succeeded, but we
+      // could not verify or repair the global wiring, so point the user at the primary
+      // fix path rather than pretending everything is wired.
+      console.warn(
+        "Repository activated, but MLA could not verify or repair global wiring. Run `mla doctor --fix`.",
+      );
+    } else if (backstop.changed && backstop.restartRequired) {
+      console.log(
+        `Wiring updated (${backstop.action}). Restart Claude Code so the change takes effect.`,
+      );
+    }
+    // Blocker 3: surface the planner's advisory even on a noop plan. A non-global install
+    // reconciles to noop (nothing changed, nothing failed), so without this the user would
+    // never learn from `mla activate` that their plugin is project-scoped. Independent of
+    // the failed/changed branches above; `warn` is only set on the success path, so it
+    // never doubles up with the fail-safe copy (the catch path returns no `warn`).
+    if (backstop.warn) {
+      console.warn(backstop.warn);
+    }
   }
 
   // A live Claude Code session is what makes `/mla onboard` invokable; key off the
@@ -1092,6 +1155,27 @@ function finishActivate(
     inSession: !!boot.sessionId,
     justProvisioned: recommendOnboard,
   });
+
+  // Machine mode: the whole activation collapses to ONE success envelope. The onboarding
+  // hand-off travels as a typed next_action (the connector invokes the onboard skill), not
+  // as the `MLA_NEXT: onboard` stdout sentinel, which is the human/legacy transport.
+  if (isMachineMode()) {
+    const command = getMachineCommand() ?? "activate";
+    return emitEnvelope(
+      successEnvelope(
+        command,
+        {
+          workspaceId,
+          repositoryRoot: cwd,
+          provisioned: recommendOnboard,
+          sessionActive: !!boot.sessionId,
+        },
+        onboard ? { nextAction: { kind: "skill", ref: "onboard" } } : {},
+      ),
+      0,
+    );
+  }
+
   if (onboard) {
     console.log("");
     console.log(onboard);

@@ -29,6 +29,7 @@ import {
 import { computeRepoFingerprint } from "./lib/git";
 import { traceUploadEnabled } from "./lib/analytics/consent";
 import { captureCommandEvent } from "./lib/analytics/capture";
+import { deriveInvoker } from "./lib/analytics/invoker";
 import {
   classifyOutcome,
   isReportableFault,
@@ -44,11 +45,25 @@ import { tryResolveWorkspaceId } from "./lib/workspace";
 import type { Tracer } from "@meetless/trace-core";
 import {
   type CommandSpec,
+  nearestCommands,
   renderCommandHelp,
   renderUsage,
   resolveCommand,
   wantsLeadingHelp,
 } from "./lib/command-registry";
+import {
+  emitUnsupportedOutputMode,
+  getOutputMode,
+  hasOutputFlag,
+  isMachineMode,
+  resetMachineCommand,
+  resetOutputMode,
+  resolveOutputMode,
+  setMachineCommand,
+  setOutputMode,
+  stripOutputFlag,
+} from "./lib/machine-output";
+import { resolveOperation, supportsMachineOutput } from "./lib/machine-capability";
 import { runInit } from "./commands/init";
 import { runLogin } from "./commands/login";
 import { runLogout } from "./commands/logout";
@@ -66,6 +81,7 @@ import { runInternalFinalize } from "./commands/internal-finalize";
 import { runInternalActiveReview } from "./commands/internal-active-review";
 import { runInternalAutoIndex } from "./commands/internal-auto-index";
 import { runInternalEvidenceInject } from "./commands/internal-evidence-inject";
+import { runInternalRuleMeter } from "./commands/internal-rule-meter";
 import { runInternalEvidenceCorrelate } from "./commands/internal-evidence-correlate";
 import {
   runInternalEvidenceTurnOpen,
@@ -467,9 +483,22 @@ export const COMMANDS: CommandSpec[] = [
                      ADVISORY: the server derives trust from the capture path, so
                      every ingest is born PENDING (reviewOutcome=PENDING) and is
                      readable but not yet trusted for knowledge-use until accepted
-                     via \`kb accept\` / Console review. Trust (reviewOutcome) is a
-                     SEPARATE axis from relationship review (\`kb pending\`/\`kb
-                     review\`). See \`mla kb help\`.)
+                     via \`kb accept <claimId>\` / Console review. Trust
+                     (reviewOutcome) is a SEPARATE axis from relationship review
+                     (\`kb pending\`/\`kb review\`). See \`mla kb help\`.)
+  mla kb claims [--pending] [--outcome <O>] [--doc <id>] [--limit <n>] [--all]
+                    [--json] [--workspace <id>]
+                    (the claim-grain TRUST queue: extraction normalizes each
+                     ingested document into claims, and a human rules on each one.
+                     --pending lists only those awaiting a verdict, with the full
+                     backlog count; --all walks every page.)
+  mla kb accept <claimId> [--expect <O>] [--json] [--workspace <id>]
+  mla kb reject <claimId> [--expect <O>] [--json] [--workspace <id>]
+                    (record the trust verdict that decides whether the agent
+                     retrieves and cites this claim. HUMAN-ONLY: \`--agent\` is
+                     refused, because a wrong auto-verdict manufactures false
+                     governance. --expect guards a concurrent reviewer (409).
+                     Prints the audit stamp — who, when, which event.)
   mla kb show <kbdoc:<id>|note:<path>|<path>>
                     [--workspace <id>] [--all] [--audit-all] [--json] [--open]
                     (document-centric view: identity, governed-liveness
@@ -904,13 +933,21 @@ export const COMMANDS: CommandSpec[] = [
   mla _internal update-check
                     (detached, throttled background version check; fetches the
                      latest release and caches it for the upgrade nag. Honors
-                     MLA_NO_UPDATE_NOTIFIER; always exits 0.)`,
+                     MLA_NO_UPDATE_NOTIFIER; always exits 0.)
+  mla _internal rule-meter --meter <json> [--trace-id <id>] [--workspace-id <id>]
+                    [--session-id <id>] [--turn-index <n>]
+                    (emit mla_rule_injection: what this turn's rules COST the
+                     model's context window, ambient floor vs scoped. The meter
+                     JSON is measured by assemble-context on the hot path and
+                     handed here to be shipped, because the hot path may not do
+                     network. Fired detached from UserPromptSubmit; fail-soft.)`,
     handler: (argv) => {
       const [, sub, ...rest] = argv;
       if (sub === "finalize-session") return runInternalFinalize(rest);
       if (sub === "active-review") return runInternalActiveReview(rest);
       if (sub === "auto-index") return runInternalAutoIndex(rest);
       if (sub === "evidence-inject") return runInternalEvidenceInject(rest);
+      if (sub === "rule-meter") return runInternalRuleMeter(rest);
       if (sub === "evidence-correlate") return runInternalEvidenceCorrelate(rest);
       if (sub === "evidence-turn-open") return runInternalEvidenceTurnOpen(rest);
       if (sub === "evidence-capture") return runInternalEvidenceCapture(rest);
@@ -958,6 +995,30 @@ function versionString(): string {
   }
 }
 
+/**
+ * The machine-output capability gate (§4.3). Returns a number to short-circuit
+ * dispatch, or null to proceed to the handler. In human mode it always returns
+ * null. In machine mode it resolves the canonical operation and branches:
+ *   - supported: arm the envelope (record the command) and proceed to the handler.
+ *   - unsupported/unresolved, strict flag: emit one `unsupported_output_mode`
+ *     error envelope and exit 2.
+ *   - unsupported/unresolved, best-effort env: downgrade to the legacy human path
+ *     (the connector summarizes the non-envelope stdout, §4.1).
+ */
+function applyMachineCapability(command: string, argv: string[]): number | null {
+  if (!isMachineMode()) return null;
+  const op = resolveOperation(command, argv);
+  if (op && supportsMachineOutput(op)) {
+    setMachineCommand(op);
+    return null;
+  }
+  if (getOutputMode() === "machine-strict") {
+    return emitUnsupportedOutputMode(op ?? command);
+  }
+  setOutputMode("human");
+  return null;
+}
+
 export async function dispatch(argv: string[]): Promise<number> {
   const [cmd, sub] = argv;
 
@@ -998,9 +1059,40 @@ export async function dispatch(argv: string[]): Promise<number> {
       console.log(renderCommandHelp(COMMANDS, cmd));
       return 0;
     }
+    // Machine-output capability, resolved at the single choke point before any
+    // handler emits (§4.3). A no-op in human mode. In machine mode it either arms
+    // the envelope for a supported operation, emits one `unsupported_output_mode`
+    // error (strict + unsupported), or downgrades to the legacy human path
+    // (best-effort + unsupported). Keyed on the CANONICAL name (spec.name), so an
+    // alias resolves the same operation. `--help` is intercepted above and stays
+    // human text, exempt from the envelope contract (§5).
+    const gated = applyMachineCapability(spec.name, argv);
+    if (gated !== null) return gated;
     return spec.handler(argv);
   }
-  console.error(`Unknown command: ${cmd}\n\n${renderUsage(COMMANDS)}${staleCommandHint()}`);
+  // An error path must not be a command emitter (proposal §3 bug 1): the old
+  // handler answered a single wrong word with the ENTIRE catalog, so a paste of
+  // one bad guess came back as forty pasteable commands, a self-amplifying
+  // failure that an agent reading piped output cannot tell from a real menu.
+  // Two narrow cases, then the concise default:
+  //   - `onboard` is deliberately NOT in COMMANDS (registering it would pollute
+  //     the help screen and break the catalog bijection test). It is an agent
+  //     SKILL. Name the skill in one line; never a catalog (proposal §3 bug 2).
+  //   - otherwise: up to three nearest command names ("did you mean"), a pointer
+  //     to `mla help` for the full catalog (that is help's job, not the error
+  //     path's), and the stale-command hint a piped agent needs to tell "mla
+  //     cannot do this" from "your mla is out of date". Exit stays 2.
+  if (cmd === "onboard") {
+    console.error(
+      "onboard is an agent skill, not a CLI command; in your coding agent, run /mla onboard",
+    );
+    return 2;
+  }
+  const near = nearestCommands(COMMANDS, cmd);
+  const didYouMean = near.length ? `\nDid you mean: ${near.join(", ")}?` : "";
+  console.error(
+    `Unknown command: ${cmd}${didYouMean}\nRun 'mla help' for the full command list.${staleCommandHint()}`,
+  );
   return 2;
 }
 
@@ -1147,6 +1239,41 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   const [cmd, sub] = argv;
   const cmdName = cmd ?? "(none)";
   const subName = sub ?? null;
+
+  // Machine-output transport (§4.1, §4.10). Consume the env request and CONTAIN
+  // it (delete it from this process's env) so no child this run spawns -- the
+  // detached background check just below, a promote re-exec, a hook subprocess --
+  // silently inherits machine mode. Then resolve the central output mode ONCE:
+  // `--output=json` flag beats `MEETLESS_OUTPUT=json` env beats human. The strict
+  // flag is stripped from argv centrally here so it never reaches a command's own
+  // parser (the crash the env transport exists to avoid). Containment must run
+  // AFTER maybePromoteStagedAndReExec (a promote re-exec re-exports the env so
+  // machine mode survives the swap) and BEFORE maybeSpawnBackgroundCheck.
+  //
+  // `mcp` is structurally excluded (§4.1): its stdout is the JSON-RPC stream for
+  // the whole session, so the env is ignored and an explicit `--output=json` is a
+  // plain usage error, never an envelope.
+  const requestedOutput = process.env.MEETLESS_OUTPUT;
+  // Derive the invoker (§4.11) from the captured value BEFORE containment deletes
+  // it: `agent` is marked only by resolve-mla's MEETLESS_OUTPUT=json transport, and
+  // by finalize (where the command event is recorded) the env var is gone, so the
+  // signal must be read here or it is lost. Derivation reads execution context only,
+  // never argv (INV-ARGV-1).
+  const invoker = deriveInvoker({ requestedOutput, env: process.env });
+  delete process.env.MEETLESS_OUTPUT;
+  resetOutputMode();
+  resetMachineCommand();
+  if (cmdName === "mcp") {
+    if (hasOutputFlag(argv)) {
+      console.error(
+        "mla mcp does not support --output; its stdout is the MCP protocol stream.",
+      );
+      return 2;
+    }
+  } else {
+    setOutputMode(resolveOutputMode(argv, requestedOutput));
+    argv = stripOutputFlag(argv);
+  }
 
   // Teardown command (BUG-1 D): `mla uninstall` deletes ~/.meetless as its whole
   // point. Every post-command telemetry writer below routes through ensureHome(),
@@ -1298,6 +1425,7 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
       actorUserId: cfg?.actorUserId ?? null,
       mlaVersion: buildInfo.version,
       gitSha: buildInfo.sha,
+      invoker,
       startedAtMs,
       nowMs: Date.now(),
       cfg: cfg ?? null,

@@ -198,28 +198,11 @@ REPORT_LINE="$(jq -c -n \
   ml_unlock 9 "$LOG_DIR/report-citations.lock"
 )
 
-# End-of-run review card: surface up to 5 deterministic stale signals to the user.
-# P0A-minimal: written to a LOCAL jsonl only (review_card is not in the flush
-# allowlist), later surfaced by `mla status` / `mla context list`. Cheap jq read of
-# the scan cache; never recomputes the scan. Always exits 0 so it cannot abort Stop.
-build_stop_review_card() {
-  local cache="$HOME/.meetless/workspaces/$WORKSPACE_ID/scan-cache.json"
-  [[ -r "$cache" ]] || return 0
-  jq -c -n \
-    --slurpfile c "$cache" \
-    --arg sid "$SESSION_ID" \
-    --arg ts "$TS" \
-    '{
-       ts: $ts, event: "review_card", session_id: $sid,
-       items: ($c[0].staleSignals // [])[0:5] | map({id: .id, detail: .detail, source: .source}),
-       total: (($c[0].staleSignals // []) | length)
-     }' 2>/dev/null || true
-}
-
-REVIEW_CARD_LINE="$(build_stop_review_card)"
-if [[ -n "$REVIEW_CARD_LINE" ]]; then
-  printf '%s\n' "$REVIEW_CARD_LINE" >> "$HOME/.meetless/workspaces/$WORKSPACE_ID/review-cards.jsonl" 2>/dev/null || true
-fi
+# End-of-run review card: up to 5 deterministic stale signals, appended to the local
+# review-cards.jsonl for `mla status` / `mla context list`. See write_stop_review_card
+# in common.sh (it owns the state-path resolution and is driven directly by
+# test/hooks/build-stop-card.spec.ts). Never aborts Stop.
+write_stop_review_card "$SESSION_ID" "$TS"
 
 STOPPED_KEY="$(gen_event_key)"
 LINE_STOPPED="$(jq -c -n \

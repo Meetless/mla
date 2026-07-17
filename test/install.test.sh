@@ -127,7 +127,7 @@ note "install.sh test suite"
 new_sandbox
 stub_uname Darwin arm64
 make_fixture "mla-aarch64-apple-darwin.tar.gz" 'echo v1'
-: > "$HOME_DIR/.zshrc"   # configure_path only touches rc files that exist
+: > "$HOME_DIR/.zshrc"
 run_installer
 if [ "$RC" -eq 0 ] && have_file "$HOME_DIR/.meetless/bin/mla" \
    && [ -x "$HOME_DIR/.meetless/bin/mla" ] \
@@ -175,8 +175,9 @@ make_fixture "mla-aarch64-apple-darwin.tar.gz" 'echo v1'
 : > "$HOME_DIR/.zshrc"
 run_installer MLA_NO_MODIFY_PATH=1
 if [ "$RC" -eq 0 ] && have_file "$HOME_DIR/.meetless/bin/env" \
-   && ! file_has "$HOME_DIR/.zshrc" '.meetless/bin/env'; then
-  ok "MLA_NO_MODIFY_PATH=1 leaves rc files untouched"
+   && ! file_has "$HOME_DIR/.zshrc" '.meetless/bin/env' \
+   && ! have_file "$HOME_DIR/.zshenv" && ! have_file "$HOME_DIR/.profile"; then
+  ok "MLA_NO_MODIFY_PATH=1 leaves rc files untouched and creates none"
 else
   bad "no-modify-path" "rc=$RC zshrc=$(cat "$HOME_DIR/.zshrc")"
 fi
@@ -296,6 +297,64 @@ if [ "$RC" -eq 0 ] && have_file "$HOME_DIR/.meetless/bin/mla" \
   ok "linux glibc fresh install resolves the gnu triple"
 else
   bad "linux glibc install" "rc=$RC out=$(cat "$OUT")"
+fi
+cleanup
+
+# --- 14. pristine account (NO rc files) still gets PATH ---------------------
+# The prod bug: a first-time macOS account has no ~/.zshrc, ~/.bashrc or ~/.profile
+# (Homebrew writes ~/.zprofile, not ~/.zshrc). configure_path skipped every rc file
+# that did not exist, so it mutated nothing -- while the installer still exited 0 and
+# said "Restart your shell". mla was never on PATH. We must CREATE the rc file.
+new_sandbox
+stub_uname Darwin arm64
+make_fixture "mla-aarch64-apple-darwin.tar.gz" 'echo v1'
+run_installer                       # note: no rc file pre-created
+if [ "$RC" -eq 0 ] && file_has "$HOME_DIR/.zshenv" '.meetless/bin/env' \
+   && file_has "$HOME_DIR/.profile" '.meetless/bin/env'; then
+  ok "pristine HOME with no rc files still gets PATH configured"
+else
+  bad "pristine HOME" "rc=$RC home=$(ls -A "$HOME_DIR")"
+fi
+
+# 14b. the assertion that matters: a real shell resolves `mla` afterwards. zsh -c is
+# what a coding agent, hook, or script spawns -- and it reads .zshenv ONLY, never
+# .zshrc, which is why "command not found: mla" persisted inside Claude Code.
+if command -v zsh >/dev/null 2>&1; then
+  got="$(env -i HOME="$HOME_DIR" zsh -c 'command -v mla' 2>/dev/null)"
+  if [ "$got" = "$HOME_DIR/.meetless/bin/mla" ]; then
+    ok "non-interactive 'zsh -c' resolves mla (the coding-agent shell)"
+  else
+    bad "zsh -c resolves mla" "got='$got' want='$HOME_DIR/.meetless/bin/mla'"
+  fi
+else
+  note "  SKIP: zsh not installed; cannot assert the coding-agent shell"
+fi
+
+# 14c. same for a bash login shell, which reads .profile.
+if command -v bash >/dev/null 2>&1; then
+  got="$(env -i HOME="$HOME_DIR" bash -lc 'command -v mla' 2>/dev/null)"
+  if [ "$got" = "$HOME_DIR/.meetless/bin/mla" ]; then
+    ok "bash login shell resolves mla"
+  else
+    bad "bash -lc resolves mla" "got='$got' want='$HOME_DIR/.meetless/bin/mla'"
+  fi
+fi
+cleanup
+
+# --- 15. env is idempotent: sourcing it twice must not duplicate PATH -------
+# env is now referenced from several rc files (.zshenv AND .zshrc for a zsh user), so
+# a naive unconditional prepend would stack a duplicate entry on every shell start.
+new_sandbox
+stub_uname Darwin arm64
+make_fixture "mla-aarch64-apple-darwin.tar.gz" 'echo v1'
+run_installer
+n="$(env -i HOME="$HOME_DIR" PATH="/usr/bin:/bin" sh -c \
+      '. "$HOME/.meetless/bin/env"; . "$HOME/.meetless/bin/env"; echo "$PATH"' \
+      | tr ':' '\n' | grep -Fc '.meetless/bin')"
+if [ "$RC" -eq 0 ] && [ "$n" = "1" ]; then
+  ok "env is idempotent (double-source leaves one PATH entry)"
+else
+  bad "env idempotency" "rc=$RC entries=$n"
 fi
 cleanup
 

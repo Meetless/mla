@@ -60,6 +60,40 @@ export interface PersistedDoc {
 // signal the server returns inside an otherwise-successful response.
 export type Persister = (docs: PersistDocument[]) => Promise<{ docs: PersistedDoc[] }>;
 
+// How many documents ride in ONE kb-add POST.
+//
+// This number is a deadline, not a taste. Every document in a POST is embedded and
+// indexed server-side before the response is written, so the request's cost scales with
+// the batch; intel runs on Cloud Run behind a HARD `timeoutSeconds = 300`, which no
+// client setting can extend. The CLI's own budget (`ingestTimeoutMs` in commands/enrich.ts)
+// is `max(120s, 20s * docCount)`, so an unbatched run of 15 documents already asks for
+// 300s: exactly the ceiling, and past it the connection is severed mid-write no matter
+// what either side intended.
+//
+// That is not hypothetical. On 2026-07-13 a pilot user's `mla onboard` sent every one of
+// his documents in a single POST, hit the ceiling, and took a 504. The run had no partial
+// state to fall back on, so his rules died IN THE CLIENT and his workspace ended up with
+// zero governed rules. He had to start over from nothing.
+//
+// 10 keeps each POST's budget at 200s, a full 100s under the ceiling, and it bounds the
+// blast radius of any single failure to ten documents instead of the whole run.
+export const PERSIST_BATCH_SIZE = 10;
+
+// Two consecutive failed batches is the line between "one batch is poison" and "the
+// server is down", and the two want opposite handling.
+//
+// A single failing batch must NOT abort the rest: if it did, a document that trips a
+// server-side bug would strand every later batch behind it, and every rerun would strand
+// them again at the same place. The run would never make progress. So we keep going, land
+// what we can, and let the failed documents come back on the next run.
+//
+// But if intel really is down, "keep going" spends 200s per batch discovering the same
+// outage over and over, and a large run would hang the CLI for many minutes before saying
+// anything. Stop after the second consecutive failure and mark the remainder failed: they
+// are retryable either way, and the operator gets the truth in minutes instead of tens of
+// minutes.
+const MAX_CONSECUTIVE_BATCH_FAILURES = 2;
+
 export interface IngestEnv {
   home: string;
   workspaceId: string; // authoritative, derived by the command (not from the agent)
@@ -403,7 +437,9 @@ export function loadState(home: string, workspaceId: string, runId: string): Onb
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as OnboardingState;
-    if (parsed?.schemaVersion !== 1) return null;
+    // A v1 file is deliberately unreadable, not upgraded: v1's `complete` could mean "landed
+    // nothing and is stranded". Reading null re-runs the scouts, which is the recovery.
+    if (parsed?.schemaVersion !== 2) return null;
     // A state file is only valid for the run it names: ignore one whose stored runId
     // drifted from its path (corruption / hand-edit), rather than resuming the wrong run.
     if (parsed.runId !== runId) return null;
@@ -686,8 +722,7 @@ export async function ingestRun(input: {
   // two near-identical docs the reviewer must reconcile. Merge is anchor-insensitive (keyed
   // by kind + normalized statement) so it also collapses a scout that emitted the same
   // statement twice; it is scoped to THIS call only, so a resuming scout (whose candidates
-  // arrive after the other is already complete) never folds across calls. Everything goes out
-  // in one POST so the run has a single persistence outcome.
+  // arrive after the other is already complete) never folds across calls.
   const merged = mergeAcceptedCandidates(completeBatch.map((b) => ({ scout: b.scout, candidates: b.accepted })));
 
   const docsByPath = new Map<string, PersistDocument>();
@@ -700,26 +735,70 @@ export async function ingestRun(input: {
   }
   const docs = [...docsByPath.values()];
 
-  let persistFailed = false;
-  let persistErrorMessage = "";
+  // Persist in BOUNDED batches, and never let one failure erase what already landed.
+  //
+  // This used to be a single POST carrying the whole run, justified as "one POST so the run
+  // has a single persistence outcome". That symmetry is what destroyed a pilot user's
+  // onboarding: one POST also means one timeout, one 504, and one all-or-nothing loss of
+  // every document, including the ones the server had already indexed. A run's persistence
+  // is not atomic on the server (kb-add reports a per-document receipt precisely because it
+  // is not), so pretending it is atomic on the client buys nothing and costs everything.
+  //
+  // Each batch is now independent. A batch that fails marks ONLY its own documents "failed",
+  // which is the same signal the server already sends for a per-document failure, so those
+  // documents flow into the `docFailedByScout` path below: the scout is left retryable, the
+  // run stays `partial`, and a rerun re-POSTs them. Documents that DID land re-POST as an
+  // idempotent `noop_unchanged`, so the retry is cheap and the progress is monotonic.
+  //
+  // `persistFailed` (the whole-run, nothing-landed fate) is now reserved for what it actually
+  // means: every batch failed. A run that lands 30 of 40 documents is a PARTIAL run that
+  // resumes, not a total loss that starts over.
   const outcomeByPath = new Map<string, PersistOutcome>();
-  if (docs.length > 0) {
+  const persistErrors: string[] = [];
+  let batchesAttempted = 0;
+  let batchesLanded = 0;
+  let consecutiveFailures = 0;
+
+  for (let start = 0; start < docs.length; start += PERSIST_BATCH_SIZE) {
+    const batch = docs.slice(start, start + PERSIST_BATCH_SIZE);
+
+    if (consecutiveFailures >= MAX_CONSECUTIVE_BATCH_FAILURES) {
+      // The server is not answering. Do not spend another timeout to prove it. These
+      // documents are marked failed, which makes them retryable, exactly as if we had
+      // tried and been refused.
+      for (const d of batch) outcomeByPath.set(d.relPath, "failed");
+      continue;
+    }
+
+    batchesAttempted += 1;
     try {
-      const res = await persist(docs);
+      const res = await persist(batch);
       // The server returns one outcome per document in input order; a length mismatch is a
       // contract violation we refuse to interpret (it would mis-attribute outcomes), so treat
-      // it as a whole-POST failure rather than silently report a partial, wrong tally.
-      if (res.docs.length !== docs.length) {
-        throw new Error(
-          `kb-add returned ${res.docs.length} outcome(s) for ${docs.length} document(s)`,
-        );
+      // it as a failure of this batch rather than silently report a partial, wrong tally.
+      if (res.docs.length !== batch.length) {
+        throw new Error(`kb-add returned ${res.docs.length} outcome(s) for ${batch.length} document(s)`);
       }
-      docs.forEach((d, i) => outcomeByPath.set(d.relPath, res.docs[i].outcome));
+      batch.forEach((d, i) => outcomeByPath.set(d.relPath, res.docs[i].outcome));
+      batchesLanded += 1;
+      consecutiveFailures = 0;
     } catch (e) {
-      persistFailed = true;
-      persistErrorMessage = e instanceof Error ? e.message : String(e);
+      // Carry the REAL message (the 504, the timeout, the connection reset). The user who
+      // lost his rules was told nothing at all about why; a generic "persistence failed" is
+      // how a 300s Cloud Run ceiling stays invisible for a day.
+      persistErrors.push(e instanceof Error ? e.message : String(e));
+      for (const d of batch) outcomeByPath.set(d.relPath, "failed");
+      consecutiveFailures += 1;
     }
   }
+
+  // Nothing landed at all: the run made zero progress, and every scout that offered a
+  // candidate shares that fate. This is the ONLY case that is still all-or-nothing, and it
+  // is all-or-nothing because it genuinely is, not because we posted it that way.
+  const persistFailed = batchesAttempted > 0 && batchesLanded === 0;
+  // Distinct messages only: five batches timing out against a wedged server produce five
+  // identical strings, and repeating them tells the operator nothing the first one did not.
+  const persistErrorMessage = [...new Set(persistErrors)].join("; ");
 
   // Tally each scout's landed documents by REAL server outcome: newly minted ("ingested") vs
   // already governed and unchanged ("noop_unchanged"). A doc shared by both scouts counts
@@ -743,9 +822,9 @@ export async function ingestRun(input: {
 
   // Attribute the single POST's outcome back to each scout. On a whole-POST failure every
   // scout that accepted at least one candidate shares the persistence_failed fate (one POST,
-  // one transactional result); a scout that accepted nothing had nothing at stake and stays
-  // complete. `persisted` is the count of the scout's merged documents that landed born
-  // PENDING (new + already-present); `deduped` is how many of those were already present.
+  // one transactional result). `persisted` is the count of the scout's merged documents that
+  // landed born PENDING (new + already-present); `deduped` is how many of those were already
+  // present.
   for (const b of completeBatch) {
     if (persistFailed && b.accepted.length > 0) {
       scoutState[b.scout] = { status: "persistence_failed", error: "kb-add persistence failed" };
@@ -775,11 +854,38 @@ export async function ingestRun(input: {
       errors.push({
         index: -1,
         code: "persistence_partial",
-        message: `${docFailed} document(s) the server could not persist; rerun ingest to retry`,
+        // Append the transport cause when there was one. A batch that timed out and a
+        // document the server refused both land here, and they are not the same problem:
+        // the first is ours to fix, the second is the payload's. Saying only "could not
+        // persist" is what left a 504 against a 300s ceiling undiagnosed for a day.
+        message:
+          `${docFailed} document(s) the server could not persist; rerun ingest to retry` +
+          (persistErrorMessage ? ` (${persistErrorMessage})` : ""),
       });
       scoutState[b.scout] = {
         status: "persistence_failed",
         error: `${docFailed} document(s) could not persist`,
+      };
+    } else if (b.received > 0 && b.accepted.length === 0) {
+      // The scout put candidates on the wire and landed NONE of them: every one was rejected
+      // on shape or evidence verification. That is zero progress, not completion, and the
+      // scout's payload is by definition malformed. Stamping it `complete` here (which this
+      // branch once did, since nothing was offered to persist and so nothing could fail to
+      // persist) strands the scout forever: resume skips a complete scout with
+      // `already_complete` and never re-reads it, so the corrected candidates can never be
+      // ingested under this run. `malformed` keeps it retryable, which is what a rerun with
+      // fixed candidates needs. Note the guard is `received > 0`, NOT `accepted === 0`: a
+      // scout that legitimately found nothing worth governing sends zero candidates and IS
+      // done, and must stay `complete` or the run never settles and the run-level
+      // idempotency gate (findCompletedRunWithDigest) re-runs a finished onboarding forever.
+      errors.push({
+        index: -1,
+        code: "all_candidates_rejected",
+        message: `all ${b.received} candidate(s) were rejected; scout stays retryable, rerun ingest with corrected candidates`,
+      });
+      scoutState[b.scout] = {
+        status: "malformed",
+        error: `all ${b.received} candidate(s) rejected`,
       };
     } else {
       scoutState[b.scout] = { status: "complete", candidateCount: b.accepted.length };
@@ -795,16 +901,28 @@ export async function ingestRun(input: {
     });
   }
 
-  // Persist the accept half's durable record: the exact post-merge candidates this call
-  // produced, so `enrich accept` can later materialize the durable ones (constraint /
-  // convention / boundary) into .meetless/rules.md. Skip on a whole-POST failure (nothing
-  // landed; the retry rewrites) and when there is nothing to add (an empty or already-complete
-  // scout), so a no-op call never churns the sidecar. upsert MERGES with any prior sidecar, so
-  // a resuming second scout appends to the first scout's candidates rather than replacing them.
+  // Persist the accept half's durable record: the post-merge candidates this call actually
+  // LANDED, so `enrich accept` can later materialize the durable ones (constraint /
+  // convention / boundary) into .meetless/rules.md. Skip when nothing landed (the retry
+  // rewrites) and when there is nothing to add (an empty or already-complete scout), so a
+  // no-op call never churns the sidecar. upsert MERGES with any prior sidecar, so a resuming
+  // second scout appends to the first scout's candidates rather than replacing them, and a
+  // batch that lands on the SECOND run joins the ones that landed on the first.
+  const records: OnboardingCandidateRecord[] = [];
   if (!persistFailed && merged.size > 0) {
-    const records: OnboardingCandidateRecord[] = [];
     for (const m of merged.values()) {
       const relPath = candidateRelPath(m);
+      const landed = outcomeByPath.get(relPath);
+      // ONLY what actually landed. `enrich accept` materializes a durable candidate from this
+      // sidecar into .meetless/rules.md and filters on KIND, not on outcome, so a candidate
+      // recorded here with landed="failed" would become a local rule with NO governed document
+      // behind it: precisely the stale-local-assumption this product exists to prevent, minted
+      // by the product itself. It never landed, so it is not in the record of what landed.
+      //
+      // Dropping it loses nothing. Its scout is left retryable by the persistence_partial path
+      // above, and upsertCandidatesSidecar MERGES, so the rerun that finally persists the
+      // document adds it to this same sidecar alongside its siblings.
+      if (landed !== "ingested" && landed !== "noop_unchanged") continue;
       records.push({
         candidateId: candidateId(m),
         kind: m.kind,
@@ -814,9 +932,14 @@ export async function ingestRun(input: {
         rationale: m.rationale ?? null,
         rationaleSource: m.rationaleSource ?? null,
         relPath,
-        landed: outcomeByPath.get(relPath) ?? "failed",
+        landed,
       });
     }
+  }
+  // `records` can be empty even when a batch landed: a 200 can carry per-document failures for
+  // every doc it was given. Writing an empty candidate list would be a churn of the sidecar
+  // that says nothing, so hold the write for a call that actually has something to record.
+  if (records.length > 0) {
     upsertCandidatesSidecar(env.home, {
       schemaVersion: 1,
       workspaceId: env.workspaceId,
@@ -832,7 +955,7 @@ export async function ingestRun(input: {
     workspaceId: env.workspaceId,
     runId,
     repositoryRoot: env.repositoryRoot,
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: allComplete ? "complete" : "partial",
     updatedAt: now,
     scouts: { documentation: scoutState.documentation, history: scoutState.history },

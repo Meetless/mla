@@ -2,6 +2,7 @@ import {
   CFG_PATH,
   CliConfig,
   configExists,
+  getConsoleUrl,
   loadWorkspaceConfig,
   readConfig,
   type WorkspaceCliConfig,
@@ -256,14 +257,24 @@ export async function runWorkspaceInvite(
 
   try {
     const res = await inviteMember(cfg, email, deps.http);
+    // The invitee's primary path is the web join link: click it, sign in with
+    // Google, land in the workspace. No CLI, no clone. The token is single-use
+    // context; we build the link but never store it. Guard on joinToken so an
+    // older control that does not mint one degrades to the legacy message.
+    const joinUrl = res.joinToken
+      ? `${getConsoleUrl(cfg)}/join/${res.joinToken}`
+      : undefined;
     if (json) {
-      out(JSON.stringify(res, null, 2));
+      out(JSON.stringify({ email: res.email, role: res.role, joinUrl }, null, 2));
       return 0;
     }
-    out(
-      `${res.email} is now a ${res.role} of workspace ${cfg.workspaceId}. ` +
-        `They can run 'mla login' with this email to bind to it.`,
-    );
+    out(`${res.email} is now a ${res.role} of workspace ${cfg.workspaceId}.`);
+    if (joinUrl) {
+      out(`Join link: ${joinUrl}`);
+      out("Share this link so they can join by signing in with Google.");
+    } else {
+      out("They can run 'mla login' with this email to bind to it.");
+    }
     return 0;
   } catch (e) {
     err(`workspace invite failed: ${serverMessage(e)}`);

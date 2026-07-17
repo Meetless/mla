@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { readKbConfig, KbCliConfig } from "../lib/config";
+import { readKbConfig, KbCliConfig, userHomeDir } from "../lib/config";
 import { verifyKbActorIsOwner, KbOwnerCheckError } from "../lib/kb_acl";
 import { KbForgetReceipt, renderKbForgetReceipt } from "../lib/render";
 import { get, post, intelPost, HttpError } from "../lib/http";
@@ -117,8 +117,8 @@ export function parseKbForgetArgs(argv: string[]): KbForgetFlags {
 // ---------------------------------------------------------------------------
 
 function expandHome(p: string): string {
-  if (p === "~") return os.homedir();
-  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  if (p === "~") return userHomeDir();
+  if (p.startsWith("~/")) return path.join(userHomeDir(), p.slice(2));
   return p;
 }
 

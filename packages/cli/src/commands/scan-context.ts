@@ -1,8 +1,10 @@
 // src/commands/scan-context.ts
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { scanWorkspace } from "../lib/scanner/scan";
 import {
   applyVerdicts,
+  readScanCache,
   readVerdicts,
   writeScanCache,
   writeProjectionReceipt,
@@ -17,6 +19,7 @@ import {
   removeOwnedProjection,
 } from "../lib/scanner/floor-projection-writer";
 import { renderProjectionBody, projectionBodyHash } from "../lib/scanner/floor-projection";
+import { refreshBundleForScan, type DeliveryOutcome } from "../lib/rules/bundle-refresh";
 
 export interface RescanArgs {
   cwd: string;
@@ -27,7 +30,9 @@ export interface RescanArgs {
 
 // Pure-ish core: scan, apply current verdicts, persist. Returns the applied result.
 export function rescanAndCache(args: RescanArgs): ScanResult {
-  const home = args.home ?? homedir();
+  // No local homedir() default: the state root is the cache module's policy (it honors
+  // MEETLESS_HOME), and duplicating the default here is exactly what made it unreachable.
+  const home = args.home;
   const now = args.now ?? (() => new Date().toISOString());
   // The scanner's injected rule set is sourced from the principal-bound backend bundle,
   // which is principal-keyed. Resolve the live session's principal (mirroring control's
@@ -45,7 +50,12 @@ export function rescanAndCache(args: RescanArgs): ScanResult {
   // delivery receipt (freshness/bundleId/bundleHash) with a pure jq read, and the same
   // bundleId/hash flow into the on-disk projection header. Throw-free.
   const floorMeta = computeFloorMeta(applied.directives, principal, now);
-  const withMeta: ScanResult = { ...applied, floorMeta };
+  // Stamp WHOSE checkout this cache is: the realpath of the scan root. Two checkouts of one
+  // workspace write the same scan-cache.json path, so a reader in checkout B must be able to
+  // tell it is holding checkout A's repo-specific scan and decline to render/inject it. Derived
+  // via resolveScanRoot (not raw args.cwd) so every caller, including activate which passes a raw
+  // cwd, stamps the SAME canonical marker-dir identity the readers compute.
+  const withMeta: ScanResult = { ...applied, floorMeta, scanRootPath: resolveScanRootIdentity(args.cwd) };
   writeScanCache(home, args.workspaceId, withMeta);
   // One producer, two projections (matrix doc, "the same successful scan"): the scan that
   // just wrote scan-cache.json.floorRulesXml for the main-agent hook ALSO materializes the
@@ -93,7 +103,7 @@ function materializeAndRecordProjection(
   workspaceId: string,
   applied: ScanResult,
   floorMeta: FloorMeta,
-  home: string,
+  home: string | undefined,
   now: () => string,
 ): void {
   const scanRoot = resolveScanRoot(cwd);
@@ -148,6 +158,41 @@ export function resolveScanRoot(startDir: string): string {
   return findWorkspaceContext(startDir)?.markerDir ?? startDir;
 }
 
+// The canonical identity of a scan cache: the realpath of the directory a scan runs FROM
+// (the marker dir; see resolveScanRoot). This is what a cache's scanRootPath is stamped with
+// on write and compared against on read, so a reader in checkout B never renders or injects
+// checkout A's stomped cache as its own. realpath canonicalizes symlinks and worktrees to one
+// stable string (the same rule resolveActiveRuntimeScopeId uses on the enforcement plane).
+// Falls back to the un-canonicalized marker path if realpath throws (dir removed mid-flight),
+// which still compares equal to itself. Cheap: a filesystem walk to the marker plus one realpath,
+// no subprocess, so it is safe on the assembler hot path.
+export function resolveScanRootIdentity(cwd?: string): string {
+  const root = resolveScanRoot(cwd ?? process.cwd());
+  try {
+    return realpathSync(root);
+  } catch {
+    return root;
+  }
+}
+
+// Read the scan cache, but ONLY return it when it belongs to the CURRENT checkout. A workspace
+// can bind several checkouts that all write one scan-cache.json (see ScanResult.scanRootPath), so
+// a raw read can hand a caller another checkout's repo-specific scan. Callers that consume
+// repo-specific fields (status/context display, the assembler's locally-parsed scopedRules) MUST
+// go through this; callers that read only workspace-global fields (floorMeta.bundleId, the bash
+// floor block) may read raw. An unstamped legacy cache is TRUSTED (returned as-is): the field is
+// additive and single-repo installs never wrote it, so guarding on its absence would be a pure
+// regression. Only a PRESENT, mismatching stamp is rejected (returns null → re-scan / floor-only).
+export function readScanCacheForRoot(
+  home: string | undefined,
+  workspaceId: string,
+  cwd?: string,
+): ScanResult | null {
+  const cache = readScanCache(home, workspaceId);
+  if (!cache || !cache.scanRootPath) return cache;
+  return cache.scanRootPath === resolveScanRootIdentity(cwd) ? cache : null;
+}
+
 // Decide which workspace to scan and which directory to scan FROM. Pure: takes
 // the start dir, env, and argv so it is fully testable without mutating process
 // state. Precedence for the id is MEETLESS_WORKSPACE_ID > --workspace > the
@@ -176,19 +221,62 @@ export function resolveScanTarget(opts: {
   return { workspaceId, scanRoot: resolveScanRoot(opts.startDir) };
 }
 
-// Thin CLI wrapper: `mla _internal scan-context`. Resolves the workspace and the
-// scan root from the marker (env/flag override the id), then scans + caches.
-export async function runScanContext(argv: string[]): Promise<number> {
+export interface ScanContextDeps {
+  refreshBundle?: (workspaceId: string) => Promise<DeliveryOutcome>;
+  /**
+   * Where the caches live. Defaults to the real home, as everywhere else. A test SHOULD override it
+   * (or set MEETLESS_HOME) to contain a scan.
+   *
+   * The note that used to sit here said macOS `os.homedir()` ignores $HOME and reads getpwuid. That
+   * is false, and believing it is what let a poisoned $HOME go unvalidated until it wrote state into
+   * a git working tree. os.homedir() returns $HOME verbatim on Darwin exactly as on Linux; it is
+   * os.userInfo() that ignores it. See config.userHomeDir.
+   */
+  home?: string;
+  out?: (line: string) => void;
+  err?: (line: string) => void;
+}
+
+// The CLI wrapper behind `mla scan` (and `mla _internal scan-context`). Resolves the workspace and
+// the scan root from the marker (env/flag override the id), re-fetches the backend rule bundle,
+// then scans + caches.
+//
+// The FETCH is the point, not an optimization. `scan` is the documented refresh lever ("rebuild
+// this repo's local rule cache from the backend bundle"), and it used to do no such thing: it
+// rescanned whatever bundle happened to be cached and never contacted control. A rule added or
+// revoked anywhere else (the Console, another machine, a teammate's TEAM promotion) therefore
+// never reached this laptop no matter how many times you scanned. A rule verb can only push what
+// IT changed; this is the pull that covers everything else.
+//
+// The refresh is BEST EFFORT: a logged-out CLI, an unbound repo, or a plane must still scan against
+// the cached bundle. We warn and keep going rather than fail, but we never silently pretend the
+// bundle is current.
+export async function runScanContext(argv: string[], deps: ScanContextDeps = {}): Promise<number> {
+  const out = deps.out ?? ((line: string) => console.log(line));
+  const err = deps.err ?? ((line: string) => console.error(line));
   const target = resolveScanTarget({ startDir: process.cwd(), env: process.env, argv });
   if ("error" in target) {
-    console.error(target.error);
+    err(target.error);
     return 2;
   }
-  const result = rescanAndCache({ cwd: target.scanRoot, workspaceId: target.workspaceId });
-  console.log(
+  const refreshBundle =
+    deps.refreshBundle ?? ((ws: string) => refreshBundleForScan(ws, { home: deps.home }));
+  const refreshed = await refreshBundle(target.workspaceId);
+  const result = rescanAndCache({
+    cwd: target.scanRoot,
+    workspaceId: target.workspaceId,
+    home: deps.home,
+  });
+  out(
     `scanned: ${result.inventory.instructionFiles} instruction files, ` +
       `${result.directives.length} rules, ${result.inventory.staleSignals} stale signals`,
   );
+  if (!refreshed.delivered) {
+    err(
+      `warning: could not refresh the rule bundle from the backend (${refreshed.error}); ` +
+        `scanned against the last cached bundle, which may be stale.`,
+    );
+  }
   return 0;
 }
 

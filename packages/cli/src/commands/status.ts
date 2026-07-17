@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readScanCache } from "../lib/scanner/cache";
+import { readScanCacheForRoot } from "./scan-context";
 import { resolveWorkspaceIdWithEnv } from "../lib/workspace";
 import { CliConfig, HOOKS_DIR, readConfig } from "../lib/config";
 import { get } from "../lib/http";
@@ -14,7 +15,8 @@ import {
 const NOT_ACTIVATED = "Meetless is not activated for this repo. Run `mla activate`.";
 
 export interface StatusView {
-  home: string;
+  // undefined = the cache module resolves the state root (it honors MEETLESS_HOME).
+  home: string | undefined;
   workspaceId: string;
   hooksInstalled: boolean;
   // Optional pre-read scan cache. When omitted, renderStatus reads it from disk
@@ -123,8 +125,11 @@ export async function runStatus(_argv: string[]): Promise<number> {
     console.log(NOT_ACTIVATED);
     return 0;
   }
-  const home = homedir();
-  const cache = readScanCache(home, workspaceId);
+  const home = undefined; // let the cache module resolve the state root (it honors MEETLESS_HOME)
+  // Guarded read: a scan cache stomped by ANOTHER checkout of this same workspace must read as
+  // "no scan for THIS repo" (its commitSha/inventory/stale signals belong to the other checkout),
+  // so the operator is steered to re-activate here rather than shown a sibling repo's status.
+  const cache = readScanCacheForRoot(home, workspaceId);
   if (!cache) {
     // No local scan for this bound workspace. Before advising `mla activate`,
     // make sure the workspace is actually usable: a marker can name a workspace

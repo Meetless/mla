@@ -1,12 +1,17 @@
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import { readKbConfig, KbCliConfig } from "../lib/config";
 import { intelPost, HttpError } from "../lib/http";
 import { verifyKbActorIsOwner, KbOwnerCheckError } from "../lib/kb_acl";
+import {
+  expandHome,
+  NotesRootError,
+  resolveNotesSourceFile,
+  resolveVaultRootForFile,
+} from "../lib/notes-root";
 import { canonicalizeSessionId } from "../lib/observability";
 import { KbReingestReceipt, renderKbReingestReceipt } from "../lib/render";
-import { gitRootForVault, vaultRelPath } from "./kb_add";
+import { vaultRelPath } from "./kb_add";
 
 // `mla kb reingest <kbdoc:<id>|note:<externalObjectId>|<path>> [flags]`.
 //
@@ -66,7 +71,6 @@ const VALUE_FLAGS = new Set([
 ]);
 
 const DEFAULT_PROFILE = "markdown_atomic_v1";
-const NOTES_IDENTITY_ROOT = "notes";
 const KBDOC_PREFIX = "kbdoc:";
 const NOTE_PREFIX = "note:";
 
@@ -159,70 +163,44 @@ export class ReingestPreconditionError extends Error {
   }
 }
 
-function expandHome(p: string): string {
-  if (p === "~") return os.homedir();
-  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
-  return p;
-}
-
-// Resolve the notes vault root the governed identity is relative to. Order
-// (mirrors the worker, minus the removed `--vault-root` flag): MEETLESS_NOTES_ROOT,
-// else a git-repo-root walk-up from `anchor` (the source file's directory for a
-// path input, else cwd). Throws a precondition when neither resolves: reingest
-// cannot read the source otherwise.
+// Resolve the notes vault root for a source file the CLIENT ALREADY HOLDS
+// (the path form of reingest, and `kb forget`). Anchored on the FILE's own
+// directory, exactly like `kb add`. A NotesRootError is a client-side
+// precondition here, so re-map it to the exit-2 error type.
 export function resolveReingestVaultRoot(anchor: string): string {
-  const envRoot = process.env.MEETLESS_NOTES_ROOT;
-  if (envRoot) {
-    const expanded = path.resolve(expandHome(envRoot));
-    if (!fs.existsSync(expanded) || !fs.statSync(expanded).isDirectory()) {
-      throw new ReingestPreconditionError(
-        `MEETLESS_NOTES_ROOT=${envRoot} is not a directory`,
-      );
+  try {
+    return resolveVaultRootForFile(anchor);
+  } catch (e) {
+    if (e instanceof NotesRootError) {
+      throw new ReingestPreconditionError(e.message);
     }
-    return fs.realpathSync(expanded);
+    throw e;
   }
-  const gitRoot = gitRootForVault(anchor);
-  if (gitRoot) return gitRoot;
-  throw new ReingestPreconditionError(
-    "could not resolve a notes vault root to read the source file; set MEETLESS_NOTES_ROOT or run inside a git repo",
-  );
 }
 
-// Reverse the governed identity mapping: `notes/<rel>` -> <vaultRoot>/<rel>.
-// Mirrors the worker's `_abs_path_from_external_object_id`. The stored id is
-// NFC + (case-insensitive fs) casefolded; lookup on such a fs is case-
-// insensitive, so the reverse-mapped path still reads the real file. Guards a
-// non-notes-rooted id and a `..` escape, and that the target is a real file.
-export function reverseMapEoidToFile(
+// Locate the source file behind a governed identity when there is NO file to
+// anchor on (the `kbdoc:<id>` / stored-`note:<eoid>` forms). This used to walk
+// up from CWD to the nearest git root and reverse-map into it, which lands in
+// the CODE repo, not the notes vault, for anyone who reingests a note while
+// working in the code repo (i.e. everyone). The identity `kb add` minted was
+// then unresolvable by the command whose entire job is to re-deliver it, and the
+// only escape was an undocumented MEETLESS_NOTES_ROOT.
+//
+// It now walks the same candidate ladder as every other notes-root consumer and
+// VERIFIES each candidate actually holds the file before accepting it. See
+// lib/notes-root.ts for why `<gitRoot>/notes` is deliberately not a candidate.
+export function reingestSourceFileForEoid(
   externalObjectId: string,
-  vaultRoot: string,
+  anchor: string,
 ): string {
-  const prefix = `${NOTES_IDENTITY_ROOT}/`;
-  if (!externalObjectId.startsWith(prefix)) {
-    throw new ReingestPreconditionError(
-      `externalObjectId ${JSON.stringify(externalObjectId)} is not under the '${NOTES_IDENTITY_ROOT}/' identity root; reingest only supports notes-sourced documents`,
-    );
+  try {
+    return resolveNotesSourceFile(externalObjectId, anchor).file;
+  } catch (e) {
+    if (e instanceof NotesRootError) {
+      throw new ReingestPreconditionError(e.message);
+    }
+    throw e;
   }
-  const rel = externalObjectId.slice(prefix.length);
-  if (!rel) {
-    throw new ReingestPreconditionError(
-      `externalObjectId ${JSON.stringify(externalObjectId)} has an empty relative path`,
-    );
-  }
-  const root = fs.realpathSync(vaultRoot);
-  const abs = path.resolve(root, rel);
-  const relCheck = path.relative(root, abs);
-  if (relCheck.startsWith("..") || path.isAbsolute(relCheck)) {
-    throw new ReingestPreconditionError(
-      `resolved source path ${abs} escapes vault root ${root}`,
-    );
-  }
-  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
-    throw new ReingestPreconditionError(
-      `source file for ${JSON.stringify(externalObjectId)} does not resolve to a readable file at ${abs}. Set MEETLESS_NOTES_ROOT, or re-add it with \`mla kb add\`.`,
-    );
-  }
-  return abs;
 }
 
 // The APPLY-mode document handle + bytes the route needs: exactly one of
@@ -258,8 +236,7 @@ async function resolveViaServer(
   );
   // RESOLVE already ran the PURGED/TOMBSTONED guards (409) and unknown-doc (404),
   // so a terminal/missing doc threw before we touch the filesystem.
-  const vaultRoot = resolveReingestVaultRoot(anchor);
-  const file = reverseMapEoidToFile(resolved.externalObjectId, vaultRoot);
+  const file = reingestSourceFileForEoid(resolved.externalObjectId, anchor);
   const content = fs.readFileSync(file, "utf8");
   return { documentId: resolved.documentId, content };
 }

@@ -15,6 +15,7 @@ import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
 import * as crypto from "crypto";
+import { userHomeDir } from "./config";
 
 export type InstallMethod = "homebrew" | "curl" | "npm" | "unknown";
 
@@ -379,7 +380,7 @@ export function detectInstallMethod(opts: {
     }
   };
 
-  const home = canon(opts.home ?? os.homedir());
+  const home = canon(opts.home ?? userHomeDir());
   const brewPrefixes = (opts.brewPrefixes ?? ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"]).map(canon);
   const candidates = [execPath, scriptPath].filter((p): p is string => Boolean(p)).map(canon);
 

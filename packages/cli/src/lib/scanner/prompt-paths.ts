@@ -3,8 +3,9 @@
 // The scoped-rule matcher needs the repo-relative paths a user NAMED in their prompt, so a
 // scoped MUST whose glob matches one of them can be promoted to REQUIRED this turn. This is
 // deliberately NOT a parser: it tokenizes on whitespace, strips the punctuation that wraps a
-// path in prose (backticks, quotes, brackets, a trailing comma/period, a `:line:col` suffix),
-// and keeps only tokens that (a) look like a path and (b) provably stay inside the repo.
+// path in prose (backticks, quotes, brackets, a trailing comma/period, a `:line:col` suffix, a
+// leading `@` mention sigil), and keeps only tokens that (a) look like a path and (b) provably
+// stay inside the repo.
 //
 // Containment is a security boundary, not a nicety: an explicit path controls which scoped
 // MUST rules become required, so a `../` escape or an absolute path outside the repo must
@@ -21,6 +22,13 @@ import { posix } from "node:path";
 // Characters that wrap a path in prose. Stripped from both ends, repeatedly, so `("file.ts")`
 // or `<file.ts>` unwrap fully before the path-shape test.
 const WRAP_CHARS = new Set(["`", '"', "'", "(", ")", "[", "]", "{", "}", "<", ">"]);
+// Sigils that PREFIX a path but never suffix one. `@notes/foo.md` is how a Claude Code user
+// names a file (the harness's own file-mention syntax), and it is by far the most common way an
+// explicit path actually arrives in a prompt, so leaving the `@` attached made `explicitPathAny`
+// unmatchable in exactly the case it exists for. Leading-only: a trailing `@` is not a mention.
+// A false positive here stays inert by the module contract above (`@meetless/mla` normalizes to
+// `meetless/mla`, which matches no real glob).
+const LEAD_SIGILS = new Set(["@"]);
 // Sentence punctuation that trails a path token in prose. A trailing `/` is NOT here: it is a
 // meaningful directory marker (`apps/control/` must keep its slash to match `apps/control/**`).
 const TRAILING_PUNCT = new Set([",", ".", ";", ":", "!", "?"]);
@@ -92,13 +100,17 @@ function normalizeToken(raw: string, repoRoot: string | undefined): string | nul
   return norm;
 }
 
-/** Strip wrapping chars and trailing sentence punctuation from both ends, repeatedly. */
+/**
+ * Strip wrapping chars and trailing sentence punctuation from both ends, repeatedly, plus any
+ * leading mention sigil. Order does not matter: the loop runs to a fixed point, so `(@file.ts)`
+ * and `@"file.ts"` both unwrap fully.
+ */
 function strip(raw: string): string {
   let t = raw.trim();
   let changed = true;
   while (changed && t.length > 0) {
     changed = false;
-    if (WRAP_CHARS.has(t[0])) {
+    if (WRAP_CHARS.has(t[0]) || LEAD_SIGILS.has(t[0])) {
       t = t.slice(1);
       changed = true;
     }

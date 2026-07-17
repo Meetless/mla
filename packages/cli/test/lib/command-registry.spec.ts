@@ -10,6 +10,7 @@ import {
 } from "../../src/lib/command-reference";
 import {
   USAGE_HEADER,
+  nearestCommands,
   renderCommandHelp,
   renderUsage,
   resolveCommand,
@@ -132,12 +133,38 @@ describe("dispatch: the registry is the dispatch table", () => {
     errSpy.mockRestore();
   });
 
-  it("a word that is not in the registry is the ONE unknown-command error", async () => {
+  it("a word that is not in the registry is the ONE unknown-command error, and it does NOT dump the catalog", async () => {
     const code = await dispatch(["definitely-not-a-command"]);
     expect(code).toBe(2);
-    expect(err.join("\n")).toContain("Unknown command: definitely-not-a-command");
-    // The unknown-command error prints the same screen `mla help` prints.
-    expect(err.join("\n")).toContain(USAGE_HEADER);
+    const text = err.join("\n");
+    expect(text).toContain("Unknown command: definitely-not-a-command");
+    // Proposal §3 bug 1: the error path must NOT be a command emitter. It points
+    // at `mla help` for the full catalog instead of pasting it back.
+    expect(text).toContain("Run 'mla help' for the full command list.");
+    expect(text).not.toContain(USAGE_HEADER);
+  });
+
+  it("a near-miss command name gets a concise 'did you mean', not the catalog", async () => {
+    // `doctorr` is one insertion from the real `doctor`.
+    const code = await dispatch(["doctorr"]);
+    expect(code).toBe(2);
+    const text = err.join("\n");
+    expect(text).toContain("Unknown command: doctorr");
+    expect(text).toContain("Did you mean:");
+    expect(text).toContain("doctor");
+    expect(text).not.toContain(USAGE_HEADER);
+  });
+
+  it("`onboard` is named as a skill, not treated as a typo or dumped as a catalog", async () => {
+    const code = await dispatch(["onboard"]);
+    expect(code).toBe(2);
+    const text = err.join("\n");
+    // Proposal §3 bug 2: exactly one line, naming the skill. No 'did you mean',
+    // no catalog. `onboard` is deliberately NOT registered in COMMANDS.
+    expect(text).toBe(
+      "onboard is an agent skill, not a CLI command; in your coding agent, run /mla onboard",
+    );
+    expect(resolveCommand(COMMANDS, "onboard")).toBeUndefined();
   });
 
   it("`mla help <command>` narrows; an unknown command falls back to the full screen", async () => {
@@ -218,6 +245,31 @@ describe("wantsLeadingHelp: a help flag inside free text is not a plea for help"
   it("a command with no subcommands treats its very first token as free text", () => {
     expect(wantsLeadingHelp(["--help"], [])).toBe(true);
     expect(wantsLeadingHelp(["a question", "--help"], [])).toBe(false);
+  });
+});
+
+describe("nearestCommands: a concise 'did you mean', never the catalog", () => {
+  // Proposal §3 bug 1: an unknown word should cost the operator (or a piped agent)
+  // a short suggestion, not a re-emission of the whole command surface.
+  it("surfaces a real command for a one-edit typo, closest first", () => {
+    expect(nearestCommands(COMMANDS, "doctorr")).toContain("doctor");
+    expect(nearestCommands(COMMANDS, "activ8")[0]).toBe("activate");
+  });
+
+  it("caps the list at the requested limit", () => {
+    expect(nearestCommands(COMMANDS, "revie", 2).length).toBeLessThanOrEqual(2);
+    expect(nearestCommands(COMMANDS, "x", 1).length).toBeLessThanOrEqual(1);
+  });
+
+  it("returns nothing for genuine gibberish, so the caller falls back to `mla help`", () => {
+    expect(nearestCommands(COMMANDS, "zzzzzzzzzzq")).toEqual([]);
+  });
+
+  it("never suggests a hidden removed-command stub", () => {
+    // `cases` is hidden; a near-miss must not resurface it as a suggestion.
+    for (const hidden of HIDDEN) {
+      expect(nearestCommands(COMMANDS, hidden)).not.toContain(hidden);
+    }
   });
 });
 

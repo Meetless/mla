@@ -2,12 +2,18 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readScanCache, readVerdicts, writeVerdicts } from "../lib/scanner/cache";
+import { readVerdicts, reviewCardsPath, writeVerdicts } from "../lib/scanner/cache";
 import { resolveWorkspaceIdWithEnv } from "../lib/workspace";
-import { rescanAndCache, resolveScanRoot } from "./scan-context";
+import {
+  readScanCacheForRoot,
+  rescanAndCache,
+  resolveScanRoot,
+  resolveScanRootIdentity,
+} from "./scan-context";
 
 export interface VerdictArgs {
-  home: string;
+  // undefined = the cache module resolves the state root (it honors MEETLESS_HOME).
+  home: string | undefined;
   workspaceId: string;
   action: "accept" | "dismiss";
   id: string;
@@ -32,16 +38,22 @@ export function applyContextVerdict(args: VerdictArgs): void {
 // These are machine_inferred (untracked, per-machine, agent-distilled), so they are
 // NEVER auto-injected as must-follow; this list is a human review surface only.
 // `?? []` guards a pre-M1 on-disk cache that predates the advisoryDirectives field.
-export function advisoryLines(home: string, workspaceId: string): string[] {
-  const cache = readScanCache(home, workspaceId);
+export function advisoryLines(home: string | undefined, workspaceId: string): string[] {
+  // Guarded read: advisory rules are distilled from THIS checkout's tree, so a cache stomped by
+  // a sibling checkout of the same workspace must not surface as this repo's advisory set.
+  const cache = readScanCacheForRoot(home, workspaceId);
   const advisory = cache?.advisoryDirectives ?? [];
   return advisory.map((d) => `${d.id}  [${d.strength}]  ${d.text}  (${d.source})`);
 }
 
 export interface ReviewItem { id: string; detail: string; source: string; }
 
-export function latestReviewCardItems(home: string, workspaceId: string): ReviewItem[] {
-  const path = join(home, ".meetless", "workspaces", workspaceId, "review-cards.jsonl");
+export function latestReviewCardItems(
+  home: string | undefined,
+  workspaceId: string,
+  currentScanRootPath?: string,
+): ReviewItem[] {
+  const path = reviewCardsPath(workspaceId, home);
   let lines: string[];
   try {
     lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
@@ -51,7 +63,14 @@ export function latestReviewCardItems(home: string, workspaceId: string): Review
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const row = JSON.parse(lines[i]);
-      if (row.event === "review_card" && Array.isArray(row.items)) return row.items;
+      if (row.event !== "review_card" || !Array.isArray(row.items)) continue;
+      // The review-cards journal is shared by every checkout of this workspace. The Stop hook
+      // stamps each card with the scan root it read from (scan_root, propagated from the cache;
+      // see write_stop_review_card). Skip a card written from a DIFFERENT checkout so this repo's
+      // "last session" fallback never shows a sibling repo's items. A card with no stamp is legacy:
+      // trust it (only a PRESENT, mismatching stamp is rejected).
+      if (currentScanRootPath && row.scan_root && row.scan_root !== currentScanRootPath) continue;
+      return row.items;
     } catch {
       // skip malformed line
     }
@@ -66,17 +85,20 @@ export async function runContext(argv: string[]): Promise<number> {
     console.error("context: run inside an activated workspace (MEETLESS_WORKSPACE_ID unset and no .meetless.json marker found).");
     return 2;
   }
-  const home = homedir();
+  const home = undefined; // let the cache module resolve the state root (it honors MEETLESS_HOME)
   if (sub === "list") {
-    const cache = readScanCache(home, workspaceId);
+    // Guarded read: a cache stomped by a sibling checkout must read as "no scan for THIS repo"
+    // so we fall through to this checkout's own review card, not the sibling's stale signals.
+    const cache = readScanCacheForRoot(home, workspaceId);
     if (cache && cache.staleSignals.length) {
       for (const s of cache.staleSignals) console.log(`${s.id}  ${s.detail}`);
       return 0;
     }
     if (!cache) {
       // No live scan cache (workspace not scanned yet, or cache cleared). Fall back to
-      // the last session's review card as a degraded, clearly-labelled view.
-      const card = latestReviewCardItems(home, workspaceId);
+      // the last session's review card as a degraded, clearly-labelled view, filtered to
+      // THIS checkout so a sibling repo's card is never shown as ours.
+      const card = latestReviewCardItems(home, workspaceId, resolveScanRootIdentity());
       if (card.length) {
         console.log("No current scan cache; showing the last session's review card. Run `mla activate` to refresh.");
         for (const item of card) console.log(`${item.id}  ${item.detail}`);

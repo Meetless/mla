@@ -12,15 +12,12 @@
 // cached HOME; in the live CLI the two agree because the env is fixed at startup.)
 
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
+import { resolveMeetlessHome } from "../config";
 
 // The trace-log directory: $MEETLESS_HOME/logs (live env, matching the hook spool).
 export function logsDir(): string {
-  return path.join(
-    process.env.MEETLESS_HOME || path.join(os.homedir(), ".meetless"),
-    "logs",
-  );
+  return path.join(resolveMeetlessHome(), "logs");
 }
 
 // Read one jsonl trace file under logsDir(). Lenient: a blank, partially-written,

@@ -174,7 +174,144 @@ export function consoleDeepLink(cfg: CliConfig, path: string): string {
   return consoleDeepLinkFrom(getConsoleUrl(cfg), cfg.workspaceId, path);
 }
 
-export const HOME = process.env.MEETLESS_HOME || path.join(os.homedir(), ".meetless");
+export interface HomeResolutionDeps {
+  env?: NodeJS.ProcessEnv;
+  homedir?: () => string;
+  passwdHomedir?: () => string;
+  warn?: (message: string) => void;
+}
+
+// One warning per distinct message, process-wide. `userHomeDir()` is the default
+// argument of a dozen functions, so a poisoned $HOME would otherwise print the same
+// paragraph once per call site and bury the one line the operator needs to read.
+const warnedHomeMessages = new Set<string>();
+function warnHomeOnce(message: string): void {
+  if (warnedHomeMessages.has(message)) return;
+  warnedHomeMessages.add(message);
+  process.stderr.write(`${message}\n`);
+}
+
+/**
+ * The user's real home directory. ALWAYS absolute. Use this instead of `os.homedir()`
+ * ANYWHERE in the CLI; a lint spec (test/lib/home-resolution.spec.ts) fails the build
+ * on a raw `os.homedir()` call outside this file.
+ *
+ * The trap: `os.homedir()` returns $HOME VERBATIM whenever $HOME is set. It consults
+ * the passwd entry only when $HOME is UNSET. (A comment in scanner/cache.ts used to
+ * claim the opposite for macOS. It was wrong: `env HOME='~' node -p 'os.homedir()'`
+ * prints `~` on Darwin, same as Linux.) So a set-but-broken $HOME (the empty string,
+ * or a literal "~" a launcher forgot to expand) came back as-is, `path.join("", ".x")`
+ * collapsed to a RELATIVE ".x", and every home path silently re-rooted under
+ * process.cwd(). Observed for real on 2026-07-13: `mla` wrote `<repo>/.meetless/` and
+ * `<repo>/~/.claude.json` into a git working tree.
+ *
+ * The damage is not litter. With state forked per-cwd, mla finds no cli-config.json and
+ * behaves as if the operator were logged out, while `wire`/`activate` rewrite a PHANTOM
+ * `~/.claude.json` that Claude Code will never read.
+ *
+ * A poisoned $HOME is the environment's fault, not the operator's, and it is fully
+ * recoverable: `os.userInfo().homedir` reads the passwd entry directly and ignores
+ * $HOME. So recover, and warn loudly enough that a human goes and fixes their launcher.
+ *
+ * Deliberately NOT memoized: the HOME-isolated tests (see plugin-migrate.ts) point
+ * process.env.HOME at a temp dir between calls, and a cached first answer would make
+ * them read the developer's real home.
+ */
+export function userHomeDir(deps: HomeResolutionDeps = {}): string {
+  const warn = deps.warn ?? warnHomeOnce;
+
+  const fromEnv = (deps.homedir ?? os.homedir)();
+  if (path.isAbsolute(fromEnv)) return fromEnv;
+
+  let passwd = "";
+  try {
+    passwd = (deps.passwdHomedir ?? (() => os.userInfo().homedir))();
+  } catch {
+    passwd = "";
+  }
+  if (!path.isAbsolute(passwd)) {
+    throw new ConfigError(
+      `Cannot resolve a home directory: $HOME is ${JSON.stringify(fromEnv)} and the system ` +
+        `passwd entry gave nothing usable. Set MEETLESS_HOME to an absolute path.`,
+    );
+  }
+
+  warn(
+    `mla: $HOME is ${JSON.stringify(fromEnv)}, which is not an absolute path. Whatever launched ` +
+      `this process set it wrong. Falling back to ${passwd} so mla state is not written into the ` +
+      `current directory.`,
+  );
+  return passwd;
+}
+
+/**
+ * The single root every mla state path hangs off (cli-config.json, queue, hooks,
+ * logs, the ce0 evidence store). It MUST be absolute.
+ *
+ * A relative MEETLESS_HOME, unlike a poisoned $HOME, is a deliberate operator input;
+ * relocating the dir they explicitly asked for would be its own surprise, so it throws
+ * instead of recovering.
+ */
+export function resolveMeetlessHome(deps: HomeResolutionDeps = {}): string {
+  const env = deps.env ?? process.env;
+
+  const override = env.MEETLESS_HOME;
+  if (override) {
+    if (!path.isAbsolute(override)) {
+      throw new ConfigError(
+        `MEETLESS_HOME is set to a relative path (${JSON.stringify(override)}), so every mla ` +
+          `state file would be written under the current directory instead of one fixed home. ` +
+          `Set MEETLESS_HOME to an absolute path, or unset it to use ~/.meetless.`,
+      );
+    }
+    return override;
+  }
+
+  return path.join(userHomeDir(deps), ".meetless");
+}
+
+/**
+ * Repair a poisoned $HOME in our own environment, so CHILD processes cannot inherit it.
+ *
+ * Fixing every `os.homedir()` in this codebase protects only what mla writes itself. It
+ * does nothing about the processes mla spawns, and they all inherit our environment:
+ * `doctor` spawns `claude plugin list` (connectors/claude-code/plugin-detect.ts), `wire`
+ * spawns git and brew, `upgrade` spawns tar, the spool spawns bash. Under HOME='~' every
+ * one of them re-roots ITS OWN home under our cwd.
+ *
+ * That is not theoretical. Observed 2026-07-13: `mla doctor` under HOME='~' spawned the
+ * Claude Code CLI, which saw a home it had never seen, and bootstrapped a brand new
+ * <cwd>/~/.claude.json (firstStartTime = now, fresh machineID, migrationVersion) while the
+ * operator's real ~/.claude.json sat untouched. A poisoned $HOME does not just misplace
+ * files; it convinces well-behaved tools they are running for the first time.
+ *
+ * We cannot patch Claude Code, git, or npm from in here. We CAN refuse to hand them a
+ * broken $HOME. Repairing the variable once, at the boundary where the poison enters,
+ * covers every child process and every third-party library that calls os.homedir()
+ * internally, which no amount of fixing our own call sites can reach.
+ *
+ * Deliberately narrow: an ABSENT $HOME is left absent (os.homedir() already falls back to
+ * the passwd entry, in our children as in us), and an absolute $HOME is never touched. The
+ * only case rewritten is the one that is unambiguously broken: set, but not absolute.
+ */
+export function repairHomeEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  deps: HomeResolutionDeps = {},
+): void {
+  const current = env.HOME;
+  if (current === undefined || path.isAbsolute(current)) return;
+  try {
+    env.HOME = userHomeDir(deps);
+  } catch {
+    // No passwd home either, so there is nothing to repair it TO. Leave it alone;
+    // resolveMeetlessHome() throws with the actionable message when a state path is
+    // actually needed, and that beats inventing a home here.
+  }
+}
+
+repairHomeEnv();
+
+export const HOME = resolveMeetlessHome();
 export const CFG_PATH = path.join(HOME, "cli-config.json");
 export const QUEUE_DIR = path.join(HOME, "queue");
 export const HOOKS_DIR = path.join(HOME, "hooks");

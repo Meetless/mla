@@ -219,7 +219,7 @@ describe("boundedTraceFlush failure path (P1.T5)", () => {
     const tracer = stubTracer(async () => {
       const e = new Error(
         "POST .../agent-traces/ingest -> HTTP 403: " +
-          '{"code":"WORKSPACE_ACCESS_DENIED","message":"You are not a member of workspace \'cmq9l2xom002n5ueiwjuoy9bb\'."}',
+          '{"code":"WORKSPACE_ACCESS_DENIED","message":"You are not a member of workspace \'cmexampledogfoodws0000000\'."}',
       ) as Error & { status?: number };
       e.status = 403;
       throw e;

@@ -8,13 +8,21 @@
 // _abs_path_from_external_object_id). It is the replacement for the deleted
 // kb-reingest-parse.spec.ts (which pinned the now-gone subprocess stdout
 // scanner; reingest no longer spawns a subprocess).
+//
+// The resolution ITSELF now lives in src/lib/notes-root.ts, shared with kb add,
+// mcp, and ask, and is specced there (test/lib/notes-root.spec.ts). What this
+// file still guards is the part that is reingest's own: every resolution failure
+// must surface as a ReingestPreconditionError, because that is what maps to exit
+// code 2 ("your input is wrong") rather than exit code 1 ("we are broken"). A
+// leaked NotesRootError would exit 1 and tell the operator to retry a command
+// that can never succeed.
 
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
 import {
-  reverseMapEoidToFile,
+  reingestSourceFileForEoid,
   resolveReingestVaultRoot,
   ReingestPreconditionError,
 } from "../../src/commands/kb_reingest";
@@ -23,40 +31,74 @@ function mkTmp(prefix: string): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
-describe("reverseMapEoidToFile", () => {
+describe("reingestSourceFileForEoid", () => {
   const vault = mkTmp("mla-reingest-rev-");
+  const savedEnv = process.env.MEETLESS_NOTES_ROOT;
+
   beforeAll(() => {
     fs.mkdirSync(path.join(vault, "decisions"), { recursive: true });
     fs.writeFileSync(path.join(vault, "decisions", "no-redis.md"), "body\n");
+  });
+
+  beforeEach(() => {
+    // Pin the vault so the candidate ladder is deterministic under a tmp dir
+    // (which has neither a git root nor a sibling vault). The ladder itself is
+    // specced in test/lib/notes-root.spec.ts.
+    process.env.MEETLESS_NOTES_ROOT = vault;
+  });
+
+  afterAll(() => {
+    if (savedEnv === undefined) delete process.env.MEETLESS_NOTES_ROOT;
+    else process.env.MEETLESS_NOTES_ROOT = savedEnv;
   });
 
   test("strips the `notes/` identity root and joins under the vault", () => {
     // The stored id is `notes/<rel>`; the vault root holds `<rel>`. (Case-
     // folding of the id is the FS's job on a case-insensitive volume; the spec
     // uses matching case so it is deterministic on any FS.)
-    const abs = reverseMapEoidToFile("notes/decisions/no-redis.md", vault);
+    const abs = reingestSourceFileForEoid(
+      "notes/decisions/no-redis.md",
+      os.tmpdir(),
+    );
     expect(abs).toBe(path.join(vault, "decisions", "no-redis.md"));
   });
 
+  test("does not depend on the CWD: the anchor never decides the answer alone", () => {
+    // THE BUG. Reingest used to walk up from process.cwd(), so running it from
+    // the code repo reverse-mapped the identity into the code repo and died.
+    // The identity resolves to the same file from any anchor.
+    const fromElsewhere = reingestSourceFileForEoid(
+      "notes/decisions/no-redis.md",
+      path.join(vault, "decisions"),
+    );
+    expect(fromElsewhere).toBe(path.join(vault, "decisions", "no-redis.md"));
+  });
+
   test("rejects an id not under the `notes/` identity root", () => {
-    expect(() => reverseMapEoidToFile("decisions/no-redis.md", vault)).toThrow(
-      ReingestPreconditionError,
-    );
-    expect(() => reverseMapEoidToFile("decisions/no-redis.md", vault)).toThrow(
-      /identity root/,
-    );
+    expect(() =>
+      reingestSourceFileForEoid("decisions/no-redis.md", os.tmpdir()),
+    ).toThrow(ReingestPreconditionError);
+    expect(() =>
+      reingestSourceFileForEoid("decisions/no-redis.md", os.tmpdir()),
+    ).toThrow(/identity root/);
   });
 
   test("rejects a `..` escape out of the vault root", () => {
     expect(() =>
-      reverseMapEoidToFile("notes/../../etc/passwd", vault),
+      reingestSourceFileForEoid("notes/../../etc/passwd", os.tmpdir()),
+    ).toThrow(ReingestPreconditionError);
+    expect(() =>
+      reingestSourceFileForEoid("notes/../../etc/passwd", os.tmpdir()),
     ).toThrow(/escapes vault root/);
   });
 
-  test("rejects an id that maps to a missing file", () => {
+  test("rejects an id that maps to a missing file, naming where it looked", () => {
     expect(() =>
-      reverseMapEoidToFile("notes/decisions/ghost.md", vault),
-    ).toThrow(/does not resolve to a readable file/);
+      reingestSourceFileForEoid("notes/decisions/ghost.md", os.tmpdir()),
+    ).toThrow(ReingestPreconditionError);
+    expect(() =>
+      reingestSourceFileForEoid("notes/decisions/ghost.md", os.tmpdir()),
+    ).toThrow(/was not found in any notes vault root[\s\S]*ghost\.md/);
   });
 });
 

@@ -6,7 +6,38 @@
 # Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
 set -euo pipefail
 
-MEETLESS_HOME_DIR="${MEETLESS_HOME:-$HOME/.meetless}"
+# home.sh FIRST, before any path is built. It repairs a poisoned $HOME (empty, a
+# literal "~", relative) from the password database and exports the honest value, so
+# every "$HOME/..." below AND every process we spawn is anchored to a real absolute
+# home. Without it, `${MEETLESS_HOME:-$HOME/.meetless}` silently resolves to the
+# RELATIVE "~/.meetless" or "/.meetless" and the whole state tree (queue, logs,
+# cli-config, session-gate, the ce0 evidence store) re-roots under the session's cwd,
+# i.e. inside the operator's repo. See home.sh for the 2026-07-13 incident.
+# It also sets MEETLESS_HOME_DIR, honoring an ABSOLUTE MEETLESS_HOME override only.
+#
+# Sourced best-effort: home.sh ships with common.sh in every install (wire.ts copies the
+# whole template dir; the plugin generator lists both), so a missing one means a CORRUPT
+# install, which `mla doctor` reports as hook drift. The hook layer's contract is fail
+# open, so a corrupt install must degrade, not wedge the session. The fallback below
+# cannot reintroduce the bug: without home.sh we lose the REPAIR, never the RULE, and
+# the rule is that a state dir is absolute or it does not exist.
+source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/home.sh" 2>/dev/null || true
+
+if [[ -z "${MEETLESS_HOME_DIR+x}" ]]; then
+  case "${MEETLESS_HOME:-}" in
+    /*) MEETLESS_HOME_DIR="$MEETLESS_HOME" ;;
+    *) if [[ "${HOME:-}" == /* ]]; then MEETLESS_HOME_DIR="$HOME/.meetless"; else MEETLESS_HOME_DIR=""; fi ;;
+  esac
+fi
+
+# Empty = no home is resolvable on this box (no $HOME, no passwd entry, no absolute
+# MEETLESS_HOME). There is nowhere legitimate to put the state, and the one thing we must
+# never do is fall back to the cwd. Capture is assistive, so degrade to a clean no-op.
+if [[ -z "${MEETLESS_HOME_DIR:-}" ]]; then
+  printf '[Meetless] no home directory could be resolved; capture is disabled for this session.\n' >&2
+  exit 0
+fi
+
 QUEUE_DIR="$MEETLESS_HOME_DIR/queue"
 LOG_DIR="$MEETLESS_HOME_DIR/logs"
 CFG="$MEETLESS_HOME_DIR/cli-config.json"
@@ -208,7 +239,22 @@ warn_capture_auth() {
   return 0
 }
 
-# Correction 7: absolute path resolved at install time; mla in PATH is NOT relied on.
+# Correction 7: the absolute path resolved at install time is PREFERRED, and it is what
+# a healthy install uses. PATH is the FALLBACK, not a non-dependency: a pinned mlaPath
+# that no longer passes -x (the binary was reinstalled elsewhere, a version manager moved
+# it, the config predates a move) must not kill capture outright, so we take whatever
+# `mla` PATH can find rather than going silently dark.
+#
+# Know what that costs, because the earlier version of this comment claimed PATH was "NOT
+# relied on" and taught readers to assume otherwise: when the pinned path is dead, these
+# hooks will invoke whatever `mla` happens to sit first on PATH. On a machine with a
+# stale, foreign, or shimmed mla, that is the wrong binary, running with MEETLESS_HOME
+# pointed at this install. The failure is silent by construction.
+#
+# It is also the reason the test suite plants a no-op `mla` at the head of PATH
+# (test/jest.global-setup.js): 39 specs pinned mlaPath to "/bin/true", which does not
+# exist on macOS, so the -x guard fired and this fallback reached for the developer's
+# real global binary mid-test.
 MLA_PATH="$(jq -r '.mlaPath // empty' "$CFG" 2>/dev/null || true)"
 if [[ -z "${MLA_PATH:-}" || ! -x "$MLA_PATH" ]]; then
   MLA_PATH="$(command -v mla 2>/dev/null || true)"
@@ -392,6 +438,37 @@ spool_append() {
   ml_unlock 9 "$lock"
 }
 
+# End-of-run review card: surface up to 5 deterministic stale signals to the user.
+# P0A-minimal: appended to a LOCAL jsonl only (review_card is not in the flush
+# allowlist), later surfaced by `mla status` / `mla context list`. A cheap jq read of
+# the scan cache; it never recomputes the scan. Always returns 0 so it cannot abort Stop.
+#
+# This lives in common.sh, next to MEETLESS_HOME_DIR, precisely because it resolves
+# state paths: while it sat inline in stop.sh it hard-coded $HOME/.meetless and so
+# ignored MEETLESS_HOME, unlike every other path in this file. Nothing could catch that,
+# because the only test copied the jq filter into TypeScript instead of driving the real
+# function. test/hooks/build-stop-card.spec.ts now drives THIS function.
+write_stop_review_card() {
+  local session_id="$1" ts="$2"
+  local ws_dir="$MEETLESS_HOME_DIR/workspaces/$WORKSPACE_ID"
+  local cache="$ws_dir/scan-cache.json"
+  [[ -r "$cache" ]] || return 0
+  local line
+  line="$(jq -c -n \
+    --slurpfile c "$cache" \
+    --arg sid "$session_id" \
+    --arg ts "$ts" \
+    '{
+       ts: $ts, event: "review_card", session_id: $sid,
+       items: ($c[0].staleSignals // [])[0:5] | map({id: .id, detail: .detail, source: .source}),
+       total: (($c[0].staleSignals // []) | length),
+       scan_root: ($c[0].scanRootPath // null)
+     }' 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 0
+  printf '%s\n' "$line" >> "$ws_dir/review-cards.jsonl" 2>/dev/null || true
+  return 0
+}
+
 # Monotonic per-session turn counter. Returns (echoes) the next 1-based index
 # for this session and persists it, under the SAME per-session lock spool_append
 # uses so it cannot race a concurrent writer. user-prompt-submit.sh stamps the
@@ -533,11 +610,23 @@ COORDINATION_TRIGGER_ENUM='["GOVERNED_SURFACE_TOUCHED","ACCEPTED_DECISION_APPLIE
 # and stop.sh (the source_ids the agent's final report CITED) so the pull side
 # and the push-reference side share one grammar. The grep can match zero (rc 1
 # under pipefail); `|| true` keeps that from aborting the caller's `set -e`.
+#
+# `/` is IN the character class on purpose: a note id is a PATH
+# (NT:notes/20260617-foo.md), which is the form the injector offers. Without the
+# slash the token stopped at the first separator and every full-path citation was
+# harvested as the useless stem `NT:notes`, so it could never overlap the offered
+# id and report_cited / citation_precision were dead by construction.
+#
+# The sed trims trailing sentence punctuation. `.` has to stay in the class (ids
+# end in `.md`), so an id cited at the end of a prose sentence came out as
+# `NT:...foo.md.` with the period glued on, which normId (it only strips a
+# trailing `.md`) could never reconcile with the offered id either.
 extract_source_ids() {
   local text="$1"
   local ids
   ids="$(printf '%s' "$text" \
-    | grep -oE '(DD|TH|NT|CC|PP|PT|RC|WA|AU|DM):[A-Za-z0-9_.-]+' \
+    | grep -oE '(DD|TH|NT|CC|PP|PT|RC|WA|AU|DM):[A-Za-z0-9_./-]+' \
+    | sed -E 's/[.,;:)]+$//' \
     | sort -u \
     | jq -R -s -c 'split("\n") | map(select(length > 0))' || true)"
   [[ -z "$ids" ]] && ids="[]"
@@ -972,6 +1061,39 @@ spawn_evidence_inject() {
       --turn-index "$turn" --offered-ids "$ids" --tokens "$tokens" \
       --confidence "$conf" --latency-ms "$latency" --trace-id "$trace" \
       --workspace-id "$ws" --session-id "$sid" >>"$LOG_DIR/evidence-inject-$sid.log" 2>&1 &) >/dev/null 2>&1 || true
+  fi
+}
+
+# ---- Rule-injection cost meter (audit 6.G / 7.10) ------------------------
+# Detached, fail-soft mla_rule_injection record. Fired from the UserPromptSubmit
+# hook on every turn the assembler produced a head, carrying the meter JSON that
+# `_internal assemble-context` just wrote to its --meterFile: how many bytes and
+# rules this prompt was charged, split ambient (the always-on floor, billed to
+# every user on every turn) vs scoped.
+#
+# The meter rides as ONE opaque JSON argv value on purpose. It is pure numbers and
+# booleans (no rule id, no path, no prompt), so unlike the assembler's inputs it is
+# safe in the process table; passing the PROMPT instead, to let this process
+# recompute the match, would leak the user's text to every `ps` on the box.
+#
+# Reuses the evidence-analytics kill switch: same hot path, same blast radius, and
+# one flag to silence all of it beats a second flag nobody remembers.
+# Args: meterJson traceId workspaceId sessionId turnIndex
+spawn_rule_meter() {
+  local meter="$1" trace="$2" ws="$3" sid="$4" turn="$5"
+  evidence_analytics_enabled || return 0
+  [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]] || return 0
+  [[ -n "$meter" ]] || return 0
+  if [[ "${MEETLESS_DEBUG:-1}" == "0" ]]; then
+    (nohup "$MLA_PATH" _internal rule-meter \
+      --meter "$meter" --trace-id "$trace" \
+      --workspace-id "$ws" --session-id "$sid" --turn-index "$turn" \
+      >/dev/null 2>&1 &) >/dev/null 2>&1 || true
+  else
+    (nohup "$MLA_PATH" _internal rule-meter \
+      --meter "$meter" --trace-id "$trace" \
+      --workspace-id "$ws" --session-id "$sid" --turn-index "$turn" \
+      >>"$LOG_DIR/rule-meter-$sid.log" 2>&1 &) >/dev/null 2>&1 || true
   fi
 }
 

@@ -9,16 +9,16 @@ import { workspaceBindingCheck } from "../../src/commands/doctor";
 // is an IO shell, so the comparison is extracted as a pure function and pinned directly.
 
 describe("workspaceBindingCheck: the folder-binding assertion", () => {
-  const MARKER = "cmq9l2xom002n5ueiwjuoy9bb";
+  const MARKER = "cmexampledogfoodws0000000";
 
   it("passes when the resolved workspace id equals the marker id, showing the id (not just the slug)", () => {
-    const c = workspaceBindingCheck(MARKER, { workspace: { id: MARKER, slug: "an-pham-s-workspace-jgqmd4cc" } });
+    const c = workspaceBindingCheck(MARKER, { workspace: { id: MARKER, slug: "example-workspace-slug" } });
     expect(c.ok).toBe(true);
     expect(c.label).toBe("token valid + workspace resolves");
     // The id must be visible so this line and the "folder activated" line are recognizably the
     // SAME workspace even though their display names differ (marker name "meetless" vs live slug).
     expect(c.detail).toContain(MARKER);
-    expect(c.detail).toContain("an-pham-s-workspace-jgqmd4cc");
+    expect(c.detail).toContain("example-workspace-slug");
   });
 
   it("shows just the id when the resolved workspace has no slug", () => {

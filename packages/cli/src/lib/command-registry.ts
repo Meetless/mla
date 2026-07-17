@@ -116,6 +116,60 @@ export function renderCommandHelp(
 }
 
 /**
+ * Levenshtein edit distance between two short command words. Iterative two-row
+ * form (O(min) memory); only ever called on the error path against a handful of
+ * command names, so the constant factors are irrelevant. Pure and total.
+ */
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array<number>(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(
+        prev[j] + 1, // deletion
+        prev[j - 1] + 1, // insertion
+        diag + (a[i - 1] === b[j - 1] ? 0 : 1), // substitution
+      );
+      diag = tmp;
+    }
+  }
+  return prev[n];
+}
+
+/**
+ * The up-to-`limit` command names nearest (by edit distance) to a typo'd word,
+ * for a concise "did you mean" on the unknown-command path (proposal §3 bug 1).
+ * This is the antidote to the self-amplifying failure where an error path dumps
+ * the whole catalog: a wrong guess costs one short line, not forty pasteable
+ * commands. Matches are gated by a length-proportional distance threshold so
+ * genuine gibberish yields an empty list (the caller then just points at `mla
+ * help`) rather than a misleading suggestion. Hidden entries (removed-command
+ * stubs) and aliases are excluded; we only ever suggest a real, visible verb.
+ * Pure, so the copy is asserted verbatim in tests.
+ */
+export function nearestCommands(
+  commands: CommandSpec[],
+  name: string,
+  limit = 3,
+): string[] {
+  const threshold = Math.max(2, Math.ceil(name.length * 0.4));
+  return commands
+    .filter((c) => !c.hidden)
+    .map((c) => ({ name: c.name, distance: levenshtein(name, c.name) }))
+    .filter((x) => x.distance <= threshold)
+    .sort((a, b) => a.distance - b.distance || a.name.localeCompare(b.name))
+    .slice(0, limit)
+    .map((x) => x.name);
+}
+
+/**
  * Is `--help` / `-h` a plea for help, for a command whose arguments are FREE TEXT?
  *
  * The dispatcher's generic interception matches `--help` ANYWHERE in the args,

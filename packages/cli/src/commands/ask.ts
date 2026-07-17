@@ -3,8 +3,10 @@ import { pathToFileURL } from "url";
 import { renderPlain } from "../lib/ask-render";
 import { loadWorkspaceConfig } from "../lib/config";
 import { DEFAULT_INTEL_URL } from "../lib/http";
+import { bestEffortNotesRoot } from "../lib/notes-root";
 import { parseAsOf } from "../lib/temporal";
 import { isPackagedBinary } from "../lib/packaged";
+import { findWorkspaceContext } from "../lib/workspace";
 
 // `mla ask`: the CLI front-end over the shared @meetless/ask-core ask
 // implementation (proposal 20260529 T5 / D-D). It reuses the SAME mode routing
@@ -120,12 +122,18 @@ function bundlePath(name: string): string {
   return path.resolve(__dirname, "..", "bundles", name);
 }
 
+// Best-effort: the standalone notes repo is a sibling of the CODE repo. This
+// used to be a `__dirname`-relative walk-up, which only ever resolved from a
+// source checkout: once the CLI is installed (npm global, brew, the curl
+// bundle), `__dirname` sits under node_modules / the Cellar and the five `..`
+// hops land somewhere meaningless, so the INDEX.md canonical matcher was dead
+// for every real install and silently degraded to plain retrieval. Anchor on the
+// operator's marker repo instead, the same ladder `mla mcp` and `mla kb *` walk.
+// A missing INDEX.md still degrades to retrieval, so an imperfect guess is
+// non-fatal.
 function notesRoot(): string {
-  if (process.env.MEETLESS_NOTES_ROOT) return process.env.MEETLESS_NOTES_ROOT;
-  // Best-effort: the standalone notes repo is a sibling of the code repo. A
-  // missing INDEX.md degrades to retrieval, so an imperfect guess here is
-  // non-fatal.
-  return path.resolve(__dirname, "..", "..", "..", "..", "..", "notes");
+  const ctx = findWorkspaceContext();
+  return bestEffortNotesRoot(ctx?.markerDir ?? process.cwd());
 }
 
 // Load ask-core from its ESM source files (the original path). Kept as the dev

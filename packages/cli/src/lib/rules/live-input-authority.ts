@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { HOOKS_DIR } from "../config";
+import { HOOKS_DIR, userHomeDir } from "../config";
 import {
   resolveInputAuthority,
   type HookConfigLayer,
@@ -17,7 +17,7 @@ import {
 // authority. This is the single source of truth shared by `mla doctor` and the live PreToolUse hook so
 // both judge admissibility off identical inputs.
 
-export function readUserHookConfigLayer(homeDir: string = os.homedir()): HookConfigLayer {
+export function readUserHookConfigLayer(homeDir: string = userHomeDir()): HookConfigLayer {
   const settingsPath = path.join(homeDir, ".claude", "settings.json");
   if (!fs.existsSync(settingsPath)) {
     return { name: "user", settings: {} };

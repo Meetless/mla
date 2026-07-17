@@ -121,9 +121,13 @@ function throwingLoader(message: string): (override?: string) => WorkspaceCliCon
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("runWorkspaceInvite", () => {
-  const invited: InviteMemberResult = { email: "bob@example.com", role: "MEMBER" };
+  const invited: InviteMemberResult = {
+    email: "bob@example.com",
+    role: "MEMBER",
+    joinToken: "tok_join_abc",
+  };
 
-  it("POSTs the email + workspaceId and prints the human grant line", async () => {
+  it("POSTs the email + workspaceId and prints the human grant line + join link", async () => {
     const { http, calls } = fakeHttp({ post: () => invited });
     const { loadConfig, seen } = loaderSpy();
     const { rec, out, err } = sink();
@@ -144,10 +148,14 @@ describe("runWorkspaceInvite", () => {
     ]);
     expect(rec.out[0]).toContain("bob@example.com is now a MEMBER");
     expect(rec.out[0]).toContain(WS);
+    // The web join link is the invitee's primary path, built from the resolved
+    // Console origin + the minted token.
+    expect(rec.out.join("\n")).toContain("Join link:");
+    expect(rec.out.join("\n")).toContain("/join/tok_join_abc");
     expect(rec.err).toEqual([]);
   });
 
-  it("--json dumps the raw InviteMemberResult", async () => {
+  it("--json emits email, role, and the built joinUrl (not the raw token)", async () => {
     const { http } = fakeHttp({ post: () => invited });
     const { loadConfig } = loaderSpy();
     const { rec, out, err } = sink();
@@ -158,7 +166,12 @@ describe("runWorkspaceInvite", () => {
       err,
     });
     expect(code).toBe(0);
-    expect(JSON.parse(rec.out.join("\n"))).toEqual(invited);
+    const parsed = JSON.parse(rec.out.join("\n"));
+    expect(parsed.email).toBe("bob@example.com");
+    expect(parsed.role).toBe("MEMBER");
+    expect(parsed.joinUrl).toContain("/join/tok_join_abc");
+    // The raw signed token is transformed into a link, never surfaced bare.
+    expect(parsed.joinToken).toBeUndefined();
   });
 
   it("threads --workspace <id> into loadConfig (BUG-3/BUG-4 target override)", async () => {

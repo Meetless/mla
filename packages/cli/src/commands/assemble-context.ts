@@ -17,47 +17,61 @@
 // bash fallback (LAYER1 + floor XML) still delivers the floor. The degraded cache states in
 // §6 are SUCCESS outputs (non-empty, with a visible marker), NOT the silent fail-soft path:
 // only a genuinely unusable environment (no cache readable AND no base) yields empty output.
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { posix } from "node:path";
 import { Buffer } from "node:buffer";
 import { ScanResult, SCAN_SCHEMA_VERSION } from "../lib/scanner/types";
 import {
   PersistedAssembleAudit,
-  readScanCache,
   writeAssembleAudit,
 } from "../lib/scanner/cache";
-import { assembleContext, BaseInvariantError } from "../lib/scanner/assemble";
+import { readScanCacheForRoot } from "./scan-context";
+import { assembleContext } from "../lib/scanner/assemble";
 import { extractExplicitPaths } from "../lib/scanner/prompt-paths";
 import {
   renderIncompleteDeliveryMarker,
   renderScopedUnavailableMarker,
 } from "../lib/scanner/render";
+import { RuleMeterFile } from "../lib/analytics/envelope";
 
-// The connector-owned byte ceiling: strictly below the Phase-0-measured harness inline cap
-// (~2048B of the complete, line-trimmed, RAW-text additionalContext — the harness trims the
-// visible text to the last complete line, it does not count JSON-serialized bytes). The
-// assembler asserts the head (base + floor + scoped) fits this; the variable Layer-2 blocks
-// the hook appends AFTER land beyond the window by design and cannot displace anything asserted
-// here. Set to the plan's P0.2 target (§Phase 0): 2048 cap, less margin for the block separator
-// and the trim line landing mid-block.
+// The connector-owned byte ceiling for the assembled head (base + floor + scoped).
 //
-// MEASURED (2026-07-06, live dogfood ws cmq9l2xom002n5ueiwjuoy9bb): LAYER1 base = 709B. The
-// original VERBOSE 6-rule global-MUST floor block measured 1896B, so base+floor = 2605B overran
-// the ~2048 cap by ~557B before any scoped rule and the base invariant could not hold at any
-// sub-cap value. Fixed by GOVERNANCE (not a renderer change): the 6 floor rules were rewritten to
-// compact single-line imperatives, shrinking the floor block to ~1258B, so base+floor = ~1967B,
-// under this 2048-anchored budget. The overflow-marker room (~224B) is now reserved CONDITIONALLY
-// (assemble.ts: only when a scoped rule exists, since the marker is unreachable otherwise), so the
-// zero-scoped common turn delivers the whole compressed floor at ~1967B instead of failing loud.
-// SAFE_TOTAL is set to 2000 (2048 cap less a small margin for the block separator and the harness
-// trimming the visible text to the last complete line).
-export const SAFE_TOTAL = 2000;
+// THE ~2048B "HARNESS INLINE CAP" THIS BUDGET WAS BUILT ON DOES NOT EXIST. The Phase-0 note
+// claimed the harness only shows the model ~2048B of additionalContext and that anything the hook
+// appends after the head "lands beyond the window by design". Both halves are false, and the
+// second one refutes the first: the Layer-2 evidence block IS appended after the head, and the
+// agent visibly reads and cites it. That block is the product. If the window were real, evidence
+// injection could never have worked once.
+//
+// MEASURED (2026-07-13, live dogfood ws, one real hook run): the hook
+// emits ONE additionalContext string of 5933B (static base 887B + floor-rules 1500B + evidence
+// 3546B) and the model reads it whole, tail included. Nothing is trimmed at 2048B or anywhere near
+// it.
+//
+// WHAT THE PHANTOM CAP COST: base (887B, it grew) + floor (1500B, 8 MUSTs) = 2387B > 2000, so the
+// base invariant threw BaseInvariantError on EVERY turn in this repo. The assembler printed
+// nothing, the hook silently fell back to emitting the base and floor blocks itself, and the floor
+// survived only by accident. The scoped tier does not exist on the fallback path, so every
+// applicable scoped MUST was dropped in silence: two of them, live in the cache, never delivered
+// once in this repo's history. A budget that forces a 2387B payload down a path that then emits
+// 5933B unbudgeted is not a safety rail, it is a hole.
+//
+// SAFE_TOTAL now budgets ONLY the best-effort SHOULD tail. Required content (base + global MUST
+// floor + every applicable scoped MUST) is always delivered whole by the assembler: since there is
+// no harness cap, the assembler's byte budget expands to max(SAFE_TOTAL, requiredBytes) rather than
+// throwing or blocking when the required set outgrows this number. So the base invariant is gone,
+// the §7.5 fail-loud path is retired (the assembler's `overflow` is permanently false), and this
+// constant no longer gates whether a MUST is delivered, only how much OPTIONAL tail rides on top.
+// It is set from measured content: base 887 + floor 1500 + both scoped MUSTs ~650 = ~3.3KB today.
+// 6000 leaves roughly 2x headroom of SHOULD-tail slack before the floor+required set eats it.
+export const SAFE_TOTAL = 6000;
 
 export interface AssembleContextDeps {
   readStdin?: () => string;
-  readCache?: (home: string, workspaceId: string) => ScanResult | null;
-  writeAudit?: (home: string, workspaceId: string, audit: PersistedAssembleAudit) => void;
+  readCache?: (home: string | undefined, workspaceId: string) => ScanResult | null;
+  writeAudit?: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
+  writeMeter?: (path: string, json: string) => void;
   home?: string;
   now?: () => string;
   log?: (out: string) => void;
@@ -71,6 +85,12 @@ interface AssembleStdin {
   workspaceId: string;
   repoRoot?: string;
   safeTotal: number;
+  // Optional caller-owned path for the rule-cost meter (audit 6.G). The hook mktemps it, reads
+  // it after we exit, and hands the JSON to a DETACHED emitter. It is a per-call temp path and
+  // not a well-known one on purpose: the per-workspace assemble-audit is last-write-wins and 10+
+  // concurrent sessions clobber it, so a meter read from there would be attributed to the wrong
+  // turn. Absent key = no meter, which is the correct behavior for every non-hook caller.
+  meterFile?: string;
 }
 
 function byteLength(s: string): number {
@@ -99,7 +119,8 @@ function parseInput(raw: string): AssembleStdin | null {
     typeof j.safeTotal === "number" && Number.isFinite(j.safeTotal) && j.safeTotal > 0
       ? Math.floor(j.safeTotal)
       : SAFE_TOTAL;
-  return { base, prompt, workingSet, workspaceId, repoRoot, safeTotal };
+  const meterFile = typeof j.meterFile === "string" && j.meterFile ? j.meterFile : undefined;
+  return { base, prompt, workingSet, workspaceId, repoRoot, safeTotal, meterFile };
 }
 
 // Sanitize the git working set to repo-relative, contained paths (§4.7 "full working set").
@@ -123,21 +144,29 @@ function normalizeWorkingSet(entries: string[]): string[] {
 }
 
 interface AssembleCtx {
-  home: string;
+  // undefined = the cache module resolves the state root (it honors MEETLESS_HOME).
+  home: string | undefined;
   now: () => string;
-  readCache: (home: string, workspaceId: string) => ScanResult | null;
-  writeAudit: (home: string, workspaceId: string, audit: PersistedAssembleAudit) => void;
+  readCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
+  writeAudit: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
 }
 
-// The result of a byte-budgeted assembly attempt. `head` is the exact model-facing envelope (or
-// null when nothing can be produced and the bash fallback must own the head). `overflow` is true
-// iff an applicable MUST could not be delivered (§7.5): the caller MUST turn this into a
-// fail-closed exit so the hook blocks the prompt (INV-DELIVERY). `blockedVersions` names the
-// undelivered mandatory RuleVersions so the block message can tell the user exactly what failed.
+// The result of a byte-budgeted assembly attempt. `head` is the exact model-facing envelope. Since
+// the base invariant + §7.5 fail-loud path were retired, every branch now produces a non-null head
+// and a non-null meter: required content always rides whole (the budget expands to hold it) and a
+// degraded branch still emits a visible-marker head. The nullable types, `overflow`, and
+// `blockedVersions` are a DORMANT, typed safety net: `overflow` is permanently false and
+// `blockedVersions` permanently empty today, but the shape stays valid so a future real byte ceiling
+// could re-arm fail-closed delivery (head null -> bash fallback owns it; overflow true -> the caller
+// turns rc==3 into a blocked prompt) without re-plumbing the audit/meter/hook contract.
 interface AssembleResult {
   head: string | null;
   overflow: boolean;
   blockedVersions: Array<{ versionId: string; text: string }>;
+  // The rule-cost meter for this turn (audit 6.G), pure numbers, no text. Non-null on every live
+  // branch; the null type is reserved for the dormant head-null path described above, where the bash
+  // fallback owns delivery and metering a head we did not build would misreport what the model got.
+  meter: RuleMeterFile | null;
 }
 
 /**
@@ -199,28 +228,53 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
     });
   };
 
+  // A degraded-branch meter: the cache could not be assembled from, so no rule COUNT is knowable
+  // and `degraded` is set. The BYTES are still true (they describe the head the model actually
+  // got), which is why these rows are kept rather than dropped: a turn that delivered no rules at
+  // all is exactly the turn a cost/coverage board must not silently omit.
+  const degradedMeter = (text: string, alwaysOnBytes: number): RuleMeterFile => ({
+    base_bytes: byteLength(input.base),
+    always_on_bytes: alwaysOnBytes,
+    always_on_rules: 0,
+    scoped_bytes: 0,
+    scoped_rules: 0,
+    scoped_configured: 0,
+    avoided_bytes: 0,
+    omitted_rules: 0,
+    head_bytes: byteLength(text),
+    safe_total: input.safeTotal,
+    overflow: false,
+    degraded: true,
+    base_invariant: false,
+  });
+
   // Row 5: invalid cache, no usable last-good -> base + visible incomplete-delivery marker.
   if (!cache) {
     const text = joinSegments([input.base, renderIncompleteDeliveryMarker()]);
     emitAudit("incomplete", text, false, [], []);
-    return { head: text, overflow: false, blockedVersions: [] };
+    return { head: text, overflow: false, blockedVersions: [], meter: degradedMeter(text, 0) };
   }
 
   // Rows 3/4: old schema. Post-activation, the bulk compat path is gone, so scoped rules cannot
   // be surfaced from this cache. Deliver the pre-rendered floor and a VISIBLE marker (not a
   // silent floor-only success), which drives the operator to rescan to the current schema.
   //
-  // Marker BEFORE floor: the harness trims the raw text to the last complete line within the
-  // inline window, and the pre-rendered floor can itself overrun that window (§Phase 0: base +
-  // floor measured at ~2605B > ~2048 cap). If the marker trailed the floor it would be the
-  // segment trimmed away, silently degrading this state back to the floor-only success it exists
-  // to distinguish. Placing the marker first (base + marker is ~1009B, always within budget)
-  // guarantees the load-bearing degradation signal survives; the floor is the segment that gets
-  // truncated instead, which is the correct sacrifice.
+  // Marker BEFORE floor. The original reason was wrong (it assumed a harness window that trims the
+  // tail, so a trailing marker would be the segment cut; see SAFE_TOTAL above, no such window
+  // exists). The ordering stands on its own merit: this state means the operator's cache is stale,
+  // and the instruction to distrust the missing scoped rules is worth more than the floor bullets
+  // it precedes, so it leads.
   if ((cache.schemaVersion ?? 1) < SCAN_SCHEMA_VERSION) {
     const text = joinSegments([input.base, renderScopedUnavailableMarker(), cache.floorRulesXml ?? ""]);
     emitAudit("old-schema", text, false, [], []);
-    return { head: text, overflow: false, blockedVersions: [] };
+    return {
+      head: text,
+      overflow: false,
+      blockedVersions: [],
+      // The pre-rendered floor XML DID ride, so its bytes are real always-on cost even though the
+      // old cache cannot tell us how many rules are inside it.
+      meter: degradedMeter(text, byteLength(cache.floorRulesXml ?? "")),
+    };
   }
 
   // Rows 1/2: current schema. Real byte-budgeted assembly. A cache written by a scan that failed
@@ -228,42 +282,51 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
   // not overwriting on failure), so reading current on-disk state IS "use last-known-good".
   const floorRules = cache.floorRules ?? [];
   const scopedRules = cache.scopedRules ?? [];
-  try {
-    const out = assembleContext({
-      base: input.base,
-      prompt: input.prompt,
-      floorRules,
-      scopedRules,
-      explicitPaths,
-      workingSetPaths,
-      safeTotal: input.safeTotal,
-    });
-    emitAudit(out.overflow ? "overflow" : "normal", out.text, out.overflow, out.delivered, out.omitted, out.bytes);
-    // On overflow the omitted set is exactly the applicable MUST rules that did not fit (§7.5).
-    // Name them by durable RuleVersion so the fail-closed block message tells the user what failed.
-    const blockedVersions = out.overflow
-      ? out.omitted.map((o) => {
-          const id = identityByRuleId.get(o.ruleId);
-          return { versionId: id?.versionId ?? o.ruleId, text: id?.text ?? "" };
-        })
-      : [];
-    return { head: out.text, overflow: out.overflow, blockedVersions };
-  } catch (e) {
-    if (e instanceof BaseInvariantError) {
-      // The universal floor no longer fits the budget (SAFE_TOTAL too small or the floor grew
-      // past it). This is the plan's "fall back to last-known-good" case (§4.1): yield to the
-      // hook's bash fallback, which emits LAYER1 + the pre-rendered floor XML (the last-known-good
-      // compiled floor). That preserves the status-quo floor delivery (the surviving floor rules
-      // still ride, harness-truncated) instead of regressing to base+marker with NO floor at all.
-      // The floor-too-big condition is an ops problem surfaced by the hook's floor-budget WARN and
-      // fixed by reclassifying a marginal global MUST, not by a model-facing marker. We still write
-      // the audit so the base-invariant is observable out-of-band. Return null -> subcommand prints
-      // nothing -> bash fallback owns the head.
-      emitAudit("base-invariant", "", false, [], [], 0);
-      return { head: null, overflow: false, blockedVersions: [] };
-    }
-    throw e;
-  }
+  // The assembler is pure and, since the base invariant + §7.5 fail-loud path were retired, never
+  // throws for budget: required content is always delivered whole. Any UNEXPECTED throw here (a
+  // genuine bug) propagates to the fail-soft catch in runAssembleContext, which yields to the bash
+  // fallback rather than crashing the hook.
+  const out = assembleContext({
+    base: input.base,
+    prompt: input.prompt,
+    floorRules,
+    scopedRules,
+    explicitPaths,
+    workingSetPaths,
+    safeTotal: input.safeTotal,
+  });
+  // `out.overflow` is permanently false (see assemble.ts). The overflow-conditional plumbing below
+  // (state "overflow", blockedVersions, the rc==3 path in runAssembleContext) is a DORMANT, typed
+  // safety net: it never fires today, but it stays valid so a future real byte ceiling could re-arm
+  // fail-closed delivery without re-plumbing the audit/meter/hook contract.
+  emitAudit(out.overflow ? "overflow" : "normal", out.text, out.overflow, out.delivered, out.omitted, out.bytes);
+  const blockedVersions = out.overflow
+    ? out.omitted.map((o) => {
+        const id = identityByRuleId.get(o.ruleId);
+        return { versionId: id?.versionId ?? o.ruleId, text: id?.text ?? "" };
+      })
+    : [];
+  const m = out.meter;
+  return {
+    head: out.text,
+    overflow: out.overflow,
+    blockedVersions,
+    meter: {
+      base_bytes: m.baseBytes,
+      always_on_bytes: m.ambientBytes,
+      always_on_rules: m.ambientRules,
+      scoped_bytes: m.scopedBytes,
+      scoped_rules: m.scopedRules,
+      scoped_configured: m.scopedConfigured,
+      avoided_bytes: m.avoidedBytes,
+      omitted_rules: m.omittedRules,
+      head_bytes: m.headBytes,
+      safe_total: input.safeTotal,
+      overflow: out.overflow,
+      degraded: false,
+      base_invariant: false,
+    },
+  };
 }
 
 // Truncate a rule's text to a single readable line for the fail-closed block message. The full
@@ -293,9 +356,11 @@ function renderBlockMessage(blocked: Array<{ versionId: string; text: string }>)
  *
  * Exit codes are the hook's control channel:
  *   2 — strict-parse error (unknown flag). Distinct from the fail-closed signal below.
- *   3 — FAIL-CLOSED (§7.5): an applicable MUST could not be delivered. The head (base + floor +
- *       marker) is still printed to stdout and the undelivered RuleVersions are named on stderr;
- *       the hook turns rc==3 into a blocked prompt (exit 2) so the run is never reported INJECTED.
+ *   3 — FAIL-CLOSED (§7.5), DORMANT: reserved for "an applicable MUST could not be delivered". The
+ *       assembler now always delivers required content whole (`overflow` is permanently false), so
+ *       this path never fires today. It is kept intact so a future real byte ceiling could re-arm
+ *       fail-closed delivery: the hook still turns rc==3 into a blocked prompt (exit 2) so a run is
+ *       never reported INJECTED while a MUST went undelivered.
  *   0 — normal delivery, a visible degraded state, or any fail-soft error (bash fallback owns it).
  */
 export async function runAssembleContext(
@@ -311,9 +376,15 @@ export async function runAssembleContext(
   try {
     const readStdin = deps.readStdin ?? (() => readFileSync(0, "utf8"));
     const ctx: AssembleCtx = {
-      home: deps.home ?? homedir(),
+      home: deps.home, // undefined = the cache module's state root (it honors MEETLESS_HOME)
       now: deps.now ?? (() => new Date().toISOString()),
-      readCache: deps.readCache ?? readScanCache,
+      // Guarded read: the assembler injects locally-parsed scopedRules, which belong to ONE
+      // checkout. A workspace shared by several checkouts writes one scan-cache.json, so an
+      // unguarded read could inject a sibling checkout's scoped rules into this session. On a
+      // mismatch this returns null and the assembler degrades to the bash floor fallback (the
+      // floor block is bundle-sourced and workspace-global, so it stays correct). cwd defaults to
+      // process.cwd() = the session repo here in the hook.
+      readCache: deps.readCache ?? readScanCacheForRoot,
       writeAudit: deps.writeAudit ?? writeAssembleAudit,
     };
     const log = deps.log ?? ((out: string) => process.stdout.write(out));
@@ -323,9 +394,22 @@ export async function runAssembleContext(
     if (!input) return 0; // fail-soft: bash fallback emits LAYER1 + floor
     const result = assemble(input, ctx);
     if (result.head) log(result.head);
+    // Drop the rule-cost meter (audit 6.G) where the caller asked for it. STRICTLY best-effort and
+    // deliberately not in the `try` that guards delivery: a full disk or a vanished temp dir must
+    // cost us a telemetry row, never the user's rules. Note the ordering. The head is already on
+    // stdout, so even a throw here (impossible, it is caught) could not unsend it.
+    if (input.meterFile && result.meter) {
+      const writeMeter = deps.writeMeter ?? ((p: string, j: string) => writeFileSync(p, j, "utf8"));
+      try {
+        writeMeter(input.meterFile, JSON.stringify(result.meter));
+      } catch {
+        /* telemetry is never load-bearing */
+      }
+    }
     if (result.overflow) {
-      // Fail-closed: an applicable MUST did not fit. Name what failed on stderr and signal rc==3
-      // so the hook blocks the prompt. Never a silent INJECTED (INV-DELIVERY, acceptance test 30).
+      // DORMANT fail-closed (result.overflow is permanently false; see assemble.ts). Kept so a
+      // future real byte ceiling can re-arm it: name what failed on stderr and signal rc==3 so the
+      // hook blocks the prompt. Never a silent INJECTED (INV-DELIVERY, acceptance test 30).
       logErr(renderBlockMessage(result.blockedVersions));
       return 3;
     }

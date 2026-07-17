@@ -3,6 +3,45 @@
 # Inspect before running:  curl -fsSL https://meetless.ai/install.sh | less
 set -u
 
+# ---- $HOME sanity, BEFORE anything derives a path from it ----------------------
+# Every path this installer writes hangs off $HOME: the install dir, the `env` file,
+# and the shell rc files. A quoted "$HOME/..." with $HOME empty or set to the literal
+# string "~" is a RELATIVE path (the shell does NOT expand a quoted tilde), so the
+# installer would quietly install mla into whatever directory the operator happened to
+# be standing in, and write a .zshenv and a .profile in there too. That is not
+# hypothetical: on 2026-07-13 a Claude Code session was launched with HOME='' and
+# every child it spawned re-rooted its state under the repo it was started in.
+#
+# `eval "h=~$user"` expands through the PASSWORD DATABASE (getpwnam), not through
+# $HOME, so it recovers the truth from a poisoned environment. If even that yields
+# nothing absolute we ABORT: an installer with nowhere legitimate to install must
+# stop, never guess, and never fall back to the current directory.
+case "${HOME:-}" in
+  /*) ;;
+  *)
+    # SET-but-empty and UNSET are different bugs and must not print the same way:
+    # `${HOME:-<unset>}` would call the 2026-07-13 incident value ('') "unset" and send
+    # the operator hunting for a variable nobody removed. `${HOME+x}` tests SET-ness.
+    if [ -n "${HOME+x}" ]; then _ml_broken="'$HOME'"; else _ml_broken="<unset>"; fi
+    _ml_user="$(id -un 2>/dev/null || true)"
+    _ml_home=""
+    case "$_ml_user" in
+      ''|*[!A-Za-z0-9._-]*) ;;                                  # never eval a metacharacter
+      *) eval "_ml_home=~$_ml_user" 2>/dev/null || _ml_home="" ;;
+    esac
+    case "$_ml_home" in /*) ;; *) _ml_home="" ;; esac           # ~nosuchuser stays literal
+    if [ -z "$_ml_home" ]; then
+      printf 'mla: error: $HOME is %s and no home directory could be recovered from the\n' "$_ml_broken" >&2
+      printf '  password database. Refusing to install into the current directory. Set HOME\n' >&2
+      printf '  to your home directory (or MLA_INSTALL_DIR to an absolute path) and retry.\n' >&2
+      exit 1
+    fi
+    printf 'mla: warning: ignoring $HOME=%s (not an absolute path); using %s instead.\n' "$_ml_broken" "$_ml_home" >&2
+    HOME="$_ml_home"
+    export HOME
+    ;;
+esac
+
 # ---- config (all overridable via env) ----
 APP="mla"
 INSTALL_DIR="${MLA_INSTALL_DIR:-$HOME/.meetless/bin}"
@@ -189,19 +228,74 @@ strip_quarantine() {
   xattr -d com.apple.quarantine "$1" >/dev/null 2>&1 || true
 }
 
+# env is sourced from more than one rc file (a zsh user gets both .zshenv and
+# .zshrc) and again on every re-install, so it must be idempotent: prepend only
+# when the dir is not already on PATH. An unconditional prepend would stack a
+# duplicate entry on every shell start.
 write_env() {
-  _dir="$1"
-  printf 'export PATH="%s:$PATH"\n' "$_dir" > "$_dir/env" || err "could not write $_dir/env"
+  _bindir="$1"
+  cat > "$_bindir/env" <<EOF || err "could not write $_bindir/env"
+# mla shell env. Sourced from your shell rc; safe to source more than once.
+case ":\${PATH}:" in
+  *:"$_bindir":*) ;;
+  *) export PATH="$_bindir:\${PATH}" ;;
+esac
+EOF
 }
 
+# Put the install dir on PATH for every shell that will go looking for mla.
+#
+# Two rules here, and both exist because of a prod bug that hit exactly the person
+# we can least afford to lose: a first-time user on a fresh Mac.
+#
+#   1. CREATE the rc file when it is absent, never skip it. A pristine macOS account
+#      has no ~/.zshrc, ~/.bashrc or ~/.profile at all (Homebrew's installer writes
+#      ~/.zprofile, not ~/.zshrc). The old loop only appended to files that already
+#      existed, so on that machine it matched nothing, mutated nothing, and the
+#      install still exited 0 saying "Restart your shell". mla was never on PATH.
+#
+#   2. Write .zshenv, not just .zshrc. zsh reads .zshrc ONLY for interactive shells;
+#      .zshenv is read by every zsh, including the non-interactive `zsh -c` that
+#      coding agents, hooks, and scripts spawn. That is the shell that kept reporting
+#      "command not found: mla" from inside Claude Code.
+#
+# Writing several files is safe: each is inert to the shells that ignore it, and env
+# is a no-op once the dir is already on PATH.
 configure_path() {
-  _dir="$1"
+  _bindir="$1"
   [ "$NO_MODIFY_PATH" = "1" ] && return 0
-  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
-    [ -f "$rc" ] || continue
-    grep -Fqs "$_dir/env" "$rc" && continue   # -F: a path is a literal, not a regex
-    printf '\n. "%s/env"\n' "$_dir" >> "$rc"
+  RC_TOUCHED=""
+
+  add_env_line "${ZDOTDIR:-$HOME}/.zshenv" "$_bindir" create   # zsh: login, interactive AND `zsh -c`
+  add_env_line "$HOME/.profile"            "$_bindir" create   # sh/bash login shells
+  # Only if the user already keeps one; we do not invent rc files we do not need.
+  for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+    add_env_line "$rc" "$_bindir" existing
   done
+
+  # The success message must never lie. If nothing could be updated (exotic shell,
+  # read-only home), say so with the exact line to add instead of "Restart your shell".
+  [ -n "$RC_TOUCHED" ] || {
+    say ""
+    say "  warning: found no shell profile to update. Add this line to your shell's"
+    say "  startup file yourself, or mla will not be on your PATH:"
+    say "    . \"$_bindir/env\""
+  }
+}
+
+# add_env_line RC BINDIR create|existing
+#   create   -> write the file when absent (the shell we must guarantee)
+#   existing -> only append to a file the user already keeps
+add_env_line() {
+  _rc="$1"; _d="$2"; _mode="$3"
+  if [ ! -f "$_rc" ]; then
+    [ "$_mode" = "create" ] || return 0
+    : > "$_rc" 2>/dev/null || return 0        # unwritable home: fall through to the warning, never abort
+  fi
+  if ! grep -Fqs "$_d/env" "$_rc"; then       # -F: a path is a literal, not a regex
+    printf '\n. "%s/env"\n' "$_d" >> "$_rc" || return 0
+  fi
+  RC_TOUCHED="$RC_TOUCHED $_rc"
 }
 
 main "$@"

@@ -19,9 +19,30 @@
 
 INPUT="$(cat 2>/dev/null || true)"
 
+# home.sh is the ONE exception to "self-contained": a poisoned $HOME (empty, a literal
+# "~", relative) makes "$HOME/.meetless" a RELATIVE path, so this hook would read a
+# cli-config.json out of the operator's REPO instead of their home. It repairs $HOME
+# from the password database, exports it (so the `mla` we spawn inherits an honest
+# one), and sets MEETLESS_HOME_DIR. Best-effort: a missing home.sh must never break
+# the pass-through.
+source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/home.sh" 2>/dev/null || true
+
 # Resolve the absolute mla path the same way common.sh does (install-time path in
 # cli-config.json, then PATH fallback). MLA in PATH is not relied upon.
-CFG="${MEETLESS_HOME:-$HOME/.meetless}/cli-config.json"
+# "Absolute or nothing." MEETLESS_HOME_DIR comes from home.sh (repaired $HOME, or an
+# absolute MEETLESS_HOME override). If home.sh is missing (a corrupt install), fall back
+# ONLY to paths we can vouch for: a raw "$HOME/.meetless" under a poisoned $HOME is a
+# RELATIVE path, which would read a cli-config.json out of whatever repo the session was
+# started in and then execute the .mlaPath it names. An empty CFG simply misses, and the
+# `command -v mla` fallback below takes over.
+CFG_DIR="${MEETLESS_HOME_DIR:-}"
+if [ -z "$CFG_DIR" ]; then
+  case "${MEETLESS_HOME:-}" in
+    /*) CFG_DIR="$MEETLESS_HOME" ;;
+    *) case "${HOME:-}" in /*) CFG_DIR="$HOME/.meetless" ;; esac ;;
+  esac
+fi
+CFG="${CFG_DIR:-/nonexistent}/cli-config.json"
 MLA_PATH="$(jq -r '.mlaPath // empty' "$CFG" 2>/dev/null || true)"
 if [[ -z "${MLA_PATH:-}" || ! -x "$MLA_PATH" ]]; then
   MLA_PATH="$(command -v mla 2>/dev/null || true)"
@@ -45,14 +66,30 @@ run_guarded() {
 # (~12ms cold) instead of cli.js's full command registry (~150ms), the latency
 # lever from notes/20260615-...-consolidated-proposal.md. Both transports call the
 # identical runInternalPretoolObserve core, so the decision body is byte-identical.
-# When the sibling is absent (a pkg binary, an older install), fall back to
-# `mla _internal pretool-observe` so the slow path stays correct. It is run the same
-# way as mla (its `#!/usr/bin/env node` shebang resolves node), under the same guard.
+#
+# Three transports, in order, because the exec bit is NOT ours to rely on:
+#
+#   1. the sibling is executable        -> run it directly (a dev build, a git install;
+#                                          its `#!/usr/bin/env node` shebang finds node).
+#   2. the sibling exists, not +x       -> run it as `node <entry>`. THIS IS THE NPM CASE.
+#                                          `pnpm pack` normalizes every packed file to 0644
+#                                          and force-sets 0755 only on `bin` entries, so the
+#                                          `chmod +x dist/pretool-entry.js` in our build
+#                                          script is real on disk and then discarded into the
+#                                          tarball. Up to 0.2.17 an `-x`-only guard meant
+#                                          EVERY npm install silently took the slow path on
+#                                          EVERY tool call: correct, just ~12x the latency,
+#                                          and invisible because the fallback works.
+#   3. no sibling at all                -> `mla _internal pretool-observe` (a pkg single-file
+#                                          binary, an older install). Run the same way as mla,
+#                                          under the same guard, so the slow path stays correct.
 RESPONSE=""
 if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
   PRETOOL_ENTRY="$(dirname "$MLA_PATH")/pretool-entry.js"
   if [[ -x "$PRETOOL_ENTRY" ]]; then
     RESPONSE="$(printf '%s' "$INPUT" | run_guarded "$PRETOOL_ENTRY" 2>/dev/null || true)"
+  elif [[ -f "$PRETOOL_ENTRY" ]] && command -v node >/dev/null 2>&1; then
+    RESPONSE="$(printf '%s' "$INPUT" | run_guarded node "$PRETOOL_ENTRY" 2>/dev/null || true)"
   else
     RESPONSE="$(printf '%s' "$INPUT" | run_guarded "$MLA_PATH" _internal pretool-observe 2>/dev/null || true)"
   fi

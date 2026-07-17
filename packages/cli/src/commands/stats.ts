@@ -121,9 +121,12 @@ export interface LoadBearingItem {
   reference_count: number;
 }
 
-// Section 2b: governed-rule enforcement (the "wrong actions caught" signal). One
-// PreToolUse deny fires an mla_enforcement_incident; an offline labeler can later
-// supersede it to flip review_status, so the summary is collapsed by incident_id
+// Section 2b: governed-rule enforcement (the "wrong actions caught" signal). A
+// PreToolUse deny OR warn fires an mla_enforcement_incident (the session ceiling
+// MEETLESS_ACTION_INTERCEPT_MAX defaults to WARN, which clamps a DENY-attested
+// rule down to a non-blocking warn, so warns are the common case, not reserved);
+// an offline labeler can later supersede it to flip review_status, so the summary
+// is collapsed by incident_id
 // (latest wins, like latestOutcomes). The adjudication split is load-bearing for
 // HONESTY: a raw deny count overclaims because a rule can misfire (the known
 // notes-location-v1 vault-own-path false positive), so `confirmed` is the only
@@ -131,7 +134,7 @@ export interface LoadBearingItem {
 export interface EnforcementSummary {
   total: number; // distinct incidents in window (collapsed by incident_id)
   denied: number; // latest decision === "deny" (hard block)
-  warned: number; // latest decision === "warn" (soft gate; reserved, 0 today)
+  warned: number; // latest decision === "warn" (non-blocking advisory; INV-8 rung)
   confirmed: number; // latest review_status === "confirmed" -- a proven catch
   false_positive: number; // latest review_status === "false_positive" -- a misfire
   unreviewed: number; // latest review_status === "unreviewed" -- not yet adjudicated

@@ -7,6 +7,7 @@ import {
   CliAuth,
   HOOKS_DIR,
   SESSION_GATE_DIR,
+  userHomeDir,
 } from "../lib/config";
 import { tryResolveWorkspaceId } from "../lib/workspace";
 import { get, ping } from "../lib/http";
@@ -14,6 +15,7 @@ import { queueDepth, reapQueue } from "../lib/spool";
 import { findActivation } from "../lib/activation";
 import {
   checkHookDrift,
+  isSupportHookFile,
   MCP_SERVER_KEY,
   mcpCommandExecutable,
   isPkgSnapshotPath,
@@ -921,7 +923,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
   }
 
   // 4. hooks registered in ~/.claude/settings.json
-  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+  const settingsPath = path.join(userHomeDir(), ".claude", "settings.json");
   if (fs.existsSync(settingsPath)) {
     try {
       const s = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
@@ -960,7 +962,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
 
   // 5. /mla skill installed
   const skillPath = path.join(
-    os.homedir(),
+    userHomeDir(),
     ".claude",
     "skills",
     "mla",
@@ -993,7 +995,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
         : null;
     };
     const hasServer = (obj: any): boolean => serverCommand(obj) !== null;
-    const claudeJsonPath = path.join(os.homedir(), ".claude.json");
+    const claudeJsonPath = path.join(userHomeDir(), ".claude.json");
     let userCommand: string | null = null;
     if (fs.existsSync(claudeJsonPath)) {
       try {
@@ -1035,7 +1037,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
       // look for a project-scope `.mcp.json` that registers the server.
       let projectMcp: string | null = null;
       let dir = process.cwd();
-      const home = os.homedir();
+      const home = userHomeDir();
       for (;;) {
         const candidate = path.join(dir, ".mcp.json");
         if (fs.existsSync(candidate)) {
@@ -1262,6 +1264,22 @@ export async function runDoctor(argv: string[]): Promise<number> {
             ? undefined
             : "installed copy differs from this binary's template; run `mla wire` to refresh",
       });
+      // A missing SUPPORT file (see isSupportHookFile) is a corrupt install, never an
+      // opt-out. Doctor computed `missing` and dropped it on the floor, so on
+      // 2026-07-13 it reported a green "hook scripts match shipped templates" on a box
+      // whose common.sh sourced a home.sh that was not installed. A missing REGISTERED
+      // script is left unflagged here: it is what `--no-post-tool-use` looks like, and
+      // the hook-event checks above already cover whether the events an operator wants
+      // are wired.
+      const missingSupport = drift.missing.filter(isSupportHookFile);
+      if (missingSupport.length > 0) {
+        checks.push({
+          ok: false,
+          label: `hook support files missing: ${missingSupport.join(", ")}`,
+          detail:
+            "the installed hooks source these; the install is incomplete. run `mla wire` to repair",
+        });
+      }
       for (const e of drift.errors) {
         checks.push({
           ok: false,

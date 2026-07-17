@@ -32,7 +32,7 @@ function completeState(run: OnboardingRun, counts = { documentation: 3, history:
     workspaceId: WS,
     runId: run.runId,
     repositoryRoot: run.repositoryRoot,
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: "complete",
     updatedAt: "2026-06-27T01:00:00.000Z",
     scouts: {

@@ -14,10 +14,36 @@ import * as path from "path";
 // current session. This spec proves that bootstrap fires when a session id is
 // present and stays inert (NEXT-session message, no spool) when it is not.
 //
-// Determinism: the staged hooks dir intentionally OMITS flush.sh, so
-// spawn_flush's nohup target is missing and no-ops (|| true). The sidecar and
-// the session_started spool line are therefore never drained by a racing
-// background flush.
+// Determinism: the staged hooks dir intentionally OMITS flush.sh, so spawn_flush's
+// nohup target is missing and no-ops (|| true). Nothing drains the spool, so the
+// sidecar and the session_started line are still there to assert on.
+//
+// That omission is only load-bearing if NOTHING re-creates flush.sh mid-test, and two
+// things will if you let them. Both are contained below, and both are worth naming,
+// because this spec was flaky on macOS and green on Linux CI for a while and the comment
+// here used to state the guarantee as if it were free.
+//
+//   1. The hook shells out to the real mla. session-start.sh resolves MLA_PATH from
+//      cli-config.json and then, if that path is not executable, falls back to
+//      `command -v mla` (common.sh). The staged config used to pin mlaPath to "/bin/true"
+//      as a no-op sentinel, and /bin/true DOES NOT EXIST on macOS (true is at
+//      /usr/bin/true). So the guard fired, the fallback resolved the operator's real,
+//      globally installed mla, and the hook ran it with MEETLESS_HOME pointed at this
+//      temp dir. That binary self-heals the full hook template, flush.sh included, right
+//      into the staged dir. On Linux /bin/true is real, the fallback never fires, and the
+//      whole thing is invisible. stageHome now writes its own executable no-op, so the
+//      sentinel exists on every OS and no real binary is ever reachable from here.
+//
+//   2. activate's own wiring self-heal installs the same template in-process. MLA_NO_WIRE
+//      is activate's documented opt-out for a headless run, which is what a jest worker
+//      is, and wire has its own spec.
+//
+// Either one hands spawn_flush a target it did not have at fork time. It detaches with
+// `(nohup "$HOOK_DIR/flush.sh" &)` and does NOT wait, so session-start.sh exits,
+// execFileSync returns, and the forked subshell reaches its exec() whenever it gets there.
+// If flush.sh has appeared by then it runs for real, and flush drains by
+// snapshot-then-truncate (TMP="$QUEUE_FILE.draining.$$"), leaving a 0-byte spool behind
+// while its POST to the dead port is still in flight. The test then reads "".
 
 const HOOKS_SRC = path.resolve(__dirname, "../../src/hooks-template");
 
@@ -29,13 +55,24 @@ function stageHome(tmp: string): string {
     fs.copyFileSync(path.join(HOOKS_SRC, f), path.join(hooks, f));
   }
   fs.chmodSync(path.join(hooks, "session-start.sh"), 0o755);
+
+  // The no-op mla the hook is allowed to call. It has to actually EXIST and be
+  // executable: common.sh falls back to `command -v mla` the moment the configured
+  // mlaPath fails its -x test, and that fallback finds the operator's real binary
+  // (see note 1 at the top). Owning the file instead of borrowing a system one keeps
+  // that true on every OS.
+  const noopMla = path.join(home, "bin", "mla");
+  fs.mkdirSync(path.dirname(noopMla), { recursive: true });
+  fs.writeFileSync(noopMla, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(noopMla, 0o755);
+
   fs.writeFileSync(
     path.join(home, "cli-config.json"),
     JSON.stringify({
       controlUrl: "http://127.0.0.1:1",
       controlToken: "test-token",
       workspaceId: "ws_test",
-      mlaPath: "/bin/true",
+      mlaPath: noopMla,
     }),
   );
   return home;
@@ -61,6 +98,7 @@ async function runActivateIn(opts: {
   const prevHome = process.env.MEETLESS_HOME;
   const prevSid = process.env.CLAUDE_CODE_SESSION_ID;
   const prevDebug = process.env.MEETLESS_DEBUG;
+  const prevNoWire = process.env.MLA_NO_WIRE;
   const logs: string[] = [];
   const spy = jest.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
     logs.push(a.map(String).join(" "));
@@ -68,6 +106,10 @@ async function runActivateIn(opts: {
   try {
     process.env.MEETLESS_HOME = opts.home;
     process.env.MEETLESS_DEBUG = "0";
+    // Keep the staged hooks dir exactly as staged (see the determinism note at the
+    // top). This is activate's own opt-out for a headless run, which is what a jest
+    // worker is; the wiring self-heal has its own spec.
+    process.env.MLA_NO_WIRE = "1";
     if (opts.sessionId) process.env.CLAUDE_CODE_SESSION_ID = opts.sessionId;
     else delete process.env.CLAUDE_CODE_SESSION_ID;
     process.chdir(opts.cwd);
@@ -84,6 +126,8 @@ async function runActivateIn(opts: {
     else process.env.CLAUDE_CODE_SESSION_ID = prevSid;
     if (prevDebug === undefined) delete process.env.MEETLESS_DEBUG;
     else process.env.MEETLESS_DEBUG = prevDebug;
+    if (prevNoWire === undefined) delete process.env.MLA_NO_WIRE;
+    else process.env.MLA_NO_WIRE = prevNoWire;
     spy.mockRestore();
   }
 }

@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import { SCAN_SCHEMA_VERSION } from "../../src/lib/scanner/types";
 import { SCOPED_UNAVAILABLE_MARKER_TEXT } from "../../src/lib/scanner/render";
+import { SAFE_TOTAL } from "../../src/commands/assemble-context";
 
 // P3.2 hook integration test (targeted-rule-injection §Phase 3): exercise the REAL
 // user-prompt-submit.sh bash hook driving the REAL built `mla _internal assemble-context`
@@ -15,9 +16,10 @@ import { SCOPED_UNAVAILABLE_MARKER_TEXT } from "../../src/lib/scanner/render";
 //   Path 1 (assemble-context succeeded): the subcommand's byte-asserted head is emitted VERBATIM
 //     as the whole additionalContext; NOTHING rule-wise is appended after it. Proven by the
 //     `normal` and `old-schema` cases (the degraded head is still a non-empty SUCCESS output).
-//   Path 2 (empty head = hard failure): the bash fallback delivers LAYER1 + the pre-rendered
-//     floor XML. Proven by the `base-invariant` case (a floor too big for the budget makes the
-//     subcommand throw BaseInvariantError, return null, and yield to the fallback).
+//   Path 2 (over-budget floor): a floor larger than SAFE_TOTAL is delivered WHOLE by the subcommand
+//     itself (the budget expands, since there is no harness cap to truncate it), so the byte-asserted
+//     head still reaches the model and the bash fallback is never needed. This is the scenario that
+//     once tripped the retired base invariant and yielded to the fallback; it now delivers whole.
 //
 // HERMETICITY: the real subcommand resolves its cache + audit under `homedir()` (which honors
 // $HOME), while the hook's bash floor fallback reads `$MEETLESS_HOME/workspaces/<ws>/…`. We set
@@ -285,33 +287,49 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     expect(r.audit!.state).toBe("old-schema");
   });
 
-  it("Path 2 (base-invariant): an over-budget floor makes the subcommand yield, and the bash fallback delivers the last-good floor XML", async () => {
-    // A global MUST so large that base + floor + marker cannot fit SAFE_TOTAL: assembleContext
-    // throws BaseInvariantError, the subcommand returns null and prints NOTHING, and the hook's
-    // bash fallback (LAYER1 + the pre-rendered floor XML) owns delivery instead. This exercises the
-    // OTHER emit branch end to end.
+  it("Path 2 (over-budget floor): the subcommand delivers a floor larger than SAFE_TOTAL whole, no fallback needed", async () => {
+    // A global MUST larger than SAFE_TOTAL. This once tripped the base invariant: assembleContext
+    // threw, the subcommand printed NOTHING, and the hook's bash fallback owned delivery. That path
+    // is retired. With no harness cap to truncate an over-budget head, the assembler's budget expands
+    // to hold the required floor and delivers it WHOLE, so the subcommand's own byte-asserted head
+    // reaches the model and the bash fallback never runs.
     const cache = normalCache();
-    cache.floorRules = [{ ruleId: "fm_big", versionId: "v1", text: "z".repeat(3000), strength: "MUST" }];
+    // Sized FROM the live budget, never hardcoded: this fixture used to be a flat 3000 chars, which
+    // silently stopped being "over-budget" the moment SAFE_TOTAL was raised past it. SAFE_TOTAL + 1000
+    // keeps the required set overrunning the budget so the EXPAND path is what is under test.
+    cache.floorRules = [
+      { ruleId: "fm_big", versionId: "v1", text: "z".repeat(SAFE_TOTAL + 1000), strength: "MUST" },
+    ];
     cache.scopedRules = [];
     const { root, home } = sandbox(cache);
     const r = await runHook({
       root,
       home,
-      sessionId: "sess-baseinv",
+      sessionId: "sess-bigfloor",
       prompt: "please update apps/control/outbox.ts",
     });
 
     expect(r.status).toBe(0);
     const ctx = r.additionalContext!;
-    // The fallback delivered the last-known-good compiled floor XML, so the floor still reaches the
-    // model even though the byte-budgeted head could not be produced.
-    expect(ctx).toContain(FLOOR_XML_SENTINEL);
-    expect(ctx).toContain('kind="static"'); // LAYER1 was re-emitted by the fallback branch
-    // The giant structured floor text never rendered to stdout (only the pre-rendered XML did).
-    expect(ctx).not.toContain("zzzz");
-    // The audit records the base-invariant, observable out-of-band even though stdout came from bash.
+    // The assembler rendered the oversize STRUCTURED floor whole (not the bash fallback's pre-rendered
+    // XML): the giant floor text rode inside the assembler's own head (base + floor).
+    expect(ctx).toContain("zzzz");
+    expect(count(ctx, 'kind="static"')).toBe(1);
+    expect(count(ctx, 'kind="floor-rules"')).toBe(1);
+    // The bash fallback did NOT run, so its pre-rendered floor-XML sentinel never appears.
+    expect(ctx).not.toContain(FLOOR_XML_SENTINEL);
+    // The audit proves the REAL subcommand success path ran: normal state, overflow false, the floor
+    // delivered by durable identity, and a head that intentionally EXCEEDS safeTotal because the
+    // budget expanded to hold the required floor.
     expect(r.audit).not.toBeNull();
-    expect(r.audit!.state).toBe("base-invariant");
-    expect(r.audit!.bytes).toBe(0);
+    expect(r.audit!.state).toBe("normal");
+    expect(r.audit!.overflow).toBe(false);
+    expect(r.audit!.delivered).toEqual([
+      { ruleId: "fm_big", tier: "floor-must", versionId: "v1" },
+    ]);
+    expect(r.audit!.omitted).toEqual([]);
+    expect(r.audit!.bytes).toBeGreaterThan(r.audit!.safeTotal);
+    // No-append-after-assert: the delivered context is EXACTLY the byte-asserted head.
+    expect(Buffer.byteLength(ctx, "utf8")).toBe(r.audit!.bytes);
   });
 });

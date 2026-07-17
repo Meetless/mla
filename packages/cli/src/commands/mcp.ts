@@ -1,6 +1,7 @@
 import * as path from "path";
 import type { CliConfig } from "../lib/config";
 import { readConfig } from "../lib/config";
+import { bestEffortNotesRoot } from "../lib/notes-root";
 import {
   resolveWorkspaceContext,
   NotActivatedError,
@@ -178,16 +179,19 @@ function resolveStartDir(
 }
 
 // notesRoot powers ONLY the INDEX.md canonical matcher, which degrades to
-// retrieval when absent, so an imperfect guess is non-fatal. Honor an explicit
-// override, else derive the standalone notes repo as a sibling of the marker
-// repo (projects/<x>/notes for the dogfood layout).
+// retrieval when absent, so an imperfect guess is non-fatal. The ladder (explicit
+// override -> the marker repo itself -> the standalone sibling repo) now lives in
+// lib/notes-root, shared with `kb add` / `kb reingest` / `ask`, so every surface
+// agrees on where the vault is. Anchored on the marker dir, not cwd: the mcp
+// server is long-lived and its cwd is whatever the agent launched it from.
 function resolveNotesRoot(
   env: NodeJS.ProcessEnv,
   ctx: WorkspaceContext,
 ): string {
   if (env.MEETLESS_NOTES_ROOT) return env.MEETLESS_NOTES_ROOT;
-  return path.resolve(ctx.markerDir, "..", "notes");
+  return bestEffortNotesRoot(ctx.markerDir);
 }
+
 
 function notActivatedStatus(): InactiveStatus {
   return {

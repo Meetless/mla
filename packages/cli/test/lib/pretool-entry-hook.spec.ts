@@ -11,10 +11,18 @@ import * as path from "path";
 // instead of cli.js's full command registry (~150ms). The contract this spec pins:
 //
 //   1. entry present  -> the hook runs the sibling, NOT `mla _internal pretool-observe`,
-//                        and forwards the sibling's decision body verbatim.
+//                        and forwards the sibling's decision body verbatim. This holds
+//                        whether or not the sibling carries the exec bit (see below).
 //   2. entry absent    -> the hook falls back to `mla _internal pretool-observe`
 //                        (pkg binary / older install path) and forwards its body.
 //   3. either path empty/whitespace -> fail OPEN to the `{}` no-decision body, exit 0.
+//
+// On the exec bit, which is the whole reason this spec has a `mode` knob: `pnpm pack`
+// normalizes every packed file to 0644 and force-sets 0755 only on `bin` entries, so
+// `chmod +x dist/pretool-entry.js` in our build script never reaches the tarball. The
+// sibling arrives from npm at 0644, forever. This spec used to plant its fixture 0755
+// and therefore only ever tested the world we do NOT ship: every npm install fell to the
+// slow transport on every tool call and no test noticed. Both modes are pinned now.
 //
 // The hook is driven for real (spawned bash) against stub executables that record how
 // they were invoked, so the dispatch + fallback + fail-open behavior is asserted
@@ -30,9 +38,12 @@ interface HookRun {
 }
 
 async function runHook(opts: {
-  // When defined, plant an executable sibling pretool-entry.js that prints this body.
+  // When defined, plant a sibling pretool-entry.js that prints this body.
   // When undefined, no sibling exists (the fallback path).
   entryBody?: string;
+  // 0o755: a dev build / git install. 0o644: what npm actually delivers (pnpm pack strips
+  // the exec bit off everything that is not a `bin`). Defaults to the npm reality.
+  entryMode?: number;
   mlaBody: string; // what the mla stub prints for `_internal pretool-observe`
   input?: string;
 }): Promise<HookRun> {
@@ -55,11 +66,18 @@ async function runHook(opts: {
 
     if (opts.entryBody !== undefined) {
       const entryPath = path.join(bin, "pretool-entry.js");
+      // A real node script, exactly like the shipped one: it has to be runnable BOTH by its
+      // shebang (the +x transport) and as an argument to `node` (the npm transport). A bash
+      // stub would have passed the first and silently broken the second.
       fs.writeFileSync(
         entryPath,
-        `#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\necho "entry" >> "${record}"\nprintf '%s' '${opts.entryBody}'\n`,
+        `#!/usr/bin/env node\n` +
+          `const fs = require("fs");\n` +
+          `try { fs.readFileSync(0, "utf8"); } catch {}\n` +
+          `fs.appendFileSync(${JSON.stringify(record)}, "entry\\n");\n` +
+          `process.stdout.write(${JSON.stringify(opts.entryBody)});\n`,
       );
-      fs.chmodSync(entryPath, 0o755);
+      fs.chmodSync(entryPath, opts.entryMode ?? 0o644);
     }
 
     fs.writeFileSync(path.join(home, "cli-config.json"), JSON.stringify({ mlaPath }));
@@ -98,12 +116,26 @@ describe("pre-tool-use.sh: latency-lever-A entrypoint dispatch + fallback", () =
 
   it("runs the sibling pretool-entry.js (not `mla _internal pretool-observe`) and forwards its body", async () => {
     const deny = '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"blocked"}}';
-    const r = await runHook({ entryBody: deny, mlaBody: "{}" });
+    const r = await runHook({ entryBody: deny, mlaBody: "{}", entryMode: 0o755 });
 
     expect(r.status).toBe(0);
     expect(r.stdout).toBe(deny);
     expect(r.record).toContain("entry");
     // the whole point of the lever: the slow `mla _internal pretool-observe` transport is bypassed.
+    expect(r.record).not.toContain("mla:_internal pretool-observe");
+  });
+
+  // The npm reality, and the regression that shipped through 0.2.17: the tarball delivers the
+  // sibling at 0644 because pnpm pack only sets 0755 on `bin` entries. An `-x`-only guard read
+  // that as "no sibling" and fell to the slow transport on every single tool call, silently,
+  // because falling back is CORRECT (just ~12x slower). The hook now runs it as `node <entry>`.
+  it("still runs the sibling when it arrives non-executable (0644), as every npm install does", async () => {
+    const deny = '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"blocked"}}';
+    const r = await runHook({ entryBody: deny, mlaBody: "{}", entryMode: 0o644 });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(deny);
+    expect(r.record).toContain("entry");
     expect(r.record).not.toContain("mla:_internal pretool-observe");
   });
 

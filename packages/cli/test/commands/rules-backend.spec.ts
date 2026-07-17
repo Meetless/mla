@@ -12,7 +12,9 @@ import {
   runRulesListBackend,
   runRulesRemoveBackend,
   runRulesRevokeBackend,
+  type RuleDeliveryFn,
 } from "../../src/commands/rules-backend";
+import type { DeliveryOutcome } from "../../src/commands/rule-delivery";
 import type { WorkspaceCliConfig } from "../../src/lib/config";
 import type {
   RuleClientHttp,
@@ -123,6 +125,22 @@ function node(over: Partial<RuleNodeView> = {}): RuleNodeView {
     },
     ...over,
   };
+}
+
+// After a verb mutates the authority it delivers the change down to the local caches an agent reads
+// (src/commands/rule-delivery.ts). Real delivery fetches a bundle over http AND writes into the real
+// homedir(), so every mutating call site injects this stub: leaving it out would put a unit test on
+// the network and let it scribble in the operator's own ~/.meetless. `calls` is what a test asserts
+// on to prove the verb delivered at all; pass an outcome to simulate a refresh that did not land.
+type DeliverStub = RuleDeliveryFn & { calls: string[] };
+function deliver(outcome: DeliveryOutcome = { delivered: true }): DeliverStub {
+  const calls: string[] = [];
+  const fn = (async (_cfg: WorkspaceCliConfig, repositoryRoot: string) => {
+    calls.push(repositoryRoot);
+    return outcome;
+  }) as DeliverStub;
+  fn.calls = calls;
+  return fn;
 }
 
 const HUMAN = () => ({ userId: "user_an", displayName: "An" });
@@ -314,6 +332,7 @@ describe("runRulesAddBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["include a Mermaid diagram"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -353,6 +372,7 @@ describe("runRulesAddBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["always test", "--team"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -380,6 +400,7 @@ describe("runRulesAddBackend", () => {
     const { http, calls } = fakeHttp({ post: () => node() });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["always test", "--team"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -398,6 +419,7 @@ describe("runRulesAddBackend", () => {
     const { http, calls } = fakeHttp({ post: () => node() });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["always test", "--team"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -421,6 +443,7 @@ describe("runRulesAddBackend", () => {
     });
     const { out, err } = sink();
     const code = await runRulesAddBackend(["always test", "--team", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -446,6 +469,7 @@ describe("runRulesAddBackend", () => {
     });
     const { out, err } = sink();
     const code = await runRulesAddBackend(["prefer real doc over mocks", "--personal"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -462,6 +486,7 @@ describe("runRulesAddBackend", () => {
     const { http, calls } = fakeHttp({ post: () => node() });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["x", "--team", "--personal"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -484,6 +509,7 @@ describe("runRulesAddBackend", () => {
     });
     const s1 = sink();
     await runRulesAddBackend(["guard the public API", "--applies-to", "src/**"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http: h1,
       resolveOperator: HUMAN,
@@ -501,6 +527,7 @@ describe("runRulesAddBackend", () => {
     });
     const s2 = sink();
     await runRulesAddBackend(["guard the public API", "--scope", "src/**"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http: h2,
       resolveOperator: HUMAN,
@@ -512,6 +539,105 @@ describe("runRulesAddBackend", () => {
     // Both flags feed the same applicability glob: statement is clean and the payloads match.
     expect((appliesToBody!.payload as RulePayloadV1).text).toBe("guard the public API");
     expect(appliesToBody!.payload).toEqual(scopeBody!.payload);
+
+    // ...and the glob actually LANDS. Asserting the two payloads merely match each other is what let
+    // this ship broken: --applies-to and --scope both dropped the glob, both minted an ambient rule,
+    // and two identically-wrong payloads are equal. Pin the applicability itself, against the value
+    // the flag promises, never against its twin.
+    expect((appliesToBody!.payload as RulePayloadV1).applicability).toEqual({
+      mode: "turn",
+      trigger: { explicitPathAny: ["src/**"] },
+    });
+  });
+
+  // The regression in full. `--applies-to` reached makeManagedRule and stopped: it landed in
+  // ManagedRule.scope, which feeds only the content-derived `managed.id`, and mintManagedRule never
+  // puts that id on the wire. The rule minted AMBIENT and was injected on every turn, which is the
+  // precise opposite of "restrict the rule to matching paths" as the help text puts it.
+  describe("--applies-to restricts the rule, rather than parsing the glob and dropping it", () => {
+    // Mint through the real command and hand back the body that reached the wire.
+    async function mint(argv: string[]): Promise<Record<string, unknown>> {
+      let body: Record<string, unknown> | undefined;
+      const { http } = fakeHttp({
+        post: (_p, b) => {
+          body = b as Record<string, unknown>;
+          return node();
+        },
+      });
+      const { out, err } = sink();
+      const code = await runRulesAddBackend(argv, {
+      refreshDelivery: deliver(),
+        loadConfig: cfg,
+        http,
+        resolveOperator: HUMAN,
+        resolveRuntimeScopeId: () => "scope_1",
+        out,
+        err,
+      });
+      expect(code).toBe(0);
+      return body!;
+    }
+    const applicabilityOf = (body: Record<string, unknown>) => (body.payload as RulePayloadV1).applicability;
+
+    it("mints a turn applicability, exactly as the internal --turn-when-path spelling does", async () => {
+      const body = await mint(["no raw fetch in the API layer", "--applies-to", "src/api/**"]);
+      expect(applicabilityOf(body)).toEqual({ mode: "turn", trigger: { explicitPathAny: ["src/api/**"] } });
+      // A restricted rule is still delivery-only: narrowing WHEN it is injected never arms it.
+      const payload = body.payload as RulePayloadV1;
+      expect(payload.deliveryChannels).toEqual(["runtimeInject"]);
+      expect(payload.enforcementCeiling).toBe("OBSERVE");
+    });
+
+    it("keeps a rule with no --applies-to ambient, so the floor is untouched", async () => {
+      expect(applicabilityOf(await mint(["never commit a secret"]))).toEqual({ mode: "ambient" });
+    });
+
+    it("accumulates repeated --applies-to globs into one trigger", async () => {
+      const body = await mint(["use the Money type", "--applies-to", "src/api/**", "--applies-to", "src/db/**"]);
+      expect(applicabilityOf(body)).toEqual({
+        mode: "turn",
+        trigger: { explicitPathAny: ["src/api/**", "src/db/**"] },
+      });
+    });
+
+    it("merges --applies-to with --turn-when-prompt rather than one clobbering the other", async () => {
+      const body = await mint(["cite the privacy doc", "--applies-to", "notes/**", "--turn-when-prompt", "privacy"]);
+      expect(applicabilityOf(body)).toEqual({
+        mode: "turn",
+        trigger: { promptAny: ["privacy"], explicitPathAny: ["notes/**"] },
+      });
+    });
+
+    // The hash covers applicability, so before the fix two rules with the same text and DIFFERENT
+    // globs hashed identically: the mint-dedup (alreadyMintedHashes) could not tell them apart, and
+    // the second one looked already minted. Two different restrictions are two different rules.
+    it("gives two different globs two different payload hashes", async () => {
+      const a = await mint(["use the Money type", "--applies-to", "src/api/**"]);
+      const b = await mint(["use the Money type", "--applies-to", "src/db/**"]);
+      expect(a.canonicalPayloadHash).not.toBe(b.canonicalPayloadHash);
+    });
+
+    it("edit: --applies-to restricts a rule that was minted ambient", async () => {
+      let patched: Record<string, unknown> | undefined;
+      const { http } = fakeHttp({
+        get: () => node({ currentVersionId: "ver_1" }),
+        patch: (_p, b) => {
+          patched = b as Record<string, unknown>;
+          return node({ currentVersionId: "ver_2" });
+        },
+      });
+      const { out, err } = sink();
+      const code = await runRulesEditBackend(
+        ["node_1", "no raw fetch in the API layer", "--applies-to", "src/api/**"],
+        {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
+      );
+      expect(code).toBe(0);
+      expect((patched!.payload as RulePayloadV1).applicability).toEqual({
+        mode: "turn",
+        trigger: { explicitPathAny: ["src/api/**"] },
+      });
+    });
   });
 
   it("honors --must as a MUST_FOLLOW strength", async () => {
@@ -524,6 +650,7 @@ describe("runRulesAddBackend", () => {
     });
     const { out, err } = sink();
     await runRulesAddBackend(["always test", "--must"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -538,6 +665,7 @@ describe("runRulesAddBackend", () => {
     const { http, calls } = fakeHttp({ post: () => node() });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["x"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: NO_OPERATOR,
@@ -551,13 +679,15 @@ describe("runRulesAddBackend", () => {
 
   it("exits 2 on a missing statement", async () => {
     const { out, err } = sink();
-    const code = await runRulesAddBackend([], { loadConfig: cfg, resolveOperator: HUMAN, out, err });
+    const code = await runRulesAddBackend([], {
+      refreshDelivery: deliver(), loadConfig: cfg, resolveOperator: HUMAN, out, err });
     expect(code).toBe(2);
   });
 
   it("fails fast (exit 2) when the workspace is unbound: offline binding writes fail fast", async () => {
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["x"], {
+      refreshDelivery: deliver(),
       loadConfig: () => {
         throw new Error("no workspace marker");
       },
@@ -577,6 +707,7 @@ describe("runRulesAddBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["x"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -615,6 +746,7 @@ describe("backend rule arg parsing", () => {
     // value), silently minting a rule whose statement was the citation. The statement must
     // be the real one.
     const code = await runRulesAddBackend(["--source", "slack-42", "Defer SSO to Q3"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -630,6 +762,7 @@ describe("backend rule arg parsing", () => {
     const { http, read } = capturingHttp();
     const { out, err } = sink();
     const code = await runRulesAddBackend(["--scope", "src/**", "guard the public API"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -646,7 +779,8 @@ describe("backend rule arg parsing", () => {
     const { out, err } = sink();
     const code = await runRulesAddBackend(
       ["guard the public API", "--scope", "src/**", "--source", "slack-42"],
-      { loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
+      {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
     );
     expect(code).toBe(0);
     expect((read()!.payload as RulePayloadV1).text).toBe("guard the public API");
@@ -657,6 +791,7 @@ describe("backend rule arg parsing", () => {
     const { out, err } = sink();
     // firstPositional() would have minted just "Defer".
     const code = await runRulesAddBackend(["Defer", "SSO", "to", "Q3"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -671,6 +806,7 @@ describe("backend rule arg parsing", () => {
   it("add: a --scope with no following value is a usage error (exit 2), never a silent empty scope", async () => {
     const { out, err, rec } = sink();
     const code = await runRulesAddBackend(["a real statement", "--scope"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       resolveOperator: HUMAN,
       out,
@@ -692,7 +828,8 @@ describe("backend rule arg parsing", () => {
     const { out, err } = sink();
     const code = await runRulesEditBackend(
       ["node_1", "--source", "slack-42", "the new statement"],
-      { loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
+      {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
     );
     expect(code).toBe(0);
     // The GET targets the nodeId (positional[0]), not the source value, and carries
@@ -710,7 +847,8 @@ describe("backend rule arg parsing", () => {
     const { out, err } = sink();
     const code = await runRulesAddBackend(
       ["cite the privacy doc", "--turn-when-prompt", "privacy", "--turn-when-path", "notes/**/*.md"],
-      { loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
+      {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
     );
     expect(code).toBe(0);
     const payload = read()!.payload as RulePayloadV1;
@@ -730,7 +868,8 @@ describe("backend rule arg parsing", () => {
     const { out, err } = sink();
     const code = await runRulesAddBackend(
       ["draft with citations", "--turn-when-prompt", "design doc", "--turn-when-prompt", "RFC,proposal"],
-      { loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
+      {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
     );
     expect(code).toBe(0);
     const payload = read()!.payload as RulePayloadV1;
@@ -750,7 +889,8 @@ describe("backend rule arg parsing", () => {
     // bundle-verify time. Sending the CLI hash for verbatim storage is the only fix that holds.
     const code = await runRulesAddBackend(
       ["cite the roadmap", "--turn-when-prompt", "roadmap", "--turn-when-prompt", "design doc", "--turn-when-prompt", "PRD"],
-      { loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
+      {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, resolveRuntimeScopeId: () => "scope_1", out, err },
     );
     expect(code).toBe(0);
     const body = read()!;
@@ -769,6 +909,7 @@ describe("backend rule arg parsing", () => {
     const { http, read } = capturingHttp();
     const { out, err } = sink();
     const code = await runRulesAddBackend(["a plain rule"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -783,6 +924,7 @@ describe("backend rule arg parsing", () => {
   it("add: --turn-when-prompt with no value is a usage error (exit 2), never a silent empty phrase", async () => {
     const { out, err, rec } = sink();
     const code = await runRulesAddBackend(["a real statement", "--turn-when-prompt"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       resolveOperator: HUMAN,
       out,
@@ -804,7 +946,8 @@ describe("backend rule arg parsing", () => {
     const { out, err } = sink();
     const code = await runRulesEditBackend(
       ["node_1", "draft with citations before code", "--turn-when-prompt", "proposal", "--turn-when-prompt", "design doc"],
-      { loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
+      {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
     );
     expect(code).toBe(0);
     const payload = patched!.payload as RulePayloadV1;
@@ -829,7 +972,8 @@ describe("backend rule arg parsing", () => {
     const { out, err } = sink();
     const code = await runRulesEditBackend(
       ["node_1", "draft with citations", "--turn-when-prompt", "proposal", "--turn-when-prompt", "design doc"],
-      { loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
+      {
+      refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
     );
     expect(code).toBe(0);
     const payload = patched!.payload as RulePayloadV1;
@@ -853,6 +997,7 @@ describe("runRulesEditBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesEditBackend(["node_1", "the new statement"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -878,6 +1023,7 @@ describe("runRulesEditBackend", () => {
     });
     const { out, err } = sink();
     await runRulesEditBackend(["node_1", "moved?"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -896,6 +1042,7 @@ describe("runRulesEditBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesEditBackend(["node_1", "x"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -914,6 +1061,7 @@ describe("runRulesEditBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesEditBackend(["nope", "x"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -928,6 +1076,7 @@ describe("runRulesEditBackend", () => {
     const { http } = fakeHttp({ get: () => node({ lifecycleStatusId: "REVOKED" }) });
     const { rec, out, err } = sink();
     const code = await runRulesEditBackend(["node_1", "x"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -940,12 +1089,14 @@ describe("runRulesEditBackend", () => {
 
   it("exits 2 on missing args", async () => {
     const { out, err } = sink();
-    expect(await runRulesEditBackend(["node_1"], { loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
+    expect(await runRulesEditBackend(["node_1"], {
+      refreshDelivery: deliver(), loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
   });
 
   it("refuses without an authenticated human", async () => {
     const { out, err } = sink();
     const code = await runRulesEditBackend(["node_1", "x"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       resolveOperator: NO_OPERATOR,
       out,
@@ -971,6 +1122,7 @@ describe("runRulesRevokeBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesRevokeBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -987,6 +1139,7 @@ describe("runRulesRevokeBackend", () => {
     const { http, calls } = fakeHttp({ get: () => node({ lifecycleStatusId: "REVOKED" }) });
     const { rec, out, err } = sink();
     const code = await runRulesRevokeBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1007,6 +1160,7 @@ describe("runRulesRevokeBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesRevokeBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1021,6 +1175,7 @@ describe("runRulesRevokeBackend", () => {
     const { http, calls } = fakeHttp({ get: () => node() });
     const { rec, out, err } = sink();
     const code = await runRulesRevokeBackend(["node_1"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1040,6 +1195,7 @@ describe("runRulesRevokeBackend", () => {
     });
     const { out, err } = sink();
     const code = await runRulesRevokeBackend(["node_1"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1056,6 +1212,7 @@ describe("runRulesRevokeBackend", () => {
     const { http, calls } = fakeHttp({ get: () => node() });
     const { out, err } = sink();
     const code = await runRulesRevokeBackend(["node_1"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1070,7 +1227,8 @@ describe("runRulesRevokeBackend", () => {
 
   it("exits 2 on a missing nodeId", async () => {
     const { out, err } = sink();
-    expect(await runRulesRevokeBackend(["--yes"], { loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
+    expect(await runRulesRevokeBackend(["--yes"], {
+      refreshDelivery: deliver(), loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
   });
 });
 
@@ -1103,6 +1261,7 @@ describe("runRulesDemoteBackend", () => {
     const { rec, out, err } = sink();
 
     const code = await runRulesDemoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1137,6 +1296,7 @@ describe("runRulesDemoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesDemoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1154,6 +1314,7 @@ describe("runRulesDemoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesDemoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1173,6 +1334,7 @@ describe("runRulesDemoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesDemoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1197,6 +1359,7 @@ describe("runRulesDemoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesDemoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1213,6 +1376,7 @@ describe("runRulesDemoteBackend", () => {
     const { http, calls } = demoteHttp();
     const { rec, out, err } = sink();
     const code = await runRulesDemoteBackend(["node_1"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1228,6 +1392,7 @@ describe("runRulesDemoteBackend", () => {
   it("refuses without an authenticated human operator (exit 1)", async () => {
     const { rec, out, err } = sink();
     const code = await runRulesDemoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       resolveOperator: NO_OPERATOR,
       out,
@@ -1239,7 +1404,8 @@ describe("runRulesDemoteBackend", () => {
 
   it("exits 2 on a missing nodeId", async () => {
     const { out, err } = sink();
-    expect(await runRulesDemoteBackend(["--yes"], { loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
+    expect(await runRulesDemoteBackend(["--yes"], {
+      refreshDelivery: deliver(), loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
   });
 });
 
@@ -1284,6 +1450,7 @@ describe("runRulesPromoteBackend", () => {
     const { rec, out, err } = sink();
 
     const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1318,6 +1485,7 @@ describe("runRulesPromoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1335,6 +1503,7 @@ describe("runRulesPromoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1352,6 +1521,7 @@ describe("runRulesPromoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1371,6 +1541,7 @@ describe("runRulesPromoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1395,6 +1566,7 @@ describe("runRulesPromoteBackend", () => {
     });
     const { rec, out, err } = sink();
     const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1411,6 +1583,7 @@ describe("runRulesPromoteBackend", () => {
     const { http, calls } = promoteHttp();
     const { rec, out, err } = sink();
     const code = await runRulesPromoteBackend(["node_1"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1426,6 +1599,7 @@ describe("runRulesPromoteBackend", () => {
   it("refuses without an authenticated human operator (exit 1)", async () => {
     const { rec, out, err } = sink();
     const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       resolveOperator: NO_OPERATOR,
       out,
@@ -1437,7 +1611,8 @@ describe("runRulesPromoteBackend", () => {
 
   it("exits 2 on a missing nodeId", async () => {
     const { out, err } = sink();
-    expect(await runRulesPromoteBackend(["--yes"], { loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
+    expect(await runRulesPromoteBackend(["--yes"], {
+      refreshDelivery: deliver(), loadConfig: cfg, resolveOperator: HUMAN, out, err })).toBe(2);
   });
 });
 
@@ -1514,9 +1689,12 @@ describe("runRulesAttestBackend", () => {
 
   function attestDeps(over: Record<string, unknown> = {}) {
     const { rec, out, err } = sink();
+    const delivery = deliver();
     return {
       rec,
+      delivery,
       deps: {
+        refreshDelivery: delivery,
         loadConfig: cfg,
         storePath: dbPath,
         resolveRuntimeScopeId: () => PILOT_SCOPE,
@@ -1677,6 +1855,54 @@ describe("runRulesAttestBackend", () => {
     const code = await runRulesAttestBackend(["--from-observed", hash, "--agent-on-user-request", "--yes"], deps);
     expect(code).toBe(1);
     expect(rec.err.join("\n")).toContain("NOT minted");
+  });
+
+  // Delivery. attest is the verb that ARMS a rule (an observed snapshot becomes an enforced one),
+  // so a mint that never reaches this machine's caches enforces nothing: the operator is told the
+  // rule is live while their own agent has never heard of it. The other five mutating verbs assert
+  // this in the "rule delivery" block below; attest was the one that did not, even though it has
+  // always called the same seam.
+  it("delivers the newly armed rule to the local caches", async () => {
+    const hash = seedObserved();
+    const { http } = fakeHttp({ post: () => node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID }) });
+    const { rec, delivery, deps } = attestDeps({ http });
+
+    const code = await runRulesAttestBackend(["--from-observed", hash, "--agent-on-user-request", "--yes"], deps);
+
+    expect(code).toBe(0);
+    expect(delivery.calls.length).toBe(1);
+    expect(rec.out.join("\n")).toContain("Delivered");
+  });
+
+  // Best effort, exactly as elsewhere: the authority write already committed, so the verb still
+  // succeeds. What must not happen is a silent claim that it reached the agent.
+  it("a failed refresh does not fail the attest, and says the change did NOT reach this machine", async () => {
+    const hash = seedObserved();
+    const { http } = fakeHttp({ post: () => node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID }) });
+    const { rec, deps } = attestDeps({
+      http,
+      refreshDelivery: deliver({ delivered: false, error: "ECONNREFUSED" }),
+    });
+
+    const code = await runRulesAttestBackend(["--from-observed", hash, "--agent-on-user-request", "--yes"], deps);
+
+    expect(code).toBe(0); // the mint committed on the authority; the rule IS live
+    expect(rec.out.join("\n")).not.toContain("Delivered:");
+    const warning = rec.err.join("\n");
+    expect(warning).toContain("NOT delivered");
+    expect(warning).toContain("ECONNREFUSED");
+    expect(warning).toContain("mla scan");
+  });
+
+  // The mirror image: nothing was minted, so there is nothing to deliver. A refresh here would be a
+  // lie in the other direction (it would report "Delivered" for a rule that does not exist).
+  it("never delivers when the mint was refused", async () => {
+    const { delivery, deps } = attestDeps({ resolveOperator: () => null });
+
+    const code = await runRulesAttestBackend(["--from-observed", "abc", "--agent-on-user-request", "--yes"], deps);
+
+    expect(code).toBe(1);
+    expect(delivery.calls.length).toBe(0);
   });
 
   // ── --forbidden-root / --ceiling: the WARN-first direct-authoring arming surface ──
@@ -1933,6 +2159,7 @@ describe("rules verbs thread --workspace into loadWorkspaceConfig", () => {
     });
     const { out, err } = sink();
     const code = await runRulesAddBackend(["--workspace", "ws_team", "Defer SSO"], {
+      refreshDelivery: deliver(),
       loadConfig,
       http,
       resolveOperator: HUMAN,
@@ -1963,6 +2190,7 @@ describe("rules verbs thread --workspace into loadWorkspaceConfig", () => {
     });
     const { out, err } = sink();
     const code = await runRulesRevokeBackend(["--workspace", "ws_team", "node_1", "--yes"], {
+      refreshDelivery: deliver(),
       loadConfig,
       http,
       resolveOperator: HUMAN,
@@ -1982,6 +2210,7 @@ describe("rules verbs thread --workspace into loadWorkspaceConfig", () => {
     const { http, calls } = fakeHttp({ post: () => node() });
     const { rec, out, err } = sink();
     const code = await runRulesAddBackend(["--workspace"], {
+      refreshDelivery: deliver(),
       loadConfig: cfg,
       http,
       resolveOperator: HUMAN,
@@ -1991,5 +2220,224 @@ describe("rules verbs thread --workspace into loadWorkspaceConfig", () => {
     expect(code).toBe(2);
     expect(calls).toHaveLength(0);
     expect(rec.err.join("\n")).toContain("--workspace needs a value");
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// delivery: every verb that mutates the AUTHORITY must also reach the local caches
+// ───────────────────────────────────────────────────────────────────────────
+//
+// The backend RuleNode store is the source of truth, but nothing on the agent hot path fetches it:
+// the prompt hook reads the scan cache, which is built from the rule-bundle cache. So a verb that
+// mints or revokes on the authority and stops there has changed the governance an agent SEES by
+// exactly nothing. That was the 0.2.17 "accept never reached the agent" bug, and it was never a
+// property of accept: it was a property of the seam, and every one of these verbs had it. `revoke`
+// is the sharpest case: the kill switch disarmed nothing locally, so the killed rule kept being
+// injected until something else happened to rescan.
+//
+// These are the regression tests for the seam. Each asserts the verb DELIVERED after its mutation,
+// which is the part that no amount of correct backend behavior can substitute for.
+describe("rule delivery", () => {
+  it("add delivers the new rule to the local caches", async () => {
+    const { http } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+    const delivery = deliver();
+
+    const code = await runRulesAddBackend(["include a Mermaid diagram"], {
+      refreshDelivery: delivery,
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(delivery.calls.length).toBe(1);
+    expect(rec.out.join("\n")).toContain("Delivered");
+  });
+
+  it("edit delivers the amended rule", async () => {
+    const { http } = fakeHttp({
+      get: () => node(),
+      patch: () => node({ currentVersionId: "ver_2" }),
+    });
+    const { rec, out, err } = sink();
+    const delivery = deliver();
+
+    const code = await runRulesEditBackend(["node_1", "the new statement"], {
+      refreshDelivery: delivery,
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(delivery.calls.length).toBe(1);
+    expect(rec.out.join("\n")).toContain("Delivered");
+  });
+
+  // The kill switch. Revoking on the authority while this machine keeps injecting the dead rule is
+  // the worst failure of the set: the operator is told the rule is gone and their agent still obeys it.
+  it("revoke delivers the removal (the kill switch must disarm locally too)", async () => {
+    const { http } = fakeHttp({
+      get: () => node({ currentVersionId: "ver_1" }),
+      post: () => node({ lifecycleStatusId: "REVOKED" }),
+    });
+    const { rec, out, err } = sink();
+    const delivery = deliver();
+
+    const code = await runRulesRevokeBackend(["node_1", "--yes"], {
+      refreshDelivery: delivery,
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(delivery.calls.length).toBe(1);
+    expect(rec.out.join("\n")).toContain("Delivered");
+  });
+
+  // A rule revoked from the Console leaves this laptop still injecting it. The local no-op is
+  // exactly when a refresh matters most, so "already revoked" delivers rather than returning early.
+  it("revoke delivers even when the node was ALREADY revoked elsewhere (local cache is the stale one)", async () => {
+    const { http } = fakeHttp({ get: () => node({ lifecycleStatusId: "REVOKED" }) });
+    const { rec, out, err } = sink();
+    const delivery = deliver();
+
+    const code = await runRulesRevokeBackend(["node_1", "--yes"], {
+      refreshDelivery: delivery,
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(rec.out.join("\n")).toContain("no-op");
+    expect(delivery.calls.length).toBe(1);
+  });
+
+  it("promote delivers the TEAM copy", async () => {
+    const { http } = fakeHttp({
+      get: () => node({ authorityScopeId: "PERSONAL", ownerUserId: "user_an", currentVersionId: "ver_1" }),
+      post: (p) =>
+        p.endsWith("/revoke")
+          ? node({ lifecycleStatusId: "REVOKED" })
+          : node({ id: "node_team", authorityScopeId: "TEAM", ownerUserId: null }),
+    });
+    const { rec, out, err } = sink();
+    const delivery = deliver();
+
+    const code = await runRulesPromoteBackend(["node_1", "--yes"], {
+      refreshDelivery: delivery,
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(delivery.calls.length).toBe(1);
+    expect(rec.out.join("\n")).toContain("Delivered");
+  });
+
+  it("demote delivers the PERSONAL copy", async () => {
+    const { http } = fakeHttp({
+      get: () => node({ authorityScopeId: "TEAM", currentVersionId: "ver_1" }),
+      post: (p) =>
+        p.endsWith("/revoke")
+          ? node({ lifecycleStatusId: "REVOKED" })
+          : node({ id: "node_personal", authorityScopeId: "PERSONAL", ownerUserId: "user_an" }),
+    });
+    const { rec, out, err } = sink();
+    const delivery = deliver();
+
+    const code = await runRulesDemoteBackend(["node_1", "--yes"], {
+      refreshDelivery: delivery,
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(delivery.calls.length).toBe(1);
+    expect(rec.out.join("\n")).toContain("Delivered");
+  });
+
+  // Delivery is BEST EFFORT and must never fail a mutation that already committed on the authority:
+  // the rule IS live. But the operator must not be told it reached their agent when it did not, and
+  // must be told how to finish the job.
+  it("a failed refresh does not fail the verb, and says the change did NOT reach this machine", async () => {
+    const { http } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+
+    const code = await runRulesAddBackend(["include a Mermaid diagram"], {
+      refreshDelivery: deliver({ delivered: false, error: "ECONNREFUSED" }),
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out,
+      err,
+    });
+
+    expect(code).toBe(0); // the authority write committed; the rule is live
+    expect(rec.out.join("\n")).not.toContain("Delivered:");
+    const warning = rec.err.join("\n");
+    expect(warning).toContain("NOT delivered");
+    expect(warning).toContain("ECONNREFUSED");
+    expect(warning).toContain("still sees the OLD rules");
+    expect(warning).toContain("mla scan");
+  });
+
+  // --json is a machine surface: the success line stays out of stdout so it cannot corrupt the
+  // payload, but a FAILED delivery still has to reach a human, so it goes to stderr in both modes.
+  it("under --json the failure still reaches stderr and stdout stays parseable", async () => {
+    const { http } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+
+    const code = await runRulesAddBackend(["include a Mermaid diagram", "--json"], {
+      refreshDelivery: deliver({ delivered: false, error: "ECONNREFUSED" }),
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(() => JSON.parse(rec.out.join("\n"))).not.toThrow();
+    expect(rec.err.join("\n")).toContain("NOT delivered");
+  });
+
+  it("under --json a successful delivery keeps stdout pure JSON", async () => {
+    const { http } = fakeHttp({ post: () => node() });
+    const { rec, out, err } = sink();
+
+    const code = await runRulesAddBackend(["include a Mermaid diagram", "--json"], {
+      refreshDelivery: deliver(),
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      resolveRuntimeScopeId: () => "scope_1",
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(() => JSON.parse(rec.out.join("\n"))).not.toThrow();
+    expect(rec.err).toEqual([]);
   });
 });

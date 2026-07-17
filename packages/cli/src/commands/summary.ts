@@ -1,6 +1,6 @@
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
+import { resolveMeetlessHome } from "../lib/config";
 
 // `mla summary` -- aggregate view over the hook's enrichment trace JSONL
 // (T18b, §6.9). Counts/latency/cost/labels across the most recent N prompts.
@@ -29,7 +29,7 @@ import * as path from "path";
 // HOME) so the short-lived CLI process picks up the operator's env, and tests
 // can point at a temp dir without module-cache tricks.
 function logDir(): string {
-  return path.join(process.env.MEETLESS_HOME || path.join(os.homedir(), ".meetless"), "logs");
+  return path.join(resolveMeetlessHome(), "logs");
 }
 function tracesFile(): string {
   return path.join(logDir(), "ask-traces.jsonl");

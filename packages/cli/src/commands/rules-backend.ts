@@ -41,8 +41,9 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import { loadWorkspaceConfig, readConfig, type WorkspaceCliConfig } from "../lib/config";
+import { loadWorkspaceConfig, type WorkspaceCliConfig } from "../lib/config";
 import type { HttpError } from "../lib/http";
+import { confirm, isInteractive } from "../lib/prompt";
 import {
   isWorkspaceAccessDenied,
   workspaceAccessDeniedMessage,
@@ -60,6 +61,8 @@ import {
 } from "../lib/rules/control-rule-client";
 import { makeManagedRule } from "../lib/scanner/managed-rules";
 import { managedRuleToRulePayload } from "../lib/rules/rule-import-mapping";
+import { mintManagedRule } from "../lib/rules/mint-managed-rule";
+import { resolveBackendOperator, type BackendOperator } from "../lib/rules/backend-operator";
 import { ruleVersionHash } from "../lib/rules/rule-version-hash";
 import { parseApplicability } from "../lib/rules/applicability";
 import { resolveActiveRuntimeScopeId } from "../lib/rules/runtime-scope";
@@ -79,8 +82,62 @@ import {
   NOTES_LOCATION_RULE_ID,
 } from "../lib/rules/attest-notes-location";
 import { serializeObservedRule } from "../lib/rules/observed-rule-hash";
+import { normalizeForbiddenRoot } from "../lib/rules/durable-observation";
 import { defaultCe0StorePath } from "./evidence";
+import { deliverRuleChange, deliveryLine, type DeliveryOutcome } from "./rule-delivery";
 import { Strength } from "../lib/scanner/types";
+
+// ───────────────────────────────────────────────────────────────────────────
+// Delivery (every verb below mutates the authority; the authority is not what an agent reads)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * The prompt hook reads a local scan cache, built from a local bundle cache, fetched from the
+ * backend. So a verb that mints or revokes on the authority and stops there has changed nothing any
+ * agent can see: the rule is live and invisible, or revoked and still injected. Every mutating verb
+ * therefore carries its own change down to those caches. See commands/rule-delivery.ts for the
+ * chain and why nothing else covers it.
+ */
+export type RuleDeliveryFn = (
+  cfg: WorkspaceCliConfig,
+  repositoryRoot: string,
+  http?: RuleClientHttp,
+) => Promise<DeliveryOutcome>;
+
+interface DeliveringDeps {
+  refreshDelivery?: RuleDeliveryFn;
+  http?: RuleClientHttp;
+  cwd?: string;
+}
+
+/**
+ * Deliver the change this verb just made to the local caches. NEVER throws and never changes an
+ * exit code: the authority write already committed, so a failed refresh is a stale cache on this
+ * machine, not a failed command. (The catch is for a misbehaving injected stub; deliverRuleChange
+ * itself already absorbs its own failures.)
+ */
+async function deliverChange(deps: DeliveringDeps, cfg: WorkspaceCliConfig): Promise<DeliveryOutcome> {
+  try {
+    return await (deps.refreshDelivery ?? deliverRuleChange)(cfg, deps.cwd ?? process.cwd(), deps.http);
+  } catch (e) {
+    return { delivered: false, error: (e as Error).message };
+  }
+}
+
+/**
+ * Say only what is true. A NOT-delivered line ALWAYS goes to stderr, including under --json, because
+ * a caller that cannot see it is exactly the caller who will act on a rule that never landed. The
+ * success line is human-mode only, so --json stdout stays parseable.
+ */
+function reportDelivery(
+  outcome: DeliveryOutcome,
+  json: boolean,
+  out: (line: string) => void,
+  err: (line: string) => void,
+): void {
+  if (!outcome.delivered) err(deliveryLine(outcome));
+  else if (!json) out(deliveryLine(outcome));
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Usage
@@ -138,35 +195,16 @@ export const RULES_PROMOTE_BACKEND_USAGE =
 // ───────────────────────────────────────────────────────────────────────────
 
 /** The accountable operator behind a binding mutation, resolved from the authenticated session. */
-export interface BackendOperator {
-  /** The audited human; only a user-token session is a human attestor (acceptance 8). */
-  userId: string;
-  displayName?: string;
-}
+// The operator resolver moved to lib/rules/backend-operator.ts when `enrich accept` became the
+// second minting command (acceptance IS the mint): one resolver, one refusal message. Re-exported
+// so the existing `BackendOperator` import surface of this module is unchanged.
+export type { BackendOperator };
+const defaultResolveOperator = resolveBackendOperator;
 
-/** Read the audited operator from the session; only a user-token is a human author/attestor. */
-function defaultResolveOperator(): BackendOperator | null {
-  const cfg = readConfig();
-  if (cfg.auth.mode !== "user-token") return null;
-  return { userId: cfg.auth.user.id, displayName: cfg.auth.user.displayName || cfg.auth.user.id };
-}
-
-/** Synchronously read one line of confirmation from stdin (the interactive default). */
-function defaultConfirm(prompt: string): boolean {
-  process.stderr.write(`${prompt} [y/N] `);
-  const buf = Buffer.alloc(256);
-  try {
-    const n = fs.readSync(0, buf, 0, buf.length, null);
-    const answer = buf.toString("utf8", 0, n).trim().toLowerCase();
-    return answer === "y" || answer === "yes";
-  } catch {
-    return false;
-  }
-}
-
-function defaultIsInteractive(): boolean {
-  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
-}
+// The confirmation seam moved to lib/prompt.ts when `enrich accept` became the second minting
+// command: one "read one line from fd 0", one non-interactive refusal.
+const defaultConfirm = confirm;
+const defaultIsInteractive = isInteractive;
 
 /** The HTTP status of a rejected request, or undefined when the request never reached the server. */
 function httpStatus(err: unknown): number | undefined {
@@ -252,20 +290,35 @@ function parseRuleArgs(argv: string[]): ParsedRuleArgs {
 }
 
 /**
- * Assemble a validated TurnTrigger from the repeated `--turn-when-prompt` / `--turn-when-path`
- * options, or `{ trigger: undefined }` when neither is present (the ambient default, unchanged).
- * The raw lists are handed to the SINGLE grammar owner (`parseApplicability`, targeted-rule-injection
- * §3.2 / P0) rather than re-validated here, so a malformed set (an empty phrase, say) is rejected with
- * the exact diagnostic the parser emits everywhere else, and the CLI never mints a turn payload the
- * hash serializer or the assembler would later choke on.
+ * Assemble a validated TurnTrigger from the repeated `--applies-to` / `--turn-when-path` /
+ * `--turn-when-prompt` options, or `{ trigger: undefined }` when none is present (the ambient
+ * default, unchanged). The raw lists are handed to the SINGLE grammar owner (`parseApplicability`,
+ * targeted-rule-injection §3.2 / P0) rather than re-validated here, so a malformed set (an empty
+ * phrase, say) is rejected with the exact diagnostic the parser emits everywhere else, and the CLI
+ * never mints a turn payload the hash serializer or the assembler would later choke on.
+ *
+ * `--applies-to <glob>` (alias `--scope`) and `--turn-when-path <glob>` are the SAME restriction and
+ * merge into the one list. There is exactly one mechanism behind both: the turn trigger's
+ * explicitPathAny, which is what the assembler matches a turn against. `--applies-to` is the spelling
+ * the help advertises; `--turn-when-path` is the internal one that predates it.
+ *
+ * They were not always one. `--applies-to` used to reach `makeManagedRule` and stop there, landing in
+ * ManagedRule.scope, which feeds only the content-derived `managed.id`, and `mintManagedRule` does not
+ * put that id on the wire: it sends the payload and its hash. So the glob was parsed, carried three
+ * frames, folded into an id, and dropped. The rule minted AMBIENT, injected on EVERY turn, and both
+ * `rules list` and the backend agreed it was fine, because by then nothing remembered a glob had been
+ * typed. Worse, `managedRuleHash` covers applicability, so two rules with the same text and DIFFERENT
+ * `--applies-to` globs hashed identically and the mint-dedup could not tell them apart. Routing the
+ * glob into the trigger repairs the flag, the injection filter, and the dedup in one move.
  */
 function triggerFromArgs(parsed: ParsedRuleArgs): { trigger?: TurnTrigger } | { error: string } {
-  if (parsed.turnPrompts.length === 0 && parsed.turnPaths.length === 0) {
+  const paths = [...parsed.scope, ...parsed.turnPaths];
+  if (parsed.turnPrompts.length === 0 && paths.length === 0) {
     return { trigger: undefined };
   }
   const raw: { promptAny?: string[]; explicitPathAny?: string[] } = {};
   if (parsed.turnPrompts.length > 0) raw.promptAny = parsed.turnPrompts;
-  if (parsed.turnPaths.length > 0) raw.explicitPathAny = parsed.turnPaths;
+  if (paths.length > 0) raw.explicitPathAny = paths;
   const result = parseApplicability({ mode: "turn", trigger: raw });
   if (result.status !== "OK" || result.applicability?.mode !== "turn") {
     return { error: result.diagnostic ?? "invalid turn trigger" };
@@ -484,6 +537,7 @@ export interface RulesAddBackendDeps {
   cwd?: string;
   isInteractive?: () => boolean;
   confirm?: (prompt: string) => boolean | Promise<boolean>;
+  refreshDelivery?: RuleDeliveryFn;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
@@ -575,8 +629,6 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
   const resolveScope = deps.resolveRuntimeScopeId ?? resolveActiveRuntimeScopeId;
   const runtimeScopeId = resolveScope(deps.cwd);
   const managed = makeManagedRule({ statement, strength, scope, sources });
-  const payload = managedRuleToRulePayload(managed, runtimeScopeId, triggerResult.trigger);
-  const requestIdempotencyKey = ruleVersionHash(payload);
 
   // TEAM is higher blast radius (enforces workspace-wide), so it confirms exactly like
   // attest/revoke: interactive Y/n, or --yes for an explicit non-interactive instruction. PERSONAL
@@ -596,24 +648,19 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
   }
 
   try {
-    const node = await mintRule(
+    // The wire shape (payload conversion + the one hash sent as BOTH canonicalPayloadHash and
+    // requestIdempotencyKey) lives in lib/rules/mint-managed-rule.ts, shared with `enrich accept`.
+    const { node, canonicalPayloadHash: requestIdempotencyKey } = await mintManagedRule(
       cfg,
-      {
-        workspaceId: cfg.workspaceId,
-        authorityScope,
-        ownerUserId,
-        projectId: null,
-        payload: payload as unknown as Record<string, unknown>,
-        // Send the CLI hash as the canonical hash so the backend stores it verbatim and
-        // the read-path re-hash (verifyEntryIntegrity) agrees; same value doubles as the
-        // idempotency key.
-        canonicalPayloadHash: requestIdempotencyKey,
-        requestIdempotencyKey,
-      },
+      managed,
+      { authorityScope, ownerUserId, runtimeScopeId, trigger: triggerResult.trigger },
       deps.http,
     );
+    // The mint is durable. Now make it REACHABLE: a rule the agent never sees is not a rule.
+    const delivery = await deliverChange(deps, cfg);
     if (json) {
       out(JSON.stringify(node, null, 2));
+      reportDelivery(delivery, json, out, err);
       return 0;
     }
     // Loud, scope-stating success + the audience line. For PERSONAL, nudge toward promotion so the
@@ -629,6 +676,7 @@ export async function runRulesAddBackend(argv: string[], deps: RulesAddBackendDe
           `Run \`mla rules promote ${node.id}\` to share it with the team.`,
       );
     }
+    reportDelivery(delivery, json, out, err);
     return 0;
   } catch (e) {
     if (isOffline(e)) {
@@ -647,6 +695,8 @@ export interface RulesEditBackendDeps {
   loadConfig?: (override?: string) => WorkspaceCliConfig;
   http?: RuleClientHttp;
   resolveOperator?: () => BackendOperator | null;
+  refreshDelivery?: RuleDeliveryFn;
+  cwd?: string;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
@@ -758,11 +808,16 @@ export async function runRulesEditBackend(argv: string[], deps: RulesEditBackend
       },
       deps.http,
     );
+    // The new version is live on the authority. Carry it to the caches the agent reads, or the
+    // agent keeps obeying the superseded text.
+    const delivery = await deliverChange(deps, cfg);
     if (json) {
       out(JSON.stringify(updated, null, 2));
+      reportDelivery(delivery, json, out, err);
       return 0;
     }
     out(`EDITED rule ${nodeId}: ${node.currentVersionId} -> ${updated.currentVersionId}`);
+    reportDelivery(delivery, json, out, err);
     return 0;
   } catch (e) {
     if (httpStatus(e) === 409) {
@@ -790,6 +845,8 @@ export interface RulesRevokeBackendDeps {
   resolveOperator?: () => BackendOperator | null;
   isInteractive?: () => boolean;
   confirm?: (prompt: string) => boolean | Promise<boolean>;
+  refreshDelivery?: RuleDeliveryFn;
+  cwd?: string;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
@@ -848,7 +905,12 @@ export async function runRulesRevokeBackend(argv: string[], deps: RulesRevokeBac
     return reportRulesBackendError(e, "rules revoke failed", err);
   }
   if (lifecycleOf(node) === "REVOKED") {
+    // No-op on the AUTHORITY, but not necessarily on this machine: the node may have been revoked
+    // from the Console or another laptop, which leaves this one still injecting a dead rule. Running
+    // the kill switch and being told "no-op" while the rule keeps governing your turns is precisely
+    // the failure this delivery exists to close, so heal the caches here too.
     out(`already revoked: rule ${nodeId}; no-op`);
+    reportDelivery(await deliverChange(deps, cfg), false, out, err);
     return 0;
   }
   if (!node.currentVersionId) {
@@ -877,7 +939,9 @@ export async function runRulesRevokeBackend(argv: string[], deps: RulesRevokeBac
       { workspaceId: cfg.workspaceId, expectedCurrentVersionId: node.currentVersionId },
       deps.http,
     );
+    // A kill switch that leaves the rule injected locally has not killed anything.
     out(`REVOKED rule ${nodeId}`);
+    reportDelivery(await deliverChange(deps, cfg), false, out, err);
     return 0;
   } catch (e) {
     if (httpStatus(e) === 409) {
@@ -909,6 +973,7 @@ export interface RulesAttestBackendDeps {
   openStore?: (dbPath: string) => Ce0Store;
   isInteractive?: () => boolean;
   confirm?: (prompt: string) => boolean | Promise<boolean>;
+  refreshDelivery?: RuleDeliveryFn;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
@@ -966,9 +1031,13 @@ function ceilingArmingNote(ceiling: EligibleEnforcement, scopeLabel: string, aud
  *
  * SCOPE (An's directive: "enforcement must take into account both personal and team rules"). The
  * enforcing payload is identical in both planes; only the node's authorityScope differs, and the
- * ONE enforcer (decideBundleEnforcement) is scope-blind, so both planes enforce through the same path:
+ * ONE enforcer (decideBundleEnforcement) is authority-scope-blind, so both planes enforce through the
+ * same path. It is NOT checkout-blind: a PERSONAL node is additionally gated to the ONE checkout it was
+ * attested from (payload.runtimeScopeId), so a per-checkout personal deny does not fire across a
+ * sibling checkout of the same workspace; TEAM/ORGANIZATION nodes stay workspace-wide.
  *   - --scope personal (default): a PERSONAL node owned by the attesting human. In every principal's
- *     bundle only for that human (personalAclWhere), so it enforces for the attestor alone.
+ *     bundle only for that human (personalAclWhere), so it enforces for the attestor alone, in the
+ *     checkout it was attested from.
  *   - --scope team: a TEAM node with ownerUserId null. TEAM is visible to every workspace member
  *     (personalAclWhere returns authorityScope != PERSONAL to all principals), so it enforces for the
  *     whole team. The human author is still recorded on the version (attestedByUserId, stamped
@@ -1035,7 +1104,12 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
     return 2;
   }
   const observedRuleHash = observed.value;
-  const directRoot = forbiddenRoot.value;
+  // Pin the stored spelling of the root. `--forbidden-root legacy/` is the natural way to name a
+  // directory, and stored verbatim it mints a rule that can never match anything (the evaluator's
+  // prefix test becomes `startsWith("legacy//")`): ACTIVE, at its attested ceiling, enforcing nothing.
+  // Normalizing at the writer means no new rule is born inert; normalizeForbiddenRoot is the same
+  // function the evaluator applies, so the two can never drift apart.
+  const directRoot = forbiddenRoot.value === undefined ? undefined : normalizeForbiddenRoot(forbiddenRoot.value);
   if (observedRuleHash !== undefined && directRoot !== undefined) {
     err(`pass either --from-observed <hash> or --forbidden-root <path>, not both\n${RULES_ATTEST_BACKEND_USAGE}`);
     return 2;
@@ -1076,10 +1150,11 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
 
   // --scope selects the authority plane. An's rule: enforcement takes BOTH personal and team
   // into account, so team is a first-class attest target, not a separate verb. The enforcer
-  // (decideBundleEnforcement) is scope-blind and every principal's bundle already carries the
-  // non-PERSONAL rules, so a TEAM attest binds the SAME DENY payload for the whole workspace;
-  // only the minted node's authorityScope + ownerUserId change. Default personal (enforces for
-  // you alone) preserves the prior single-operator behavior when the flag is omitted.
+  // (decideBundleEnforcement) is authority-scope-blind and every principal's bundle already carries
+  // the non-PERSONAL rules, so a TEAM attest binds the SAME DENY payload for the whole workspace;
+  // only the minted node's authorityScope + ownerUserId change. Default personal (enforces for you
+  // alone, and only in the checkout you attested from: PERSONAL nodes are gated to payload.runtimeScopeId)
+  // preserves the prior single-operator behavior when the flag is omitted.
   const scopeIdx = rest.indexOf("--scope");
   let authorityScope: RuleAuthorityScope = "PERSONAL";
   if (scopeIdx >= 0) {
@@ -1248,6 +1323,8 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
     out(
       `MINTED rule ${node.id} version ${node.currentVersionId} (${canonicalPayloadHash}) ${scopeLabel} ${ceiling}`,
     );
+    // An attested rule that never reaches the local caches enforces nothing.
+    reportDelivery(await deliverChange(deps, cfg), false, out, err);
     return 0;
   } catch (e) {
     if (isOffline(e)) {
@@ -1268,6 +1345,8 @@ export interface RulesDemoteBackendDeps {
   resolveOperator?: () => BackendOperator | null;
   isInteractive?: () => boolean;
   confirm?: (prompt: string) => boolean | Promise<boolean>;
+  refreshDelivery?: RuleDeliveryFn;
+  cwd?: string;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
@@ -1443,7 +1522,9 @@ export async function runRulesDemoteBackend(argv: string[], deps: RulesDemoteBac
     return 1;
   }
 
+  // Both halves of the MOVE are live (personal minted, team revoked). One refresh delivers both.
   out(`DEMOTED rule ${nodeId} (TEAM, revoked) -> ${personal.id} (PERSONAL, owner ${operator.userId})`);
+  reportDelivery(await deliverChange(deps, cfg), false, out, err);
   return 0;
 }
 
@@ -1457,6 +1538,8 @@ export interface RulesPromoteBackendDeps {
   resolveOperator?: () => BackendOperator | null;
   isInteractive?: () => boolean;
   confirm?: (prompt: string) => boolean | Promise<boolean>;
+  refreshDelivery?: RuleDeliveryFn;
+  cwd?: string;
   out?: (line: string) => void;
   err?: (line: string) => void;
 }
@@ -1641,7 +1724,9 @@ export async function runRulesPromoteBackend(argv: string[], deps: RulesPromoteB
     return 1;
   }
 
+  // Both halves of the MOVE are live (team minted, personal revoked). One refresh delivers both.
   out(`PROMOTED rule ${nodeId} (PERSONAL, revoked) -> ${team.id} (TEAM)`);
+  reportDelivery(await deliverChange(deps, cfg), false, out, err);
   return 0;
 }
 

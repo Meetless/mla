@@ -14,8 +14,8 @@
 // `scanWorkspace` keeps these out of the auto-injected `confirmedRulesXml` pack entirely.
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { userHomeDir } from "../config";
 import { Directive, directiveId } from "./types";
 import { parseFrontmatter } from "./frontmatter";
 
@@ -29,7 +29,7 @@ const MUST_TOKENS = /\b(MUST|NEVER|ALWAYS|REQUIRED|DO NOT|DON'?T|FORBIDDEN|NON-N
 // same repo encodes to different dirs from its git root, a nested dir, a worktree, or a
 // symlinked clone (memo Phase 2). Discovery keeps it behind the provider seam so the
 // path convention never leaks into the workspace model.
-export function agentMemoryDir(cwd: string, home = homedir()): string {
+export function agentMemoryDir(cwd: string, home = userHomeDir()): string {
   const encoded = cwd.replace(/[/.]/g, "-");
   return join(home, ".claude", "projects", encoded, "memory");
 }
@@ -148,7 +148,7 @@ export interface AgentMemoryDiscoveryOptions {
 // zero-result. Sorted by name (then sourcePath) for a stable, diffable worklist.
 export function collectAgentMemoryFiles(
   cwd: string,
-  home = homedir(),
+  home = userHomeDir(),
   opts: AgentMemoryDiscoveryOptions = {},
 ): MemoryFile[] {
   const providers = opts.providers ?? DEFAULT_AGENT_MEMORY_PROVIDERS;
@@ -182,7 +182,7 @@ export function collectAgentMemoryFiles(
 // root or a custom provider set.
 export function discoverAgentMemoryDirectives(
   cwd: string,
-  home = homedir(),
+  home = userHomeDir(),
   cap = DEFAULT_AGENT_MEMORY_CAP,
   opts: AgentMemoryDiscoveryOptions = {},
 ): Directive[] {

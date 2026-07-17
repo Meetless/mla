@@ -132,11 +132,10 @@ describe("internal steer-sync job 4: rule-bundle sync", () => {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+    // The tmp home IS the scan cache's root now (MEETLESS_HOME is honored end to end), so one
+    // rm takes the stamp with it. Until 2026-07-13 rescanAndCache stamped the REAL ~/.meetless
+    // and this teardown had to reach into the operator's own home to delete it.
     fs.rmSync(home, { recursive: true, force: true });
-    // rescanAndCache stamps the scan cache to REAL homedir()/ws_1 (it ignores MEETLESS_HOME),
-    // so tmp-home cleanup misses it. Remove it too, or a leftover rev-N stamp from this run
-    // leaks into the next test's behind-trigger comparison.
-    fs.rmSync(scanCachePath("ws_1", os.homedir()), { force: true });
     jest.resetModules();
   });
 
@@ -238,14 +237,14 @@ describe("internal steer-sync job 4: rule-bundle sync", () => {
   // bundleId) or missing entirely must still rescan, because the bump trigger alone only
   // ever fires on the single turn the revision changes. Without this, a fresh checkout or a
   // cleared/interrupted scan cache stays empty forever while the bundle sits at a steady
-  // revision. rescanAndCache stamps the scan cache to REAL homedir()/ws_1 (the scanner's
-  // home resolution ignores MEETLESS_HOME), which is exactly where the hook reads it, so we
-  // seed and assert the behind-state there.
+  // revision. Seed the stamp through the SAME default resolution the product uses (no explicit
+  // home: the cache module resolves MEETLESS_HOME), so the seed lands exactly where steer-sync
+  // reads it.
   function seedScanCacheRevision(rev: number): void {
     const stub = {
       floorMeta: { bundleId: `rev-${rev}`, bundleHash: null, freshness: "stale" },
     } as unknown as ScanResult;
-    writeScanCache(os.homedir(), "ws_1", stub);
+    writeScanCache(undefined, "ws_1", stub);
   }
 
   it("rescans when the scan cache is behind the bundle even without a revision bump", async () => {
@@ -267,7 +266,7 @@ describe("internal steer-sync job 4: rule-bundle sync", () => {
     // sync faces a MISSING cache. Missing is treated as infinitely behind -> rescan.
     process.env.MEETLESS_RULE_BUNDLE_SYNC_STUB = JSON.stringify(makeBundle({ bundleRevision: 7 }));
     expect(await syncAndReadFlag("sess_missing")).toBe(true);
-    fs.rmSync(scanCachePath("ws_1", os.homedir()), { force: true });
+    fs.rmSync(scanCachePath("ws_1"), { force: true });
     expect(await syncAndReadFlag("sess_missing")).toBe(true);
   });
 

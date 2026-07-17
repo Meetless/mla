@@ -16,7 +16,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { telemetryDisabled } from "./config";
+import { resolveMeetlessHome, telemetryDisabled } from "./config";
 
 // Schema version stamped on every deadletter record. Bump when the record shape
 // changes so a post-upgrade replay can drop records it no longer understands
@@ -171,10 +171,12 @@ export interface DeadletterRecord {
   event: Record<string, unknown>;
 }
 
-// Mirror config.ts HOME resolution but compute per-call so a test can redirect
-// the whole store to a temp dir via MEETLESS_HOME without module-cache games.
+// config.ts's HOME resolution, computed per-call so a test can redirect the whole
+// store to a temp dir via MEETLESS_HOME without module-cache games. This used to be
+// a hand-rolled copy of the same expression, which is how it inherited the
+// `os.homedir()` trap independently of config.ts (see userHomeDir).
 function homeDir(env: NodeJS.ProcessEnv): string {
-  return env.MEETLESS_HOME || path.join(os.homedir(), ".meetless");
+  return resolveMeetlessHome({ env });
 }
 
 export function deadletterPath(env: NodeJS.ProcessEnv = process.env): string {

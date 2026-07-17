@@ -92,11 +92,29 @@ export function normId(s: string): string {
   return s.trim().replace(/\.md$/i, "").toLowerCase();
 }
 
+// An offered note id is a PATH (nt:notes/20260602-foo); the agent routinely cites
+// the same document by its bare basename (nt:20260602-foo), which is a lossy but
+// unambiguous reference to it. Treat one id as matching the other when the shorter
+// is a suffix of the longer AT A SEGMENT BOUNDARY, so nt:20260602-foo matches
+// nt:notes/20260602-foo but nt:foo never matches nt:notes/not-foo. Exact equality
+// still wins first; only the lossy bare form takes this path. Two same-basename
+// notes in different directories can collide here, which is the irreducible cost
+// of the agent dropping the directory, and it errs the same conservative direction
+// the rest of the v1 metric does.
+function idMatches(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [shortId, longId] = a.length < b.length ? [a, b] : [b, a];
+  return longId.endsWith(`/${shortId}`);
+}
+
 // Original-form lookup so the row can report the injected id the agent matched,
 // not its normalized form.
 export function overlap(injected: string[], touched: string[]): string[] {
-  const touchedSet = new Set(touched.map(normId));
-  return injected.filter((id) => touchedSet.has(normId(id)));
+  const touchedNorm = touched.map(normId);
+  return injected.filter((id) => {
+    const n = normId(id);
+    return touchedNorm.some((t) => idMatches(n, t));
+  });
 }
 
 // computeFollowthrough scores each inject turn against the pulls and report

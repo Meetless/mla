@@ -15,7 +15,7 @@ import * as path from "node:path";
 // from the whoami URL, or stopped feeding whoami into the check, would pass the unit test and
 // fail here.
 
-const MARKER = "cmq9l2xom002n5ueiwjuoy9bb";
+const MARKER = "cmexampledogfoodws0000000";
 const OTHER = "cmr9nonon00r37o4rspjl9n88";
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "mla-doctor-e2e-home-"));
@@ -115,8 +115,8 @@ describe("mla doctor: folder-binding assertion (blackbox against a control stub)
     whoamiResponse = {
       status: 200,
       body: {
-        workspace: { id: MARKER, slug: "an-pham-s-workspace-jgqmd4cc" },
-        actor: { displayName: "An Pham", role: "OWNER" },
+        workspace: { id: MARKER, slug: "example-workspace-slug" },
+        actor: { displayName: "Ada Lovelace", role: "OWNER" },
         actorIsOwner: true,
         caseKindAgentReviewSeeded: true,
       },

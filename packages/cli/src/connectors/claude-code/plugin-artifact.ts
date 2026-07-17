@@ -110,17 +110,53 @@ export function renderResolverScript(): string {
 # still works under a stripped PATH (env -i), where external tools are absent.
 set -u
 
+# §4.1 machine-output transport (proposal 20260715-mla-the-agent-is-the-only-executor):
+# ask the binary for its machine (JSON envelope) voice by exporting one environment
+# variable, then exec verbatim. resolve-mla is only ever the agent path, so every
+# command it exec's is an agent invocation that should speak machine mode. An env var
+# (not a machine-output argv flag) is deliberate: an OLD binary that predates the
+# protocol never reads MEETLESS_OUTPUT and simply ignores it, so this cannot crash a
+# strict argument parser; a NEW binary reads it and, for a converted operation, emits
+# the envelope. Best effort: an unconverted operation still runs and prints its legacy
+# human text, which the agent summarizes. The binary's own bootstrap excludes the
+# long-lived \`mla mcp\` stdio daemon and deletes this variable before spawning any
+# child, so nothing downstream inherits the request.
+export MEETLESS_OUTPUT=json
+
 self="\$0"
 selfreal="\$self"
 if command -v realpath >/dev/null 2>&1; then
   selfreal="\$(realpath "\$self" 2>/dev/null || printf '%s' "\$self")"
 fi
 
+# \$HOME is not trustworthy. On 2026-07-13 a Claude Code session was launched with HOME=''
+# (a shell that sourced its env file from the wrong cwd, so \$BOX_HOME expanded to nothing),
+# and every child it spawned inherited that: npm resolved "~/.npm" as a LITERAL directory and
+# planted a 71MB <repo>/~/.npm tree, mla wrote <repo>/.meetless.
+#
+# An empty or literal-"~" \$HOME makes every "\$HOME/..." path RELATIVE, and a quoted "~" is
+# NOT tilde-expanded by the shell, so this script would otherwise (a) probe, and \`exec\`, an
+# mla out of the CURRENT DIRECTORY, and (b) mkdir a literal "~" directory into whatever repo
+# Claude Code happened to be started in, then run install.sh under the same broken \$HOME.
+#
+# The Node CLI repairs \$HOME for its own children (lib/config.ts repairHomeEnv), but this
+# script runs BEFORE mla, in the environment Claude Code hands us, so it has to defend
+# itself. Accept \$HOME only when it is absolute; \`home\` is empty otherwise and every use
+# below is guarded by \${home:+...} or [ -n "\$home" ], which degrades to "no home candidate,
+# no bootstrap" rather than to "write into the cwd".
+home=""
+case "\${HOME:-}" in
+  /*) home="\${HOME}" ;;
+  "") ;;
+  *) printf 'resolve-mla: ignoring \$HOME=%s (not an absolute path); whatever launched Claude Code set it wrong.\\n' "\${HOME}" >&2 ;;
+esac
+
 # §5 candidate order. MEETLESS_MLA_PATH is the operator override; then the
 # install.sh default; then Homebrew (Apple silicon and Intel); then Linuxbrew.
+# The home candidate expands to the empty string (and is skipped) when \$HOME is unusable.
 for cand in \\
   "\${MEETLESS_MLA_PATH:-}" \\
-  "\${HOME:-}/.meetless/bin/mla" \\
+  "\${home:+\${home}/.meetless/bin/mla}" \\
   "/opt/homebrew/bin/mla" \\
   "/usr/local/bin/mla" \\
   "/home/linuxbrew/.linuxbrew/bin/mla"
@@ -155,8 +191,13 @@ fi
 # before the binary. Opt out with MEETLESS_MLA_NO_BOOTSTRAP=1; override the
 # installer source with MEETLESS_INSTALL_URL (enterprise mirror / tests). Every
 # line here writes to stderr: stdout is the MCP JSON-RPC channel and must stay clean.
-bootstrap_target="\${HOME:-}/.meetless/bin/mla"
-if [ "\${MEETLESS_MLA_NO_BOOTSTRAP:-}" != "1" ] && [ -n "\${HOME:-}" ]; then
+#
+# \`home\` (not \$HOME) throughout: a non-absolute \$HOME would otherwise make the mkdir, the
+# lock, and the install target all relative, planting a literal "~" tree in the cwd and then
+# running the installer inside it. No usable home means no bootstrap, which is the correct
+# outcome: there is nowhere legitimate to install to.
+bootstrap_target="\${home}/.meetless/bin/mla"
+if [ "\${MEETLESS_MLA_NO_BOOTSTRAP:-}" != "1" ] && [ -n "\$home" ]; then
   install_url="\${MEETLESS_INSTALL_URL:-https://meetless.ai/install.sh}"
   if command -v curl >/dev/null 2>&1; then
     fetch="curl -fsSL --max-time 180"
@@ -166,8 +207,8 @@ if [ "\${MEETLESS_MLA_NO_BOOTSTRAP:-}" != "1" ] && [ -n "\${HOME:-}" ]; then
     fetch=""
   fi
   if [ -n "\$fetch" ]; then
-    mkdir -p "\${HOME}/.meetless" 2>/dev/null || true
-    lock="\${HOME}/.meetless/.mla-bootstrap.lock"
+    mkdir -p "\${home}/.meetless" 2>/dev/null || true
+    lock="\${home}/.meetless/.mla-bootstrap.lock"
     # Atomic single-runner guard: if two Claude Code sessions cold-boot the MCP
     # at once, only the lock holder installs; the other falls through to the hint
     # and boots clean on its next restart once the binary lands.

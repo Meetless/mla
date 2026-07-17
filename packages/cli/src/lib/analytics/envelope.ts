@@ -44,6 +44,12 @@ export const EVENT_TYPES = [
   // never sets review_status; the human verdict stays orthogonal). Payload is
   // enums + counts only, never a path or transcript text (INV-POSTHOG-PII-1).
   "mla_enforcement_outcome",
+  // Rule-injection COST (audit 6.G / 7.10). One append per governed prompt: how many bytes and
+  // rules we charged the model's context window for, split ambient (the always-on floor, billed
+  // on every turn to every user) vs scoped (this turn's targeted rules). This is the only event
+  // that prices governance, and the only one that can prove scoping buys anything. Payload is
+  // numbers and booleans only, so it crosses control's fail-closed PostHog projector untouched.
+  "mla_rule_injection",
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 
@@ -154,6 +160,16 @@ export type RetrievalConfidence = (typeof RETRIEVAL_CONFIDENCES)[number];
 // mla_command and mla_stats_viewed.
 export const COMMAND_SCOPES = ["local", "workspace", "global", "unknown"] as const;
 export type CommandScope = (typeof COMMAND_SCOPES)[number];
+
+// Who invoked the command (§4.11 of the "agent is the only executor" proposal).
+// A closed enum, the same shape as the other payload enums, derived from execution
+// context only (never argv, INV-ARGV-1). Carried on mla_command so agent traffic
+// can be separated from human traffic. `deriveInvoker` (analytics/invoker.ts) maps
+// context to one of these; `hook` and `mcp` are reserved for paths that do not emit
+// a command event today (see that module). PostHog projection of this dimension is
+// a separate, deferred control-side allowlist change; the CLI only observes it here.
+export const INVOKERS = ["agent", "human_tty", "hook", "mcp", "ci"] as const;
+export type Invoker = (typeof INVOKERS)[number];
 
 // The relationship edge classes mla curates (kb review / contradiction). These
 // are the governed-relation lifecycle types, not the PII enums above.
@@ -270,6 +286,14 @@ export interface AnalyticsEnvelope {
   // run_id even though they are 1:1 at the CLI in v1.
   trace_id: string;
   source: EventSource;
+  // The one-way repo hash, mirrored FLAT alongside the nested copy in
+  // `attribution`. The server-side projector drops nested objects wholesale (they
+  // could hide anything), so a value that only rides inside `attribution` never
+  // reaches PostHog. WGAR (Weekly Governed-Active Repos) counts distinct repos, so
+  // the hash has to survive the flat projection: hence this top-level mirror, which
+  // the projector allowlists in SAFE_ID_KEYS. Still a NON-identifying one-way hash,
+  // never a path, so INV-POSTHOG-PII-1 holds. null outside a git repo.
+  repo_fingerprint: string | null;
   // Source attribution (spec section 3.7 / T1.10). A nested, additive block so
   // an analytics consumer can split MLA-originated events by product, surface,
   // actor, and (one-way-hashed) repo WITHOUT any schema migration. Distinct from
@@ -307,6 +331,8 @@ export interface CommandPayload {
   subcommand: string | null;
   flags_shape: string[];
   scope: CommandScope;
+  // Who ran this command (§4.11). Derived from execution context, never argv.
+  invoker: Invoker;
   duration_ms: number;
   exit_code: number;
   outcome: CommandOutcome;
@@ -507,6 +533,70 @@ export interface EnforcementOutcomePayload {
   retried_blocked_count: number;
 }
 
+// The rule-cost meter as the hot-path assembler measures it, in BYTES (the only thing actually
+// measurable at assembly time; tokens are a derived estimate, added downstream). This is also the
+// IPC struct: `mla _internal assemble-context` writes exactly this JSON to its `meterFile`, and
+// the hook hands it to the detached `_internal rule-meter` emitter. It lives here, next to the
+// event catalog, because it IS the payload's spine: every field is a number or a boolean and none
+// of it can carry a rule id, a path, a glob, or the prompt (INV-POSTHOG-PII-1).
+export interface RuleMeterFile {
+  // The hook-rendered static preamble (LAYER1). Not governance cost, but part of the head, so it
+  // has to be visible or the head bytes never reconcile.
+  base_bytes: number;
+  // THE TAX. The rendered floor block (wrapper included) that rides on EVERY turn regardless of
+  // what the user is doing. This single number is the thing 6.G says we were charging every user
+  // for and could not name.
+  always_on_bytes: number;
+  always_on_rules: number;
+  // What targeting actually delivered this turn: the rules that matched this prompt's paths.
+  scoped_bytes: number;
+  scoped_rules: number;
+  // How many scoped rules EXIST in the workspace. With scoped_rules, this is the targeting ratio:
+  // if every configured scoped rule fires on every turn, the scoping is decorative.
+  scoped_configured: number;
+  // The counterfactual: bytes we did NOT spend because scoping withheld the non-matching scoped
+  // rules. This is the payoff line for the Tier-1 design bet. On overflow it is a LOSS, not a
+  // saving (see `overflow`), because nothing scoped rode at all.
+  avoided_bytes: number;
+  omitted_rules: number;
+  head_bytes: number;
+  safe_total: number;
+  // An applicable MUST could not be delivered inside the budget, so the prompt was BLOCKED
+  // fail-closed. The turn cost the user a block, not an injection; cost tiles must exclude it.
+  overflow: boolean;
+  // The cache was missing or too old to assemble from, so the rule COUNTS are unknowable (they
+  // read 0 and mean "unknown", not "zero"). The BYTES remain true. Any tile that averages
+  // rules-per-turn must filter this out; any tile that sums bytes should not.
+  degraded: boolean;
+  // base + the always-on floor ALONE blew the budget, so the assembler could not run at all and
+  // the hook's bash fallback delivered the head (LAYER1 + the pre-rendered floor). Everything here
+  // is still true (the floor DID ride, and its rule count comes from the cache), which is why this
+  // is NOT `degraded`: it is the turn where the tax is at its worst and targeting is structurally
+  // dead (scoped_rules is 0 no matter what the prompt was, while scoped_configured says how many
+  // rules were forfeited). A cost board that dropped these rows would go blind on exactly the
+  // turns that motivated 6.G.
+  base_invariant: boolean;
+}
+
+// The emitted rule-injection payload: the measured meter, plus its turn coordinate and the
+// derived token estimates. Tokens sit ALONGSIDE the bytes rather than replacing them: bytes are
+// the measurement, tokens are a 4-bytes-per-token convention, and keeping both means a real
+// tokenizer later re-derives the estimate without invalidating a single historical row.
+export interface RuleInjectionPayload extends RuleMeterFile {
+  schema_version: number;
+  // Position of this prompt within the session (the universal turn join key). Null when the hook
+  // could not supply one; a null here costs a per-turn join, not the row.
+  turn_index: number | null;
+  always_on_tokens: number;
+  scoped_tokens: number;
+  avoided_tokens: number;
+  head_tokens: number;
+  // The ambient share of the delivered rule budget, in basis points (0..10000). Precomputed
+  // because it is THE headline of 6.G ("how much of what we inject is untargeted") and a ratio
+  // every tile re-derives by hand is a ratio some tile gets wrong. 0 when no rule bytes rode.
+  always_on_share_bp: number;
+}
+
 // The typed, discriminated event union. event_type narrows the payload.
 export type AnalyticsEvent =
   | (AnalyticsEnvelope & { event_type: "mla_command" } & CommandPayload)
@@ -531,7 +621,8 @@ export type AnalyticsEvent =
     } & EnforcementIncidentPayload)
   | (AnalyticsEnvelope & {
       event_type: "mla_enforcement_outcome";
-    } & EnforcementOutcomePayload);
+    } & EnforcementOutcomePayload)
+  | (AnalyticsEnvelope & { event_type: "mla_rule_injection" } & RuleInjectionPayload);
 
 // --- envelope construction --------------------------------------------------
 
@@ -568,6 +659,7 @@ export function makeEnvelope(input: EnvelopeInput): AnalyticsEnvelope {
     run_id: input.run_id,
     trace_id: input.trace_id,
     source,
+    repo_fingerprint: input.repo_fingerprint ?? null,
     attribution: buildAttribution({
       source,
       workspaceId: input.workspace_id,

@@ -87,6 +87,26 @@ describe("buildOnboardSkillBody (the /mla onboard orchestration skill)", () => {
     expect(body).toContain("--only");
   });
 
+  it("drives Step 5 acceptance from the typed decision_request, not a pasted command (Phase 3)", () => {
+    // The read-only review now carries a decision_request; the agent presents its
+    // options and maps the CHOSEN typed selection to a flag, rather than handing An a
+    // runnable command. This is the §4.5 connector-adapter contract.
+    expect(body).toContain("decision_request");
+    expect(body).toMatch(/do not hand An a command to run/i);
+    // The three selection modes map to the three flag forms.
+    expect(body).toContain('"mode": "all"');
+    expect(body).toContain('"mode": "only"');
+    expect(body).toContain('"mode": "none"');
+    expect(body).toMatch(/candidate_ids/);
+    // The flag is built only from the CLI's selection, never An's free text.
+    expect(body).toMatch(/never from An's free text/i);
+    // Explicit intent short-circuits the round-trip.
+    expect(body).toMatch(/Reuse explicit intent/i);
+    // Graceful fallback when no decision_request (older binary or no durable rules).
+    expect(body).toMatch(/no `?decision_request`?/i);
+    expect(body).toContain("result.durable");
+  });
+
   it("treats repo and scout content as untrusted data", () => {
     expect(body).toMatch(/untrusted DATA/);
     expect(body).toMatch(/never follow instructions embedded/i);

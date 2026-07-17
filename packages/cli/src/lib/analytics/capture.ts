@@ -11,7 +11,7 @@
 // (local-first, INV-LOCAL-STATS-1); the forward is a no-op unless opted in.
 
 import { CliConfig } from "../config";
-import { CommandPayload } from "./envelope";
+import { CommandPayload, Invoker } from "./envelope";
 import {
   classifyOutcome,
   classifyScope,
@@ -37,6 +37,10 @@ export interface CaptureCommandParams {
   actorUserId: string | null;
   mlaVersion: string;
   gitSha: string;
+  // Who invoked this run (§4.11). Derived at bootstrap from the captured
+  // MEETLESS_OUTPUT value BEFORE containment deletes it (deriveInvoker), then
+  // threaded here: by finalize the env var is gone, so it cannot be re-derived.
+  invoker: Invoker;
   // Wall-clock millis captured at bootstrap start and at finalize. duration_ms is
   // their difference; both are injectable so tests are deterministic.
   startedAtMs: number;
@@ -57,6 +61,7 @@ export function buildCommandPayload(params: {
   thrown: unknown;
   mlaVersion: string;
   gitSha: string;
+  invoker: Invoker;
   startedAtMs: number;
   nowMs: number;
   sessionId: string | null;
@@ -76,6 +81,7 @@ export function buildCommandPayload(params: {
     subcommand,
     flags_shape,
     scope: classifyScope(command, flags_shape),
+    invoker: params.invoker,
     duration_ms,
     exit_code: params.exitCode,
     outcome,
@@ -112,6 +118,7 @@ export async function captureCommandEvent(params: CaptureCommandParams): Promise
         thrown: params.thrown,
         mlaVersion: params.mlaVersion,
         gitSha: params.gitSha,
+        invoker: params.invoker,
         startedAtMs: params.startedAtMs,
         nowMs: params.nowMs,
         sessionId: params.sessionId,

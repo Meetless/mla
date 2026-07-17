@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { userHomeDir } from "./config";
 
 // Detect Claude Code sessions whose transcript has been DELETED on disk and
 // archive the mirrored Meetless AgentRun (`mla session reconcile`).
@@ -121,7 +122,7 @@ export function makeTranscriptStatusResolver(
   deps: TranscriptResolverDeps = {},
 ): TranscriptStatusResolver {
   const projectsRoot =
-    deps.projectsRoot ?? path.join(os.homedir(), ".claude", "projects");
+    deps.projectsRoot ?? path.join(userHomeDir(), ".claude", "projects");
 
   const present = new Set<string>();
   let rootEntries: string[] = [];

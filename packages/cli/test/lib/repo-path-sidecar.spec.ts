@@ -66,6 +66,19 @@ describe("repoPath sidecar (Wedge v6 Epoch 35)", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mla-sidecar-ss-"));
     try {
       const stage = stageHooksDir(tmp);
+      // session-start.sh ends by DETACHING two children (spawn_flush's nohup'd
+      // flush.sh, and spawn_reconcile). They outlive spawnSync and keep writing
+      // under $MEETLESS_HOME, so they race this test's rmSync teardown -- which
+      // is how it fails: ENOTEMPTY on a loaded CI box, and in principle a real
+      // flake, since the detached flusher also mutates the queue dir we assert
+      // on. Neuter both, the same way spawn-flush-workspace-reassert.spec.ts
+      // does: an inert flush.sh, MEETLESS_DEBUG=0 so the nohup redirect lands on
+      // /dev/null instead of a fresh log file inside the tree, and the reconcile
+      // kill switch. This spec owns the sidecar WRITE; the spawns themselves are
+      // locked by session-reconcile-spawn.spec.ts, so nothing is lost here.
+      fs.writeFileSync(path.join(stage, "flush.sh"), "#!/usr/bin/env bash\nexit 0\n", {
+        mode: 0o755,
+      });
       const home = makeMeetlessHome(tmp, "/bin/true");
       const fakeRepo = fs.mkdtempSync(path.join(os.tmpdir(), "mla-sidecar-repo-"));
       // Per-folder activation gate (opt-in): session-start.sh exits 0 before
@@ -80,7 +93,12 @@ describe("repoPath sidecar (Wedge v6 Epoch 35)", () => {
           }),
           encoding: "utf8",
           cwd: fakeRepo,
-          env: { ...process.env, MEETLESS_HOME: home },
+          env: {
+            ...process.env,
+            MEETLESS_HOME: home,
+            MEETLESS_DEBUG: "0",
+            MEETLESS_SESSION_RECONCILE: "0",
+          },
         });
         expect(r.status).toBe(0);
 

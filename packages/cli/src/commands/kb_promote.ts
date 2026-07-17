@@ -1,34 +1,39 @@
-// `mla kb promote <doc-id>` / `mla kb promote --reject <doc-id>` (Personal-KB
-// posture promotion, Phase 3).
+// `mla kb promote <doc-id>` / `mla kb promote --reject <doc-id>`: promote a
+// PERSONAL knowledge doc to TEAM scope (PERSON -> WORKSPACE).
 //
 // Renamed from `kb share`: "share" read as "invite a teammate", but this verb
-// has nothing to do with membership. It flips a SHADOW Personal-KB doc to LIVE,
-// i.e. it PROMOTES the doc into the workspace's grounded, agent-visible corpus.
-// `kb share` survives as a hidden, deprecated alias in kb.ts (see the dispatch).
+// has nothing to do with membership. It moves a doc from your personal scope into
+// the workspace's shared, team-visible corpus. `kb share` survives as a hidden,
+// deprecated alias in kb.ts. The reverse move is `mla kb demote` (kb_demote.ts).
 //
-//   promote <doc-id>          -> PATCH /internal/v1/kb/documents/<id>/posture with
-//                                { workspaceId, actorUserId, posture: "LIVE" }. This
-//                                promotes the owner's Personal-KB doc from SHADOW to
-//                                LIVE: the "promote into the workspace corpus" action.
-//   promote --reject <doc-id> -> the owner declines to promote. Makes NO posture call
-//                                and NO delete call, so the personal doc survives
-//                                untouched at SHADOW. Records the decline locally so
-//                                the agent can avoid re-proposing it later (test 16).
+//   promote <doc-id>          -> POST /internal/v1/kb/documents/<id>/scope with
+//                                { scope: "WORKSPACE", actorBy, reason? } (workspaceId
+//                                as a query param). Flips the doc's scope PERSON ->
+//                                WORKSPACE in place and appends a PROMOTE lifecycle
+//                                event. The route replaced the PATCH .../posture
+//                                endpoint dropped in the 2026-06-21 two-axis cutover.
+//   promote --reject <doc-id> -> the owner declines to promote. Makes NO scope call,
+//                                so the personal doc survives untouched. Records the
+//                                decline locally so the agent can avoid re-proposing
+//                                it later (test 16).
 //
 // Mirrors the kb_personal.ts deps-injection shape: a thin public `runKbPromote`
-// that loads the real config (readKbConfig) and wires the real intelPatch +
+// that loads the real config (readKbConfig) and wires the real intelPost +
 // rejection recorder, while every collaborator is injectable so the unit test
-// drives it offline without touching the network, config, or disk.
+// drives it offline without touching the network, config, or disk. The scope
+// flip itself lives in the shared kb_scope.ts (promote and demote share it).
 
 import * as fs from "fs";
 import * as path from "path";
 
 import { KbCliConfig, readKbConfig, HOME } from "../lib/config";
-import { intelPatch, HttpError, DEFAULT_INTEL_URL } from "../lib/http";
+import { intelPost, HttpError, DEFAULT_INTEL_URL } from "../lib/http";
 import {
-  isWorkspaceAccessDenied,
-  workspaceAccessDeniedMessage,
-} from "../lib/workspace-access";
+  KbScopeHttp,
+  explainScopeError,
+  parseScopeArgs,
+  setKbScope,
+} from "./kb_scope";
 
 export interface KbPromoteResult {
   rejected: boolean;
@@ -37,57 +42,12 @@ export interface KbPromoteResult {
 
 export interface KbPromoteDeps {
   cfg?: KbCliConfig;
-  http?: {
-    intelPatch: (
-      cfg: KbCliConfig,
-      path: string,
-      body: unknown,
-      timeoutMs?: number,
-    ) => Promise<unknown>;
-  };
+  http?: KbScopeHttp;
   recordReject?: (cfg: KbCliConfig, docId: string) => void;
 }
 
-const USAGE = "Usage: mla kb promote <doc-id> | mla kb promote --reject <doc-id>";
-
-interface ParsedPromoteArgs {
-  docId: string;
-  reject: boolean;
-}
-
-// Parse a single positional <doc-id> plus an optional --reject flag. The flag may
-// appear before or after the id (`--reject doc_1` or `doc_1 --reject`). Unknown
-// flags, a missing id, or a second positional are usage errors.
-export function parseKbPromoteArgs(argv: string[]): ParsedPromoteArgs {
-  let docId: string | null = null;
-  let reject = false;
-  for (const a of argv) {
-    if (a === "--reject") {
-      reject = true;
-    } else if (a.startsWith("-")) {
-      throw new Error(`Unknown flag: ${a}. ${USAGE}`);
-    } else if (docId === null) {
-      docId = a;
-    } else {
-      throw new Error(`Unexpected argument: ${a}. ${USAGE}`);
-    }
-  }
-  if (docId === null) {
-    throw new Error(`mla kb promote requires a document id. ${USAGE}`);
-  }
-  // `kb add` / `kb reingest` receipts print the id as `kbdoc:<cuid>`, so
-  // operators paste that exact token. The posture route keys on the bare cuid;
-  // a `kbdoc:` prefix flowed verbatim into the URL used to 404 with a
-  // misleading "intel does not expose the posture endpoint" message. Strip it
-  // (mirrors the kb_reingest `kbdoc:` input handling) so both spellings work.
-  if (docId.startsWith("kbdoc:")) {
-    docId = docId.slice("kbdoc:".length);
-    if (docId.length === 0) {
-      throw new Error(`mla kb promote requires a document id after 'kbdoc:'. ${USAGE}`);
-    }
-  }
-  return { docId, reject };
-}
+const USAGE =
+  "Usage: mla kb promote <doc-id> [--reason <text>] | mla kb promote --reject <doc-id>";
 
 // The local rejections spool. Path + filename live under the SAME logs directory
 // the Phase 1 Active Review store uses (HOME/logs), so both the agent and this
@@ -123,26 +83,6 @@ function recordRejectDefault(cfg: KbCliConfig, docId: string): void {
   }
 }
 
-// Surface an intel HTTP failure helpfully, mirroring kb.ts's explainIntelError
-// for the postures most likely on a posture flip; falls back to the raw message.
-function explainPromoteError(err: HttpError, intelUrl: string): string {
-  if (err.status === 404) {
-    return `intel returned 404 for the posture route. Document not found, or this intel does not expose the KB posture endpoint.`;
-  }
-  // Membership 403 (folder marker / --workspace names a workspace you are not
-  // in) is not a token problem; route it to the shared canonical line (BUG-5).
-  if (isWorkspaceAccessDenied(err)) {
-    return workspaceAccessDeniedMessage(err);
-  }
-  if (err.status === 401 || err.status === 403) {
-    return `intel rejected the token (HTTP ${err.status}). Run \`mla doctor\` to check your login and workspace access.`;
-  }
-  if (err.status === undefined) {
-    return `intel not reachable at ${intelUrl}. Is it running? Try \`mla doctor\`.`;
-  }
-  return err.message;
-}
-
 export async function runKbPromote(argv: string[], deps?: KbPromoteDeps): Promise<KbPromoteResult> {
   let cfg: KbCliConfig;
   try {
@@ -152,41 +92,36 @@ export async function runKbPromote(argv: string[], deps?: KbPromoteDeps): Promis
     return { rejected: false, code: 2 };
   }
 
-  let parsed: ParsedPromoteArgs;
+  let parsed;
   try {
-    parsed = parseKbPromoteArgs(argv);
+    parsed = parseScopeArgs(argv, { usage: USAGE, allowReject: true });
   } catch (e) {
     console.error((e as Error).message);
     return { rejected: false, code: 2 };
   }
 
-  const patch = deps?.http?.intelPatch ?? intelPatch;
+  const http: KbScopeHttp = deps?.http ?? { intelPost };
   const recordReject = deps?.recordReject ?? recordRejectDefault;
 
-  // REJECT path: no posture call, no delete. Record the decline and confirm the
-  // personal doc is unchanged.
+  // REJECT path: no scope call. Record the decline and confirm the personal doc
+  // is unchanged.
   if (parsed.reject) {
     recordReject(cfg, parsed.docId);
     console.log(
-      `Declined to promote ${parsed.docId}. Your personal copy is unchanged (still SHADOW, not deleted).`,
+      `Declined to promote ${parsed.docId}. Your personal copy is unchanged (still Personal, not deleted).`,
     );
     return { rejected: true, code: 0 };
   }
 
-  // PROMOTE path: flip the posture to LIVE.
-  const body = {
-    workspaceId: cfg.workspaceId,
-    actorUserId: cfg.actorUserId,
-    posture: "LIVE",
-  };
+  // PROMOTE path: flip the scope PERSON -> WORKSPACE.
   try {
-    await patch(cfg, `/internal/v1/kb/documents/${parsed.docId}/posture`, body);
+    await setKbScope(cfg, parsed.docId, "WORKSPACE", parsed.reason, http);
   } catch (e) {
     const intelUrl = cfg.intelUrl || DEFAULT_INTEL_URL;
-    console.error(explainPromoteError(e as HttpError, intelUrl));
+    console.error(explainScopeError(e as HttpError, intelUrl));
     return { rejected: false, code: 1 };
   }
 
-  console.log(`Promoted ${parsed.docId} to the workspace corpus (posture is now LIVE).`);
+  console.log(`Promoted ${parsed.docId} to the team (scope is now Team; anyone in the workspace can see it).`);
   return { rejected: false, code: 0 };
 }

@@ -15,6 +15,7 @@ import {
   renderScoutAgent,
   renderScoutToolsLine as surfaceRenderScoutToolsLine,
 } from "../connectors/claude-code/surface";
+import { userHomeDir } from "./config";
 import {
   CE0_POST_TOOL_USE_MATCHER,
   MANAGED_HOOK_SCRIPTS,
@@ -393,6 +394,39 @@ export interface HookDrift {
   errors: { file: string; error: string }[];
 }
 
+// A SUPPORT file is any hook-template file that is not a registered hook script:
+// today home.sh, common.sh, flush.sh, event-batch-filter.jq. The registered scripts
+// `source` them, so they are libraries, not entry points, and Claude Code never
+// invokes them directly.
+//
+// The distinction decides what a MISSING file MEANS, which is why it is one exported
+// definition rather than two lists that can drift apart:
+//   - a missing REGISTERED script may be a deliberate opt-out (`--no-post-tool-use`),
+//     so nothing may resurrect it behind the operator's back;
+//   - a missing SUPPORT file is never a choice. It is a corrupt install, and something
+//     is about to source a file that is not there.
+// Defined by EXCLUSION (template minus registered) so a new support file needs no
+// second registration to be treated as one.
+export function isSupportHookFile(file: string): boolean {
+  return !MANAGED_HOOK_SCRIPTS.some((w) => w.script === file);
+}
+
+// Which support files this binary ships but the install does not have. Existence only:
+// no hashing, no content read. Content drift is checkHookDrift's job.
+export function missingSupportFiles(templateDir: string, hooksDir: string): string[] {
+  const missing: string[] = [];
+  for (const f of fs.readdirSync(templateDir)) {
+    if (!isSupportHookFile(f)) continue;
+    try {
+      if (!fs.statSync(path.join(templateDir, f)).isFile()) continue;
+    } catch {
+      continue; // unreadable template entry: checkHookDrift reports it, we do not guess
+    }
+    if (!fs.existsSync(path.join(hooksDir, f))) missing.push(f);
+  }
+  return missing;
+}
+
 // Generic hook content-drift detector. Compares every installed hook against
 // the template THIS binary ships, byte for byte. Replaces the old
 // marker-substring scan (which only covered flush.sh / session-start.sh and
@@ -556,19 +590,37 @@ export function maybeResyncHooks(opts?: {
 
     const want = buildStampId(buildInfo);
     const stampPath = path.join(hooksDir, HOOK_STAMP_FILE);
-    // Hot path: the stamp already names this binary -> hooks are in sync. Single
-    // small read, no directory walk, no template comparison.
-    if (readHookStamp(stampPath) === want) {
+    const templateDir = opts?.templateDir ?? locateHooksTemplate();
+    // Hot path: the stamp already names this binary -> the hooks it INSTALLED are in
+    // sync. One small read, no hashing, no template comparison.
+    //
+    // But the stamp only ever vouched for CONTENT freshness ("what is here came from
+    // this binary"), and this branch was reading it as a claim about EXISTENCE too.
+    // Those are different claims, and the gap between them IS the 2026-07-13 corrupt
+    // install: the resync refreshed common.sh, stamped the dir current, and never
+    // delivered the home.sh that common.sh sources. Every invocation afterwards read
+    // the stamp, said "current", and skipped the one check that would have caught it.
+    // A stamp may only be honored for files that are actually THERE.
+    //
+    // The existence probe is a readdir of a flat ~14-entry dir plus a handful of
+    // existsSync, against a Node process spawn: free. Registered scripts are excluded
+    // on purpose, since a missing one is what `--no-post-tool-use` looks like.
+    if (readHookStamp(stampPath) === want && missingSupportFiles(templateDir, hooksDir).length === 0) {
       return { ran: false, refreshed: [], reason: "current" };
     }
 
-    // Stamp absent or stale: a different binary is in charge. Find which
-    // installed hooks drifted from THIS binary's templates and rewrite only
-    // those. `missing` files are intentionally left alone (opt-outs / new hooks
-    // that need a real rewire).
-    const drift = checkHookDrift({ hooksDir, templateDir: opts?.templateDir });
-    const refreshed: string[] = [];
-    for (const f of drift.drifted) {
+    // Stamp absent or stale: a different binary is in charge. Rewrite every
+    // installed hook that drifted from THIS binary's templates.
+    //
+    // A MISSING file is not all one thing (see isSupportHookFile), and conflating
+    // the two kinds cost us a live corrupt install on 2026-07-13. home.sh shipped as
+    // a NEW support file that the refreshed common.sh sources. Refresh-without-create
+    // pushed the new common.sh onto every already-wired box and delivered NONE of
+    // them its dependency, so each one ran a hook that sourced a file that was not
+    // there. A missing REGISTERED script stays missing: that is what
+    // `mla rewire --no-post-tool-use` looks like, and doctor nags about it instead.
+    const drift = checkHookDrift({ hooksDir, templateDir });
+    const install = (f: string) => {
       const srcFile = path.join(drift.templateDir, f);
       const dstFile = path.join(hooksDir, f);
       const mode = f.endsWith(".sh") ? 0o755 : undefined;
@@ -576,6 +628,17 @@ export function maybeResyncHooks(opts?: {
         fs.copyFileSync(srcFile, tmp);
         if (mode !== undefined) fs.chmodSync(tmp, mode);
       });
+    };
+    const refreshed: string[] = [];
+    // Support files FIRST: a hook must never be able to observe a refreshed sourcer
+    // before its dependency exists. Hooks fire concurrently with this resync.
+    for (const f of drift.missing) {
+      if (!isSupportHookFile(f)) continue;
+      install(f);
+      refreshed.push(f);
+    }
+    for (const f of drift.drifted) {
+      install(f);
       refreshed.push(f);
     }
     // Stamp LAST, only after every drifted file landed, so the stamp always
@@ -664,7 +727,7 @@ export function maybeHealMcpCommand(opts?: {
       return { ran: false, reason: "not-wired" };
     }
     const claudeJsonPath =
-      opts?.claudeJsonPath ?? path.join(os.homedir(), ".claude.json");
+      opts?.claudeJsonPath ?? path.join(userHomeDir(), ".claude.json");
     if (!fs.existsSync(claudeJsonPath)) {
       return { ran: false, reason: "no-claude-json" };
     }
@@ -825,7 +888,7 @@ export function ensureClaudeSettings(
   settingsPathOverride?: string,
 ): { added: string[]; settingsPath: string } {
   const settingsPath =
-    settingsPathOverride ?? path.join(os.homedir(), ".claude", "settings.json");
+    settingsPathOverride ?? path.join(userHomeDir(), ".claude", "settings.json");
 
   // Silent-poison guard (dogfood F3 idle-session incident 2026-06-11). The hook
   // command paths we are about to write all live under HOOKS_DIR. If HOOKS_DIR is
@@ -989,7 +1052,7 @@ export function ensureClaudeMcpServer(
   mlaPathOverride?: string,
 ): McpRegisterResult {
   const claudeJsonPath =
-    claudeJsonPathOverride ?? path.join(os.homedir(), ".claude.json");
+    claudeJsonPathOverride ?? path.join(userHomeDir(), ".claude.json");
   const command = mlaPathOverride ?? resolveMlaPath();
 
   let current: string | null = null;
@@ -1052,7 +1115,7 @@ export function renderScoutToolsLine(tools: readonly string[]): string {
 }
 
 function installSkill(): string {
-  const dir = path.join(os.homedir(), ".claude", "skills", "mla");
+  const dir = path.join(userHomeDir(), ".claude", "skills", "mla");
   fs.mkdirSync(dir, { recursive: true });
 
   const skillBody = buildMlaSkillBody();
@@ -1088,7 +1151,7 @@ function installSkill(): string {
 // hand-edit is reconciled on the next rewire); memory.md and events.jsonl are seeded
 // once and never clobbered (the skill baseline).
 function installOnboardSkill(): string {
-  const dir = path.join(os.homedir(), ".claude", "skills", "mla-onboard");
+  const dir = path.join(userHomeDir(), ".claude", "skills", "mla-onboard");
   fs.mkdirSync(dir, { recursive: true });
 
   fs.writeFileSync(path.join(dir, "SKILL.md"), buildOnboardSkillBody(), "utf8");
@@ -1122,7 +1185,7 @@ function installOnboardSkill(): string {
 // SCOUT_TOOL_ALLOWLIST in surface.ts) can never silently drift from the code. Returns
 // the file paths.
 function installScoutAgents(): string[] {
-  const dir = path.join(os.homedir(), ".claude", "agents");
+  const dir = path.join(userHomeDir(), ".claude", "agents");
   fs.mkdirSync(dir, { recursive: true });
   const written: string[] = [];
   for (const role of SCOUT_NAMES) {
@@ -1149,7 +1212,7 @@ export function runWire(opts: WireOpts): WireResult {
     return {
       copied: [],
       hooksAdded: [],
-      settingsPath: path.join(os.homedir(), ".claude", "settings.json"),
+      settingsPath: path.join(userHomeDir(), ".claude", "settings.json"),
       skillDir,
       onboardSkillDir,
       scoutAgents,

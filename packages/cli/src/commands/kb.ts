@@ -14,7 +14,9 @@ import { runKbReviewList } from "./kb_pending";
 import { runKbReview } from "./kb_review";
 import { runKbPersonal } from "./kb_personal";
 import { runKbPromote } from "./kb_promote";
+import { runKbDemote } from "./kb_demote";
 import { runKbRetime } from "./kb_retime";
+import { runKbClaims, runKbClaimVerdict, looksLikeDocumentRef } from "./kb_claims";
 
 // `mla kb`: Knowledge Base subcommand router (T40, kb curation v2.3).
 //
@@ -33,8 +35,10 @@ import { runKbRetime } from "./kb_retime";
 //   retime         -> correct a SOURCE ITEM's effective date and regenerate its
 //                     derived relations (Phase 4 correction path); never edits an
 //                     accepted relation's valid_at in place
-//   share          -> promote a Personal-KB doc SHADOW -> LIVE; --reject declines
-//                     the share and preserves the owner's personal doc untouched
+//   promote        -> promote a doc from Personal to Team scope (PERSON ->
+//                     WORKSPACE); --reject declines and preserves the personal doc
+//   demote         -> demote a doc from Team back to Personal scope (WORKSPACE ->
+//                     PERSON); the retained owner receives it back, nothing deleted
 //
 // Relationship review subcommands (B5, agent-proxy review queue):
 //   review (list)  -> with NO candidate id: list PENDING_REVIEW candidates. Defaults
@@ -48,7 +52,7 @@ import { runKbRetime } from "./kb_retime";
 //                     injects --all when no explicit scope so old behavior holds
 //
 // Personal-KB owner-scoped views (Phase 3, Task 3.3):
-//   personal list  -> list THIS actor's own SHADOW-posture Personal-KB docs via
+//   personal list  -> list THIS actor's own PERSON-scope (personal) KB docs via
 //                     the owner-scoped GET /internal/v1/kb/documents
 //   personal show  -> inspect one of them (reuses `mla kb show <id>`)
 //
@@ -284,12 +288,16 @@ Independent axes govern every KB doc. Do not conflate them:
       \`--provenance\` is an advisory lineage label (how the bytes arrived) that
       sets neither trust nor grounding.
           PENDING  -> served, flagged untrusted (grounds answers now, awaiting review)
-          ACCEPTED -> trusted + served (\`mla kb accept\`)
-          REJECTED -> dropped from serving, stops grounding (\`mla kb reject\`)
-      Personal-KB posture (SHADOW/LIVE) is a SEPARATE sharing control, not
-      provenance-driven and not the trust axis: \`mla kb promote\` promotes your
-      personal doc into the workspace's shared corpus (SHADOW -> LIVE) and
-      \`mla kb personal\` lists your own un-promoted docs.
+          ACCEPTED -> trusted + served (\`mla kb accept <claimId>\`)
+          REJECTED -> dropped from serving, stops grounding (\`mla kb reject <claimId>\`)
+      The verdict is recorded on a CLAIM, not on the document: extraction normalizes
+      each document into claims and a human rules on each one. List them with
+      \`mla kb claims --pending\`. (Document-grain accept/reject is retired.)
+      SCOPE (Personal vs Team) is a SEPARATE sharing control, not provenance-driven
+      and not the trust axis: a doc is born Personal (only you see it); \`mla kb
+      promote\` shares it to the Team (PERSON -> WORKSPACE) and \`mla kb demote\`
+      pulls it back to Personal (WORKSPACE -> PERSON). \`mla kb personal\` lists your
+      own Personal docs.
 
   relationships (coherence): how does this doc relate to existing docs?
       Edges (SUPERSEDES / CONTRADICTS / REFINES / REFERENCES) are proposed as
@@ -330,11 +338,23 @@ Usage:
                        SOURCE ITEM, not a relation: an accepted relation is never
                        edited in place nor deleted.)
 
-  grounding (posture)
-    mla kb promote <doc-id>          promote a SHADOW Personal-KB doc to LIVE
-    mla kb promote --reject <doc-id> decline the promotion; leaves it SHADOW, untouched
-    mla kb personal list             this actor's own SHADOW Personal-KB docs
-    mla kb personal show <id>        inspect one (reuses \`mla kb show\`)
+  scope (Personal vs Team: who can see the doc)
+    mla kb promote <doc-id> [--reason <s>]   share a Personal doc to the Team (PERSON -> WORKSPACE)
+    mla kb promote --reject <doc-id>         decline the share; leaves it Personal, untouched
+    mla kb demote <doc-id> [--reason <s>]    pull a Team doc back to Personal (WORKSPACE -> PERSON)
+    mla kb personal list                     this actor's own Personal docs
+    mla kb personal show <id>                inspect one (reuses \`mla kb show\`)
+
+  trust review (claim grain — the verdict that decides grounding)
+    mla kb claims                          the current claim inventory (all outcomes)
+    mla kb claims --pending                only those awaiting your verdict, + backlog count
+    mla kb claims --outcome ACCEPTED       filter by trust outcome
+    mla kb claims [--all] [--limit <n>] [--doc <id>] [--json]
+                                           --all walks every page (the whole corpus)
+    mla kb accept <claimId> [--expect <O>] [--json]   trust it: retrieved + cited
+    mla kb reject <claimId> [--expect <O>] [--json]   drop it from serving
+                                           Human-only (\`--agent\` is refused). --expect
+                                           guards against a concurrent reviewer (409).
 
   relationship review
     mla kb review                              list the queue (defaults to your current session)
@@ -371,9 +391,11 @@ export function pendingAliasArgs(argv: string[]): string[] {
 // change instead of silently succeeding. No workspace or network is touched.
 export function runKbDocumentReviewRetired(sub: string): number {
   console.error(
-    `\`mla kb ${sub}\` is retired: a KB document revision is navigate + withdraw only ` +
-      `(importing a source no longer implies trust, and there is no document accept / reject). ` +
-      `Trust now lives at CLAIM grain: review the extracted claims in the Console /claims queue.`,
+    `\`mla kb ${sub} <document>\` is retired: a KB document revision is navigate + withdraw only ` +
+      `(importing a source no longer implies trust, and there is no document accept / reject).\n` +
+      `Trust lives at CLAIM grain. Rule on the extracted claims instead:\n` +
+      `  mla kb claims --pending          list the claims awaiting your verdict\n` +
+      `  mla kb ${sub} <claimId>${" ".repeat(Math.max(0, 8 - sub.length))}     record the verdict (or use the Console /claims queue)`,
   );
   return 2;
 }
@@ -413,25 +435,36 @@ export async function runKb(argv: string[]): Promise<number> {
       return runKbPersonal(rest);
     case "promote":
     // `share` is the deprecated alias for `promote` (renamed because "share"
-    // read as "invite a teammate"; the verb only flips SHADOW -> LIVE posture).
+    // read as "invite a teammate"; the verb flips Personal -> Team scope).
     // Kept routing so existing hooks/scripts/muscle-memory keep working; it is
     // intentionally NOT advertised in the catalog, exactly like `pending`.
     case "share":
       return (await runKbPromote(rest)).code;
+    case "demote":
+      return (await runKbDemote(rest)).code;
     case "retime":
       return runKbRetime(rest);
-    // `accept` / `reject` were the document-grain trust verdict (kbdoc HEAD
-    // revision PENDING -> ACCEPTED / REJECTED). RETIRED under Design A
-    // (kb-document-review-grain proposal §13.3): a KB document revision is now
-    // navigate + withdraw only; importing a source no longer implies trust and
-    // there is no document accept / reject. All human-promotable trust moved to
-    // CLAIM grain. Kept as explicit routed cases (not a silent "unknown
-    // subcommand") so an operator or script with the verb in muscle memory gets
-    // the retirement pointer, mirroring the intel route's 410
-    // KB_DOCUMENT_REVIEW_RETIRED signal.
+    case "claims":
+      return runKbClaims(rest);
+    // `accept` / `reject` are the CLAIM-grain trust verdict (PENDING -> ACCEPTED /
+    // REJECTED on a normalized claim). They used to be the DOCUMENT-grain verdict,
+    // which was retired under Design A (kb-document-review-grain proposal §13.3): a
+    // KB document revision is navigate + withdraw only, and all human-promotable
+    // trust moved to the claim.
+    //
+    // The retirement shipped without a replacement, so for a while these verbs did
+    // nothing but print a pointer at the Console — claim-grain trust, the operation
+    // that IS the product, had no CLI at all. It does now.
+    //
+    // Both grains answer to the same word, so route on the SHAPE of the argument: a
+    // document reference (`kbdoc:` / `note:` / a path) still gets the retirement
+    // notice — mirroring the intel route's 410 KB_DOCUMENT_REVIEW_RETIRED — while a
+    // claim id records the verdict. Muscle memory keeps working AND lands somewhere
+    // honest; nothing silently misroutes, because the two shapes cannot collide.
     case "accept":
     case "reject":
-      return runKbDocumentReviewRetired(sub);
+      if (rest[0] && looksLikeDocumentRef(rest[0])) return runKbDocumentReviewRetired(sub);
+      return runKbClaimVerdict(sub, rest);
   }
 
   // Anything that is not a routed subcommand and not summary/dump is unknown.

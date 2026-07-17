@@ -182,6 +182,82 @@ describe("resolve-mla (generated script)", () => {
     expect(fs.existsSync(path.join(home, ".meetless", "bin", "mla"))).toBe(false);
   });
 
+  // A launcher that exports HOME='~' (or '') is the same class of poison the Node CLI
+  // now repairs in lib/config, but this script runs BEFORE mla, in the environment Claude
+  // Code hands it, so it has to defend itself. A quoted "~" is NOT tilde-expanded, so
+  // "$HOME/.meetless" is a RELATIVE path and every use lands in the cwd. Observed
+  // 2026-07-13: a 71MB <repo>/~/.npm tree, and a <repo>/~/.claude.json, in a git checkout.
+  //
+  // The two cases differ in ONE way, deliberately: a non-empty garbage $HOME is a launcher
+  // bug worth naming on stderr, while an EMPTY $HOME is indistinguishable from the unset
+  // $HOME of a stripped GUI env (below), which is legitimate and must stay quiet. Both are
+  // equally refused; only one is announced.
+  describe.each([
+    ['a literal "~"', "~", true],
+    ["an empty string", "", false],
+  ])("when $HOME is %s", (_label, poisoned, warns) => {
+    // Run FROM a scratch cwd so any relative write lands somewhere we can inspect. This is
+    // the whole point of the test: assert on the filesystem, not just on stdout.
+    function runIn(cwd: string, env: NodeJS.ProcessEnv, script: string, ...args: string[]) {
+      try {
+        const stdout = execFileSync("sh", [script, ...args], {
+          cwd,
+          env: { PATH: "/usr/bin:/bin", HOME: poisoned, ...env },
+          encoding: "utf8",
+        });
+        return { code: 0, stdout, stderr: "" };
+      } catch (e: any) {
+        return { code: e.status as number, stdout: String(e.stdout ?? ""), stderr: String(e.stderr ?? "") };
+      }
+    }
+
+    it("never execs an mla out of the CURRENT DIRECTORY", () => {
+      // The exploit shape, not a hypothetical: with HOME='~' the candidate
+      // "$HOME/.meetless/bin/mla" is the relative path "~/.meetless/bin/mla", so a file
+      // sitting in the repo you happen to have open satisfies `[ -x ]` and gets exec'd.
+      //
+      // No MEETLESS_MLA_PATH here on purpose: the override is the FIRST candidate, so
+      // setting it would short-circuit the loop before it ever probed the home candidate
+      // and the test would pass with the bug still in. The system candidates are stubbed
+      // out and bootstrap is off, so the ONLY thing that can produce output is the cwd
+      // binary. Under the old script this printed CWD-BINARY and exited 0.
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "poisoned-cwd-"));
+      makeFakeMla(path.join(cwd, "~", ".meetless", "bin"), "CWD-BINARY");
+      const absent = path.join(root, "no-candidates", "mla");
+      const hermetic = path.join(root, `resolver-cwd-${warns ? "tilde" : "empty"}`);
+      fs.writeFileSync(hermetic, renderScriptWithoutSystemCandidates(absent));
+      fs.chmodSync(hermetic, 0o755);
+
+      const r = runIn(cwd, { MEETLESS_MLA_NO_BOOTSTRAP: "1" }, hermetic, "mcp");
+
+      expect(r.stdout).not.toContain("CWD-BINARY");
+      expect(r.code).toBe(127); // refused every candidate and said so, honestly
+      expect(r.stderr).toContain("could not find");
+      expect(r.stderr.includes("not an absolute path")).toBe(warns);
+      fs.rmSync(cwd, { recursive: true, force: true });
+    });
+
+    it("does not bootstrap, so no literal ~ tree is planted in the cwd", () => {
+      // The bootstrap is what actually did the damage: `mkdir -p "$HOME/.meetless"` with a
+      // relative $HOME, then curl | sh with the SAME broken $HOME, so the installer wrote
+      // its whole tree (and npm its cache) under <cwd>/~. With no usable home there is
+      // nowhere legitimate to install to, and refusing is the only correct answer.
+      const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "poisoned-boot-"));
+      const installer = makeFakeInstaller(root, `poisoned-installer-${poisoned ? "tilde" : "empty"}`);
+      const absent = path.join(root, "no-candidates", "mla");
+      const hermetic = path.join(root, `resolver-poisoned-${poisoned ? "tilde" : "empty"}`);
+      fs.writeFileSync(hermetic, renderScriptWithoutSystemCandidates(absent));
+      fs.chmodSync(hermetic, 0o755);
+
+      const r = runIn(cwd, { MEETLESS_INSTALL_URL: `file://${installer}` }, hermetic, "mcp");
+
+      expect(r.code).toBe(127); // reached the honest "could not find mla" exit
+      expect(r.stderr).toContain("could not find");
+      expect(fs.readdirSync(cwd)).toEqual([]); // the load-bearing assertion
+      fs.rmSync(cwd, { recursive: true, force: true });
+    });
+  });
+
   it("does not abort under `set -u` when HOME is unset (stripped GUI env)", () => {
     // A GUI-launched Claude Code, or an `env -i` MCP boot, may run the resolver
     // with HOME unset. The $HOME candidate MUST be written `${HOME:-}` so `set -u`

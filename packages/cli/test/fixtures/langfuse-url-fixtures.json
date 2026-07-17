@@ -8,9 +8,9 @@
       "url": "https://cloud.langfuse.com/project/p_abc/traces/0123456789abcdef0123456789abcdef"
     },
     {
-      "projectId": "cmpzughg20174kvzao5gh6x6y",
+      "projectId": "cmexamplelangfuseproj0000",
       "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "url": "https://cloud.langfuse.com/project/cmpzughg20174kvzao5gh6x6y/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "url": "https://cloud.langfuse.com/project/cmexamplelangfuseproj0000/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     {
       "projectId": "proj-123-xyz",

@@ -12,7 +12,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
-import { HOME } from "../config";
+import { HOME, userHomeDir } from "../config";
 import { localStatsEnabled } from "./consent";
 import { AnalyticsEvent } from "./envelope";
 
@@ -26,7 +26,9 @@ export function eventsPath(): string {
 let cachedMachineId: string | null = null;
 export function machineId(): string {
   if (cachedMachineId) return cachedMachineId;
-  const seed = `${os.hostname()}::${os.homedir()}`;
+  // userHomeDir(), not os.homedir(): a launcher with a poisoned $HOME would otherwise
+  // reseed the machine id and split this box's analytics into a second phantom machine.
+  const seed = `${os.hostname()}::${userHomeDir()}`;
   cachedMachineId = "m_" + crypto.createHash("sha256").update(seed).digest("hex").slice(0, 24);
   return cachedMachineId;
 }

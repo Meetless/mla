@@ -268,7 +268,7 @@ describe("mla enrich plan: workspace-marker gate wiring", () => {
       workspaceId: WS,
       runId: first.runId,
       repositoryRoot: repoDir,
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: "complete",
       updatedAt: "2026-07-01T00:00:00.000Z",
       scouts: {

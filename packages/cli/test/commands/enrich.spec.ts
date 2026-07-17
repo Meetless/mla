@@ -335,8 +335,16 @@ function accepted(over: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe("parseMaterializeArgs", () => {
-  it("defaults to no file, json off, dry-run off", () => {
-    expect(parseMaterializeArgs([])).toEqual({ json: false, dryRun: false });
+  it("defaults to no file, json off, dry-run off, and the PERSONAL plane", () => {
+    // Materialize now mints, so it carries the same two-plane flags as `rules add` / `enrich accept`:
+    // neither --team nor --personal set means the default PERSONAL plane (injected for the author).
+    expect(parseMaterializeArgs([])).toEqual({
+      json: false,
+      dryRun: false,
+      team: false,
+      personal: false,
+      yes: false,
+    });
   });
 
   it("parses --accepted-file, --dry-run, --json", () => {
@@ -344,7 +352,19 @@ describe("parseMaterializeArgs", () => {
       acceptedFile: "/tmp/a.json",
       dryRun: true,
       json: true,
+      team: false,
+      personal: false,
+      yes: false,
     });
+  });
+
+  it("parses the authority-plane flags: --team, --personal, --yes", () => {
+    expect(parseMaterializeArgs(["--team", "--yes"])).toMatchObject({ team: true, yes: true });
+    expect(parseMaterializeArgs(["--personal"])).toMatchObject({ personal: true, team: false });
+  });
+
+  it("rejects --team and --personal together (they are the two mutually exclusive planes)", () => {
+    expect(() => parseMaterializeArgs(["--team", "--personal"])).toThrow(/not both/);
   });
 
   it("rejects a missing --accepted-file value and unknown flags", () => {

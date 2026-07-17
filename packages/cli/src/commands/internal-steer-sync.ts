@@ -241,7 +241,7 @@ export async function runInternalSteerSync(argv: string[]): Promise<number> {
           const bumped =
             write.outcome === "written" &&
             (write.priorRevision === null || stored > write.priorRevision);
-          const scanRevision = scanCacheBundleRevision(homedir(), bundle.workspaceId);
+          const scanRevision = scanCacheBundleRevision(undefined, bundle.workspaceId);
           const scanBehind = scanRevision === null || scanRevision < stored;
           if (bumped || scanBehind) {
             try {
@@ -271,7 +271,7 @@ export async function runInternalSteerSync(argv: string[]): Promise<number> {
 // not a numbered revision. Feeds the BEHIND rescan trigger: null (missing/unusable) is treated
 // as "infinitely behind" so a first-ever or cleared scan cache always rescans. Throw-free by
 // construction (readScanCache swallows read/parse errors and returns null).
-function scanCacheBundleRevision(home: string, workspaceId: string): number | null {
+function scanCacheBundleRevision(home: string | undefined, workspaceId: string): number | null {
   const bundleId = readScanCache(home, workspaceId)?.floorMeta?.bundleId;
   if (!bundleId) return null;
   const m = /^rev-(\d+)$/.exec(bundleId);

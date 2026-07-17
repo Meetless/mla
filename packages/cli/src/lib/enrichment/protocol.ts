@@ -204,7 +204,16 @@ export interface OnboardingState {
   workspaceId: string;
   runId: string;
   repositoryRoot: string;
-  schemaVersion: 1;
+  // v2 (2026-07-14): v1 wrote `complete` for a scout that offered candidates and landed NONE
+  // of them (every candidate rejected), which resume then skipped forever with
+  // `already_complete` — the corrected candidates could never be re-ingested and the run was
+  // stranded with no recovery path. v2 stamps that scout `malformed` instead. The versions
+  // disagree about what `complete` MEANS, so a v1 file is not upgradable in place: loadState
+  // reads it as null, the run re-plans, and both scouts re-run. That is the recovery. The
+  // re-POST is harmless because kb/add is an idempotent upsert (a doc that already landed
+  // comes back `noop_unchanged`), so the only cost of discarding v1 state is one redundant
+  // scout pass on a run that had genuinely finished.
+  schemaVersion: 2;
   status: "complete" | "partial";
   updatedAt: string;
   scouts: { documentation: ScoutRunState; history: ScoutRunState };

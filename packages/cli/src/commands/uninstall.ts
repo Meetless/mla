@@ -2,7 +2,7 @@ import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
 import * as fs from "fs";
-import { HOME, QUEUE_DIR } from "../lib/config";
+import { HOME, QUEUE_DIR, userHomeDir } from "../lib/config";
 import {
   RemoveHooksResult,
   RemoveMcpResult,
@@ -87,9 +87,9 @@ export async function runUninstall(argv: string[], deps: UninstallDeps = {}): Pr
   }
 
   const home = deps.home ?? HOME;
-  const settingsPath = deps.settingsPath ?? path.join(os.homedir(), ".claude", "settings.json");
-  const claudeJsonPath = deps.claudeJsonPath ?? path.join(os.homedir(), ".claude.json");
-  const skillDir = deps.skillDir ?? path.join(os.homedir(), ".claude", "skills", "mla");
+  const settingsPath = deps.settingsPath ?? path.join(userHomeDir(), ".claude", "settings.json");
+  const claudeJsonPath = deps.claudeJsonPath ?? path.join(userHomeDir(), ".claude.json");
+  const skillDir = deps.skillDir ?? path.join(userHomeDir(), ".claude", "skills", "mla");
   const queueDir = deps.queueDir ?? QUEUE_DIR;
   const isTTY = deps.isTTY ?? Boolean(process.stdin.isTTY);
   const env = deps.env ?? process.env;

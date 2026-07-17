@@ -45,6 +45,26 @@ export const EVALUATOR_CONTRACT_VERSION = "four-state-evaluator-v1";
 export const MATCHER_SCHEMA_VERSION = "action-applicability-v1";
 export const PATH_CANONICALIZER_VERSION = "notes-path-v1";
 
+/**
+ * The one canonical spelling of a forbidden root: no leading "./", no trailing slash.
+ *
+ * The prefix test below is `path === root || path.startsWith(root + "/")`. A root stored with the
+ * trailing slash a human naturally types ("legacy/") therefore tests `startsWith("legacy//")`, which
+ * NOTHING can match. Such a rule mints, lists, syncs into the bundle, and renders as ACTIVE at its
+ * attested ceiling, and enforces nothing at all. It is a rule that lies.
+ *
+ * Both sides of the wire normalize. The writer (`rules attest --forbidden-root`) pins the stored
+ * spelling so no new rule is born inert. The reader normalizes too, because rule payloads are
+ * immutable history: every "legacy/" rule already minted in the field starts enforcing what its
+ * author meant. Widening here can only ever turn an inert rule live; it cannot change the verdict of
+ * any rule that already matched, because a trailing-slash root matched no path in the first place.
+ * Replay stays deterministic: normalization is pure, and a snapshot replays to the same verdict the
+ * live evaluation now returns.
+ */
+export function normalizeForbiddenRoot(forbiddenRootRelativePath: string): string {
+  return forbiddenRootRelativePath.trim().replace(/^\.\/+/, "").replace(/\/+$/, "");
+}
+
 /** The snapshot-pure verdict: the SOLE rule by which a stored observation (and its later replay)
  * derives a three-state result from the stored target + forbidden root. It is a pure string
  * comparison over the already-canonicalized posix relative path, with no filesystem probe, so a
@@ -60,9 +80,11 @@ export function verdictFromEvaluationInput(
     case "OUTSIDE_RUNTIME_SCOPE":
       return { result: "COMPLIANT", verdictReasonCode: "COMPLIANT_OUTSIDE_FORBIDDEN_ROOT" };
     case "RUNTIME_RELATIVE": {
-      const underForbidden =
-        target.path === forbiddenRootRelativePath ||
-        target.path.startsWith(forbiddenRootRelativePath + "/");
+      const root = normalizeForbiddenRoot(forbiddenRootRelativePath);
+      // An empty root (a rule forbidding the repo root) stays inert here, exactly as before: a
+      // runtime-relative path is never "" and never starts with "/". The mint-time admission gate
+      // (FORBIDDEN_ROOT_EMPTY) is what rejects it, and it stays the only place that decides.
+      const underForbidden = root.length > 0 && (target.path === root || target.path.startsWith(root + "/"));
       return underForbidden
         ? { result: "VIOLATION", verdictReasonCode: "FORBIDDEN_PATH_MATCH" }
         : { result: "COMPLIANT", verdictReasonCode: "COMPLIANT_OUTSIDE_FORBIDDEN_ROOT" };

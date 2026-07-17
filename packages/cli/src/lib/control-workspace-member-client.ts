@@ -47,6 +47,11 @@ export interface ListMembersResult {
 export interface InviteMemberResult {
   email: string;
   role: string;
+  // A freshly minted, single-use join token for the email-invite web flow
+  // (notes/20260715-email-invite-web-join-flow-design.md). The caller builds
+  // `${consoleUrl}/join/${joinToken}`. Optional so an older control that does
+  // not yet mint one still types (the caller then omits the join link).
+  joinToken?: string;
 }
 
 /** DELETE /members response: the target email + whether a row was actually deactivated. */

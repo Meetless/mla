@@ -1,29 +1,60 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { resolveMeetlessHome } from "../config";
 import { ScanResult, Verdicts } from "./types";
 import { renderStaleContextXml } from "./render";
 
-function wsDir(home: string, workspaceId: string): string {
-  return join(home, ".meetless", "workspaces", workspaceId);
+// This machine's Meetless state root, i.e. the `.meetless` dir that holds every per-workspace
+// artifact below.
+//
+// An EXPLICIT `home` always wins and keeps this module's historical convention: `home` is the OS
+// home and we append the `.meetless` segment ourselves (unlike config.HOME, where `home` IS the
+// `.meetless` dir). Tests and injected deps rely on that to get an isolated root per case.
+//
+// With no home passed, MEETLESS_HOME decides. It always should have: that variable is the documented
+// "relocate this machine's Meetless state" knob, and config.HOME (bundle cache, telemetry, logs)
+// already honored it while every path here ignored it, so an operator who set it got a split brain,
+// bundle in the new root and scan cache in the old one.
+//
+// A correction, because the note that used to sit here had it exactly backwards and that error is
+// what let the $HOME bug live: it claimed "on macOS os.homedir() reads getpwuid and IGNORES $HOME".
+// The opposite is true, on Darwin as on Linux. `env HOME=/tmp/x node -p 'os.homedir()'` prints
+// /tmp/x, and `HOME='~'` prints a literal `~`. os.homedir() returns $HOME VERBATIM and consults
+// getpwuid only when $HOME is UNSET; it is os.userInfo() that ignores $HOME. Believing the inverse
+// made a poisoned $HOME look impossible, so nothing validated it, and a launcher that exported
+// HOME='' had this join() collapse to a relative ".meetless" under process.cwd(). Resolution now
+// goes through config.resolveMeetlessHome, which validates and recovers.
+//
+// With the variable unset (every production install) this resolves exactly as before.
+function stateRoot(home?: string): string {
+  if (home !== undefined) return join(home, ".meetless");
+  return resolveMeetlessHome();
 }
-export function scanCachePath(workspaceId: string, home = homedir()): string {
+function wsDir(home: string | undefined, workspaceId: string): string {
+  return join(stateRoot(home), "workspaces", workspaceId);
+}
+export function scanCachePath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "scan-cache.json");
 }
-export function verdictsPath(workspaceId: string, home = homedir()): string {
+export function verdictsPath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "scanner-verdicts.json");
 }
 // The floor-projection materialization receipt (matrix doc Phase 2). A local artifact,
 // written next to scan-cache.json, that records the outcome of the last projection write
 // (written | unchanged | blocked) for the async flush to upload. No network on this path.
-export function projectionReceiptPath(workspaceId: string, home = homedir()): string {
+export function projectionReceiptPath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "projection-receipt.json");
+}
+// The review-card journal the Stop hook appends to at the end of a session. Written shell-side
+// (hooks-template/stop.sh, straight to $HOME); this is the reader's half of the same path.
+export function reviewCardsPath(workspaceId: string, home?: string): string {
+  return join(wsDir(home, workspaceId), "review-cards.jsonl");
 }
 // The assembler's out-of-band audit (targeted-rule-injection §4.4). The assemble-context
 // subcommand budgets the model-facing envelope, then records WHAT it delivered vs dropped
 // (and any overflow) here rather than in the byte-limited prompt. Diagnostic only: a failed
 // write never breaks delivery.
-export function assembleAuditPath(workspaceId: string, home = homedir()): string {
+export function assembleAuditPath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "assemble-audit.json");
 }
 
@@ -39,10 +70,10 @@ function readJson<T>(path: string): T | null {
   }
 }
 
-export function writeScanCache(home: string, workspaceId: string, result: ScanResult): void {
+export function writeScanCache(home: string | undefined, workspaceId: string, result: ScanResult): void {
   writeJson(scanCachePath(workspaceId, home), result);
 }
-export function readScanCache(home: string, workspaceId: string): ScanResult | null {
+export function readScanCache(home: string | undefined, workspaceId: string): ScanResult | null {
   return readJson<ScanResult>(scanCachePath(workspaceId, home));
 }
 
@@ -61,7 +92,7 @@ export interface PersistedProjectionReceipt {
   bundleId: string;
 }
 export function writeProjectionReceipt(
-  home: string,
+  home: string | undefined,
   workspaceId: string,
   receipt: PersistedProjectionReceipt,
 ): void {
@@ -72,7 +103,7 @@ export function writeProjectionReceipt(
   }
 }
 export function readProjectionReceipt(
-  home: string,
+  home: string | undefined,
   workspaceId: string,
 ): PersistedProjectionReceipt | null {
   return readJson<PersistedProjectionReceipt>(projectionReceiptPath(workspaceId, home));
@@ -102,7 +133,7 @@ export interface PersistedAssembleAudit {
   omitted: Array<{ ruleId: string; reason: string; versionId?: string }>;
 }
 export function writeAssembleAudit(
-  home: string,
+  home: string | undefined,
   workspaceId: string,
   audit: PersistedAssembleAudit,
 ): void {
@@ -114,10 +145,10 @@ export function writeAssembleAudit(
 }
 
 const EMPTY_VERDICTS: Verdicts = { schemaVersion: 1, accepted: [], dismissed: [] };
-export function readVerdicts(home: string, workspaceId: string): Verdicts {
+export function readVerdicts(home: string | undefined, workspaceId: string): Verdicts {
   return readJson<Verdicts>(verdictsPath(workspaceId, home)) ?? { ...EMPTY_VERDICTS };
 }
-export function writeVerdicts(home: string, workspaceId: string, v: Verdicts): void {
+export function writeVerdicts(home: string | undefined, workspaceId: string, v: Verdicts): void {
   writeJson(verdictsPath(workspaceId, home), v);
 }
 

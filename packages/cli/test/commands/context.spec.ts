@@ -70,33 +70,20 @@ describe("runContext workspace resolution", () => {
   });
 
   it("resolves workspaceId from .meetless.json when MEETLESS_WORKSPACE_ID is unset", async () => {
-    // runContext uses homedir() internally; we cannot override that without monkey-patching,
-    // but we can verify the command does NOT return rc=2 (the "no workspace" error code),
-    // which is what it returns today when the env var is absent.
-    // With the fix in place it must resolve via the marker (rc=0).
-    // We use a custom home so there is a populated cache to read; but since runContext
-    // calls homedir() internally we stub the env path instead: restore home via the
-    // cache written to the real homedir path would be fragile; assert rc != 2 is sufficient.
-    //
-    // The observable contract: rc=2 means "no workspace found". rc=0 means resolved.
-    // Inject a minimal scan cache under the real homedir for ws_from_marker so list returns 0.
-    const { homedir } = await import("node:os");
-    const realHome = homedir();
-    const wsDir = join(realHome, ".meetless", "workspaces", "ws_from_marker");
-    mkdirSync(wsDir, { recursive: true });
-    const cacheFile = join(wsDir, "scan-cache.json");
+    // The observable contract: rc=2 means "no workspace found", rc=0 means the marker resolved
+    // it. runContext needs a readable scan cache for that workspace to reach rc=0, so seed one
+    // through the SAME default resolution the command uses (no explicit home: the cache module
+    // resolves MEETLESS_HOME, which the harness points at a temp dir). Until 2026-07-13 the
+    // command hard-coded homedir() and this test had no choice but to write into, and then
+    // delete from, the operator's REAL ~/.meetless.
     const fakeResult: ScanResult = {
       schemaVersion: 1, workspaceId: "ws_from_marker", commitSha: "abc", generatedAt: "2026-06-12T00:00:00Z",
       inventory: { instructionFiles: 0, decisionDocs: 0, legacyNotes: 0, staleSignals: 0, agentMemoryRules: 0 },
       directives: [], staleSignals: [], confirmedRulesXml: "", floorRulesXml: "", staleContextXml: "", advisoryDirectives: [],
     };
-    writeFileSync(cacheFile, JSON.stringify(fakeResult));
-    try {
-      const rc = await runContext(["list"]);
-      expect(rc).toBe(0); // must NOT return 2 (workspace not found)
-    } finally {
-      rmSync(cacheFile, { force: true });
-    }
+    writeScanCache(undefined, "ws_from_marker", fakeResult);
+    const rc = await runContext(["list"]);
+    expect(rc).toBe(0); // must NOT return 2 (workspace not found)
   });
 });
 

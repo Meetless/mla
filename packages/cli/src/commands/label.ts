@@ -1,6 +1,6 @@
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
+import { resolveMeetlessHome } from "../lib/config";
 
 // `mla label` -- the A3 operator-label affordance (notes/20260603-mla-kb-agent
 // -proxy-and-evidence-adoption.md §3, §7.2). A lightweight way for the operator
@@ -28,7 +28,7 @@ import * as path from "path";
 // so the short-lived CLI picks up the operator's env and tests can point at a
 // temp dir.
 function logDir(): string {
-  return path.join(process.env.MEETLESS_HOME || path.join(os.homedir(), ".meetless"), "logs");
+  return path.join(resolveMeetlessHome(), "logs");
 }
 function tracesFile(): string {
   return path.join(logDir(), "ask-traces.jsonl");

@@ -93,6 +93,7 @@ import {
   removeMeetlessAgents,
 } from "../../lib/unwire";
 import type { PluginOwnership } from "./plugin-detect";
+import { userHomeDir } from "../../lib/config";
 
 // --- Inspection ------------------------------------------------------------------
 
@@ -385,7 +386,7 @@ export interface LegacyWiringPaths {
   agentsDir: string;
 }
 
-export function legacyWiringPaths(home: string = os.homedir()): LegacyWiringPaths {
+export function legacyWiringPaths(home: string = userHomeDir()): LegacyWiringPaths {
   const claudeDir = path.join(home, ".claude");
   return {
     settingsPath: path.join(claudeDir, "settings.json"),

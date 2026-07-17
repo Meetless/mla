@@ -12,9 +12,18 @@ import type { BuildInfo } from "../../src/lib/observability";
 // Design under test (notes/20260626-hook-auto-resync.md):
 //   - A hidden `.mla-build-stamp` in the hooks dir records the build identity
 //     that last synced the install. Matching stamp => cheap no-op (no walk).
-//   - On a stamp mismatch (build changed), re-copy ONLY the `drifted` files
-//     (installed-but-different). NEVER create `missing` files (that would
+//   - On a stamp mismatch (build changed), re-copy the `drifted` files
+//     (installed-but-different), and create a `missing` SUPPORT file (a template
+//     file that is not a registered hook script: home.sh, common.sh, flush.sh,
+//     event-batch-filter.jq). NEVER create a missing REGISTERED script (that would
 //     resurrect a --no-post-tool-use opt-out) and NEVER touch settings.json.
+//
+//     The support/registered split was added 2026-07-13. Before it, "never create
+//     missing" was absolute, and it produced a live corrupt install: home.sh landed
+//     as a NEW support file that the refreshed common.sh sources, so the resync
+//     pushed the new common.sh to every wired box and delivered none of them the
+//     file it sources. Only a registered script's absence can be a CHOICE; a support
+//     file's absence is always a defect.
 //   - Fail-open: never throws; unbuilt `dev` sha and an unwired machine are
 //     skipped; a kill switch disables it.
 
@@ -83,6 +92,75 @@ describe("maybeResyncHooks (bootstrap hook self-heal)", () => {
     expect(res.reason).toBe("current");
     // Untouched: same-build drift is doctor's job, not auto-resync's.
     expect(fs.readFileSync(path.join(inst, "common.sh"), "utf8")).toContain("v1");
+  });
+
+  it("does NOT honor a current stamp when a support file it vouches for is missing", () => {
+    const tpl = mkTmp("ml-tpl-");
+    const inst = mkTmp("ml-inst-");
+    seedTemplate(tpl, {
+      "home.sh": "#!/usr/bin/env bash\n# repair $HOME\n",
+      "common.sh": '#!/usr/bin/env bash\nsource "$(dirname "$0")/home.sh"\n',
+    });
+    // The terminal state the refresh-without-create bug left on a live box: common.sh
+    // already holds THIS build's bytes and the stamp already names THIS build, but the
+    // home.sh it sources was never delivered. The stamp vouched for content freshness
+    // and got read as a claim about existence, so every later invocation short-circuited
+    // on "current" and skipped the one walk that would have noticed. Without this, a box
+    // stays broken for the entire life of the build that broke it.
+    fs.writeFileSync(
+      path.join(inst, "common.sh"),
+      '#!/usr/bin/env bash\nsource "$(dirname "$0")/home.sh"\n',
+    );
+    fs.writeFileSync(path.join(inst, STAMP), "aaaaaaa|clean|2026-06-26T00:00:00.000Z\n");
+
+    const res = maybeResyncHooks({ buildInfo: BUILD_A, templateDir: tpl, hooksDir: inst, env: {} });
+
+    expect(res.ran).toBe(true);
+    expect(res.refreshed).toEqual(["home.sh"]);
+    expect(fs.readFileSync(path.join(inst, "home.sh"), "utf8")).toContain("repair $HOME");
+  });
+
+  it("a current stamp DOES still excuse a missing registered script: that one is the opt-out", () => {
+    const tpl = mkTmp("ml-tpl-");
+    const inst = mkTmp("ml-inst-");
+    seedTemplate(tpl, {
+      "common.sh": "#!/usr/bin/env bash\nv1\n",
+      "post-tool-use.sh": "#!/usr/bin/env bash\ncapture\n",
+    });
+    // Same-build install, post-tool-use.sh deliberately absent (`--no-post-tool-use`).
+    // The existence probe added above must not reach registered scripts, or every mla
+    // invocation would silently undo the operator's opt-out.
+    fs.writeFileSync(path.join(inst, "common.sh"), "#!/usr/bin/env bash\nv1\n");
+    fs.writeFileSync(path.join(inst, STAMP), "aaaaaaa|clean|2026-06-26T00:00:00.000Z\n");
+
+    const res = maybeResyncHooks({ buildInfo: BUILD_A, templateDir: tpl, hooksDir: inst, env: {} });
+
+    expect(res.ran).toBe(false);
+    expect(res.reason).toBe("current");
+    expect(fs.existsSync(path.join(inst, "post-tool-use.sh"))).toBe(false);
+  });
+
+  it("creates a MISSING support file, so a refreshed hook never sources a file that is not there", () => {
+    const tpl = mkTmp("ml-tpl-");
+    const inst = mkTmp("ml-inst-");
+    // The exact 2026-07-13 shape: the new build's common.sh sources a NEW support
+    // file (home.sh) that no install has yet. Refresh-without-create shipped the
+    // sourcer and withheld the source.
+    seedTemplate(tpl, {
+      "home.sh": "#!/usr/bin/env bash\n# repair $HOME\n",
+      "common.sh": '#!/usr/bin/env bash\nsource "$(dirname "$0")/home.sh"\n',
+    });
+    fs.writeFileSync(path.join(inst, "common.sh"), "#!/usr/bin/env bash\n# v1, no home.sh\n");
+
+    const res = maybeResyncHooks({ buildInfo: BUILD_B, templateDir: tpl, hooksDir: inst, env: {} });
+
+    // Both files land, and in THIS order. Dependency before dependent: hooks fire
+    // concurrently with the resync, so a hook must never be able to observe the
+    // refreshed common.sh before the home.sh it sources exists.
+    expect(res.refreshed).toEqual(["home.sh", "common.sh"]);
+    expect(fs.readFileSync(path.join(inst, "home.sh"), "utf8")).toContain("repair $HOME");
+    // Executable, like every other .sh the resync writes.
+    expect(fs.statSync(path.join(inst, "home.sh")).mode & 0o111).not.toBe(0);
   });
 
   it("never resurrects a missing (opted-out) hook, only refreshes installed ones", () => {

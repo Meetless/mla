@@ -44,7 +44,7 @@ import { resolveWorkspaceIdWithEnv } from "../lib/workspace";
 import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 import { readRuleBundleCache, type BundleCacheRead, type BundlePrincipal } from "../lib/rules/bundle-cache";
 import { HOME } from "../lib/config";
-import { decideBundleEnforcement } from "../lib/rules/bundle-enforce";
+import { decideBundleEnforcement, type WarnEvidence } from "../lib/rules/bundle-enforce";
 import { type EligibleEnforcement } from "../lib/rules/deny-admission";
 import { resolveMaxEnforcement } from "../lib/rules/max-enforcement";
 import { type ToolCall } from "../lib/rules/evaluator";
@@ -264,6 +264,7 @@ async function computePretoolDecision(raw: string, deps: PretoolObserveDeps): Pr
       call,
       read,
       runtimeProjectRoot: scope.runtimeProjectRoot,
+      runtimeScopeId: scope.runtimeScopeId,
       classifyRuntime: deps.classifyRuntime,
       maxEnforcement,
     });
@@ -296,6 +297,13 @@ async function computePretoolDecision(raw: string, deps: PretoolObserveDeps): Pr
       return renderPreToolUseAsk(decision.reason);
     }
     if (decision.kind === "WARN") {
+      // Record each warned rule as an incident (decision: "warn") so the review queue surfaces WARN
+      // violations, not only hard DENY blocks. A DENY-attested rule clamped to WARN by the session
+      // ceiling (MEETLESS_ACTION_INTERCEPT_MAX) warns instead of blocking; without this emit that
+      // violation persisted nothing and never reached the queue. Awaited + fail-soft: the local append
+      // must land before this short-lived hook exits, but a telemetry fault must never turn the
+      // non-blocking advisory into a block.
+      await emitWarnIncidents(raw, decision.warnings, clock.now, deps);
       // The non-blocking middle rung (INV-8). Surface the governed-rule advisory and, when the session
       // also has an open cross-session conflict, concatenate both (they both ride additionalContext, so
       // the model reads them together on its next request). Never a permissionDecision: never a block.
@@ -451,6 +459,83 @@ async function defaultEmitIncident(
   // never run (recorder.ts: no cross-run replay, and the deny path exits before flush).
   // Hand delivery to a detached child so the incident actually reaches control's review
   // queue (INV-ENFORCEMENT-DELIVERY-1). Best-effort; never blocks or throws.
+  const { spawnEnforcementForward } = await import("../lib/analytics/spawn-enforcement-forward");
+  spawnEnforcementForward(coords.sessionId);
+}
+
+/**
+ * Emit one enforcement-incident per warned rule (the review-queue record for the WARN rung, INV-8).
+ * A WARN is non-blocking and additive: `decideBundleEnforcement` hands back EVERY warned rule's evidence
+ * (uncapped, even the ones the display cap suppressed from the advisory text), so each becomes its own
+ * incident (`decision: "warn"`) with a fresh incident id. The tool + surface + coords are the same for
+ * all warns on this one call and are computed once. Fail-soft: a telemetry fault must never turn the
+ * advisory into a block. The default emit path appends every incident locally, then hands delivery to a
+ * SINGLE detached forward child (the exiting hook never drains its own buffer); an injected emitter
+ * (tests) is called per incident and spawns nothing.
+ */
+async function emitWarnIncidents(
+  raw: string,
+  warnings: WarnEvidence[],
+  nowMs: number,
+  deps: PretoolObserveDeps,
+): Promise<void> {
+  try {
+    if (warnings.length === 0) return;
+    const parsed = parsePreToolUseInput(raw);
+    const filePath =
+      typeof parsed?.tool_input?.file_path === "string" ? parsed.tool_input.file_path : null;
+    let workspaceId: string | null = null;
+    try {
+      workspaceId = resolveWorkspaceIdWithEnv() || null;
+    } catch {
+      workspaceId = null;
+    }
+    // The tool + PII-safe surface enum are the same for every warned rule on this one call (they classify
+    // the acting tool + the touched path, not the rule). Compute once; the raw absolute file_path only
+    // feeds the surface classifier and is never persisted.
+    const tool = normalizeEnforcedTool(parsed?.tool_name);
+    const touchedSurface = classifyTouchedSurface(filePath);
+    const coords: EnforcementIncidentCoords = {
+      workspaceId,
+      sessionId: parsed?.session_id ?? null,
+      nowMs,
+    };
+    const inputs: EnforcementIncidentInput[] = warnings.map((w) => ({
+      // A fresh ULID per warned rule: the incident id is this warn's own business + dedup key (control
+      // dedups by event_id = deterministicEventId(incidentId, 0)). The 80-bit random suffix keeps two
+      // warns minted in the same millisecond distinct, so co-firing rules are never dedup-collapsed.
+      incidentId: ulid(nowMs),
+      decision: "warn",
+      tool,
+      touchedSurface,
+      ruleVersionId: w.ruleVersionId,
+      ruleNodeId: w.ruleNodeId,
+      ruleText: w.ruleText,
+      // `blocked_path` is the generic "path this incident was about"; for a warn it is the warned path.
+      blockedPath: w.targetPath,
+    }));
+    if (deps.emitIncident) {
+      for (const input of inputs) await deps.emitIncident(input, coords);
+      return;
+    }
+    await defaultEmitWarnIncidents(inputs, coords);
+  } catch {
+    // Fail-soft: warn telemetry must never escalate into a blocking hook.
+  }
+}
+
+/** Production warn emitter: lazy-imports the recorder-touching emit (kept off the non-warn hot path),
+ * appends every warn incident locally, then hands delivery to ONE detached forward child. Awaited by the
+ * caller so the appends land before the short-lived hook exits. */
+async function defaultEmitWarnIncidents(
+  inputs: EnforcementIncidentInput[],
+  coords: EnforcementIncidentCoords,
+): Promise<void> {
+  const { emitEnforcementIncident } = await import("../lib/analytics/enforcement-incident");
+  for (const input of inputs) emitEnforcementIncident(input, coords);
+  // Every incident only appended locally + buffered for a forward this exiting hook will never run.
+  // One detached child forwards ALL buffered incidents (it re-reads the buffer), so a single spawn
+  // delivers every warn to control's review queue (INV-ENFORCEMENT-DELIVERY-1). Best-effort.
   const { spawnEnforcementForward } = await import("../lib/analytics/spawn-enforcement-forward");
   spawnEnforcementForward(coords.sessionId);
 }

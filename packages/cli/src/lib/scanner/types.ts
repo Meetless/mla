@@ -137,6 +137,16 @@ export interface ScanResult {
   // Surfaced for human review; deliberately kept OUT of confirmedRulesXml (never auto-injected
   // as must-follow). A fresh scan always sets it; readers of a pre-M1 on-disk cache must guard with `?? []`.
   advisoryDirectives: Directive[];
+  // The realpath of the directory this scan ran FROM (the .meetless.json marker dir; see
+  // resolveScanRootIdentity). One workspace can bind several checkouts (meetless-monorepo + intel
+  // share a workspace), and EVERY per-workspace artifact lives under workspaces/<workspaceId>/,
+  // so two checkouts' scans stomp this one file. This stamp lets a reader tell whose scan it is
+  // holding: workspace-global fields (floorRules, floorMeta) are identical across checkouts and
+  // stomp-safe, but the repo-specific fields (commitSha, inventory, staleSignals, locally-parsed
+  // scopedRules/directives) belong to exactly ONE checkout. Optional: a pre-stamp on-disk cache
+  // lacks it, and readers TRUST an unstamped cache (single-repo installs, the vast majority, never
+  // wrote one) rather than hiding it.
+  scanRootPath?: string;
 }
 
 export interface Verdicts {

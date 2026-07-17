@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   ingestRun,
   loadState,
+  writeState,
   renderCandidateDocument,
   CANDIDATE_DOC_SCHEMA_VERSION,
   verifyCandidate,
@@ -11,6 +12,7 @@ import {
   loadCandidatesSidecar,
   upsertCandidatesSidecar,
   candidatesSidecarPath,
+  PERSIST_BATCH_SIZE,
   type FsProbe,
   type Persister,
   type PersistDocument,
@@ -346,6 +348,95 @@ describe("ingestRun — orchestration", () => {
     expect(docs[0].content).toContain("dogfood gate");
   });
 
+  it("does not mark a scout complete when every candidate it sent was rejected", async () => {
+    // Regression (prod, 2026-07-14): a doc scout sent 10 candidates and every one was
+    // rejected (each omitted `sourceScout`). received=10, accepted=0, persisted=0 — zero
+    // progress — yet the scout was still stamped `complete`, because completion keyed off
+    // "did anything fail to persist?" and nothing had been *offered* to persist. Resume
+    // skips complete scouts, so the corrected candidates could never be re-ingested: the
+    // run was permanently stranded with no recovery path. A scout that put candidates on
+    // the wire and landed none of them has made no progress and MUST stay retryable.
+    seedRun(home);
+    const bad = { ...docCandidate(), sourceScout: undefined };
+    const first = ingestArgs(home, "run-1", [
+      { scout: "documentation", status: "complete", candidates: [bad, bad] },
+      { scout: "history", status: "complete", candidates: [histCandidate()] },
+    ]);
+    const firstRes = await ingestRun(first);
+
+    const docFirst = firstRes.outcomes.find((o) => o.scout === "documentation")!;
+    expect(docFirst).toMatchObject({ received: 2, accepted: 0, persisted: 0 });
+    // The whole point: total rejection is NOT completion.
+    expect(firstRes.state?.scouts.documentation.status).not.toBe("complete");
+    expect(firstRes.state?.status).not.toBe("complete");
+
+    // Rerun with the corrected candidates: they must actually land, not be skipped.
+    const second = ingestArgs(home, "run-1", [
+      { scout: "documentation", status: "complete", candidates: [docCandidate()] },
+      { scout: "history", status: "complete", candidates: [histCandidate()] },
+    ]);
+    const res = await ingestRun(second);
+    const docOut = res.outcomes.find((o) => o.scout === "documentation")!;
+    expect(docOut.errors.map((e) => e.code)).not.toContain("already_complete");
+    expect(docOut).toMatchObject({ received: 1, accepted: 1, persisted: 1 });
+    expect(res.state?.scouts.documentation.status).toBe("complete");
+    expect(res.state?.status).toBe("complete");
+  });
+
+  it("discards a v1 state file rather than resuming it, so a run stranded by the v1 bug re-runs", async () => {
+    // The recovery path for runs already stranded on disk before the fix. Their state says
+    // `documentation: complete` with zero candidates landed; nothing in v2's write path can
+    // repair a file it never wrote. Because v1 and v2 disagree about what `complete` MEANS,
+    // loadState refuses the v1 file, the scouts re-run, and the corrected candidates land.
+    const run = seedRun(home);
+    writeState(home, {
+      workspaceId: "ws_1",
+      runId: "run-1",
+      repositoryRoot: "/repo",
+      schemaVersion: 1 as unknown as 2, // the stranded v1 shape, exactly as An's run has it
+      status: "partial",
+      updatedAt: NOW,
+      scouts: {
+        documentation: { status: "complete", candidateCount: 0 }, // landed nothing, skipped forever
+        history: { status: "persistence_failed", error: "kb-add persistence failed" },
+      },
+    } as unknown as Parameters<typeof writeState>[1]);
+    expect(loadState(home, "ws_1", "run-1")).toBeNull(); // refused, not resumed
+    expect(run.runId).toBe("run-1");
+
+    // The documentation scout is therefore runnable again: its candidates actually land.
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [
+        { scout: "documentation", status: "complete", candidates: [docCandidate()] },
+        { scout: "history", status: "complete", candidates: [histCandidate()] },
+      ]),
+    );
+    const docOut = res.outcomes.find((o) => o.scout === "documentation")!;
+    expect(docOut.errors.map((e) => e.code)).not.toContain("already_complete");
+    expect(docOut).toMatchObject({ received: 1, accepted: 1, persisted: 1 });
+    expect(res.state?.status).toBe("complete");
+    expect(loadState(home, "ws_1", "run-1")?.schemaVersion).toBe(2);
+  });
+
+  it("keeps a scout complete when it genuinely had nothing to say (zero candidates)", async () => {
+    // The counterpart to the test above, and the reason the rule is `received > 0`, not
+    // `accepted === 0`. A scout that legitimately finds nothing worth governing sends zero
+    // candidates. That IS a finished scout. If it were left retryable, the run would never
+    // reach `complete` and the run-level idempotency gate (findCompletedRunWithDigest)
+    // would re-run a finished onboarding forever.
+    seedRun(home);
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [
+        { scout: "documentation", status: "complete", candidates: [] },
+        { scout: "history", status: "complete", candidates: [histCandidate()] },
+      ]),
+    );
+    const docOut = res.outcomes.find((o) => o.scout === "documentation")!;
+    expect(docOut).toMatchObject({ received: 0, accepted: 0, persisted: 0 });
+    expect(res.state?.scouts.documentation.status).toBe("complete");
+    expect(res.state?.status).toBe("complete");
+  });
+
   it("enforces the run-wide candidate cap", async () => {
     seedRun(home, { limits: { ...defaultLimits(), maxCandidatesTotal: 1 } });
     const results = [
@@ -626,8 +717,12 @@ describe("ingestRun — orchestration", () => {
     ], probe);
     const res = await ingestRun(args);
     expect(args.persist).not.toHaveBeenCalled();
-    // the scout still ran successfully; its candidates were merely all rejected
-    expect(res.state?.scouts.documentation.status).toBe("complete");
+    // ...but the scout is NOT done. It offered candidates and landed none, so it stays
+    // retryable. (This assertion used to read `complete`, on the reasoning that "the scout
+    // still ran successfully; its candidates were merely all rejected" — which pinned the
+    // prod bug of 2026-07-14 as the intent: resume skips a complete scout, so the corrected
+    // candidates could never be re-ingested. See the total-rejection test above.)
+    expect(res.state?.scouts.documentation.status).toBe("malformed");
   });
 
   it("records persistence_failed when the kb-add POST throws", async () => {
@@ -757,6 +852,219 @@ describe("ingestRun — orchestration", () => {
     });
     expect(res.state?.scouts.documentation.status).toBe("persistence_failed");
     expect(res.state?.status).toBe("partial");
+  });
+});
+
+// A run's persistence is NOT atomic, and the client used to pretend it was.
+//
+// Every candidate went out in ONE kb-add POST, on the reasoning that one POST gives the run
+// "a single persistence outcome". It also gives it a single TIMEOUT. Intel runs behind a hard
+// 300s Cloud Run ceiling and the CLI asks for 20s per document, so a full-cap run (20 docs)
+// requests 400s: past the ceiling, the connection dies mid-write, and the client throws away
+// every document in the POST, including the ones intel had already indexed. That is how a
+// pilot user's onboarding produced a workspace with ZERO governed rules on 2026-07-13: the
+// run had no partial state to resume from, so his rules died in the client and he had to
+// start over from nothing.
+//
+// These tests pin the property that was missing: PROGRESS IS MONOTONIC. Whatever lands, stays
+// landed, and only the documents that actually failed come back on the next run.
+describe("ingestRun — batched persistence (progress must survive a failure)", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "ml-ingest-batch-"));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  // Caps default to 10 per scout / 20 total, which is exactly one batch and exactly two. Raise
+  // them so a single scout can produce a run that spans several POSTs.
+  const wideLimits: EnrichmentLimits = {
+    ...defaultLimits(),
+    maxCandidatesTotal: 40,
+    maxCandidatesPerScout: 30,
+  };
+
+  // n distinct, verifiable candidates. Distinct statements mean distinct KB paths, which is
+  // what makes each document independently attributable to a batch.
+  const nDocs = (n: number): EnrichmentCandidate[] =>
+    Array.from({ length: n }, (_, i) => docCandidate({ statement: `Convention number ${i}: prefer the explicit form.` }));
+
+  function batchArgs(persist: Persister, candidates: EnrichmentCandidate[], runId = "run-1") {
+    return {
+      env: { home, workspaceId: "ws_1", repositoryRoot: "/repo" },
+      request: { protocolVersion: 1, runId, results: [{ scout: "documentation", status: "complete", candidates }] },
+      persist,
+      now: NOW,
+      probe: makeProbe(),
+    };
+  }
+
+  it("splits a run across several bounded POSTs instead of one unbounded one", async () => {
+    seedRun(home, { limits: wideLimits });
+    const sizes: number[] = [];
+    const persist: Persister = jest.fn(async (docs) => {
+      sizes.push(docs.length);
+      return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
+    });
+
+    const res = await ingestRun(batchArgs(persist, nDocs(25)));
+
+    // 25 documents, batches of 10: three POSTs, none of them larger than the cap. The cap is
+    // the whole point (it keeps each request's 20s-per-doc budget under intel's 300s ceiling),
+    // so assert against PERSIST_BATCH_SIZE rather than a copied literal.
+    expect(sizes).toEqual([PERSIST_BATCH_SIZE, PERSIST_BATCH_SIZE, 5]);
+    expect(sizes.every((s) => s <= PERSIST_BATCH_SIZE)).toBe(true);
+    expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(25);
+    expect(res.state?.scouts.documentation.status).toBe("complete");
+  });
+
+  it("keeps what landed when a later batch fails, and only the failed documents come back", async () => {
+    seedRun(home, { limits: wideLimits });
+    let call = 0;
+    const persist: Persister = jest.fn(async (docs) => {
+      call += 1;
+      if (call === 2) throw new Error("504 Gateway Timeout"); // the exact prod shape
+      return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
+    });
+
+    const res = await ingestRun(batchArgs(persist, nDocs(15)));
+
+    // THE REGRESSION. Under the single POST this was 0: a 504 anywhere erased everything. Ten
+    // documents reached the KB and ten documents are counted.
+    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
+    expect(doc.persisted).toBe(10);
+
+    // ...and the five that did not are not silently dropped. They mark the scout retryable, so
+    // resume re-attempts exactly them.
+    expect(doc.errors.map((e) => e.code)).toContain("persistence_partial");
+    expect(res.state?.scouts.documentation.status).toBe("persistence_failed");
+    expect(res.state?.status).toBe("partial");
+  });
+
+  it("carries the REAL failure cause, not a generic 'could not persist'", async () => {
+    seedRun(home, { limits: wideLimits });
+    let call = 0;
+    const persist: Persister = jest.fn(async (docs) => {
+      call += 1;
+      if (call === 2) throw new Error("504 Gateway Timeout");
+      return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
+    });
+
+    const res = await ingestRun(batchArgs(persist, nDocs(15)));
+
+    // A user who is told only "persistence failed" cannot tell a timeout from a rejected
+    // payload. That silence is how a 300s ceiling stayed undiagnosed for a day.
+    const partial = res.outcomes
+      .find((o) => o.scout === "documentation")!
+      .errors.find((e) => e.code === "persistence_partial")!;
+    expect(partial.message).toContain("504 Gateway Timeout");
+  });
+
+  it("still reports a whole-run failure when NOTHING lands", async () => {
+    seedRun(home, { limits: wideLimits });
+    const persist: Persister = jest.fn(async () => {
+      throw new Error("intel unreachable");
+    });
+
+    const res = await ingestRun(batchArgs(persist, nDocs(15)));
+
+    // Batching must not soften a total outage into a cheerful partial. Zero landed is zero
+    // progress, and every scout that offered a candidate shares that fate, exactly as before.
+    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
+    expect(doc.persisted).toBe(0);
+    expect(doc.errors.map((e) => e.code)).toContain("persistence_failed");
+    expect(res.state?.scouts.documentation.status).toBe("persistence_failed");
+  });
+
+  it("stops hammering a server that is down, and marks the unattempted documents retryable", async () => {
+    seedRun(home, { limits: wideLimits });
+    const persist: Persister = jest.fn(async () => {
+      throw new Error("intel unreachable");
+    });
+
+    // 40 documents is four batches. Once two in a row have failed, the server is down, not the
+    // batch: spending another 200s timeout per remaining batch to rediscover that would hang
+    // the CLI for many minutes before telling the operator anything.
+    await ingestRun(batchArgs(persist, nDocs(30)));
+
+    expect(persist).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps trying past a SINGLE poison batch, or a bad document would strand every batch behind it", async () => {
+    seedRun(home, { limits: wideLimits });
+    const persist: Persister = jest.fn(async (docs) => {
+      // The middle batch is poison: some document in it trips a server-side bug, forever.
+      if (docs[0].content.includes("Convention number 10:")) throw new Error("kb-add 500");
+      return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
+    });
+
+    const res = await ingestRun(batchArgs(persist, nDocs(25)));
+
+    // If a failed batch aborted the run, batch 3 would never be attempted, and it would never
+    // be attempted on ANY rerun either: every run would die at the same poison batch and the
+    // documents behind it would be permanently unreachable. Keep going.
+    expect(persist).toHaveBeenCalledTimes(3);
+    expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(15);
+  });
+
+  it("records ONLY what landed in the accept sidecar", async () => {
+    seedRun(home, { limits: wideLimits });
+    let call = 0;
+    const persist: Persister = jest.fn(async (docs) => {
+      call += 1;
+      if (call === 2) throw new Error("504 Gateway Timeout");
+      return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
+    });
+
+    await ingestRun(batchArgs(persist, nDocs(15)));
+
+    // `enrich accept` materializes durable candidates out of this sidecar into .meetless/rules.md
+    // and filters on KIND, not on outcome. A candidate parked here that never reached the KB
+    // would become a local rule with no governed document behind it: a stale local assumption,
+    // minted by the very product that exists to prevent them.
+    const sidecar = loadCandidatesSidecar(home, "ws_1", "run-1")!;
+    expect(sidecar.candidates).toHaveLength(10);
+    expect(sidecar.candidates.every((c) => c.landed === "ingested" || c.landed === "noop_unchanged")).toBe(true);
+  });
+
+  it("resumes: the retry re-POSTs the landed docs as no-ops and finishes the failed ones", async () => {
+    seedRun(home, { limits: wideLimits });
+    const candidates = nDocs(15);
+
+    let call = 0;
+    const flaky: Persister = jest.fn(async (docs) => {
+      call += 1;
+      if (call === 2) throw new Error("504 Gateway Timeout");
+      return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
+    });
+    const first = await ingestRun(batchArgs(flaky, candidates));
+    expect(first.state?.scouts.documentation.status).toBe("persistence_failed");
+
+    // Run 2: intel is healthy. The scout is retryable, so it re-reports, and kb-add is an
+    // idempotent upsert: the ten documents that already landed come back noop_unchanged (cheap,
+    // no re-index) and the five that were lost finally persist. THIS is what "progress is
+    // monotonic" buys, and what the single POST could never do.
+    const landed = new Set<string>();
+    const healthy: Persister = jest.fn(async (docs) => ({
+      docs: docs.map((d) => {
+        const seen = landed.has(d.relPath);
+        landed.add(d.relPath);
+        return { relPath: d.relPath, outcome: seen ? ("noop_unchanged" as const) : ("ingested" as const) };
+      }),
+    }));
+    // Seed the server's memory with what run 1 actually persisted (the first batch).
+    for (const c of candidates.slice(0, 10)) landed.add(candidateRelPath(asMerged(c)));
+
+    const second = await ingestRun(batchArgs(healthy, candidates));
+
+    const doc = second.outcomes.find((o) => o.scout === "documentation")!;
+    expect(doc.persisted).toBe(15); // all fifteen are now governed
+    expect(doc.deduped).toBe(10); // ten of them were already there: the run-1 survivors
+    expect(second.state?.scouts.documentation.status).toBe("complete");
+
+    // And the sidecar the accept half reads now holds the whole set: upsert MERGES, so the five
+    // that landed late joined the ten that landed early rather than replacing them.
+    const sidecar = loadCandidatesSidecar(home, "ws_1", "run-1")!;
+    expect(sidecar.candidates).toHaveLength(15);
   });
 });
 

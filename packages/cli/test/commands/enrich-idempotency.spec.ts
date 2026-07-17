@@ -105,7 +105,7 @@ describe("mla enrich plan: plan-digest idempotency gate", () => {
       workspaceId: WS,
       runId: first.runId,
       repositoryRoot: repoDir,
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: "complete",
       updatedAt: "2026-06-27T00:00:00.000Z",
       scouts: {
@@ -173,7 +173,7 @@ describe("mla enrich plan: plan-digest idempotency gate", () => {
       workspaceId: WS,
       runId: first.runId,
       repositoryRoot: repoDir,
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: "partial",
       updatedAt: "2026-06-27T00:00:00.000Z",
       scouts: {

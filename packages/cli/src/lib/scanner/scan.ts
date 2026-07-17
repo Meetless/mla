@@ -17,6 +17,7 @@ import { parseDirectivesFromMarkdown } from "./parse-directives";
 import { parseAdrStatus, parseClaudeRulesFile } from "./parse-structured";
 import {
   dedupeDirectives,
+  isScopedRule,
   renderConfirmedRulesXml,
   renderFloorRulesXml,
   renderStaleContextXml,
@@ -166,17 +167,6 @@ function isBundleSourced(d: Directive): boolean {
     .includes("rule-bundle");
 }
 
-function hasGlobs(d: Directive): boolean {
-  return Array.isArray(d.globs) && d.globs.length > 0;
-}
-
-// A directive carries a turn trigger iff it was threaded from a governed `turn`-mode bundle
-// rule (targeted-rule-injection §5.4). Turn rules route to SCOPED (best-effort, trigger-matched
-// per turn), never to the always-on FLOOR: a turn rule must not tax every turn's floor budget.
-function hasTrigger(d: Directive): boolean {
-  return d.trigger !== undefined;
-}
-
 // A rule's durable identity for the cache/matcher/audit: the backend rule-node id when the
 // directive was threaded from the governed bundle, else its content-hash `id` (file-sourced
 // .claude/rules and per-service CLAUDE.md have no bundle identity).
@@ -205,7 +195,7 @@ export function buildStructuredRules(dirs: Directive[]): {
   scopedRules: ScopedRuleEntry[];
 } {
   const floorRules: FloorRuleEntry[] = dirs
-    .filter((d) => d.attestation === "human_attested" && isBundleSourced(d) && !hasGlobs(d) && !hasTrigger(d))
+    .filter((d) => d.attestation === "human_attested" && isBundleSourced(d) && !isScopedRule(d))
     .map((d) => ({
       ruleId: ruleIdOf(d),
       versionId: versionIdOf(d),
@@ -215,7 +205,7 @@ export function buildStructuredRules(dirs: Directive[]): {
       representedVersionIds: d.representedVersionIds,
     }));
   const scopedRules: ScopedRuleEntry[] = dirs
-    .filter((d) => d.attestation === "human_attested" && (hasGlobs(d) || hasTrigger(d)))
+    .filter((d) => d.attestation === "human_attested" && isScopedRule(d))
     .map((d) => ({
       ruleId: ruleIdOf(d),
       versionId: versionIdOf(d),
@@ -232,9 +222,17 @@ export function buildStructuredRules(dirs: Directive[]): {
   return { floorRules, scopedRules };
 }
 
+// Every git probe here is best-effort: a non-git scan root is a supported state (the workspace
+// marker can sit above the checkouts), and each of these already catches and degrades. But
+// execFileSync INHERITS stderr by default, so git still printed "fatal: not a git repository"
+// straight to the operator's terminal on every scan, every rule verb, and every hook turn: a
+// handled condition that looked like a crash. Discard git's stderr (the same stdio the projection
+// writer's runGit already uses); the degradation is the API, the noise was never part of it.
+const GIT_STDIO = ["ignore", "pipe", "ignore"] as const;
+
 function gitLsFiles(cwd: string): string[] {
   try {
-    return execFileSync("git", ["ls-files"], { cwd, encoding: "utf8" })
+    return execFileSync("git", ["ls-files"], { cwd, encoding: "utf8", stdio: [...GIT_STDIO] })
       .split("\n")
       .map((s) => s.trim())
       .filter(Boolean);
@@ -247,7 +245,11 @@ function gitLsFiles(cwd: string): string[] {
 // agent-memory discovery beyond the active session path; it does NOT define workspace identity.
 function gitToplevel(cwd: string): string | undefined {
   try {
-    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
+    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf8",
+      stdio: [...GIT_STDIO],
+    }).trim();
     return top || undefined;
   } catch {
     return undefined;
@@ -277,7 +279,11 @@ function resolveInjectedRuleDirectives(
 
 function gitHead(cwd: string): string {
   try {
-    return execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd,
+      encoding: "utf8",
+      stdio: [...GIT_STDIO],
+    }).trim();
   } catch {
     return "unknown";
   }

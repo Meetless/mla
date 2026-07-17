@@ -1,8 +1,8 @@
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import { createHash } from "crypto";
 import { readKbConfig, KbCliConfig, consoleDeepLink, HOME } from "../lib/config";
+import { resolveVaultRootForFile } from "../lib/notes-root";
 import { intelGet, intelPost } from "../lib/http";
 import { verifyKbActorIsOwner, KbOwnerCheckError } from "../lib/kb_acl";
 import { KbAddReceipt, renderKbAddReceipt } from "../lib/render";
@@ -195,33 +195,14 @@ export function parseKbAddArgs(argv: string[]): KbAddFlags {
 // the locally-seeded one byte-for-byte (dedup parity).
 // ---------------------------------------------------------------------------
 
-function expandHome(p: string): string {
-  if (p === "~") return os.homedir();
-  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
-  return p;
-}
-
-// Walk up from `start` looking for a `.git` entry; return the containing dir.
-// Mirrors the worker's `_git_root_for` (first/closest match wins).
-export function gitRootForVault(start: string): string | null {
-  let cur: string;
-  try {
-    cur = fs.realpathSync(start);
-  } catch {
-    cur = path.resolve(start);
-  }
-  for (;;) {
-    if (fs.existsSync(path.join(cur, ".git"))) return cur;
-    const parent = path.dirname(cur);
-    if (parent === cur) return null;
-    cur = parent;
-  }
-}
-
 // Resolve the notes vault root the governed identity is relative to.
 // Order (mirrors the worker, minus the removed `--vault-root` flag): corpus
-// folder (corpus mode), else MEETLESS_NOTES_ROOT, else a git-repo-root walk-up
-// from the file's directory. `resolvedPath` is the absolute target.
+// folder (corpus mode), else the shared lib/notes-root ladder (MEETLESS_NOTES_ROOT
+// -> git-repo walk-up from the FILE's directory -> sibling vault). Anchoring on
+// the file, not on cwd, is the whole trick: it is what makes `kb add` land in the
+// standalone notes repo when you run it from the code repo. `mla kb reingest` now
+// walks the SAME ladder, so an identity this command mints is one that command can
+// always resolve back to a file. `resolvedPath` is the absolute target.
 export function resolveVaultRoot(
   flags: Pick<KbAddFlags, "mode">,
   resolvedPath: string,
@@ -229,20 +210,7 @@ export function resolveVaultRoot(
   if (flags.mode === "corpus") {
     return fs.realpathSync(resolvedPath);
   }
-  const envRoot = process.env.MEETLESS_NOTES_ROOT;
-  if (envRoot) {
-    const expanded = path.resolve(expandHome(envRoot));
-    if (!fs.existsSync(expanded) || !fs.statSync(expanded).isDirectory()) {
-      throw new Error(`MEETLESS_NOTES_ROOT=${envRoot} is not a directory`);
-    }
-    return fs.realpathSync(expanded);
-  }
-  const anchor = path.dirname(resolvedPath);
-  const gitRoot = gitRootForVault(anchor);
-  if (gitRoot) return gitRoot;
-  throw new Error(
-    "could not resolve a notes vault root for the governed identity; set MEETLESS_NOTES_ROOT or run inside a git repo",
-  );
+  return resolveVaultRootForFile(path.dirname(resolvedPath));
 }
 
 // The vault-relative POSIX path for `file`, validated to live INSIDE the vault.
@@ -568,6 +536,136 @@ function ingestTimeoutMs(docCount: number): number {
   return Math.max(120_000, docCount * 20_000);
 }
 
+// A corpus ingest is not one atomic act, and this client used to pretend it was.
+//
+// Every document went out in ONE POST whose timeout was 20s * n. Intel sits behind a
+// HARD 300s Cloud Run ceiling that no client setting can raise, so a corpus of 16+ docs
+// asked for longer than the server is ever allowed to take. Past the ceiling the
+// connection dies mid-write and the CLI printed `kb add failed` and returned 1, throwing
+// away every receipt in the response, INCLUDING the documents the server had already
+// committed. The operator was told nothing landed. Documents had landed. There was no
+// record of which, and no way to resume: a corpus over ~15 files was structurally
+// unshippable, and got less shippable the more notes you wrote.
+//
+// So: send the corpus in batches. 10 documents is a 200s request against a 300s ceiling,
+// which leaves 100s of margin for a slow doc without ever approaching the wall.
+export const KB_ADD_BATCH_SIZE = 10;
+
+// Two in a row is a down server, not a bad batch. Proving that costs a full 200s timeout
+// per remaining batch, so a 100-doc corpus against a dead intel would hang for half an
+// hour before telling the operator anything. Stop, and report what did not land.
+const MAX_CONSECUTIVE_BATCH_FAILURES = 2;
+
+// The POST seam, injected so the batching logic is testable without a server (the same
+// idiom `pollReceiptsToTerminal` uses for its fetcher).
+export type KbAddPoster = (body: unknown, timeoutMs: number) => Promise<{ receipts?: KbAddReceipt[] }>;
+
+// A document that never reached the server. It is a receipt, not a silence: the operator
+// must be able to read WHICH files are missing from their KB, and `outcome: "failed"`
+// carries that into the corpus rollup and the non-zero exit for free.
+function transportFailureReceipt(
+  doc: KbAddDocument,
+  ctx: { mode: "file" | "corpus"; workspaceId: string; provenance: string; failedAt: string },
+  code: string,
+  reason: string,
+): KbAddReceipt {
+  return {
+    mode: ctx.mode,
+    workspaceId: ctx.workspaceId,
+    outcome: "failed",
+    documentId: "",
+    canonicalPath: doc.relPath,
+    parentUuid: "",
+    provenance: ctx.provenance,
+    failure: { code, reason, failedAt: ctx.failedAt },
+  };
+}
+
+/**
+ * POST the documents in bounded batches, one receipt per document, in input order.
+ *
+ * A failed batch fails only ITS OWN documents. The server's front door is an idempotent
+ * per-document upsert with no reconciliation pass (it never removes a document just
+ * because this request did not mention it), so a rerun re-delivers the survivors as
+ * cheap `noop_unchanged` and retries only what is actually missing. That is the whole
+ * point: progress is monotonic, and a big corpus converges across runs instead of
+ * failing forever at whichever document happens to blow the budget.
+ */
+export async function postDocumentsInBatches(
+  documents: KbAddDocument[],
+  baseBody: Record<string, unknown>,
+  ctx: { mode: "file" | "corpus"; workspaceId: string; provenance: string; post: KbAddPoster; now: () => string },
+): Promise<{ receipts: KbAddReceipt[]; errors: string[] }> {
+  const receipts: KbAddReceipt[] = [];
+  const errors: string[] = [];
+  let consecutiveFailures = 0;
+
+  for (let start = 0; start < documents.length; start += KB_ADD_BATCH_SIZE) {
+    const batch = documents.slice(start, start + KB_ADD_BATCH_SIZE);
+    const stamp = { mode: ctx.mode, workspaceId: ctx.workspaceId, provenance: ctx.provenance, failedAt: ctx.now() };
+
+    if (consecutiveFailures >= MAX_CONSECUTIVE_BATCH_FAILURES) {
+      for (const d of batch) {
+        receipts.push(transportFailureReceipt(d, stamp, "ingest_not_attempted", "skipped: the preceding batches did not land, so the server is treated as down"));
+      }
+      continue;
+    }
+
+    try {
+      const res = await ctx.post({ ...baseBody, documents: batch }, ingestTimeoutMs(batch.length));
+      const got = res.receipts ?? [];
+      // One receipt per document, in order, is the route's contract. A short response
+      // means we cannot say which document each receipt belongs to, and mis-attributing
+      // an "ingested" to the wrong file would report a document as governed when it is
+      // not. Fail the batch instead of guessing.
+      if (got.length !== batch.length) {
+        throw new Error(`kb add returned ${got.length} receipt(s) for ${batch.length} document(s)`);
+      }
+      receipts.push(...got);
+      consecutiveFailures = 0;
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      errors.push(reason);
+      for (const d of batch) receipts.push(transportFailureReceipt(d, stamp, "ingest_post_failed", reason));
+      consecutiveFailures += 1;
+    }
+  }
+
+  return { receipts, errors };
+}
+
+/**
+ * Recompute ONE corpus rollup over every batch's receipts.
+ *
+ * The server stamps a rollup on the first receipt of each response, so a batched corpus
+ * comes back carrying several partial summaries, each of which counts only its own
+ * batch. Printing them would show the operator three "totals" lines and none of them
+ * would be the total. Strip them and derive one, from the receipts, which are the only
+ * per-document truth we have.
+ */
+export function stampMergedCorpusRollup(receipts: KbAddReceipt[], corpusName: string, rootPath: string): void {
+  if (receipts.length === 0) return;
+  for (const r of receipts) delete r.corpus;
+
+  const count = (outcome: KbAddReceipt["outcome"]) => receipts.filter((r) => r.outcome === outcome).length;
+  receipts[0].mode = "corpus";
+  receipts[0].corpus = {
+    corpusName,
+    rootPath,
+    ingested: count("ingested"),
+    restored: 0, // the governed front door has no restore branch
+    noChange: count("noop_unchanged"),
+    failed: count("failed"),
+    perDoc: receipts.map((r) => ({
+      canonicalPath: r.canonicalPath,
+      outcome: r.outcome,
+      revisionId: r.revisionId ?? null,
+      chunkCount: r.chunkCount ?? null,
+      failureCode: r.failure?.code ?? null,
+    })),
+  };
+}
+
 export async function runKbAdd(argv: string[]): Promise<number> {
   // Parse flags BEFORE loading config so `--workspace <id>` can override the
   // marker-resolved workspace (T1.1 folder = workspace). Passing the override
@@ -668,10 +766,9 @@ export async function runKbAdd(argv: string[]): Promise<number> {
   // value yields no session here, never a composed or console value.
   const agentSession = canonicalizeSessionId(flags.agentSession ?? null);
 
-  const body = {
+  const baseBody = {
     workspaceId,
     actor: cfg.actorUserId,
-    documents,
     provenance: flags.provenance, // advisory; the server derives the recorded value
     profile: flags.profile || DEFAULT_PROFILE,
     agentSession: agentSession ?? undefined,
@@ -679,47 +776,39 @@ export async function runKbAdd(argv: string[]): Promise<number> {
     corpusName: marker?.corpusName,
   };
 
-  let receipts: KbAddReceipt[];
-  try {
-    const res = await intelPost<{ receipts: KbAddReceipt[] }>(
-      cfg,
-      "/internal/v1/kb/add",
-      body,
-      ingestTimeoutMs(documents.length),
-    );
-    receipts = res.receipts ?? [];
-  } catch (e) {
-    console.error(`kb add failed: ${(e as Error).message}`);
-    // F5 (kb-write-blocked): the ingest POST did not land, so the lesson did not
-    // land. Record locally only; never throws, kill-switch aware.
-    recordKbWriteBlocked({
-      traceId: getRunTraceId(),
-      workspaceId,
-      reasonCode: "ingest_post_failed",
-      status: 1,
-    });
-    return 1;
-  }
+  const { receipts, errors } = await postDocumentsInBatches(documents, baseBody, {
+    mode: flags.mode,
+    workspaceId,
+    provenance: flags.provenance,
+    post: (b, timeoutMs) => intelPost<{ receipts: KbAddReceipt[] }>(cfg, "/internal/v1/kb/add", b, timeoutMs),
+    now: () => new Date().toISOString(),
+  });
+  for (const e of errors) console.error(`kb add: a batch did not land: ${e}`);
 
   if (receipts.length === 0) {
     console.error("kb add: the ingest route returned no receipts.");
     return 1;
   }
 
-  // The server has no filesystem, so it cannot fill the corpus display root.
-  // Stamp the resolved corpus folder back onto the rollup the operator sees.
-  if (flags.mode === "corpus" && corpusRootDisplay && receipts[0].corpus) {
-    receipts[0].corpus.rootPath = corpusRootDisplay;
+  // The server stamps one rollup per RESPONSE, so a batched corpus comes back with
+  // several partial ones, each counting only its own batch. Replace them with a single
+  // rollup derived from every receipt (and fill the display root, which the server has
+  // no filesystem to know).
+  if (flags.mode === "corpus") {
+    stampMergedCorpusRollup(receipts, marker?.corpusName ?? "", corpusRootDisplay ?? "");
   }
 
-  // A per-doc intake failure is reported in the receipt, not the HTTP status.
-  // Mirror the worker's exit semantics: any failed doc -> non-zero exit.
+  // A per-doc intake failure is reported in the receipt, not the HTTP status, and a batch
+  // that never reached the server synthesizes one failed receipt per document it carried.
+  // Either way: any failed doc -> non-zero exit.
   const anyFailed = receipts.some((r) => r.outcome === "failed");
   if (anyFailed) {
     recordKbWriteBlocked({
       traceId: getRunTraceId(),
       workspaceId,
-      reasonCode: "ingest_doc_failed",
+      // One deadletter per run, named for the dominant cause: a dead transport is an
+      // operator/infra problem, a server-side per-doc rejection is a content problem.
+      reasonCode: errors.length > 0 ? "ingest_post_failed" : "ingest_doc_failed",
       status: 1,
     });
   }

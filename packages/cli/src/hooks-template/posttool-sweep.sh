@@ -17,7 +17,10 @@ meetless_activated || exit 0
 
 INPUT="$(cat 2>/dev/null || true)"
 
-CFG="${MEETLESS_HOME:-$HOME/.meetless}/cli-config.json"
+# MEETLESS_HOME_DIR (not a raw "$HOME/.meetless"): common.sh, sourced above, has already
+# run home.sh, which repairs a poisoned $HOME from the password database and resolves the
+# state dir absolutely. A raw $HOME here would re-root this read into the operator's repo.
+CFG="$MEETLESS_HOME_DIR/cli-config.json"
 MLA_PATH="$(jq -r '.mlaPath // empty' "$CFG" 2>/dev/null || true)"
 if [[ -z "${MLA_PATH:-}" || ! -x "$MLA_PATH" ]]; then
   MLA_PATH="$(command -v mla 2>/dev/null || true)"

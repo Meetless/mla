@@ -38,6 +38,7 @@ function baseParams(over: Record<string, unknown> = {}) {
     actorUserId: "usr_cuid_1",
     mlaVersion: "0.1.0",
     gitSha: "abc1234",
+    invoker: "human_tty",
     startedAtMs: STARTED,
     nowMs: NOW,
     cfg: CFG,
@@ -88,6 +89,7 @@ describe("captureCommandEvent", () => {
       thrown: null,
       mlaVersion: "0.1.0",
       gitSha: "abc1234",
+      invoker: "agent",
       startedAtMs: STARTED,
       nowMs: NOW,
       sessionId: null, // null session -> null sequence fields, no I/O
@@ -102,6 +104,9 @@ describe("captureCommandEvent", () => {
     expect(p.touched_surface).toBe("unknown");
     expect(p.mla_version).toBe("0.1.0");
     expect(p.git_sha).toBe("abc1234");
+    // The invoker (§4.11) is threaded straight through, never re-derived here: the
+    // caller derives it at bootstrap before MEETLESS_OUTPUT is deleted.
+    expect(p.invoker).toBe("agent");
   });
 
   it("records an mla_command event locally", async () => {
@@ -115,6 +120,16 @@ describe("captureCommandEvent", () => {
     expect(ev.run_id).toBe("11111111-1111-1111-1111-111111111111");
     expect(ev.trace_id).toBe("0123456789abcdef0123456789abcdef");
     expect(ev.distinct_id).toBe("usr_cuid_1");
+    expect(ev.invoker).toBe("human_tty");
+  });
+
+  it("carries the agent invoker onto the on-disk event (§4.11)", async () => {
+    // The bootstrap derives `agent` from resolve-mla's MEETLESS_OUTPUT=json transport
+    // and threads it here. The finalize path must persist it verbatim so agent traffic
+    // is separable from human traffic in the local funnel.
+    await capture.captureCommandEvent(baseParams({ invoker: "agent" }));
+    const ev = store.readEvents()[0] as unknown as Record<string, unknown>;
+    expect(ev.invoker).toBe("agent");
   });
 
   it("does NOT emit an mla_command for an `_internal` subcommand (funnel hygiene)", async () => {

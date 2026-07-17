@@ -58,15 +58,20 @@ const pluginRoot = process.env.MLA_PLUGIN_ROOT
   : path.join(marketplaceRoot, "plugin");
 const hooksTemplateDir = path.join(cliRoot, "src", "hooks-template");
 
-// Every hook-template file ships in the plugin (12 files). Listed by an EXPLICIT
+// Every hook-template file ships in the plugin (13 files). Listed by an EXPLICIT
 // allowlist, NOT a readdir: the 9 registered scripts come from MANAGED_HOOK_SCRIPTS
-// (the single source of truth the hook manifest is built from), and the 3 support
-// files (common.sh, flush.sh, event-batch-filter.jq) are the un-registered files the
-// registered scripts source at runtime. Explicit so a NEW template file is a
+// (the single source of truth the hook manifest is built from), and the 4 support
+// files (home.sh, common.sh, flush.sh, event-batch-filter.jq) are the un-registered
+// files the registered scripts source at runtime. Explicit so a NEW template file is a
 // deliberate addition here, and a MISSING registered file fails the generator loudly
 // instead of silently shipping a broken plugin.
+//
+// home.sh is sourced by common.sh AND, directly, by every self-contained hook (the
+// ce0-* family, pre-tool-use.sh): it is the shell-side $HOME repair. Omit it here and
+// the plugin ships hooks that source a file that is not there, so `mla` resolves its
+// state under the operator's repo again the moment a session inherits a broken $HOME.
 const REGISTERED_HOOK_SCRIPTS = [...new Set(MANAGED_HOOK_SCRIPTS.map((w) => w.script))];
-const SUPPORT_HOOK_FILES = ["common.sh", "flush.sh", "event-batch-filter.jq"];
+const SUPPORT_HOOK_FILES = ["home.sh", "common.sh", "flush.sh", "event-batch-filter.jq"];
 const HOOK_TEMPLATE_FILES = [...REGISTERED_HOOK_SCRIPTS, ...SUPPORT_HOOK_FILES].sort();
 
 for (const f of HOOK_TEMPLATE_FILES) {

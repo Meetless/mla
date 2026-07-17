@@ -29,6 +29,7 @@
 import type { BundleCacheRead } from "./bundle-cache";
 import type { RuleBundleEntry } from "./control-rule-client";
 import { type EligibleEnforcement, projectEligibleEnforcement } from "./deny-admission";
+import { normalizeForbiddenRoot } from "./durable-observation";
 import type { EvaluationTarget } from "./evaluation-input-hash";
 import { selectRule, type ToolCall } from "./evaluator";
 import { matchesGlob } from "./glob-match";
@@ -37,8 +38,26 @@ import type { RulePayloadV1 } from "./types";
 import { versionBackedVerdict } from "./version-evaluation";
 import { deriveWriteTargets, isWriteCapableTool } from "./write-targets";
 
+/** The per-rule evidence one WARN carries so the caller can emit a warn incident to the review queue.
+ * A DENY records a SINGLE deciding rule (it short-circuits on the first violation); a WARN aggregates
+ * EVERY warned rule (INV-8: additive advisory, no short-circuit), so it hands back one of these per rule
+ * rather than a single identity. Same evidence shape a DENY stamps: node id + version id + the warned
+ * path + the rule's own statement, all snapshotted at warn time so the review queue never depends on a
+ * version-id join that rots. `targetPath` and `ruleText` are dropped from PostHog by control's fail-closed
+ * projector (INV-POSTHOG-PII-1); they live only on the console review surface. */
+export interface WarnEvidence {
+  ruleNodeId: string;
+  ruleVersionId: string;
+  /** The runtime-relative path the rule warned about (micro-decision A: never absolute); null when the
+   * target was not a runtime-relative file. */
+  targetPath: string | null;
+  /** The warned rule's own statement (RulePayloadV1.text), snapshotted at warn time. */
+  ruleText: string;
+}
+
 /** The PreToolUse decision. DENY/ASK carry the deciding rule's node + version identity so the
- * caller can stamp deny telemetry; UNAVAILABLE carries the diagnostic reason; PASS carries nothing. */
+ * caller can stamp deny telemetry; WARN carries one {@link WarnEvidence} per warned rule so the caller
+ * can emit a warn incident per rule; UNAVAILABLE carries the diagnostic reason; PASS carries nothing. */
 export type BundleEnforceDecision =
   | {
       kind: "DENY";
@@ -62,8 +81,10 @@ export type BundleEnforceDecision =
   // no DENY or ASK outranking them. `reason` is the already-aggregated, cap-honored advisory body the
   // hook renders as model-facing additionalContext (never a permissionDecision); `count` is how many
   // rules warned (>= the number of reasons shown, since the cap may have suppressed some) so the render
-  // and any future telemetry can note suppression honestly.
-  | { kind: "WARN"; reason: string; count: number }
+  // and any future telemetry can note suppression honestly. `warnings` is the UNCAPPED per-rule evidence
+  // (one entry per warned rule, in ruleNodeId order): the caller emits one warn incident per entry so the
+  // review queue records EVERY warned rule, even the ones the display cap suppressed from `reason`.
+  | { kind: "WARN"; reason: string; count: number; warnings: WarnEvidence[] }
   | { kind: "UNAVAILABLE"; reason: string }
   | { kind: "PASS" };
 
@@ -74,6 +95,14 @@ export interface BundleEnforceInput {
   read: BundleCacheRead;
   /** The activated runtime project root (absolute); relative targets resolve from here. */
   runtimeProjectRoot: string;
+  /**
+   * The current checkout's runtime scope identity (realpath of the active project root, the same
+   * `resolveActiveRuntimeScopeId` value attest stamped into `payload.runtimeScopeId`). A PERSONAL rule
+   * is a per-checkout preference: it enforces ONLY in the checkout it was attested from, so its
+   * `payload.runtimeScopeId` must equal this. TEAM/ORGANIZATION rules are workspace-wide and ignore it
+   * (their attestor's realpath can never match another member's machine). See {@link evaluateEntry}.
+   */
+  runtimeScopeId: string;
   /** Runtime-scope path classifier; defaults to the real filesystem canonicalizer. Injected in tests. */
   classifyRuntime?: (rawFilePath: unknown, runtimeProjectRoot: string) => Promise<EvaluationTarget>;
   /**
@@ -100,19 +129,29 @@ function runtimeRelativePath(target: EvaluationTarget): string | null {
   return target.kind === "RUNTIME_RELATIVE" ? target.path : null;
 }
 
+/**
+ * The root as the operator should READ it, which is not always how it was stored.
+ *
+ * Every reason string below renders the root as `"<root>/"`, so a payload holding the trailing slash
+ * a human naturally types ("legacy/") prints `"legacy//"`. The evaluator already normalizes before it
+ * matches (normalizeForbiddenRoot), so rendering the raw string would show the operator a root that is
+ * not the one they were actually judged against. Name the same thing in both places.
+ */
+function displayRoot(payload: RulePayloadV1): string {
+  return normalizeForbiddenRoot(payload.compliance.config.forbiddenRootRelativePath);
+}
+
 /** The hard-block reason. Same prose shape as the legacy CE0 deny so the operator sees one block voice. */
 function buildBundleDenyReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  const forbidden = payload.compliance.config.forbiddenRootRelativePath;
-  return `Blocked by Meetless rule ${entry.ruleNodeId}. Writing ${where} under the forbidden "${forbidden}/" root is prohibited. ${payload.text}`;
+  return `Blocked by Meetless rule ${entry.ruleNodeId}. Writing ${where} under the forbidden "${displayRoot(payload)}/" root is prohibited. ${payload.text}`;
 }
 
 /** The degrade-to-ASK reason: a DENY that cannot be enforced on a stale lease, asking for one confirmation. */
 function buildDegradedAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  const forbidden = payload.compliance.config.forbiddenRootRelativePath;
   return (
-    `Meetless rule ${entry.ruleNodeId} would block writing ${where} under the forbidden "${forbidden}/" root, ` +
+    `Meetless rule ${entry.ruleNodeId} would block writing ${where} under the forbidden "${displayRoot(payload)}/" root, ` +
     `but its rule bundle is stale (offline past its lease), so this needs your explicit confirmation. ${payload.text}`
   );
 }
@@ -120,16 +159,14 @@ function buildDegradedAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, 
 /** The native-ASK reason: a ceiling the human attested as ASK, surfacing one confirmation prompt. */
 function buildAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  const forbidden = payload.compliance.config.forbiddenRootRelativePath;
-  return `Meetless rule ${entry.ruleNodeId} asks you to confirm writing ${where} under the "${forbidden}/" root. ${payload.text}`;
+  return `Meetless rule ${entry.ruleNodeId} asks you to confirm writing ${where} under the "${displayRoot(payload)}/" root. ${payload.text}`;
 }
 
 /** The non-blocking WARN reason: a VIOLATION whose attested ceiling is WARN. Advises but never gates,
  * so the copy names the concern and leaves the correction to the agent (INV-8: no false-positive block). */
 function buildWarnReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  const forbidden = payload.compliance.config.forbiddenRootRelativePath;
-  return `Meetless rule ${entry.ruleNodeId}: writing ${where} under the "${forbidden}/" root is discouraged. ${payload.text}`;
+  return `Meetless rule ${entry.ruleNodeId}: writing ${where} under the "${displayRoot(payload)}/" root is discouraged. ${payload.text}`;
 }
 
 // The authority ladder as an ordinal so eligibility can be clamped to the session ceiling cap. The
@@ -162,7 +199,7 @@ function aggregateWarnReasons(reasons: string[]): string {
 type EntryDecision =
   | { kind: "DENY"; reason: string; targetPath: string | null; ruleText: string }
   | { kind: "ASK"; reason: string; degraded: boolean }
-  | { kind: "WARN"; reason: string }
+  | { kind: "WARN"; reason: string; targetPath: string | null; ruleText: string }
   | null;
 
 /**
@@ -175,6 +212,7 @@ async function evaluateEntry(
   entry: RuleBundleEntry,
   call: ToolCall,
   runtimeProjectRoot: string,
+  currentRuntimeScopeId: string,
   classify: (rawFilePath: unknown, runtimeProjectRoot: string) => Promise<EvaluationTarget>,
   stale: boolean,
   maxEnforcement: EligibleEnforcement,
@@ -182,6 +220,24 @@ async function evaluateEntry(
   // A surviving bundle entry already passed re-hashing, so its payload is a structurally valid
   // RulePayloadV1; narrow defensively anyway so a malformed entry degrades to "not selected", never throws.
   const payload = entry.payload as RulePayloadV1;
+  // A PERSONAL rule binds to the ONE checkout it was attested from (RulePayloadV1.runtimeScopeId: "a rule
+  // binds to one checkout scope"). The bundle is principal-bound, so it already carries only the owner's
+  // rules; but one owner has MANY checkouts of one workspace, and pre-cutover the local CE0 store keyed
+  // enforcement by runtimeScopeId, so a personal deny fired only in its own checkout. The bundle path
+  // dropped that gate, silently over-broadening a per-checkout personal deny into an all-checkouts deny.
+  // Restore it: a PERSONAL rule whose attested scope is not THIS checkout is not enforced here.
+  // TEAM/ORGANIZATION rules are workspace-wide (they must fire for other members on other machines, whose
+  // realpath can never equal the attestor's), so they are never scope-gated. Doctrine mirrors the
+  // scan-cache guard: only a PRESENT, mismatching stamp is skipped; a missing/empty stamp is trusted
+  // (enforced), so a legacy payload without a scope never regresses to silently un-enforced.
+  if (
+    entry.authorityScope === "PERSONAL" &&
+    typeof payload.runtimeScopeId === "string" &&
+    payload.runtimeScopeId.length > 0 &&
+    payload.runtimeScopeId !== currentRuntimeScopeId
+  ) {
+    return null;
+  }
   const app = payload.applicability;
   if (payload.effect !== "PROHIBIT" || app.mode !== "action") return null;
   const forbidden = payload.compliance?.config?.forbiddenRootRelativePath;
@@ -239,7 +295,14 @@ async function evaluateEntry(
   if (eligible === "OBSERVE") return null;
   if (eligible === "WARN") {
     // Non-blocking (INV-8): a WARN never degrades and never blocks, so bundle freshness is irrelevant.
-    return { kind: "WARN", reason: buildWarnReason(entry, payload, target) };
+    // Carry the same path + statement evidence a DENY does, so the caller can record this warn in the
+    // review queue as an incident (decision: "warn") rather than dropping it.
+    return {
+      kind: "WARN",
+      reason: buildWarnReason(entry, payload, target),
+      targetPath: runtimeRelativePath(target),
+      ruleText: payload.text,
+    };
   }
   if (eligible === "DENY") {
     return stale
@@ -280,10 +343,11 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
 
   let ask: { reason: string; ruleNodeId: string; ruleVersionId: string; degraded: boolean } | null = null;
   const warns: string[] = [];
+  const warnings: WarnEvidence[] = [];
   for (const entry of entries) {
     let decided: EntryDecision;
     try {
-      decided = await evaluateEntry(entry, input.call, input.runtimeProjectRoot, classify, stale, maxEnforcement);
+      decided = await evaluateEntry(entry, input.call, input.runtimeProjectRoot, input.runtimeScopeId, classify, stale, maxEnforcement);
     } catch {
       // One unparseable / faulty entry must never block the hook nor mask the rest of the bundle.
       continue;
@@ -301,8 +365,15 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
     }
     if (decided.kind === "WARN") {
       // WARN outranks nothing: collect ALL of them (in ruleNodeId order) so they aggregate into one
-      // advisory. DENY/ASK, if any also selected, still win below.
+      // advisory. DENY/ASK, if any also selected, still win below. Capture the per-rule evidence in
+      // lockstep so the caller can emit one warn incident per warned rule (the review-queue record).
       warns.push(decided.reason);
+      warnings.push({
+        ruleNodeId: entry.ruleNodeId,
+        ruleVersionId: entry.ruleVersionId,
+        targetPath: decided.targetPath,
+        ruleText: decided.ruleText,
+      });
       continue;
     }
     if (ask === null) {
@@ -313,7 +384,7 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
     return { kind: "ASK", reason: ask.reason, ruleNodeId: ask.ruleNodeId, ruleVersionId: ask.ruleVersionId, degraded: ask.degraded };
   }
   if (warns.length > 0) {
-    return { kind: "WARN", reason: aggregateWarnReasons(warns), count: warns.length };
+    return { kind: "WARN", reason: aggregateWarnReasons(warns), count: warns.length, warnings };
   }
   return { kind: "PASS" };
 }
