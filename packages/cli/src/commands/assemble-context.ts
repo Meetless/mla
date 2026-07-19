@@ -26,6 +26,10 @@ import {
   PersistedAssembleAudit,
   writeAssembleAudit,
 } from "../lib/scanner/cache";
+import {
+  ArtifactByteReader,
+  filterReconciliationFindings,
+} from "../lib/scanner/reconciliation-rehash";
 import { readScanCacheForRoot } from "./scan-context";
 import { assembleContext } from "../lib/scanner/assemble";
 import { extractExplicitPaths } from "../lib/scanner/prompt-paths";
@@ -72,6 +76,9 @@ export interface AssembleContextDeps {
   readCache?: (home: string | undefined, workspaceId: string) => ScanResult | null;
   writeAudit?: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
   writeMeter?: (path: string, json: string) => void;
+  // Byte reader for the reconciliation rehash gate (ADR §3.3 item 9). Injected in tests to feed
+  // controlled bytes; defaults to a repoRoot-contained filesystem reader built per call.
+  readArtifactBytes?: ArtifactByteReader;
   home?: string;
   now?: () => string;
   log?: (out: string) => void;
@@ -143,12 +150,36 @@ function normalizeWorkingSet(entries: string[]): string[] {
   return out;
 }
 
+// The default artifact byte reader for the reconciliation rehash gate: read one
+// repo-relative instruction file's UTF-8 bytes, contained under `repoRoot`. It
+// mirrors normalizeWorkingSet's containment discipline exactly (reject absolute
+// paths and `..` escapes) so a finding can never coerce a read outside the repo,
+// and swallows every fs error to null so an unreadable path becomes
+// NEEDS_REEVALUATION rather than throwing. Pure-posix join, matching the rest of
+// this file's path handling.
+function makeArtifactByteReader(repoRoot: string | undefined): ArtifactByteReader {
+  const root = repoRoot ?? process.cwd();
+  return (rel: string): string | null => {
+    const t = rel.trim();
+    if (!t || t.startsWith("/")) return null;
+    const n = posix.normalize(t);
+    if (n === "" || n === "." || n === ".." || n.startsWith("../") || n.startsWith("/")) return null;
+    try {
+      return readFileSync(posix.join(root, n), "utf8");
+    } catch {
+      return null;
+    }
+  };
+}
+
 interface AssembleCtx {
   // undefined = the cache module resolves the state root (it honors MEETLESS_HOME).
   home: string | undefined;
   now: () => string;
   readCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
   writeAudit: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
+  // Reads one repo-relative instruction file's bytes for the rehash gate; null when unreadable.
+  readArtifactBytes: ArtifactByteReader;
 }
 
 // The result of a byte-budgeted assembly attempt. `head` is the exact model-facing envelope. Since
@@ -191,6 +222,31 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
     identityByRuleId.set(s.ruleId, { versionId: s.versionId, text: s.text, represents: s.representedVersionIds });
   }
 
+  // Prompt-time reconciliation rehash gate (ADR §3.3 item 9). Re-hash every cited instruction
+  // file's current bytes and partition the findings into KEPT (digest still matches) vs
+  // NEEDS_REEVALUATION (drifted / unreadable / normalization-refused). Computed ONCE from the
+  // cache and recorded in the out-of-band audit below (the sole Phase 2A consumer). This is the
+  // filter GATE only; rendering the kept findings into the head is Phase 3 (blocked), so KEPT has
+  // no head-side effect today and an empty partition (every Phase 2A cache) leaves the head
+  // byte-identical. `reconciliationFindings` is forward-only and absent in every 2A cache, so this
+  // is a clean no-op that costs zero file reads until the Phase 2B detector populates it.
+  const reconciliation = filterReconciliationFindings(
+    cache?.reconciliationFindings ?? [],
+    ctx.readArtifactBytes,
+  );
+  const reconciliationAudit =
+    reconciliation.kept.length || reconciliation.needsReevaluation.length
+      ? {
+          reconciliation: {
+            kept: reconciliation.kept.map((o) => ({ path: o.finding.path, reason: o.reason })),
+            needsReevaluation: reconciliation.needsReevaluation.map((o) => ({
+              path: o.finding.path,
+              reason: o.reason,
+            })),
+          },
+        }
+      : {};
+
   const emitAudit = (
     state: PersistedAssembleAudit["state"],
     text: string,
@@ -225,6 +281,10 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
           ...(id?.versionId ? { versionId: id.versionId } : {}),
         };
       }),
+      // Recorded only when the rehash actually partitioned findings; omitted on every Phase 2A
+      // audit (no findings in the cache), matching the versionId/represents "absent when unknown"
+      // idiom above so an older reader still parses.
+      ...reconciliationAudit,
     });
   };
 
@@ -375,9 +435,14 @@ export async function runAssembleContext(
   }
   try {
     const readStdin = deps.readStdin ?? (() => readFileSync(0, "utf8"));
+    const input = parseInput(readStdin());
+    if (!input) return 0; // fail-soft: bash fallback emits LAYER1 + floor
     const ctx: AssembleCtx = {
       home: deps.home, // undefined = the cache module's state root (it honors MEETLESS_HOME)
       now: deps.now ?? (() => new Date().toISOString()),
+      // Repo-contained byte reader for the rehash gate, rooted at this turn's repoRoot (the hook
+      // passes it; absent -> process.cwd(), the session repo). Injected wholesale in tests.
+      readArtifactBytes: deps.readArtifactBytes ?? makeArtifactByteReader(input.repoRoot),
       // Guarded read: the assembler injects locally-parsed scopedRules, which belong to ONE
       // checkout. A workspace shared by several checkouts writes one scan-cache.json, so an
       // unguarded read could inject a sibling checkout's scoped rules into this session. On a
@@ -390,8 +455,6 @@ export async function runAssembleContext(
     const log = deps.log ?? ((out: string) => process.stdout.write(out));
     const logErr = deps.logErr ?? ((out: string) => process.stderr.write(out));
 
-    const input = parseInput(readStdin());
-    if (!input) return 0; // fail-soft: bash fallback emits LAYER1 + floor
     const result = assemble(input, ctx);
     if (result.head) log(result.head);
     // Drop the rule-cost meter (audit 6.G) where the caller asked for it. STRICTLY best-effort and

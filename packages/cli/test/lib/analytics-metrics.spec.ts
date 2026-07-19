@@ -132,7 +132,7 @@ describe("computeMetrics", () => {
     expect(m.unknown_coverage).toBeNull();
   });
 
-  it("labels the v1 precision honestly (section 4.2)", () => {
-    expect(REFERENCE_PRECISION_V1_LABEL).toBe("Reference Precision (v1)");
+  it("labels the v1 follow-through honestly (section 4.2, rollout step 4)", () => {
+    expect(REFERENCE_PRECISION_V1_LABEL).toBe("Reference follow-through (v1)");
   });
 });

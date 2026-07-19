@@ -5,6 +5,7 @@
 
 import {
   ABANDONED_AFTER_MS,
+  CURRENT_CAPTURE_CONTRACT_VERSION,
   DeriveOutcomeContext,
   InjectRecord,
   OUTCOME_VERSION,
@@ -63,6 +64,48 @@ describe("buildInjectPayload", () => {
     });
     expect(p.zero_results).toBe(true);
     expect(p.evidence_offered).toBe(0);
+  });
+
+  it("carries the two material-incorporation provenance keys (§6.4)", () => {
+    // version is static per build (capability advertisement), never null for this client.
+    const consented = buildInjectPayload({
+      turn_index: 2,
+      evidence_offered: 1,
+      offered_source_ids: ["NT:x.md"],
+      evidence_tokens: 10,
+      retrieval_confidence: "high",
+      retrieval_latency_ms: 5,
+      createdAtMs: T0,
+      traceUploadConsented: true,
+    });
+    expect(consented.trace_upload_consented).toBe(true);
+    expect(consented.work_product_capture_version).toBe(CURRENT_CAPTURE_CONTRACT_VERSION);
+
+    // Declined consent still advertises capability (version non-null) but flags no egress.
+    const declined = buildInjectPayload({
+      turn_index: 2,
+      evidence_offered: 1,
+      offered_source_ids: ["NT:x.md"],
+      evidence_tokens: 10,
+      retrieval_confidence: "high",
+      retrieval_latency_ms: 5,
+      createdAtMs: T0,
+      traceUploadConsented: false,
+    });
+    expect(declined.trace_upload_consented).toBe(false);
+    expect(declined.work_product_capture_version).toBe(CURRENT_CAPTURE_CONTRACT_VERSION);
+
+    // Omitted consent defaults to false so an old caller never over-claims.
+    const omitted = buildInjectPayload({
+      turn_index: 2,
+      evidence_offered: 1,
+      offered_source_ids: ["NT:x.md"],
+      evidence_tokens: 10,
+      retrieval_confidence: "high",
+      retrieval_latency_ms: 5,
+      createdAtMs: T0,
+    });
+    expect(omitted.trace_upload_consented).toBe(false);
   });
 });
 

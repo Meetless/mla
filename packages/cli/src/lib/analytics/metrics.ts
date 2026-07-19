@@ -6,11 +6,12 @@
 //                                 the wall metric: did the injection land at all
 //   Evidence Item Utilization     distinct referenced ids / distinct offered ids
 //                                 the drilldown: did the offered DOCS get used
-//   Reference Precision (v1)      used / (used + ignored)
+//   Reference follow-through (v1) used / (used + ignored)
 //                                 v1 used:=referenced, so this is a reference-
 //                                 followthrough proxy, NOT material use. The
-//                                 dashboard MUST label it "Reference Precision
-//                                 (v1)", never "Inject Precision" (§4.2).
+//                                 dashboard MUST label it "Reference follow-through
+//                                 (v1)", never "Inject Precision" and no longer
+//                                 "Reference Precision" (§4.2, rollout step 4 §13).
 //   Unknown Coverage              unknown / closed inject windows
 //                                 the honesty term: how often we could not classify
 //
@@ -118,5 +119,9 @@ export function computeMetrics(inputs: MetricInput[]): MetricFamily {
 }
 
 // The v1 dashboard label for reference_precision_v1. Centralized so every render
-// path (mla stats, mla adoption) shows the same honest wording (§4.2).
-export const REFERENCE_PRECISION_V1_LABEL = "Reference Precision (v1)";
+// path (mla stats, mla adoption) shows the same honest wording (§4.2). Relabeled
+// from "Reference Precision (v1)" to "Reference follow-through (v1)" as the
+// material-incorporation correlator rollout step 4 (§13): the deterministic
+// number now reads over the full all_decided population (referenced / all_decided)
+// and its name no longer over-claims "precision".
+export const REFERENCE_PRECISION_V1_LABEL = "Reference follow-through (v1)";

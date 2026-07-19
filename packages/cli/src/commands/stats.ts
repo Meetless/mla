@@ -30,6 +30,7 @@ import {
   StatsViewedPayload,
 } from "../lib/analytics/envelope";
 import { computeMetrics, MetricFamily, MetricInput, REFERENCE_PRECISION_V1_LABEL } from "../lib/analytics/metrics";
+import { coverageGapPresentation } from "../lib/analytics/coverage-gap-presentation";
 import { normId } from "../lib/analytics/followthrough";
 import { readEvents } from "../lib/analytics/store";
 import { RecordContext, recordAnalyticsEvent } from "../lib/analytics/recorder";
@@ -452,7 +453,7 @@ export function renderDashboard(d: StatsDashboard, verbose: boolean): string {
       `   Injection Utilization:    ${pct(m.injection_utilization)} (${m.injects_referenced}/${m.injects_offered} offered injects referenced)`,
     );
     lines.push(
-      `   ${REFERENCE_PRECISION_V1_LABEL}:  ${pct(m.reference_precision_v1)} (${m.used}/${m.used + m.ignored} closed used vs ignored)`,
+      `   ${REFERENCE_PRECISION_V1_LABEL}:  ${pct(m.reference_precision_v1)} (${m.used}/${m.used + m.ignored} referenced / decided)`,
     );
     lines.push(
       `   Unknown Coverage:         ${pct(m.unknown_coverage)} (${m.unknown}/${m.closed_windows} closed windows unclassified)`,
@@ -489,7 +490,10 @@ export function renderDashboard(d: StatsDashboard, verbose: boolean): string {
     lines.push("   No coverage gaps recorded in this window.");
   } else {
     lines.push(`   ${d.coverage_gaps_total} query/queries returned nothing useful, by type:`);
-    for (const g of d.coverage_gaps) lines.push(`     ${g.type}: ${g.count}`);
+    for (const g of d.coverage_gaps) {
+      const gap = coverageGapPresentation(g.type);
+      lines.push(`     ${gap.label}: ${g.count}  (${gap.hint})`);
+    }
   }
   lines.push("");
 
@@ -539,7 +543,7 @@ export function renderGlobalDashboard(r: GlobalRollup): string {
       `   Injection Utilization:    ${pct(m.injection_utilization)} (${m.injects_referenced}/${m.injects_offered} offered injects referenced)`,
     );
     lines.push(
-      `   ${REFERENCE_PRECISION_V1_LABEL}:  ${pct(m.reference_precision_v1)} (${m.used}/${m.used + m.ignored} closed used vs ignored)`,
+      `   ${REFERENCE_PRECISION_V1_LABEL}:  ${pct(m.reference_precision_v1)} (${m.used}/${m.used + m.ignored} referenced / decided)`,
     );
     lines.push(
       `   Unknown Coverage:         ${pct(m.unknown_coverage)} (${m.unknown}/${m.closed_windows} closed windows unclassified)`,
@@ -580,7 +584,10 @@ export function renderGlobalDashboard(r: GlobalRollup): string {
     lines.push("   No coverage gaps recorded in this window.");
   } else {
     lines.push(`   ${r.coverage_gaps_total} query/queries returned nothing useful, by type:`);
-    for (const g of r.coverage_gaps) lines.push(`     ${g.type}: ${g.count}`);
+    for (const g of r.coverage_gaps) {
+      const gap = coverageGapPresentation(g.type);
+      lines.push(`     ${gap.label}: ${g.count}  (${gap.hint})`);
+    }
   }
 
   return lines.join("\n");

@@ -52,8 +52,15 @@ export function ensureAllowed(value, allowed, fieldName) {
 /**
  * Build a controlFetch helper bound to a base URL + control-token bearer.
  * Returns an async (pathAndQuery, init) closure that throws on non-2xx with
- * the body snippet attached. Used by server.js (production) and tests (stubbed
- * via `fetchImpl`).
+ * the body snippet attached. Used by the legacy env bin (server.js
+ * buildDepsFromEnv) and tests (stubbed via `fetchImpl`).
+ *
+ * On a non-2xx the thrown Error additionally carries `.status` (the HTTP
+ * status) and, when the body parses as control's ApiErrorResponse envelope,
+ * `.code` (the top-level error code) and `.reason` (the `details.reason`
+ * sub-code). This lets a dispatch handler map a typed control 409 to
+ * operator-facing text instead of leaking a raw status line. The attachment is
+ * additive: the message is unchanged, and a non-JSON body leaves status only.
  */
 export function makeControlFetch({ baseUrl, apiKey, fetchImpl = fetch }) {
   if (!baseUrl) throw new Error("makeControlFetch: baseUrl required");
@@ -68,9 +75,21 @@ export function makeControlFetch({ baseUrl, apiKey, fetchImpl = fetch }) {
     const res = await fetchImpl(url, { ...init, headers });
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(
+      const err = new Error(
         `control ${init.method || "GET"} ${pathAndQuery} ${res.status}: ${text.slice(0, 600)}`,
       );
+      err.status = res.status;
+      err.body = text;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && parsed.details && typeof parsed.details.reason === "string") {
+          err.reason = parsed.details.reason;
+        }
+        if (parsed && typeof parsed.code === "string") err.code = parsed.code;
+      } catch (_e) {
+        /* non-JSON body: leave status + body only */
+      }
+      throw err;
     }
     return text ? JSON.parse(text) : {};
   };

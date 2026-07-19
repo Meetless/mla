@@ -42,6 +42,7 @@ import {
   runRelationships,
   runVerdict,
 } from "./relationship_actions.js";
+import { runDismissConflict } from "./dismiss_conflict_action.js";
 import { randomUUID } from "node:crypto";
 import { makeIntelFetch, runKbDocDetail } from "./kb_actions.js";
 import { runRetrieveKnowledge } from "./evidence_actions.js";
@@ -77,6 +78,9 @@ export async function dispatchTool(name, args, deps) {
     askModes,
     defaultWorkspaceId,
     operatorUserId = null,
+    // The coding agent runtime label (e.g. "claude_code"), threaded as the
+    // agent-dismiss runtimeHint. Optional: the legacy env bin leaves it null.
+    agentRuntime = null,
     mintSubmissionId = randomUUID,
   } = deps;
 
@@ -153,6 +157,37 @@ export async function dispatchTool(name, args, deps) {
             text: JSON.stringify({
               tool: "meetless__relationship_verdict",
               error: String(err.message || err),
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === "meetless__dismiss_conflict") {
+    try {
+      const result = await runDismissConflict(args || {}, {
+        controlFetch,
+        defaultWorkspaceId,
+        agentRuntime,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      // A typed control 409 is handled INSIDE runDismissConflict (returned as a
+      // non-error not_dismissed result). Reaching here means an untyped failure
+      // (a 500, a network error, a validation throw): surface it so the agent
+      // does not read a silent success.
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              tool: "meetless__dismiss_conflict",
+              error: String(err.message || err),
+              status: err && err.status ? err.status : undefined,
             }),
           },
         ],
@@ -390,6 +425,10 @@ export function createMcpServer(deps) {
     defaultWorkspaceId,
     notesRoot,
     operatorUserId = null,
+    // The coding agent runtime label (cli wires env.MEETLESS_AGENT_RUNTIME).
+    // Optional: the legacy env bin leaves it null, so the dismiss runtimeHint
+    // is simply absent there.
+    agentRuntime = null,
     // Per-call staleness probe (cli wires makeMcpStaleCheck()). Optional: the
     // legacy buildDepsFromEnv path leaves it undefined, so the wrap is a no-op.
     staleCheck = null,
@@ -421,6 +460,7 @@ export function createMcpServer(deps) {
     askModes,
     defaultWorkspaceId,
     operatorUserId,
+    agentRuntime,
   };
 
   const server = new Server(

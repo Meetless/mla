@@ -56,6 +56,14 @@ export const OUTCOME_VERSION = 3;
 // no_opportunity it actually was.
 export const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000; // 24h, parity with deriveLiveness
 
+// The work-product capture schema THIS build emits (notes/20260716-evidence-material
+// -incorporation-correlator.md §5, §6.4). It salts the seal event_id and the
+// input_digest_hash on BOTH ends (the control port pins the same integer), so a bump
+// re-keys every downstream identity and lets a new capture shape coexist with the old.
+// It rides on the inject payload as work_product_capture_version to advertise
+// capability; consent to actually egress is a separate boolean (trace_upload_consented).
+export const CURRENT_CAPTURE_CONTRACT_VERSION = 1;
+
 // The TERMINAL outcomes: a window that reaches one of these has a verdict for good.
 // The correlator's idempotency skip-set holds ONLY these, so once an inject is
 // terminal it is never re-derived. `unknown` is deliberately NON-terminal: a
@@ -91,6 +99,11 @@ export interface InjectInput {
   retrieval_confidence: string;
   retrieval_latency_ms: number;
   createdAtMs: number;
+  // The value of traceUploadEnabled(env) at inject time (§6.4). Threaded in by the
+  // caller (the command reads env; buildInjectPayload stays hermetic). Rides on the
+  // payload so the seal path and rollup know whether this inject could EVER egress a
+  // capture. Defaults to false when omitted so an old caller never over-claims consent.
+  traceUploadConsented?: boolean;
   // Test/replay seam: reuse a known inject_id instead of minting a fresh one.
   injectId?: string;
 }
@@ -123,6 +136,11 @@ export function buildInjectPayload(input: InjectInput): EvidenceInjectPayload {
       : 0,
     zero_results: offeredCount === 0,
     window_deadline: new Date(input.createdAtMs + WINDOW_MS).toISOString(),
+    // Capability is static per build (this client CAN capture at v1); consent is the
+    // runtime gate the caller threads in. version stays non-null even when consent is
+    // false so the rollup can distinguish "capable-but-declined" from "old client".
+    trace_upload_consented: input.traceUploadConsented === true,
+    work_product_capture_version: CURRENT_CAPTURE_CONTRACT_VERSION,
   };
 }
 

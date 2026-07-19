@@ -2,8 +2,17 @@ import {
   AssembleContextDeps,
   runAssembleContext,
 } from "../../../src/commands/assemble-context";
-import { ScanResult, SCAN_SCHEMA_VERSION } from "../../../src/lib/scanner/types";
+import {
+  ReconciliationFinding,
+  ScanResult,
+  SCAN_SCHEMA_VERSION,
+} from "../../../src/lib/scanner/types";
 import { PersistedAssembleAudit } from "../../../src/lib/scanner/cache";
+import { ArtifactByteReader } from "../../../src/lib/scanner/reconciliation-rehash";
+import {
+  CONTENT_NORMALIZATION_V1,
+  normalizedContentHash,
+} from "../../../src/lib/scanner/content-normalization";
 import {
   INCOMPLETE_DELIVERY_MARKER_TEXT,
   SCOPED_UNAVAILABLE_MARKER_TEXT,
@@ -49,6 +58,10 @@ async function run(
   stdin: Record<string, unknown> | string,
   cacheValue: ScanResult | null,
   argv: string[] = [],
+  // Injected only by the reconciliation-rehash tests; every other caller leaves it undefined and
+  // the subcommand falls back to its repoRoot-contained filesystem reader (never invoked here,
+  // because no cache below carries reconciliation findings for it to rehash).
+  readArtifactBytes?: ArtifactByteReader,
 ): Promise<Harness> {
   const audits: PersistedAssembleAudit[] = [];
   const meters: { path: string; json: string }[] = [];
@@ -62,6 +75,7 @@ async function run(
     writeMeter: (path, json) => {
       meters.push({ path, json });
     },
+    readArtifactBytes,
     home: "/tmp/unused",
     now: () => "2026-07-05T12:00:00.000Z",
     log: (out) => {
@@ -410,5 +424,89 @@ describe("assemble-context — rule-injection meter", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("floor rule");
     expect(audits[0].state).toBe("normal");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// ADR Phase 2A test 9, part (b): the prompt-time rehash gate end-to-end through the subcommand
+// (§3.3 item 9, notes/20260717-adr-decision-record-projection-and-reconciliation.md). The pure
+// partition is pinned in test/lib/scanner/reconciliation-rehash.spec.ts; here we drive
+// runAssembleContext with a cache carrying reconciliation findings + an injected byte reader and
+// assert the OUT-OF-BAND AUDIT partition, which is the sole Phase 2A consumer of the rehash. The
+// gate is filter-only in Phase 2A (rendering kept findings into the head is the blocked Phase 3),
+// so the head must be byte-identical whether findings are present or absent.
+// ---------------------------------------------------------------------------------------------
+
+describe("assemble-context — prompt-time reconciliation rehash (ADR Phase 2A test 9)", () => {
+  const KEPT_PATH = "CLAUDE.md";
+  const DRIFT_PATH = "apps/control/CLAUDE.md";
+  const GONE_PATH = ".claude/rules/removed.md";
+
+  // The KEPT file still hashes to what the finding recorded.
+  const KEPT_BYTES = "# CLAUDE.md\n\nAlways prefer 127.0.0.1 over localhost.\n";
+  // The DRIFT file's CURRENT bytes differ from the bytes the finding was evaluated against: the
+  // operator edited it after the detector read it (the edit-between-scan case).
+  const DRIFT_NOW = "# CLAUDE.md\n\nEdited after the scan read it.\n";
+  const DRIFT_OLD = "# CLAUDE.md\n\nThe revision the finding was evaluated against.\n";
+
+  const FLOOR = [
+    { ruleId: "fm1", versionId: "v1", text: "never push without consent", strength: "MUST" as const },
+  ];
+
+  const findings: ReconciliationFinding[] = [
+    {
+      path: KEPT_PATH,
+      evaluatedDigest: normalizedContentHash(KEPT_BYTES, CONTENT_NORMALIZATION_V1),
+      reason: "a scoped decision superseded this instruction",
+    },
+    {
+      path: DRIFT_PATH,
+      evaluatedDigest: normalizedContentHash(DRIFT_OLD, CONTENT_NORMALIZATION_V1),
+      reason: "a scoped decision superseded this instruction",
+    },
+    {
+      path: GONE_PATH,
+      evaluatedDigest: normalizedContentHash("whatever\n", CONTENT_NORMALIZATION_V1),
+      reason: "a scoped decision superseded this instruction",
+    },
+  ];
+
+  // Serves each path's CURRENT bytes; an unknown path (a deleted file) reads as null (unreadable),
+  // exactly as the real filesystem reader behaves.
+  const reader: ArtifactByteReader = (p) =>
+    p === KEPT_PATH ? KEPT_BYTES : p === DRIFT_PATH ? DRIFT_NOW : null;
+
+  it("audits KEPT vs NEEDS_REEVALUATION and drops nothing into the head (edit-between-scan)", async () => {
+    const h = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts" }),
+      cache({ floorRules: FLOOR, reconciliationFindings: findings }),
+      [],
+      reader,
+    );
+
+    expect(h.code).toBe(0);
+    expect(h.audits[0].state).toBe("normal");
+    // The rehash partitioned the three findings: the matched digest is KEPT (eligible to inject,
+    // pending the blocked Phase-3 renderer); the drifted file and the deleted file are held back as
+    // NEEDS_REEVALUATION, in input order, each stamped with WHY it was held.
+    expect(h.audits[0].reconciliation).toEqual({
+      kept: [{ path: KEPT_PATH, reason: "digest_match" }],
+      needsReevaluation: [
+        { path: DRIFT_PATH, reason: "digest_drift" },
+        { path: GONE_PATH, reason: "unreadable" },
+      ],
+    });
+
+    // The gate is a FILTER in Phase 2A: a KEPT finding has no head effect yet (rendering is Phase 3,
+    // blocked), so the head is byte-identical to the same turn with no findings at all. Prove it by
+    // replaying the identical cache without reconciliation findings; that run also proves the audit
+    // key is OMITTED when there is nothing to partition (a clean no-op).
+    const plain = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts" }),
+      cache({ floorRules: FLOOR }),
+      [],
+    );
+    expect(plain.stdout).toBe(h.stdout);
+    expect(plain.audits[0].reconciliation).toBeUndefined();
   });
 });

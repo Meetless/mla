@@ -35,6 +35,10 @@ function conflict(over: Partial<ActiveConflict> = {}): ActiveConflict {
     caseId: "case_1",
     openedAt: "2026-06-26T00:00:00.000Z",
     reason: "Another session is changing the same decision.",
+    // coerceConflicts always emits this field on read (fail-closed default false),
+    // so the canonical read shape carries it; the factory mirrors that shape so the
+    // round-trip `toEqual` assertions below compare like against like (Task 8a).
+    agentDismissEligible: false,
     ...over,
   };
 }
@@ -73,6 +77,49 @@ describe("writeActiveConflictCache / readActiveConflicts round-trip", () => {
   it("returns an empty set when the writer recorded no open conflicts", () => {
     writeActiveConflictCache("sess_1", [], home, 1000);
     expect(readActiveConflicts("sess_1", { home, nowSeconds: 1005 })).toEqual([]);
+  });
+});
+
+describe("agentDismissEligible: the read boundary is fail-closed", () => {
+  // The writer passes the control projection through verbatim; coerceConflicts is the
+  // single choke point that decides whether a dismiss steer is allowed (Task 8a). Only
+  // an explicit boolean `true` survives; anything else normalizes to `false` so a stale
+  // or corrupted snapshot can never invite a dismiss steer control did not bless.
+  it("preserves an explicit true across the round-trip", () => {
+    writeActiveConflictCache("sess_1", [conflict({ agentDismissEligible: true })], home, 1000);
+    const read = readActiveConflicts("sess_1", { home, nowSeconds: 1005 });
+    expect(read).toEqual([conflict({ agentDismissEligible: true })]);
+  });
+
+  it("normalizes a missing field to false (older snapshot, written before the field existed)", () => {
+    const file = activeConflictCachePath("sess_1", home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        ts: 1000,
+        conflicts: [{ caseId: "case_1", openedAt: "2026-06-26T00:00:00.000Z", reason: "r" }],
+      }),
+    );
+    const read = readActiveConflicts("sess_1", { home, nowSeconds: 1005 });
+    expect(read).toEqual([{ caseId: "case_1", openedAt: "2026-06-26T00:00:00.000Z", reason: "r", agentDismissEligible: false }]);
+  });
+
+  it("normalizes a non-boolean field to false (corrupted snapshot)", () => {
+    const file = activeConflictCachePath("sess_1", home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        ts: 1000,
+        conflicts: [
+          { caseId: "case_1", openedAt: "2026-06-26T00:00:00.000Z", reason: "r", agentDismissEligible: "true" },
+          { caseId: "case_2", openedAt: "2026-06-26T00:00:00.000Z", reason: "r", agentDismissEligible: 1 },
+        ],
+      }),
+    );
+    const read = readActiveConflicts("sess_1", { home, nowSeconds: 1005 });
+    expect(read.every((c) => c.agentDismissEligible === false)).toBe(true);
   });
 });
 

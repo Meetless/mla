@@ -31,6 +31,7 @@ import {
   recordAnalyticsEvent,
 } from "../lib/analytics/recorder";
 import { machineId } from "../lib/analytics/store";
+import { traceUploadEnabled } from "../lib/analytics/consent";
 
 export interface EvidenceInjectArgs {
   turnIndex: number | null;
@@ -186,6 +187,10 @@ export async function runInternalEvidenceInject(
       retrieval_confidence: args.confidence,
       retrieval_latency_ms: args.latencyMs,
       createdAtMs: nowMs,
+      // Content-upload consent at inject time (§6.4). Read here (the command owns env
+      // access) and threaded in so buildInjectPayload stays hermetic. When false the
+      // seal path never stages or POSTs a capture for this inject.
+      traceUploadConsented: traceUploadEnabled(env),
       ...(args.injectId ? { injectId: args.injectId } : {}),
     });
 

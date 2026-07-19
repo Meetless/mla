@@ -1,0 +1,338 @@
+{
+  "normalization": [
+    {
+      "label": "no-op: plain ascii (raw hash == normalized hash)",
+      "raw": "hello world",
+      "version": "content-normalization-v1",
+      "normalized": "hello world",
+      "normalizedContentHash": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+      "rawContentHash": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    },
+    {
+      "label": "CRLF to LF",
+      "raw": "a\r\nb",
+      "version": "content-normalization-v1",
+      "normalized": "a\nb",
+      "normalizedContentHash": "7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78",
+      "rawContentHash": "18745f36a05e29072709042d6062ce54f1b08ff36c27ba80c39f81fb010c8ce2"
+    },
+    {
+      "label": "lone CR to LF",
+      "raw": "a\rb",
+      "version": "content-normalization-v1",
+      "normalized": "a\nb",
+      "normalizedContentHash": "7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78",
+      "rawContentHash": "af9081672dd5ef3247a30c2db5b0dafcc9bcf981a26aefb3c55d210d43fcc14e"
+    },
+    {
+      "label": "mixed CRLF and lone CR",
+      "raw": "a\r\nb\rc",
+      "version": "content-normalization-v1",
+      "normalized": "a\nb\nc",
+      "normalizedContentHash": "ea7fb08b7a2dc4619ffb7c7bb38d95a2047935fa165d71b12efd3852a2e6d0cc",
+      "rawContentHash": "03b1360e770ce9cd95ee7db455c6bcd6237688889d5d46a3ca8dfcae6db63242"
+    },
+    {
+      "label": "leading BOM stripped",
+      "raw": "﻿hi",
+      "version": "content-normalization-v1",
+      "normalized": "hi",
+      "normalizedContentHash": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
+      "rawContentHash": "7611e336d2b333aa772acee003373474c86cd9ce975c10d66a4b0156e8641dca"
+    },
+    {
+      "label": "interior FEFF preserved, only leading BOM stripped",
+      "raw": "﻿a﻿b",
+      "version": "content-normalization-v1",
+      "normalized": "a﻿b",
+      "normalizedContentHash": "47a12dcb64e9ad8dc2c0819464d72388679ea0da7811edea2acedaf2f13deda7",
+      "rawContentHash": "ee3c9317a6ef9f77cbd9e3cb8158aee81ec8d631534c75ca547f01538cf6300d"
+    },
+    {
+      "label": "NFC composes decomposed cafe + combining acute",
+      "raw": "café",
+      "version": "content-normalization-v1",
+      "normalized": "café",
+      "normalizedContentHash": "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e",
+      "rawContentHash": "81ef060bcd98adc7824eb5c1ada83c32491b16018e11e79f00ab9d09e04b015a"
+    },
+    {
+      "label": "empty string",
+      "raw": "",
+      "version": "content-normalization-v1",
+      "normalized": "",
+      "normalizedContentHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "rawContentHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "trailing newline preserved (no trim)",
+      "raw": "x\n",
+      "version": "content-normalization-v1",
+      "normalized": "x\n",
+      "normalizedContentHash": "73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac",
+      "rawContentHash": "73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac"
+    },
+    {
+      "label": "astral char passes through unchanged",
+      "raw": "a😀b",
+      "version": "content-normalization-v1",
+      "normalized": "a😀b",
+      "normalizedContentHash": "6fba5b2ea783ded096fc2444d540ffbdf49168df30993b155b7efb683313f110",
+      "rawContentHash": "6fba5b2ea783ded096fc2444d540ffbdf49168df30993b155b7efb683313f110"
+    }
+  ],
+  "slice": [
+    {
+      "label": "ascii interior slice",
+      "content": "hello",
+      "contentHash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "version": "content-normalization-v1",
+      "codePointLength": 5,
+      "startOffset": 1,
+      "endOffset": 4,
+      "slice": "ell"
+    },
+    {
+      "label": "ascii full slice",
+      "content": "hello",
+      "contentHash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "version": "content-normalization-v1",
+      "codePointLength": 5,
+      "startOffset": 0,
+      "endOffset": 5,
+      "slice": "hello"
+    },
+    {
+      "label": "empty span (start == end)",
+      "content": "hello",
+      "contentHash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "version": "content-normalization-v1",
+      "codePointLength": 5,
+      "startOffset": 2,
+      "endOffset": 2,
+      "slice": ""
+    },
+    {
+      "label": "astral: slice before the emoji",
+      "content": "a😀b",
+      "contentHash": "6fba5b2ea783ded096fc2444d540ffbdf49168df30993b155b7efb683313f110",
+      "version": "content-normalization-v1",
+      "codePointLength": 3,
+      "startOffset": 0,
+      "endOffset": 1,
+      "slice": "a"
+    },
+    {
+      "label": "astral: slice exactly the emoji",
+      "content": "a😀b",
+      "contentHash": "6fba5b2ea783ded096fc2444d540ffbdf49168df30993b155b7efb683313f110",
+      "version": "content-normalization-v1",
+      "codePointLength": 3,
+      "startOffset": 1,
+      "endOffset": 2,
+      "slice": "😀"
+    },
+    {
+      "label": "astral: slice after the emoji",
+      "content": "a😀b",
+      "contentHash": "6fba5b2ea783ded096fc2444d540ffbdf49168df30993b155b7efb683313f110",
+      "version": "content-normalization-v1",
+      "codePointLength": 3,
+      "startOffset": 2,
+      "endOffset": 3,
+      "slice": "b"
+    },
+    {
+      "label": "astral: whole string",
+      "content": "a😀b",
+      "contentHash": "6fba5b2ea783ded096fc2444d540ffbdf49168df30993b155b7efb683313f110",
+      "version": "content-normalization-v1",
+      "codePointLength": 3,
+      "startOffset": 0,
+      "endOffset": 3,
+      "slice": "a😀b"
+    },
+    {
+      "label": "multiple emoji tail slice",
+      "content": "😀😁😂",
+      "contentHash": "d7534e4aab2425def4bf739532e9a9de8eb945788fb896aa97f09e2874e5ecb6",
+      "version": "content-normalization-v1",
+      "codePointLength": 3,
+      "startOffset": 1,
+      "endOffset": 3,
+      "slice": "😁😂"
+    },
+    {
+      "label": "composed accent single code point",
+      "content": "café",
+      "contentHash": "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e",
+      "version": "content-normalization-v1",
+      "codePointLength": 4,
+      "startOffset": 3,
+      "endOffset": 4,
+      "slice": "é"
+    }
+  ],
+  "containment": [
+    {
+      "label": "inner strictly inside outer",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 3,
+        "endOffset": 5,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": true
+    },
+    {
+      "label": "inner equals outer",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": true
+    },
+    {
+      "label": "inner on left edge",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 4,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": true
+    },
+    {
+      "label": "inner on right edge",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 6,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": true
+    },
+    {
+      "label": "inner starts before outer",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 1,
+        "endOffset": 5,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": false
+    },
+    {
+      "label": "inner ends after outer",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 5,
+        "endOffset": 9,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": false
+    },
+    {
+      "label": "disjoint",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 10,
+        "endOffset": 12,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": false
+    },
+    {
+      "label": "empty inner inside",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 2,
+        "endOffset": 8,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 5,
+        "endOffset": 5,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": true
+    },
+    {
+      "label": "different hash never contains",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 0,
+        "endOffset": 10,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "84fd0a04935391ac64e290194fc05c065f112c56b38b6098cefc5b1bb4e83f16",
+        "startOffset": 1,
+        "endOffset": 2,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "contains": false
+    },
+    {
+      "label": "different version never contains",
+      "outer": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 0,
+        "endOffset": 10,
+        "normalizationVersion": "content-normalization-v1"
+      },
+      "inner": {
+        "normalizedContentHash": "215f21085aeaf4107f8468baebe2eeffd6e456a301f2bff9d808181abfd78d34",
+        "startOffset": 1,
+        "endOffset": 2,
+        "normalizationVersion": "content-normalization-v2"
+      },
+      "contains": false
+    }
+  ]
+}

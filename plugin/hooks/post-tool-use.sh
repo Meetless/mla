@@ -310,6 +310,33 @@ if [[ "$TOOL" == "Edit" || "$TOOL" == "Write" || "$TOOL" == "MultiEdit" || "$TOO
       --arg story "$FILE_STORY" \
       '{ts: $ts, event: $event, eventKey: $key, sessionId: $sessionId, payload: {tool: $tool, filePath: $fp, storyCategory: $story}}')"
     spool_append "$SESSION_ID" "$LINE"
+
+    # ---- Evidence material-incorporation P1: stage the changed hunk(s) --------
+    # notes/20260716-evidence-material-incorporation-correlator.md (§5, §8, §10.6, §11).
+    # UNLIKE the metadata-only tool_used_file event above, this stages the actual
+    # changed CODE (a diff-shaped hunk) so the seal-on-window-close builder has the
+    # agent's OWN work product before auto-compaction can drop it from the transcript.
+    # It DELIBERATELY crosses the v0 privacy boundary and so is gated on the SAME
+    # content-upload consent as trace upload -- the check lives inside the command AND
+    # inside the store's append helpers (traceUploadEnabled); nothing is staged when
+    # consent is off. Content is redacted + byte-capped downstream. The turn is READ
+    # (never advanced) here, exactly like the report/citation path. Single-writer: the
+    # append rides under its own ml_lock so it never races another writer to this store.
+    # Best-effort and fail-soft: a missing binary, a timeout, or any error is swallowed
+    # and never disturbs the governed tool spool above.
+    if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
+      mkdir -p "$LOG_DIR" 2>/dev/null || true
+      WP_TURN="$(current_turn_index "$SESSION_ID" 2>/dev/null || echo 0)"
+      _wp_to="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+      (
+        ml_lock 7 "$LOG_DIR/work-product-capture.lock"
+        printf '%s' "$INPUT" \
+          | ${_wp_to:+"$_wp_to" 5} "$MLA_PATH" _internal capture-work-product \
+              --event post_tool_use --session "$SESSION_ID" --turn "$WP_TURN" \
+              >/dev/null 2>&1 || true
+        ml_unlock 7 "$LOG_DIR/work-product-capture.lock"
+      ) || true
+    fi
   fi
 fi
 

@@ -35,6 +35,18 @@ export interface ActiveConflict {
   caseId: string;
   openedAt: string;
   reason: string;
+  /**
+   * Whether control marked THIS conflict agent-dismissible as a verified false
+   * positive (Task 6 projection: `deriveAgentFalsePositiveDismissEligibility` over
+   * the raw case fields, surfaced on the active-conflict projection). Optional on
+   * the type because older snapshots (written before this field existed) and
+   * hand-built values omit it; `coerceConflicts` normalizes a missing / non-boolean
+   * value to `false` on read (fail-closed), so a stale snapshot can never invite a
+   * dismiss steer for a conflict control did not bless. Only an explicit `true` from
+   * a fresh projection enables the PreToolUse verify-then-dismiss steer
+   * (internal-pretool-observe.ts, Task 8a).
+   */
+  agentDismissEligible?: boolean;
 }
 
 // How long a snapshot stays trusted before a reader treats it as stale and fails
@@ -103,7 +115,18 @@ function coerceConflicts(raw: unknown): ActiveConflict[] {
       typeof (item as ActiveConflict).reason === "string"
     ) {
       const c = item as ActiveConflict;
-      out.push({ caseId: c.caseId, openedAt: c.openedAt, reason: c.reason });
+      out.push({
+        caseId: c.caseId,
+        openedAt: c.openedAt,
+        reason: c.reason,
+        // Fail-closed (Task 8a): only an explicit boolean `true` survives. An older
+        // snapshot omits the field entirely, and a corrupted one could carry any
+        // JSON type; either way it normalizes to `false` here, so the read boundary
+        // is the single choke point that decides whether a dismiss steer is allowed.
+        // The writer passes the control projection through verbatim; the reader is
+        // what gates it.
+        agentDismissEligible: c.agentDismissEligible === true,
+      });
     }
   }
   return out;

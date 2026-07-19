@@ -28,11 +28,21 @@ import {
   coverageGapNotUsedEventId,
 } from "../lib/analytics/coverage-gap";
 import {
+  CURRENT_CAPTURE_CONTRACT_VERSION,
+  WINDOW_TURNS,
   deriveEndedSessions,
   deriveOutcome,
   InjectRecord,
   isTerminalOutcome,
 } from "../lib/analytics/evidence";
+import { readCaptures, reapLocalCaptures } from "../lib/analytics/work-product-capture";
+import {
+  WorkProductCaptureBody,
+  buildPromptsBySession,
+  buildSealBody,
+  postWorkProductCapture,
+} from "../lib/analytics/work-product-seal";
+import { traceUploadEnabled } from "../lib/analytics/consent";
 import {
   McpCall,
   ReportCitation,
@@ -142,6 +152,11 @@ export interface EvidenceCorrelateDeps {
   record?: typeof recordAnalyticsEvent;
   flush?: typeof flushAnalyticsEvents;
   readCfg?: () => CliConfig | null;
+  // Seal seams (§8/§12.1): read the local capture store and POST the atomic intake.
+  readCaptures?: typeof readCaptures;
+  postCapture?: (cfg: CliConfig, body: WorkProductCaptureBody) => Promise<void>;
+  // Local-capture reaper seam (§11): drops staged capture files past the 48h TTL.
+  reap?: typeof reapLocalCaptures;
   nowMs?: number;
   // Test seam: pin the turn window (defaults to evidence.WINDOW_TURNS inside deriveOutcome).
   window?: number;
@@ -231,6 +246,22 @@ export async function runInternalEvidenceCorrelate(
       endedSessions,
       ...(deps.window !== undefined ? { window: deps.window } : {}),
     };
+
+    // Seal-on-window-close cohort (§8/§12.1). An inject that closes in `all_decided`
+    // (referenced OR ignored) and is capture-capable + live-consented has its work-product
+    // window sealed via ONE atomic capture-intake POST. The POSTs are DEFERRED until after
+    // the flush so control has the inject row first (§10.6 step 1 authenticates the intake
+    // through the inject's indexed (workspaceId, eventId) identity). Live consent is read
+    // once: consent withdrawn since emit means no capture request at all (§11).
+    const sealConsentLive = traceUploadEnabled(env);
+    const effectiveWindow = deps.window ?? WINDOW_TURNS;
+    const sealTasks: Array<{
+      injectId: string;
+      workspaceId: string;
+      sessionId: string;
+      turnIndex: number;
+      captureContractVersion: number;
+    }> = [];
 
     let closedCount = 0;
     let pendingCount = 0;
@@ -324,6 +355,39 @@ export async function runInternalEvidenceCorrelate(
         gapInjectIds.add(injectId);
       }
 
+      // Seal-on-window-close (§8/§12.1). A decided inject (referenced -> outcome "used",
+      // or "ignored") that is capture-capable (carries a positive emit-time
+      // work_product_capture_version) and consented (emit-time trace_upload_consented AND
+      // live consent) is queued for one atomic capture-intake POST after the flush. A
+      // referenced inject is sealed too: capture COVERAGE (§9.1) counts it in
+      // capture_expected, so it must reach capture_ready. no_opportunity / unknown are
+      // never sealed. The seal POST is deferred so the inject lands in control first.
+      const outcome = derived.payload.outcome;
+      const decided = outcome === "used" || outcome === "ignored";
+      const captureVersion =
+        typeof ev.work_product_capture_version === "number" &&
+        Number.isInteger(ev.work_product_capture_version) &&
+        ev.work_product_capture_version > 0
+          ? ev.work_product_capture_version
+          : null;
+      if (
+        decided &&
+        captureVersion !== null &&
+        ev.trace_upload_consented === true &&
+        sealConsentLive &&
+        ctx.workspaceId &&
+        inject.session_id &&
+        inject.turn_index !== null
+      ) {
+        sealTasks.push({
+          injectId,
+          workspaceId: ctx.workspaceId,
+          sessionId: inject.session_id,
+          turnIndex: inject.turn_index,
+          captureContractVersion: captureVersion,
+        });
+      }
+
       // Guard against a duplicate (S, inject_id) line in the same sweep; the
       // deterministic event_id already makes a cross-process race idempotent.
       terminallyClosed.add(injectId);
@@ -345,6 +409,52 @@ export async function runInternalEvidenceCorrelate(
     if (cfg) {
       const flush = deps.flush ?? flushAnalyticsEvents;
       await flush(cfg, env);
+
+      // Seal AFTER the flush so the inject row is durable in control before its capture
+      // intake authenticates against it (§10.6 step 1, §12.1). One best-effort POST per
+      // eligible inject: control owns idempotency + the 200/409/failed resolution, so a
+      // failure here just leaves the capture local (48h reaper) and the inject as
+      // capture-not-ready, which the metric reports honestly (§9.1). Never re-driven.
+      if (sealTasks.length > 0) {
+        const promptsBySession = buildPromptsBySession(asks);
+        const readCaps = deps.readCaptures ?? readCaptures;
+        const postCap = deps.postCapture ?? postWorkProductCapture;
+        for (const task of sealTasks) {
+          try {
+            const body = buildSealBody({
+              inject: {
+                injectId: task.injectId,
+                workspaceId: task.workspaceId,
+                sessionId: task.sessionId,
+                turnIndex: task.turnIndex,
+              },
+              captures: readCaps(task.sessionId, env),
+              promptsByTurn:
+                promptsBySession.get(task.sessionId) ?? new Map<number, string[]>(),
+              window: effectiveWindow,
+              captureContractVersion: task.captureContractVersion,
+              sealedAtIso: nowIso,
+            });
+            await postCap(cfg, body);
+          } catch {
+            // Best-effort: a failed seal never disturbs the sweep.
+          }
+        }
+      }
+    }
+
+    // Backstop reaper (§11): drop locally staged work-product captures past the 48h TTL.
+    // The seal store is keyed per SESSION and shared by every inject in that session, so
+    // there is no safe per-inject eager delete (a sibling inject's window may still be
+    // open); this age-based sweep is the guaranteed local cleanup. It touches only the
+    // work-product-capture store, never the general events file. Runs regardless of
+    // control config (a machine that staged captures then logged out still gets cleaned)
+    // and is fail-soft. The Stop-detached correlator is the natural recompute tick.
+    try {
+      const reap = deps.reap ?? reapLocalCaptures;
+      reap(env, nowMs);
+    } catch {
+      // Best-effort: a reaper failure never disturbs the sweep.
     }
 
     console.log(

@@ -131,6 +131,18 @@ export interface PersistedAssembleAudit {
   explicitPaths: string[];
   delivered: Array<{ ruleId: string; tier: string; versionId?: string; represents?: string[] }>;
   omitted: Array<{ ruleId: string; reason: string; versionId?: string }>;
+  // The prompt-time reconciliation rehash partition (ADR §3.3 item 9). Present ONLY when the
+  // scan cache carried reconciliation findings; Phase 2B populates them, so every Phase 2A cache
+  // carries none and this key is omitted from every 2A audit. `kept` = findings whose cited file's
+  // current content-normalization-v1 digest still equals the evaluated digest (eligible to inject,
+  // pending the blocked Phase-3 renderer). `needsReevaluation` = findings dropped from THIS prompt
+  // because the file drifted (`digest_drift`), could not be read (`unreadable`), or failed
+  // normalization (`normalization_error`); never auto-resolved (item #6), only held back. This
+  // audit is the sole Phase 2A consumer of the rehash, so it is where the partition is observed.
+  reconciliation?: {
+    kept: Array<{ path: string; reason: string }>;
+    needsReevaluation: Array<{ path: string; reason: string }>;
+  };
 }
 export function writeAssembleAudit(
   home: string | undefined,

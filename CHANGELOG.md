@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.23 (2026-07-19)
+
+This release makes your coding agent a first-class participant in resolving conflicts and
+capturing evidence. A new `meetless__dismiss_conflict` MCP tool lets the agent clear a flagged
+conflict without leaving its session, and a verify-then-dismiss steer makes it confirm what
+actually changed before it does, so dismissals stay honest. Meetless now captures the work
+product your agent produces as it goes, seals each capture when the edit window closes, and reaps
+it locally after 48 hours. Under the hood, the scanner normalizes content and stamps a local
+digest for every artifact so repeated scans reconcile idempotently instead of churning, evidence
+is validated for materiality and grounding before it counts, and `mla stats` presents coverage
+gaps as a readable roadmap instead of raw enum slugs.
+
+- your coding agent can dismiss a flagged conflict from its own session with the new `meetless__dismiss_conflict` MCP tool
+- a verify-then-dismiss steer makes the agent confirm what changed before dismissing an eligible conflict
+- Meetless captures your agent's work product as it goes, seals it when the edit window closes, and reaps it locally after 48 hours
+- evidence is validated for materiality and grounding before it is counted
+- the scanner normalizes content consistently and stamps a local digest for every scanned artifact
+- repeated scans reconcile idempotently through a prompt-time rehash gate
+- `mla stats` shows coverage gaps as a readable roadmap instead of raw enum slugs
+- fixed a doubled content-type header on the agent-dismiss path
+
 ## 0.2.22 (2026-07-17)
 
 This release makes the knowledge trust surface usable from the terminal. `mla kb promote` now

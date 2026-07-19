@@ -33,6 +33,7 @@ export const ADVERTISED_EVIDENCE_TOOLS = Object.freeze([
 // not by naming convention.
 export const MUTATING_TOOL_NAMES = Object.freeze([
   "meetless__relationship_verdict",
+  "meetless__dismiss_conflict",
 ]);
 
 /**
@@ -177,6 +178,29 @@ export const TOOLS = [
         },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "meetless__dismiss_conflict",
+    description:
+      "Dismiss a draft-vs-draft session conflict you have verified is a false positive. " +
+      "Only call this after checking both claims against the working tree, the diff, and the intent, " +
+      "and only for a conflict THIS session was told is agent-dismissible. Closing it durably queues " +
+      "re-detection suppression (effective asynchronously). Leave real or uncertain conflicts for a human.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["case_id", "rationale"],
+      properties: {
+        case_id: {
+          type: "string",
+          description: "The conflict case id from this session's snapshot.",
+        },
+        rationale: {
+          type: "string",
+          description: "Why you concluded this is a false positive.",
+        },
+      },
     },
   },
 ];

@@ -321,15 +321,16 @@ describe("buildDashboard", () => {
 });
 
 describe("renderDashboard", () => {
-  it("labels reference precision as the v1 honest wording and shows the pending count", () => {
+  it("labels reference follow-through as the v1 honest wording and shows the pending count", () => {
     const events = [
       inject({ id: "p1", createdMsAgo: 1 * DAY, offered: 1, offeredIds: ["NT:a"] }),
     ];
     const d = buildDashboard(events, 30, NOW);
     const text = renderDashboard(d, false);
-    expect(text).toContain("Reference Precision (v1)");
+    expect(text).toContain("Reference follow-through (v1)");
     expect(text).toContain("pending");
     expect(text).not.toContain("Inject Precision"); // §4.2: never call v1 that
+    expect(text).not.toContain("Reference Precision"); // rollout step 4: no longer "precision"
   });
 
   it("only shows the activity footnote under --verbose", () => {
@@ -372,6 +373,20 @@ describe("renderDashboard", () => {
     const d = buildDashboard(events, 30, NOW);
     expect(renderDashboard(d, false)).not.toContain("by tool:");
     expect(renderDashboard(d, true)).toContain("by tool: Edit 1");
+  });
+
+  it("labels coverage gaps in plain English instead of dumping the raw enum slug", () => {
+    const events = [
+      coverageGap("candidates_found_not_used", 1 * DAY),
+      coverageGap("low_confidence_candidates", 2 * DAY),
+    ];
+    const d = buildDashboard(events, 30, NOW);
+    const text = renderDashboard(d, false);
+    expect(text).toContain("Found but unused: 1");
+    expect(text).toContain("Weak matches: 1");
+    // The bug: the internal slug must never survive into the rendered roadmap.
+    expect(text).not.toContain("candidates_found_not_used");
+    expect(text).not.toContain("low_confidence_candidates");
   });
 });
 

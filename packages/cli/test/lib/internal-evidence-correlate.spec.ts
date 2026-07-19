@@ -13,6 +13,11 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+// Type-only (erased at compile, so they never defeat jest.resetModules): the seal
+// seams are typed against the real dep signatures the correlator declares.
+import type { CliConfig } from "../../src/lib/config";
+import type { WorkProductCaptureBody } from "../../src/lib/analytics/work-product-seal";
+import type { ForwardResult } from "../../src/lib/analytics/forwarder";
 
 jest.mock("../../src/lib/http", () => ({
   post: jest.fn().mockResolvedValue({}),
@@ -75,6 +80,9 @@ describe("runInternalEvidenceCorrelate", () => {
     turn: number,
     sids = "NT:20260529-foo.md,PR:bar",
     extra: string[] = [],
+    // Emit-time env override: a case that seeds the inject with trace upload OFF gets an
+    // inject payload carrying trace_upload_consented:false (the seal path then skips it).
+    envOverride?: NodeJS.ProcessEnv,
   ): Promise<string> {
     await inject.runInternalEvidenceInject(
       [
@@ -96,7 +104,13 @@ describe("runInternalEvidenceCorrelate", () => {
         "ws_1",
         ...extra,
       ],
-      { readCfg: () => null, machineId: () => "m_test", mintRunId: () => "run_inj", nowMs: NOW },
+      {
+        readCfg: () => null,
+        machineId: () => "m_test",
+        mintRunId: () => "run_inj",
+        nowMs: NOW,
+        ...(envOverride ? { env: envOverride } : {}),
+      },
     );
     const injects = store.readEvents().filter((e) => (e as { event_type: string }).event_type === "mla_evidence_inject");
     return (injects[injects.length - 1] as unknown as { inject_id: string }).inject_id;
@@ -111,6 +125,37 @@ describe("runInternalEvidenceCorrelate", () => {
   // synthetic ask-traces lines so the per-session max turn is whatever the case needs.
   const logsWithMaxTurn = (turn: number) => (file: string): Record<string, unknown>[] =>
     file === "ask-traces.jsonl" ? [{ session_id: "s1", turn_index: turn }] : [];
+
+  // Seed an inject the raw way (via the recorder) so its payload OMITS
+  // work_product_capture_version. The live command always stamps it (=1), so this is
+  // the only way to exercise the correlator's "not capture-capable -> never seal" guard.
+  // Everything the close path needs (run/trace/session/turn/offered ids/deadline) is present.
+  function seedRawInjectNoCaptureVersion(turn: number): string {
+    const injectId = "inj_no_capture_version";
+    recorder.recordAnalyticsEvent(
+      {
+        workspaceId: "ws_1",
+        sessionId: "s1",
+        runId: "run_inj",
+        traceId: TRACE,
+        source: "hook",
+        now: new Date(NOW).toISOString(),
+      },
+      {
+        eventType: "mla_evidence_inject",
+        eventId: injectId,
+        payload: {
+          inject_id: injectId,
+          turn_index: turn,
+          offered_source_ids: ["NT:20260529-foo.md"],
+          window_deadline: new Date(NOW + evidence.WINDOW_MS).toISOString(),
+          trace_upload_consented: true,
+          zero_results: true, // suppress the outcome-time coverage gap (irrelevant here)
+        },
+      },
+    );
+    return injectId;
+  }
 
   it("rejects an unknown flag with exit 2", async () => {
     expect(await correlate.runInternalEvidenceCorrelate(["--bogus"], {})).toBe(2);
@@ -402,9 +447,15 @@ describe("runInternalEvidenceCorrelate", () => {
       }),
       nowMs: RUN,
     });
-    expect(httpPost).toHaveBeenCalledTimes(1);
-    const [, route, body] = httpPost.mock.calls[0];
-    expect(route).toBe("/internal/v1/analytics/events");
+    // The decided (ignored), consented, capture-capable inject now ALSO seals its
+    // window: with nothing staged that seal is a `failed` POST to the capture route
+    // (asserted in the seal-on-window-close block). Isolate the analytics forward by
+    // route so this test stays about outcome forwarding, not the seal.
+    const analyticsCalls = httpPost.mock.calls.filter(
+      (c) => c[1] === "/internal/v1/analytics/events",
+    );
+    expect(analyticsCalls).toHaveLength(1);
+    const body = analyticsCalls[0][2];
     // A confident, non-empty inject that closes ignored forwards BOTH the outcome
     // and the paired outcome-time candidates_found_not_used coverage gap.
     const forwarded = (body as { events: { event_type: string }[] }).events;
@@ -449,5 +500,357 @@ describe("runInternalEvidenceCorrelate", () => {
       nowMs: RUN,
     });
     expect(code).toBe(0);
+  });
+
+  // --- local capture reaper wiring (§11 backstop, WORK_PRODUCT_CAPTURE_LOCAL_TTL_HOURS) ---
+  // Every sweep drops locally staged work-product captures past the 48h TTL. The store is
+  // per-session (shared by sibling injects), so there is no safe per-inject eager delete;
+  // this age-based sweep is the guaranteed local cleanup. It runs regardless of control
+  // config and never disturbs the sweep.
+  describe("local capture reaper wiring (§11)", () => {
+    it("invokes the reaper once per sweep with the sweep's env + clock", async () => {
+      await seedInject(5);
+      recorder.resetRecorderForTesting();
+      const reap = jest.fn((_env?: NodeJS.ProcessEnv, _nowMs?: number) => 0);
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => null, // no forward: proves the reaper runs even with no control cfg
+        reap,
+        nowMs: RUN,
+      });
+      expect(reap).toHaveBeenCalledTimes(1);
+      const [envArg, nowArg] = reap.mock.calls[0];
+      expect(envArg).toBe(process.env); // deps.env defaulted to process.env
+      expect(nowArg).toBe(RUN); // the same clock the close path used
+    });
+
+    it("a reaper that throws never disturbs the sweep (fail-soft, exit 0, outcome still landed)", async () => {
+      const injectId = await seedInject(5);
+      recorder.resetRecorderForTesting();
+      const code = await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => null,
+        reap: () => {
+          throw new Error("unlink EPERM");
+        },
+        nowMs: RUN,
+      });
+      expect(code).toBe(0);
+      expect(outcomes()[0].inject_id).toBe(injectId);
+      expect(outcomes()[0].outcome).toBe("ignored");
+    });
+
+    it("end to end: a full sweep reaps a stale capture file and keeps a fresh one", async () => {
+      const wpc = require("../../src/lib/analytics/work-product-capture");
+      // Stage two real capture files under the tmp MEETLESS_HOME store.
+      wpc.appendHunkCapture(
+        { sessionId: "stale", turnIndex: 5, file: "/repo/a.ts", tool: "Edit", hunk: "code" },
+        process.env,
+      );
+      wpc.appendHunkCapture(
+        { sessionId: "fresh", turnIndex: 5, file: "/repo/b.ts", tool: "Edit", hunk: "code" },
+        process.env,
+      );
+      const stalePath = wpc.captureSessionPath("stale", process.env);
+      const freshPath = wpc.captureSessionPath("fresh", process.env);
+      expect(fs.existsSync(stalePath)).toBe(true);
+      expect(fs.existsSync(freshPath)).toBe(true);
+
+      // Backdate the stale file past the 48h TTL; leave the fresh one recent.
+      const hourMs = 60 * 60 * 1000;
+      const oldSecs = (RUN - (wpc.WORK_PRODUCT_CAPTURE_LOCAL_TTL_HOURS + 1) * hourMs) / 1000;
+      fs.utimesSync(stalePath, oldSecs, oldSecs);
+      const freshSecs = (RUN - hourMs) / 1000;
+      fs.utimesSync(freshPath, freshSecs, freshSecs);
+
+      await seedInject(5);
+      recorder.resetRecorderForTesting();
+      // A full sweep with the REAL reaper (no seam) at the sweep clock.
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => null,
+        nowMs: RUN,
+      });
+      expect(fs.existsSync(stalePath)).toBe(false); // reaped
+      expect(fs.existsSync(freshPath)).toBe(true); // kept
+    });
+  });
+
+  // --- seal-on-window-close: the atomic capture-intake POST (§8, §12.1) --------
+  // A DECIDED inject (referenced -> outcome "used", or "ignored") that is capture-capable
+  // (positive emit-time work_product_capture_version) AND consented (emit-time
+  // trace_upload_consented AND live consent at correlate time) has its work-product window
+  // sealed via ONE best-effort POST, DEFERRED until after the flush so control has the
+  // inject row first (§10.6 step 1). These stage REAL captures onto disk under the tmp
+  // MEETLESS_HOME and assert the exact POST body through a postCapture seam; readCaptures
+  // reads the real bytes (no store mock), and a flush seam records call order.
+  describe("seal-on-window-close (§8, §12.1)", () => {
+    const NOW_ISO = new Date(NOW).toISOString();
+    const RUN_ISO = new Date(RUN).toISOString();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const CFG: CliConfig = {
+      controlUrl: "http://127.0.0.1:9",
+      controlToken: "t",
+      mlaPath: "/tmp/mla",
+      auth: { mode: "shared-key" as const, accessToken: "t" },
+    };
+
+    // The seal path is content-upload consent gated; make emit + correlate default to ON
+    // unless a case flips it, and never leak the flag to a sibling test.
+    beforeEach(() => {
+      delete process.env.MEETLESS_TRACE_UPLOAD;
+    });
+    afterEach(() => {
+      delete process.env.MEETLESS_TRACE_UPLOAD;
+    });
+
+    // A postCapture + flush seam pair that records call ORDER and every POST body, so a
+    // case can assert both WHAT was sealed and that the flush ran first.
+    const emptyForward: ForwardResult = {
+      attempted: 0,
+      forwarded: 0,
+      skippedConsent: false,
+      skippedNotEmittable: 0,
+      failed: 0,
+    };
+
+    function seams(): {
+      bodies: WorkProductCaptureBody[];
+      order: string[];
+      postCapture: (cfg: CliConfig, body: WorkProductCaptureBody) => Promise<void>;
+      flush: () => Promise<ForwardResult>;
+    } {
+      const bodies: WorkProductCaptureBody[] = [];
+      const order: string[] = [];
+      const postCapture = jest.fn(
+        async (_cfg: CliConfig, body: WorkProductCaptureBody): Promise<void> => {
+          order.push("post");
+          bodies.push(body);
+        },
+      );
+      const flush = jest.fn(async (): Promise<ForwardResult> => {
+        order.push("flush");
+        return emptyForward;
+      });
+      return { bodies, order, postCapture, flush };
+    }
+
+    function stageHunk(turn: number): void {
+      require("../../src/lib/analytics/work-product-capture").appendHunkCapture(
+        {
+          sessionId: "s1",
+          turnIndex: turn,
+          file: "/repo/a.ts",
+          tool: "Edit",
+          hunk: "- const x = 1;\n+ const x = 2;",
+          nowIso: NOW_ISO,
+        },
+        process.env,
+      );
+    }
+
+    function stageAssistant(turn: number, text: string): void {
+      require("../../src/lib/analytics/work-product-capture").appendAssistantOutputCapture(
+        { sessionId: "s1", turnIndex: turn, text, nowIso: NOW_ISO },
+        process.env,
+      );
+    }
+
+    // ask-traces to turn 8 (closes the turn-5 window at turn_limit) + one evidence pull at
+    // turn 6 referencing an offered id -> outcome "used".
+    const usedLog = (file: string): Record<string, unknown>[] => {
+      if (file === "ask-traces.jsonl") return [{ session_id: "s1", turn_index: 8 }];
+      if (file === "mcp-calls.jsonl")
+        return [
+          { session_id: "s1", turn_index: 6, evidence_tool: true, source_ids: ["NT:20260529-foo"], query: "q" },
+        ];
+      return [];
+    };
+
+    it("a referenced (used) inject seals with the §5 digest for its exact window", async () => {
+      const injectId = await seedInject(5);
+      stageHunk(6); // a real changed-code hunk inside the window [5, 8]
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      const code = await correlate.runInternalEvidenceCorrelate([], {
+        readLog: usedLog,
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN,
+      });
+      expect(code).toBe(0);
+      expect(outcomes()[0].outcome).toBe("used");
+      expect(s.bodies).toHaveLength(1);
+      const body = s.bodies[0];
+      expect(body.status).toBe("sealed");
+      expect(body.injectId).toBe(injectId);
+      expect(body.captureContractVersion).toBe(evidence.CURRENT_CAPTURE_CONTRACT_VERSION);
+      expect(body.capturedTurnStart).toBe(5);
+      expect(body.capturedTurnEnd).toBe(8);
+      const digest = JSON.parse(String(body.workProductDigest)) as Record<string, unknown>;
+      expect(digest.window_start_turn).toBe(5);
+      expect(digest.window_end_turn).toBe(8);
+      expect(digest.capture_contract_version).toBe(1);
+      expect(digest.sealed_at).toBe(RUN_ISO);
+      const turns = digest.turns as Array<{ changed_hunks: unknown[] }>;
+      expect(turns.some((t) => t.changed_hunks.length > 0)).toBe(true);
+    });
+
+    it("an ignored inject with staged output seals (referenced=false is still capture_expected)", async () => {
+      await seedInject(5);
+      stageAssistant(6, "Here is the closing summary for the turn.");
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8), // turn_limit -> ignored
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN,
+      });
+      expect(outcomes()[0].outcome).toBe("ignored");
+      expect(s.bodies).toHaveLength(1);
+      expect(s.bodies[0].status).toBe("sealed");
+      expect(typeof s.bodies[0].workProductDigest).toBe("string");
+    });
+
+    it("a decided-but-empty window seals as `failed` with NO digest body", async () => {
+      await seedInject(5); // consented + capable, but nothing is staged for the window
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN,
+      });
+      expect(outcomes()[0].outcome).toBe("ignored");
+      expect(s.bodies).toHaveLength(1);
+      expect(s.bodies[0].status).toBe("failed");
+      expect(s.bodies[0].workProductDigest).toBeUndefined();
+    });
+
+    it("a no_opportunity close is never sealed (terminal but not decided)", async () => {
+      await seedInject(5);
+      stageAssistant(5, "some output"); // present, but the outcome is not decided
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(5), // no later turn -> session_ended / no_opportunity
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: NOW + DAY_MS + 1000, // > 24h -> s1 ended
+      });
+      expect(outcomes()[0].outcome).toBe("no_opportunity");
+      expect(s.bodies).toHaveLength(0);
+    });
+
+    it("does NOT seal when live consent was withdrawn since inject time", async () => {
+      await seedInject(5);
+      stageAssistant(6, "output");
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN,
+        env: { ...process.env, MEETLESS_TRACE_UPLOAD: "off" }, // live consent off
+      });
+      expect(outcomes()[0].outcome).toBe("ignored"); // outcome still closes
+      expect(s.bodies).toHaveLength(0); // but nothing is sealed
+    });
+
+    it("does NOT seal an inject whose emit-time consent was false", async () => {
+      // Recorded under trace-upload OFF -> the inject carries trace_upload_consented:false.
+      await seedInject(5, "NT:20260529-foo.md,PR:bar", [], {
+        ...process.env,
+        MEETLESS_TRACE_UPLOAD: "off",
+      });
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN, // live consent ON here, but the emit-time flag gates it out
+      });
+      expect(outcomes()[0].outcome).toBe("ignored");
+      expect(s.bodies).toHaveLength(0);
+    });
+
+    it("does NOT seal an inject with no work_product_capture_version (not capture-capable)", async () => {
+      const injectId = seedRawInjectNoCaptureVersion(5);
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN,
+      });
+      // The inject still closes (proves it was processed, not skipped for another reason).
+      expect(outcomes().find((o) => o.inject_id === injectId)?.outcome).toBe("ignored");
+      expect(s.bodies).toHaveLength(0);
+    });
+
+    it("does NOT seal when the run has no control config (nothing to authenticate against)", async () => {
+      await seedInject(5);
+      stageAssistant(6, "output");
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => null, // no cfg -> the whole flush+seal block is skipped
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN,
+      });
+      expect(outcomes()[0].outcome).toBe("ignored"); // outcome still recorded locally
+      expect(s.bodies).toHaveLength(0);
+      expect(s.order).toEqual([]); // neither flush nor seal ran
+    });
+
+    it("flushes the inject BEFORE it POSTs the capture intake (§10.6 step 1)", async () => {
+      await seedInject(5);
+      stageAssistant(6, "output for ordering test");
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: s.postCapture,
+        nowMs: RUN,
+      });
+      expect(s.bodies).toHaveLength(1);
+      expect(s.order).toEqual(["flush", "post"]);
+    });
+
+    it("a seal POST that throws never disturbs the sweep (best-effort, exit 0)", async () => {
+      await seedInject(5);
+      stageAssistant(6, "output");
+      recorder.resetRecorderForTesting();
+      const s = seams();
+      const throwingPost = jest.fn(async () => {
+        throw new Error("control 500");
+      });
+      const code = await correlate.runInternalEvidenceCorrelate([], {
+        readLog: logsWithMaxTurn(8),
+        readCfg: () => CFG,
+        flush: s.flush,
+        postCapture: throwingPost,
+        nowMs: RUN,
+      });
+      expect(code).toBe(0);
+      expect(throwingPost).toHaveBeenCalledTimes(1);
+      expect(outcomes()[0].outcome).toBe("ignored"); // the outcome still landed
+    });
   });
 });

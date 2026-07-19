@@ -362,6 +362,17 @@ export interface EvidenceInjectPayload {
   retrieval_latency_ms: number;
   zero_results: boolean;
   window_deadline: string;
+  // Material-incorporation correlator provenance (notes/20260716-evidence-material-incorporation-correlator.md §6.4).
+  // Both additive keys are known at prompt-submit; they let the seal path and the
+  // downstream rollup reason about this inject WITHOUT re-deriving CLI state.
+  //   trace_upload_consented: the value of traceUploadEnabled(env) at inject time.
+  //     When false the client never stages a work-product capture and never POSTs an
+  //     intake, so no seal event is ever emitted for this inject (zero-egress path).
+  //   work_product_capture_version: the capture schema THIS client is capable of
+  //     emitting (CURRENT_CAPTURE_CONTRACT_VERSION), or null for an old/non-capable
+  //     client. It says the client CAN capture, not that it DID.
+  trace_upload_consented: boolean;
+  work_product_capture_version: number | null;
 }
 
 export interface EvidenceOutcomePayload {

@@ -198,6 +198,31 @@ REPORT_LINE="$(jq -c -n \
   ml_unlock 9 "$LOG_DIR/report-citations.lock"
 )
 
+# ---- Evidence material-incorporation P1: stage the closing assistant output ----
+# notes/20260716-evidence-material-incorporation-correlator.md (§5, §8, §10.6, §11).
+# The agent's CLOSING message (FINAL_MSG above, already end_turn-extracted and
+# flush-settled) is part of the judged work product: the seal-on-window-close builder
+# pairs it with the PostToolUse hunks so materiality is judged over what the agent
+# actually produced this turn. Piped as raw text on stdin so we reuse stop.sh's careful
+# extraction rather than re-parsing the transcript in TS. DELIBERATELY crosses the v0
+# privacy boundary and so is gated on trace-upload consent INSIDE the command and the
+# store's append helper (traceUploadEnabled); nothing is staged when consent is off.
+# Content is redacted + byte-capped downstream. The turn is the READ counter
+# (REPORT_TURN, never advanced here). Single-writer under the SAME lock the post-tool-use
+# hunk capture uses. Best-effort and fail-soft: a missing binary, a timeout, or any error
+# is swallowed and never aborts Stop.
+if [[ -n "$FINAL_MSG" && -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
+  _wp_to="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  (
+    ml_lock 7 "$LOG_DIR/work-product-capture.lock"
+    printf '%s' "$FINAL_MSG" \
+      | ${_wp_to:+"$_wp_to" 5} "$MLA_PATH" _internal capture-work-product \
+          --event stop --session "$SESSION_ID" --turn "$REPORT_TURN" \
+          >/dev/null 2>&1 || true
+    ml_unlock 7 "$LOG_DIR/work-product-capture.lock"
+  ) || true
+fi
+
 # End-of-run review card: up to 5 deterministic stale signals, appended to the local
 # review-cards.jsonl for `mla status` / `mla context list`. See write_stop_review_card
 # in common.sh (it owns the state-path resolution and is driven directly by

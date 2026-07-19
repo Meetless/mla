@@ -83,6 +83,7 @@ import { runInternalAutoIndex } from "./commands/internal-auto-index";
 import { runInternalEvidenceInject } from "./commands/internal-evidence-inject";
 import { runInternalRuleMeter } from "./commands/internal-rule-meter";
 import { runInternalEvidenceCorrelate } from "./commands/internal-evidence-correlate";
+import { runInternalCaptureWorkProduct } from "./commands/internal-capture-work-product";
 import {
   runInternalEvidenceTurnOpen,
   runInternalEvidenceCapture,
@@ -891,6 +892,14 @@ export const COMMANDS: CommandSpec[] = [
   mla _internal evidence-stop
                     (CE0 RECORD_ONLY: freeze the turn obligation's eligibility
                      boundary; fired from the Stop hook)
+  mla _internal capture-work-product --event <post_tool_use|stop>
+                    --session <id> --turn <n>
+                    (stage the agent's own work product LIVE for the evidence
+                     material-incorporation correlator: post_tool_use composes the
+                     changed-code hunk(s) from the PostToolUse hook JSON on stdin;
+                     stop stages the turn's closing assistant message (piped on
+                     stdin) as an assistant_output. Redacted + byte-capped +
+                     consent-gated in the store; fail-soft, always exits 0)
   mla _internal steer-sync --session <sid>
                     (pull pending cross-session steers into the local cache and
                      mark the surfaced ones injected; invoked by flush.sh)
@@ -949,6 +958,7 @@ export const COMMANDS: CommandSpec[] = [
       if (sub === "evidence-inject") return runInternalEvidenceInject(rest);
       if (sub === "rule-meter") return runInternalRuleMeter(rest);
       if (sub === "evidence-correlate") return runInternalEvidenceCorrelate(rest);
+      if (sub === "capture-work-product") return runInternalCaptureWorkProduct(rest);
       if (sub === "evidence-turn-open") return runInternalEvidenceTurnOpen(rest);
       if (sub === "evidence-capture") return runInternalEvidenceCapture(rest);
       if (sub === "evidence-stop") return runInternalEvidenceStop(rest);

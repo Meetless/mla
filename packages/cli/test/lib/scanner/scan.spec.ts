@@ -4,6 +4,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { scanWorkspace } from "../../../src/lib/scanner/scan";
+import {
+  CONTENT_NORMALIZATION_V1,
+  normalizedContentHash,
+} from "../../../src/lib/scanner/content-normalization";
 import { agentMemoryDir } from "../../../src/lib/scanner/agent-memory";
 import {
   MANAGED_RULES_PATH,
@@ -53,6 +57,41 @@ describe("scanWorkspace", () => {
     const adrSignals = result.staleSignals.filter((s) => s.source === "docs/adr/0007-x.md");
     expect(adrSignals.map((s) => s.reason)).toEqual(["adr_superseded"]);
     expect(result.staleSignals).toHaveLength(2);
+  });
+
+  // Local normalized digest per instruction-file (T1) artifact (ADR §3.3 item 2):
+  // the primitive the artifact-revision contract addresses. Digested through the
+  // shared content-normalization-v1 helper so a locally-computed digest equals a
+  // server-evaluated one.
+  it("emits a content-normalization-v1 digest per instruction-file (T1) artifact only", () => {
+    const result = scanWorkspace(repo, { workspaceId: "ws1", now: () => "x" });
+    const digests = result.artifactDigests ?? [];
+    const raw = "# Rules\n- NEVER commit secrets.\n- Use pnpm, not npm.\n";
+    const claude = digests.find((d) => d.relativePath === "CLAUDE.md");
+    expect(claude).toBeDefined();
+    expect(claude!.normalizedContentHash).toBe(normalizedContentHash(raw));
+    expect(claude!.contentNormalizationVersion).toBe(CONTENT_NORMALIZATION_V1);
+    expect(claude!.byteLength).toBe(Buffer.byteLength(raw, "utf8"));
+    // T2 decision docs and T4 legacy notes are NOT instruction files: no digest.
+    const paths = digests.map((d) => d.relativePath);
+    expect(paths).not.toContain("docs/adr/0007-x.md");
+    expect(paths).not.toContain("notes/20260101-old.md");
+  });
+
+  it("digest is stable across CRLF/BOM capture artifacts and covers .claude/rules/", () => {
+    const lf = "# Rules\n- NEVER commit secrets.\n- Use pnpm, not npm.\n";
+    // Rewrite CLAUDE.md with a leading BOM + CRLF endings; the normalized digest must not move.
+    const crlfBom = "\uFEFF" + lf.replace(/\n/g, "\r\n");
+    writeFileSync(join(repo, "CLAUDE.md"), crlfBom);
+    // A .claude/rules/ file is also a T1 instruction source (covered by the same digest branch).
+    mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+    writeFileSync(join(repo, ".claude", "rules", "a.md"), "- MUST ship tests.\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "crlf"]);
+    const result = scanWorkspace(repo, { workspaceId: "ws1", now: () => "x" });
+    const byPath = new Map((result.artifactDigests ?? []).map((d) => [d.relativePath, d]));
+    expect(byPath.get("CLAUDE.md")!.normalizedContentHash).toBe(normalizedContentHash(lf));
+    expect(byPath.has(".claude/rules/a.md")).toBe(true);
   });
 
   // The same boilerplate rule repeated across per-service CLAUDE.md files must

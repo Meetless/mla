@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
+  ArtifactDigest,
   Directive,
   FloorRuleEntry,
   SCAN_SCHEMA_VERSION,
@@ -12,6 +13,11 @@ import {
   directiveId,
 } from "./types";
 import { classifyTier, isInstructionFile } from "./score";
+import {
+  CONTENT_NORMALIZATION_V1,
+  normalizeContent,
+  normalizedContentHash,
+} from "./content-normalization";
 import { parseFrontmatter } from "./frontmatter";
 import { parseDirectivesFromMarkdown } from "./parse-directives";
 import { parseAdrStatus, parseClaudeRulesFile } from "./parse-structured";
@@ -44,6 +50,7 @@ export function scanWorkspace(cwd: string, opts: ScanOptions): ScanResult {
   const tracked = gitLsFiles(cwd);
   const directives: Directive[] = [];
   const staleSignals: StaleSignal[] = [];
+  const artifactDigests: ArtifactDigest[] = [];
   let instructionFiles = 0;
   let decisionDocs = 0;
   let legacyNotes = 0;
@@ -62,6 +69,23 @@ export function scanWorkspace(cwd: string, opts: ScanOptions): ScanResult {
 
     const text = safeRead(join(cwd, rel));
     if (text === null) continue;
+
+    // Local normalized digest per instruction-file (T1) artifact (ADR §3.3 item 2).
+    // Computed through the SAME shared content-normalization-v1 helper the server
+    // recomputes with, so a locally-computed digest equals a server-evaluated one
+    // (raw-byte hashing would false-mismatch on CRLF/BOM/Unicode-form). Placed here,
+    // before the .claude/rules/ and T1 branches, so every instruction file (basenames,
+    // .claude/rules/, .cursor/rules/) is covered in one spot. Surfaced in ScanResult;
+    // no Phase 2A live path consumes it (the upload/detector is Phase 2B).
+    if (isInstructionFile(rel)) {
+      const { normalized } = normalizeContent(text);
+      artifactDigests.push({
+        relativePath: rel,
+        normalizedContentHash: normalizedContentHash(text),
+        contentNormalizationVersion: CONTENT_NORMALIZATION_V1,
+        byteLength: Buffer.byteLength(normalized, "utf8"),
+      });
+    }
 
     if (rel.startsWith(".claude/rules/")) {
       directives.push(...parseClaudeRulesFile(text, rel).directives);
@@ -154,6 +178,7 @@ export function scanWorkspace(cwd: string, opts: ScanOptions): ScanResult {
     scopedRules,
     staleContextXml: renderStaleContextXml(dedupedSignals),
     advisoryDirectives,
+    artifactDigests,
   };
 }
 

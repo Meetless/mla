@@ -105,6 +105,54 @@ export interface ScopedRuleEntry {
   representedVersionIds?: string[];
 }
 
+/**
+ * A local content-addressed digest of one instruction-file (T1) artifact,
+ * computed scan-time through the vendored `content-normalization-v1` helper
+ * (BOM strip, CRLF/CR to LF, NFC, SHA-256). This is the primitive the
+ * artifact-revision contract addresses (ADR §3.3 item 2,
+ * notes/20260717-adr-decision-record-projection-and-reconciliation.md): the
+ * server recomputes the SAME digest from the uploaded normalized bytes, so a
+ * finding's `evaluatedDigest` is directly comparable across the CLI/server
+ * boundary. The scan-time UPLOAD of these snapshots is Phase 2B (its only
+ * consumer, the reconciliation detector, is blocked); Phase 2A surfaces the
+ * digest here so the primitive exists, is cached, and is testable.
+ */
+export interface ArtifactDigest {
+  relativePath: string;
+  normalizedContentHash: string;
+  contentNormalizationVersion: string;
+  byteLength: number; // UTF-8 byte length of the normalized content the digest was taken over
+}
+
+/**
+ * A prompt-time reconciliation finding cached for the assembler's rehash gate
+ * (ADR §3.3 item 9, notes/20260717-adr-decision-record-projection-and-reconciliation.md).
+ * Each finding cites one instruction-file path plus the `content-normalization-v1`
+ * digest of that path AT EVALUATION TIME (`evaluatedDigest`). At prompt-assembly
+ * the assembler re-derives the digest from the file's CURRENT bytes through the
+ * same vendored helper and keeps the finding only when it still matches; a
+ * mismatch is `NEEDS_REEVALUATION` and the finding is dropped from this prompt
+ * (never asserted stale, never auto-resolved: item #6).
+ *
+ * Optional + forward-only: NO Phase 2A live path writes this field. The detector
+ * that produces findings is Phase 2B (blocked), so it is absent in every 2A cache
+ * and the rehash pass is a clean no-op. Readers guard with `?? []`.
+ */
+export interface ReconciliationFinding {
+  // Repo-relative path of the cited instruction file whose bytes are rehashed.
+  path: string;
+  // The content-normalization-v1 digest of `path` at evaluation time. The rehash
+  // keeps the finding iff the file's current normalized digest still equals this.
+  evaluatedDigest: string;
+  // The normalization version `evaluatedDigest` was taken under. Rehash uses THIS
+  // version so a future v2 finding is verified under its own contract; absent =>
+  // content-normalization-v1 (the only version any 2A cache could carry).
+  contentNormalizationVersion?: string;
+  // Advisory human-readable "why stale" summary. Carried through for the Phase 3
+  // renderer; the rehash gate never reads it (it gates on digest identity only).
+  reason: string;
+}
+
 export interface ScanResult {
   // Widened from the `1` literal to `number` so old on-disk caches (which carry
   // schemaVersion: 1 and no structured arrays) parse into this type and the assembler can
@@ -147,6 +195,17 @@ export interface ScanResult {
   // lacks it, and readers TRUST an unstamped cache (single-repo installs, the vast majority, never
   // wrote one) rather than hiding it.
   scanRootPath?: string;
+  // Local normalized digests of the instruction-file (T1) artifacts this scan saw
+  // (ADR §3.3 item 2). Repo-specific (like commitSha/inventory): belongs to exactly
+  // ONE checkout. Optional and forward-only: absent in a pre-2A on-disk cache, and
+  // NOT consumed by any Phase 2A live path (the detector that uploads/reads these is
+  // Phase 2B). Readers guard with `?? []`.
+  artifactDigests?: ArtifactDigest[];
+  // Prompt-time reconciliation findings the assembler rehashes and gates on (ADR §3.3 item 9,
+  // see ReconciliationFinding). Forward-only: the detector that produces these is Phase 2B
+  // (blocked), so this is absent in every Phase 2A cache and the rehash gate is a clean no-op.
+  // Readers guard with `?? []`.
+  reconciliationFindings?: ReconciliationFinding[];
 }
 
 export interface Verdicts {
