@@ -71,6 +71,7 @@ import { runUninstall } from "./commands/uninstall";
 import { runWhoami } from "./commands/whoami";
 import { runRewire } from "./commands/rewire";
 import { runActivate, runDeactivate, runMute, runUnmute } from "./commands/activate";
+import { runCodex } from "./commands/codex";
 import { runReview, runReviewById, reviewUsage } from "./commands/review";
 import { runEnforcement } from "./commands/enforcement";
 import { runConflicts } from "./commands/conflicts";
@@ -92,6 +93,7 @@ import {
 import { runInternalSteerSync } from "./commands/internal-steer-sync";
 import { runCaptureDecisions } from "./commands/internal-capture-decisions";
 import { runInternalPretoolObserve } from "./commands/internal-pretool-observe";
+import { runInternalCodexHook } from "./commands/internal-codex-hook";
 import { runInternalEnforcementBaseline, runInternalPosttoolSweep } from "./commands/internal-enforcement-sweep";
 import { runInternalForwardEnforcement } from "./commands/internal-forward-enforcement";
 import { runInternalEnforcementCorrelate } from "./commands/internal-enforcement-correlate";
@@ -270,6 +272,24 @@ export const COMMANDS: CommandSpec[] = [
     handler: (argv) => runActivate(argv.slice(1)),
   },
   {
+    name: "codex",
+    summary: "Install or remove the Codex connector (governs OpenAI Codex sessions).",
+    usage: `  mla codex install
+                    (register the Meetless Codex hooks in $CODEX_HOME/hooks.json:
+                     PreToolUse -> the shared deny seam, UserPromptSubmit -> the
+                     shared grounding assembly. Provisions the shared hook scripts
+                     and prints the one-time /hooks trust instruction. Idempotent;
+                     a malformed hooks.json fails visibly instead of being clobbered.
+                     A SIBLING of 'mla activate' (which wires Claude Code), not a
+                     replacement: both can be installed at once.)
+  mla codex uninstall
+                    (remove ONLY the Meetless Codex hook entries from
+                     $CODEX_HOME/hooks.json; leaves your other hooks, the shared
+                     ~/.meetless/hooks scripts, and the Claude wiring in place.
+                     Use 'mla uninstall' to remove everything.)`,
+    handler: (argv) => runCodex(argv.slice(1)),
+  },
+  {
     name: "deactivate",
     summary: "Remove this folder's workspace binding.",
     usage: `  mla deactivate [--yes] [--from-root|--marker <path>]
@@ -381,7 +401,7 @@ export const COMMANDS: CommandSpec[] = [
                      workspace; --session scopes to an explicit sid; --json prints
                      the raw read.)
   mla conflicts resolve <case-id> --rationale <text>
-                    --outcome <uphold-subject|uphold-counterparty|dismiss|reject-both>
+                    --outcome <uphold-subject|uphold-counterparty|dismiss|discard-both>
   mla conflicts dismiss <case-id> --rationale <text>
                     (record one of the four D1 verdicts on a case, as the logged-in
                      human, via the same endpoint the console drives: closes the
@@ -913,6 +933,11 @@ export const COMMANDS: CommandSpec[] = [
                      PreToolUse payload from stdin, records a side-channel
                      observation, and always emits the empty {} pass-through body
                      so it can never change a permission decision)
+  mla _internal codex-hook <event>
+                    (Codex connector hook wrapper. Reads Codex's Claude-shaped
+                     stdin and shells into the matching ~/.meetless/hooks script,
+                     relaying its stdout back as additionalContext. Today handles
+                     one event, user-prompt-submit; fail-open, always exits 0.)
   mla _internal forward-enforcement [--session <sid>]
                     (deliver hook-emitted mla_enforcement_incident rows from the
                      local spool to control's analytics ingest; fired detached
@@ -965,6 +990,10 @@ export const COMMANDS: CommandSpec[] = [
       if (sub === "steer-sync") return runInternalSteerSync(rest);
       if (sub === "capture-decisions") return runCaptureDecisions(rest);
       if (sub === "pretool-observe") return runInternalPretoolObserve(rest);
+      // Codex UserPromptSubmit wrapper: translate Codex's hook I/O envelope and
+      // shell into the shared ~/.meetless/hooks grounding script. PreToolUse needs
+      // no wrapper (Codex points straight at `pretool-observe`).
+      if (sub === "codex-hook") return runInternalCodexHook(rest);
       // Enforcement backstop: baseline the forbidden roots at SessionStart, then revert
       // anything that appears under them after ANY tool call (tool-agnostic; a shell
       // redirect the PreToolUse parser missed is still undone here).

@@ -27,10 +27,19 @@ brew upgrade --cask mla
 
 `render-cask.sh <version> <release-dir>` reads the macOS archives' `.sha256`
 sidecars (the same `<hex>  <filename>` files `install.sh` verifies) and emits a
-dual-arch cask:
+cask whose shape tracks which arches the release actually shipped:
 
-- one `url` template interpolating the per-machine triple (`arch` stanza), and
-- per-arch `sha256` in `on_arm` / `on_intel`.
+- **Both sidecars present** -> dual-arch cask: one `url` template interpolating
+  the per-machine triple (`arch` stanza) and per-arch `sha256` in `on_arm` /
+  `on_intel`.
+- **Only the arm sidecar present** -> arm-only cask: the `aarch64-apple-darwin`
+  triple is hard-coded into the `url`, with a single `sha256` and
+  `depends_on arch: :arm64`. This matches the current release matrix, which
+  drops the macos-x64 (Intel) build (see `release-cli.yml`); re-adding that
+  matrix entry restores the dual-arch cask automatically.
+
+A missing **arm** sidecar still aborts the render: arm is the shipped arch, so
+its absence is a release error, not a degradation.
 
 The download URL pattern and the architecture triples are byte-identical to
 `install.sh`'s `resolve_url`, so `brew install --cask` and `curl | sh` fetch the

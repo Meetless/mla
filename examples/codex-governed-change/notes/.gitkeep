@@ -1,0 +1,9 @@
+# This directory is the PROHIBITED documentation location for this fixture.
+#
+# The notes-location governance rule (see ../governance/notes-location.md) denies
+# any Markdown write under this notes/ directory before it executes, when the
+# session raises the enforcement ceiling with MEETLESS_ACTION_INTERCEPT_MAX=deny.
+#
+# The demo shows Codex attempting to write its design note here, getting blocked,
+# and writing to ../docs/decisions/ instead. Nothing should ever be committed
+# under this directory.

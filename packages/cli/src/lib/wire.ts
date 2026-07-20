@@ -461,10 +461,32 @@ export function checkHookDrift(opts?: { templateDir?: string; hooksDir?: string 
   return { templateDir, drifted, missing, errors };
 }
 
-function copyHooks(noPostToolUse: boolean): string[] {
+// Connector-neutral provisioning of the shared hook scripts into
+// ~/.meetless/hooks/. Extracted from `copyHooks` so EITHER connector can lay the
+// scripts down: the Claude connector (via `copyHooks`, which passes the
+// PostToolUse skip set) and the Codex connector, which needs the full set on
+// disk, above all user-prompt-submit.sh (~92 KB) plus its bash dependencies
+// (common.sh, home.sh, flush.sh, ...) that the Codex UserPromptSubmit wrapper
+// shells into. Copies every template file (chmod 0755 on `.sh`), skipping any
+// basename in `opts.skip`. Returns the basenames copied.
+export function ensureHookScripts(opts: { skip?: ReadonlySet<string> } = {}): string[] {
   const src = locateHooksTemplate();
   fs.mkdirSync(HOOKS_DIR, { recursive: true });
   const copied: string[] = [];
+  const skip = opts.skip ?? EMPTY_SKIP;
+  for (const f of fs.readdirSync(src)) {
+    if (skip.has(f)) continue;
+    const dst = path.join(HOOKS_DIR, f);
+    fs.copyFileSync(path.join(src, f), dst);
+    if (f.endsWith(".sh")) fs.chmodSync(dst, 0o755);
+    copied.push(f);
+  }
+  return copied;
+}
+
+const EMPTY_SKIP: ReadonlySet<string> = new Set<string>();
+
+function copyHooks(noPostToolUse: boolean): string[] {
   // --no-post-tool-use is an EVENT opt-out: skip EVERY script registered on the
   // PostToolUse event (the load-bearing post-tool-use.sh AND ce0-post-tool-use.sh),
   // derived from the canonical MANAGED_HOOK_SCRIPTS so a new PostToolUse script is
@@ -475,14 +497,7 @@ function copyHooks(noPostToolUse: boolean): string[] {
       if (w.event === "PostToolUse") skip.add(w.script);
     }
   }
-  for (const f of fs.readdirSync(src)) {
-    if (skip.has(f)) continue;
-    const dst = path.join(HOOKS_DIR, f);
-    fs.copyFileSync(path.join(src, f), dst);
-    if (f.endsWith(".sh")) fs.chmodSync(dst, 0o755);
-    copied.push(f);
-  }
-  return copied;
+  return ensureHookScripts({ skip });
 }
 
 // --- hook auto-resync (self-heal the installed hooks on a binary upgrade) ----
@@ -805,8 +820,10 @@ export const SETTINGS_BACKUP_RETENTION = 10;
 
 // Snapshot the current settings file to `.bak.<now>` (called only when we are
 // about to overwrite it), then prune so at most SETTINGS_BACKUP_RETENTION backups
-// survive, newest kept (ordered by the numeric timestamp suffix).
-function backupAndPruneSettings(settingsPath: string): void {
+// survive, newest kept (ordered by the numeric timestamp suffix). Path-generic:
+// the Codex connector reuses it for `$CODEX_HOME/hooks.json` so both connectors
+// share one backup/retention policy.
+export function backupAndPruneSettings(settingsPath: string): void {
   fs.copyFileSync(settingsPath, settingsPath + ".bak." + Date.now());
 
   const dir = path.dirname(settingsPath);

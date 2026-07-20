@@ -322,6 +322,26 @@ export const HOOKS_DIR = path.join(HOME, "hooks");
 // SESSION_GATE_DIR in common.sh.
 export const SESSION_GATE_DIR = path.join(HOME, "session-gate");
 
+/**
+ * Resolve the Codex CLI home directory, the root Codex reads its global
+ * `hooks.json` and plugin state from. Honors `$CODEX_HOME` exactly as Codex
+ * itself does (used verbatim when set, so our reconciler writes to the SAME file
+ * Codex reads), and defaults to `~/.codex`. Read at call time, not frozen at
+ * import, so per-process overrides (and tests) take effect. Distinct from the
+ * meetless HOME above: Codex owns this dir, not us.
+ */
+export function resolveCodexHome(deps: HomeResolutionDeps = {}): string {
+  const env = deps.env ?? process.env;
+  const override = env.CODEX_HOME;
+  if (override && override.length > 0) return override;
+  return path.join(userHomeDir(deps), ".codex");
+}
+
+/** Absolute path to the global Codex hooks file, `$CODEX_HOME/hooks.json`. */
+export function codexHooksPath(deps: HomeResolutionDeps = {}): string {
+  return path.join(resolveCodexHome(deps), "hooks.json");
+}
+
 // The master telemetry kill switch. The single source of truth for "no telemetry
 // of any kind leaves (or, for the local deadletter, is even recorded on) this
 // machine." It lives here in low-level config (not in observability.ts) so the

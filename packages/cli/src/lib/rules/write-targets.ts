@@ -37,7 +37,27 @@ const DIRECT_PATH_FIELD: Record<string, string> = {
 
 /** True for any tool that can put bytes on disk (used to scope enforcement). */
 export function isWriteCapableTool(toolName: string): boolean {
-  return toolName in DIRECT_PATH_FIELD || toolName === "Bash";
+  return toolName in DIRECT_PATH_FIELD || toolName === "Bash" || toolName === "apply_patch";
+}
+
+/**
+ * Extract every path changed by Codex's native `apply_patch` tool. Codex sends
+ * the whole patch in `tool_input.command`; file operations are introduced by
+ * stable patch headers. `Move to` is a second write target in addition to the
+ * preceding Update path.
+ */
+export function applyPatchWriteTargets(command: string): string[] {
+  if (typeof command !== "string" || command.length === 0) return [];
+  const out: string[] = [];
+  const header = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$/gm;
+  const move = /^\*\*\* Move to:\s*(.+?)\s*$/gm;
+  for (const re of [header, move]) {
+    for (const match of command.matchAll(re)) {
+      const target = match[1]?.trim();
+      if (target) out.push(target);
+    }
+  }
+  return [...new Set(out)];
 }
 
 // Strip quoting so `cat > "notes/a.md"` and `cat > 'notes/a.md'` resolve to the same
@@ -111,8 +131,9 @@ export function shellWriteTargets(command: string): string[] {
  * Every path this tool call would write. `[]` for read-only tools.
  *
  * For Write/Edit/MultiEdit/NotebookEdit this is the declared path field (exactly what
- * the seam evaluated before, so their behaviour is unchanged). For Bash it is the
- * best-effort shell parse — the surface that used to be a free pass.
+ * the seam evaluated before, so their behaviour is unchanged). For apply_patch it is
+ * every file-operation header in the patch. For Bash it is the best-effort shell
+ * parse — the surface that used to be a free pass.
  */
 export function deriveWriteTargets(call: ToolCallLike): string[] {
   const field = DIRECT_PATH_FIELD[call.toolName];
@@ -123,6 +144,10 @@ export function deriveWriteTargets(call: ToolCallLike): string[] {
   if (call.toolName === "Bash") {
     const cmd = call.toolInput?.command;
     return typeof cmd === "string" ? shellWriteTargets(cmd) : [];
+  }
+  if (call.toolName === "apply_patch") {
+    const cmd = call.toolInput?.command;
+    return typeof cmd === "string" ? applyPatchWriteTargets(cmd) : [];
   }
   return [];
 }

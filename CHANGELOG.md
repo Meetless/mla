@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.24 (2026-07-20)
+
+This release brings Meetless to Codex. `mla codex install` wires the connector in, hooks and
+wrapper included, so the governance you already get in Claude Code runs there too: governed paths
+are enforced on `apply_patch`, MCP reads and governed writes are classified correctly, and because
+Codex has no ASK response in its PreToolUse seam the connector resolves the decision itself instead
+of stalling. `mla doctor` now reports connector health and fails loudly on a half-finished install
+rather than looking fine. On the conflict side, `mla conflicts resolve` takes a new
+`--outcome discard-both` for contradictions where neither side survives.
+
+- `mla codex install` and `mla codex uninstall` wire the Meetless connector into Codex
+- a static Codex plugin package ships `mla mcp`, so governed memory is reachable in-session
+- governed path rules are enforced on Codex's `apply_patch`
+- MCP reads and governed writes are classified correctly on the Codex seam
+- the connector resolves its own decision where Codex cannot return ASK from PreToolUse
+- `mla doctor` reports Codex connector health and fails on a partial setup
+- `mla conflicts resolve` accepts `--outcome discard-both`; the `reject-both` spelling is retired
+
 ## 0.2.23 (2026-07-19)
 
 This release makes your coding agent a first-class participant in resolving conflicts and

@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -7,6 +7,7 @@ import {
   CliAuth,
   HOOKS_DIR,
   SESSION_GATE_DIR,
+  codexHooksPath,
   userHomeDir,
 } from "../lib/config";
 import { tryResolveWorkspaceId } from "../lib/workspace";
@@ -59,6 +60,7 @@ import {
   type ReconcilePlan,
   type ReconcileIO,
 } from "../connectors/claude-code/plugin-migrate";
+import { codexHooksInstalled } from "../connectors/codex/wire";
 
 // `mla doctor` (§4.9, §6.4 step 14, Acceptance §11.14)
 //
@@ -237,6 +239,120 @@ export function pluginStatusCheck(ownership: PluginOwnership): Check {
     detail: `install state unknown (${ownership.reason})`,
     level: "info",
   };
+}
+
+export function codexHookDoctorCheck(installed: boolean, hooksPath: string): Check {
+  return installed
+    ? {
+        id: "codex.hooks.registered",
+        ok: true,
+        label: "Codex Meetless hooks registered",
+        detail: hooksPath,
+      }
+    : {
+        id: "codex.hooks.registered",
+        ok: true,
+        level: "info",
+        label: "Codex Meetless hooks not installed",
+        detail: "run `mla codex install` to enable Codex grounding and enforcement",
+      };
+}
+
+export type CodexMcpProbe =
+  | { kind: "configured"; detail: string }
+  | { kind: "absent"; detail: string }
+  | { kind: "unavailable"; detail: string };
+
+export function codexMcpDoctorCheck(probe: CodexMcpProbe): Check {
+  if (probe.kind === "configured") {
+    return {
+      id: "codex.mcp.registered",
+      ok: true,
+      label: "Codex Meetless MCP server registered",
+      detail: probe.detail,
+    };
+  }
+  return {
+    id: "codex.mcp.registered",
+    ok: true,
+    level: "info",
+    label:
+      probe.kind === "absent"
+        ? "Codex Meetless MCP server not installed"
+        : "Codex MCP status unavailable",
+    detail: probe.detail,
+  };
+}
+
+/**
+ * Codex support has two independent halves. Keep Codex optional when neither
+ * half is installed, but fail doctor when an operator has installed only one:
+ * that state can retrieve without governance, or govern without retrieval.
+ */
+export function codexConnectorCompleteCheck(
+  hooksInstalled: boolean,
+  probe: CodexMcpProbe,
+): Check {
+  const mcpInstalled = probe.kind === "configured";
+  if (!hooksInstalled && !mcpInstalled) {
+    return {
+      id: "codex.connector.complete",
+      ok: true,
+      level: "info",
+      label: "Codex connector not enabled",
+      detail: "install the MLA Codex plugin and run `mla codex install` to enable it",
+    };
+  }
+  if (hooksInstalled && mcpInstalled) {
+    return {
+      id: "codex.connector.complete",
+      ok: true,
+      label: "Codex connector complete",
+      detail: "governed hooks and MCP tools are both installed",
+    };
+  }
+  return {
+    id: "codex.connector.complete",
+    ok: false,
+    label: "Codex connector incomplete",
+    detail: hooksInstalled
+      ? "hooks are installed but the Meetless MCP plugin is missing or unavailable"
+      : "the Meetless MCP plugin is installed but hooks are missing; run `mla codex install`",
+  };
+}
+
+function probeCodexMcp(): CodexMcpProbe {
+  try {
+    const raw = execFileSync("codex", ["mcp", "get", "meetless", "--json"], {
+      encoding: "utf8",
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const parsed = JSON.parse(raw);
+    const transport = parsed?.transport;
+    const args = Array.isArray(transport?.args) ? transport.args : [];
+    if (
+      parsed?.enabled === true &&
+      transport?.type === "stdio" &&
+      transport?.command === "mla" &&
+      args[0] === "mcp"
+    ) {
+      return { kind: "configured", detail: "meetless -> `mla mcp` (enabled)" };
+    }
+    return {
+      kind: "absent",
+      detail: "a meetless entry exists but is disabled or does not launch `mla mcp`; install `mla@meetless`",
+    };
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      return { kind: "unavailable", detail: "Codex CLI is not on PATH" };
+    }
+    return {
+      kind: "absent",
+      detail: "install the `mla@meetless` Codex plugin to enable governed retrieval",
+    };
+  }
 }
 
 // Resolve the directory that actually holds the live capture hooks, so doctor's
@@ -959,6 +1075,25 @@ export async function runDoctor(argv: string[]): Promise<number> {
   } else {
     checks.push({ ok: false, label: "~/.claude/settings.json present" });
   }
+
+  // Codex is an optional connector, so absence is informational for operators
+  // who only use Claude Code. When present, these rows make its two independent
+  // halves visible: lifecycle hooks and the governed-retrieval MCP plugin.
+  const liveCodexHooksPath = codexHooksPath();
+  const liveCodexHooksInstalled = codexHooksInstalled({
+    hooksPathOverride: liveCodexHooksPath,
+  });
+  const liveCodexMcpProbe = probeCodexMcp();
+  checks.push(
+    codexHookDoctorCheck(
+      liveCodexHooksInstalled,
+      liveCodexHooksPath,
+    ),
+  );
+  checks.push(codexMcpDoctorCheck(liveCodexMcpProbe));
+  checks.push(
+    codexConnectorCompleteCheck(liveCodexHooksInstalled, liveCodexMcpProbe),
+  );
 
   // 5. /mla skill installed
   const skillPath = path.join(

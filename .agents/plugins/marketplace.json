@@ -1,0 +1,14 @@
+{
+  "name": "meetless",
+  "interface": {
+    "displayName": "Meetless"
+  },
+  "plugins": [
+    {
+      "name": "mla",
+      "source": { "source": "local", "path": "./codex/mla" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_USE" },
+      "category": "Developer Tools"
+    }
+  ]
+}

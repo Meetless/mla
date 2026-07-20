@@ -100,6 +100,24 @@ test("registry membership: read-only evidence tools vs the mutating surface", ()
   assert.ok(!ADVERTISED_EVIDENCE_TOOLS.includes("meetless__relationship_verdict"));
 });
 
+test("MCP annotations let clients distinguish reads from governed writes", () => {
+  for (const name of [
+    "meetless__query",
+    "meetless__retrieve_knowledge",
+    "meetless__kb_doc_detail",
+  ]) {
+    const tool = toolByName(name);
+    assert.equal(tool.annotations?.readOnlyHint, true, `${name} must be marked read-only`);
+    assert.equal(tool.annotations?.destructiveHint, false, `${name} must not be destructive`);
+  }
+
+  for (const name of MUTATING_TOOL_NAMES) {
+    const tool = toolByName(name);
+    assert.equal(tool.annotations?.readOnlyHint, false, `${name} must not be marked read-only`);
+    assert.equal(tool.annotations?.destructiveHint, true, `${name} must require destructive approval`);
+  }
+});
+
 test("assertReadOnlyManifest throws when registries overlap (guard is real)", () => {
   // Simulate the failure mode the boot guard exists to catch: a future edit that
   // advertises a mutating tool as evidence. We re-implement the check against a

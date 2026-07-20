@@ -1,0 +1,5 @@
+# This directory is the APPROVED documentation location for this fixture.
+#
+# After the notes-location rule blocks the write under ../../notes/, Codex writes
+# its design note here instead. This is the corrected path in the demo (step 6 of
+# the workflow in the top-level README).

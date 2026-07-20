@@ -228,8 +228,8 @@ function harness(
       return response;
     },
     // Default write seam: record the call and echo the verdict back as the server
-    // would (resolution unused by the CLI copy; linkedCaseId defaults null, the
-    // REJECT_BOTH-escalated case is set per-test via `over`).
+    // would (resolution unused by the CLI copy; linkedCaseId is always null now
+    // that the only outcome which ever set it is retired).
     resolveConflict: async (cfg, caseId, outcome, rationale) => {
       h.resolveConflictCalls.push({
         caseId,
@@ -481,19 +481,15 @@ describe("describeResolveResult", () => {
     assertNoSmellDashes(line);
   });
 
-  it("REJECT_BOTH with an escalation names the linked decision case", () => {
-    const line = describeResolveResult(
-      result({ outcome: "REJECT_BOTH", linkedCaseId: "c00-linked999" }),
-    );
+  // Present tense, deliberately. The CLI returns as soon as control commits the
+  // verdict; the claims leave current knowledge on intel's clock, which this
+  // command never observes. "were removed" would be a claim it cannot support.
+  it("DISCARD_BOTH reports the removal as in flight, not as done", () => {
+    const line = describeResolveResult(result({ outcome: "DISCARD_BOTH" }));
     expect(line).toBe(
-      "Resolved c00-abcd1234: rejected both sides, escalated to decision case c00-linked999.",
+      "Resolved c00-abcd1234: both claims are being removed from current knowledge; the conflicting session was notified.",
     );
-    assertNoSmellDashes(line);
-  });
-
-  it("REJECT_BOTH without a linked case omits the escalation clause", () => {
-    const line = describeResolveResult(result({ outcome: "REJECT_BOTH", linkedCaseId: null }));
-    expect(line).toBe("Resolved c00-abcd1234: rejected both sides.");
+    expect(line).not.toMatch(/were removed|have been removed/);
     assertNoSmellDashes(line);
   });
 });
@@ -532,13 +528,13 @@ describe("parseConflictsArgs write verbs", () => {
     const p = parseConflictsArgs([
       "resolve",
       "--outcome",
-      "reject-both",
+      "discard-both",
       "--rationale",
       "neither",
       "c00-late-id",
     ]);
     expect(p.caseId).toBe("c00-late-id");
-    expect(p.outcome).toBe("REJECT_BOTH");
+    expect(p.outcome).toBe("DISCARD_BOTH");
   });
 
   it("dismiss fixes the outcome to DISMISS without an --outcome flag", () => {
@@ -559,9 +555,41 @@ describe("parseConflictsArgs write verbs", () => {
     ).toThrow(/Unknown outcome/);
   });
 
+  // The retired verdict must fail HERE, before any network call, and it must not
+  // be lumped in with typos: `reject-both` worked for months, so an operator who
+  // types it needs to be told it is gone and what replaced it, not that they
+  // misspelled something.
+  it("rejects the retired reject-both with a pointer to discard-both, not 'unknown'", () => {
+    const call = () =>
+      parseConflictsArgs([
+        "resolve",
+        "c00-abcd1234",
+        "--outcome",
+        "reject-both",
+        "--rationale",
+        "x",
+      ]);
+    expect(call).toThrow(/retired/);
+    expect(call).toThrow(/discard-both/);
+    expect(call).not.toThrow(/Unknown outcome/);
+  });
+
+  it("rejects the retired outcome in its raw enum form too", () => {
+    expect(() =>
+      parseConflictsArgs([
+        "resolve",
+        "c00-abcd1234",
+        "--outcome",
+        "REJECT_BOTH",
+        "--rationale",
+        "x",
+      ]),
+    ).toThrow(/retired/);
+  });
+
   it("rejects --outcome on dismiss (the shorthand already fixes the verdict)", () => {
     expect(() =>
-      parseConflictsArgs(["dismiss", "c00-abcd1234", "--outcome", "reject-both", "--rationale", "x"]),
+      parseConflictsArgs(["dismiss", "c00-abcd1234", "--outcome", "discard-both", "--rationale", "x"]),
     ).toThrow(/already implies --outcome dismiss/);
   });
 
@@ -635,23 +663,37 @@ describe("runConflicts resolve/dismiss verbs", () => {
     ]);
   });
 
-  it("REJECT_BOTH surfaces the escalated decision case in the confirmation", async () => {
-    const { deps, h } = harness(NO_READ, {
-      resolveConflict: async (_cfg, caseId, outcome) => ({
-        caseId,
-        outcome,
-        resolution: "",
-        linkedCaseId: "c00-linked999",
-      }),
-    });
+  it("discard-both reaches the endpoint as DISCARD_BOTH and confirms the in-flight removal", async () => {
+    const { deps, h } = harness(NO_READ);
+    const code = await runConflicts(
+      ["resolve", "c00-abcd1234", "--outcome", "discard-both", "--rationale", "neither holds"],
+      deps,
+    );
+    expect(code).toBe(0);
+    expect(h.resolveConflictCalls).toEqual([
+      {
+        caseId: "c00-abcd1234",
+        outcome: "DISCARD_BOTH",
+        rationale: "neither holds",
+        workspaceId: "ws_test",
+      },
+    ]);
+    expect(h.out).toEqual([
+      "Resolved c00-abcd1234: both claims are being removed from current knowledge; the conflicting session was notified.",
+    ]);
+  });
+
+  // Retirement is enforced client-side: the request must never leave the machine.
+  it("the retired reject-both exits 2 and never calls the endpoint", async () => {
+    const { deps, h } = harness(NO_READ);
     const code = await runConflicts(
       ["resolve", "c00-abcd1234", "--outcome", "reject-both", "--rationale", "neither holds"],
       deps,
     );
-    expect(code).toBe(0);
-    expect(h.out).toEqual([
-      "Resolved c00-abcd1234: rejected both sides, escalated to decision case c00-linked999.",
-    ]);
+    expect(code).toBe(2);
+    expect(h.resolveConflictCalls).toEqual([]);
+    expect(h.err.join(" ")).toMatch(/retired/);
+    expect(h.err.join(" ")).toMatch(/discard-both/);
   });
 
   it("a parse error on a write verb returns code 2 and never calls the endpoint", async () => {

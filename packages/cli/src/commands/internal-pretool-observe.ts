@@ -99,6 +99,37 @@ export function renderPreToolUseAsk(reason: string): PretoolObserveOutput {
   };
 }
 
+/**
+ * Codex currently rejects `permissionDecision: "ask"` as an unsupported
+ * PreToolUse result and then continues the tool call. That would turn MLA's
+ * stale-degraded / human-confirmation posture into fail-open. In Codex response
+ * mode, preserve every supported response byte-for-byte and convert only ASK
+ * into a supported deny so the governed write cannot land silently.
+ */
+export function adaptPretoolResponseForCodex(out: PretoolObserveOutput): PretoolObserveOutput {
+  try {
+    const body = JSON.parse(out.stdout);
+    const hook = body?.hookSpecificOutput;
+    if (hook?.hookEventName !== "PreToolUse" || hook?.permissionDecision !== "ask") {
+      return out;
+    }
+    return {
+      stdout: JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason:
+            `${hook.permissionDecisionReason ?? "Meetless requires human confirmation."} ` +
+            "Codex cannot prompt from PreToolUse yet, so this action was blocked instead.",
+        },
+      }),
+      exitCode: 0,
+    };
+  } catch {
+    return out;
+  }
+}
+
 /** The two audiences of a non-blocking advisory: `systemMessage` is human-facing (shown to the
  * operator), `additionalContext` is model-facing (fed to the agent on its NEXT request). Both the
  * cross-session conflict warning and the governed-rule WARN produce this shape, so they can be
@@ -295,9 +326,10 @@ export interface PretoolObserveDeps {
   /** The principal-bound, lease-stamped rule bundle cache reader (zero-network). Production reads the
    * gitignored bundle from the home cache; tests inject a fixed read (fresh | stale | unavailable). */
   readBundle?: (principal: BundlePrincipal, nowMs: number) => BundleCacheRead;
-  /** The session ceiling cap resolver (the `MEETLESS_ACTION_INTERCEPT_MAX` kill switch). Production reads
-   * the env var; tests pin the cap. Absent/unset/unrecognized => DENY (uncapped), preserving current
-   * behavior. Capping to WARN turns every would-be block into a non-blocking advisory. */
+  /** The session ceiling cap resolver (the `MEETLESS_ACTION_INTERCEPT_MAX` control). Production reads
+   * the env var; tests pin the cap. Absent/unset/unrecognized => WARN (`DEFAULT_MAX_ENFORCEMENT`, owner
+   * ruling 2026-07-12: ship warn, never block), so every would-be block surfaces as a non-blocking
+   * advisory. Raising the cap to `deny` re-arms the notes-location hard block for the session. */
   resolveMaxEnforcement?: () => EligibleEnforcement;
 }
 
@@ -660,9 +692,10 @@ export function defaultReadBundle(principal: BundlePrincipal, nowMs: number): Bu
 }
 
 // IO shell. Reads stdin best-effort (a read failure still yields the pass-through body so the hook never
-// blocks a tool), computes the decision, writes stdout, returns the exit code (always 0). Takes no argv.
+// blocks a tool), computes the decision, writes stdout, returns the exit code (always 0). `--codex`
+// selects the narrow Codex wire adapter; all other argv is ignored for backward compatibility.
 export async function runInternalPretoolObserve(
-  _argv: string[],
+  argv: string[],
   deps: PretoolObserveDeps = defaultDeps,
 ): Promise<number> {
   let raw = "";
@@ -672,7 +705,8 @@ export async function runInternalPretoolObserve(
     // A stdin read error must never escalate into a blocking hook decision.
     raw = "";
   }
-  const out = await computePretoolDecision(raw, deps);
+  const computed = await computePretoolDecision(raw, deps);
+  const out = argv.includes("--codex") ? adaptPretoolResponseForCodex(computed) : computed;
   deps.writeOut(out.stdout);
   return out.exitCode;
 }

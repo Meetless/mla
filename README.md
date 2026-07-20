@@ -1,6 +1,8 @@
 # mla: the coordination layer for your coding agents
 
-**Claude Code owns code. `mla` owns coordination.**
+**Your coding agent owns code. `mla` owns coordination.**
+
+Works with **Claude Code** and **OpenAI Codex**.
 
 `mla` (short for **Meetless Agent**) is the command-line client for Meetless. It
 keeps your AI coding agents grounded in the architecture you approved, captures
@@ -36,10 +38,77 @@ coding agents and runs a tight loop:
 The result: less context re-explaining, fewer reversals, and agents that stay on
 the architecture you actually chose.
 
+## Supported coding agents
+
+`mla` governs both major coding-agent CLIs through one neutral decision core. The
+loop above is identical for each; only the wiring differs.
+
+| Agent | Grounding | Governed retrieval | Pre-execution enforcement | Install |
+|---|---|---|---|---|
+| Claude Code | `UserPromptSubmit` floor injection | MCP (`meetless-mcp`) | `PreToolUse` | `mla activate` |
+| OpenAI Codex | `UserPromptSubmit` floor injection | MCP (`meetless-mcp`) | `PreToolUse` | `mla codex install` |
+
+These are siblings, not alternatives. Install both and each agent is governed by
+the same approved decisions, because the decision logic lives in the core rather
+than in either connector.
+
+### OpenAI Codex
+
+Tested against Codex CLI `0.144.6`.
+
+```bash
+# 1. Register the MCP server so Codex can retrieve governed knowledge.
+codex plugin add mla@meetless
+
+# 2. Register the Codex hooks (writes $CODEX_HOME/hooks.json). Idempotent.
+mla codex install
+
+# 3. In Codex, grant hook trust once:
+#      codex  ->  /hooks  ->  review the MLA commands  ->  grant trust
+
+# 4. Bind the repo, then verify both halves are live.
+mla activate
+mla doctor
+```
+
+Codex support has two independent halves (hooks and MCP), so `mla doctor` reports
+it as three checks: `codex.hooks.registered`, `codex.mcp.registered`, and
+`codex.connector.complete`. A half-finished setup fails the doctor visibly
+instead of looking healthy.
+
+`mla codex uninstall` removes only the Meetless entries from
+`$CODEX_HOME/hooks.json`, leaving your own hooks and your Claude Code wiring
+intact.
+
+#### What enforcement actually does today
+
+Two statements we do not soften anywhere.
+
+**Hooks fail open until you trust them.** While Codex hooks are untrusted, Codex
+silently skips them: governance is inactive and tool execution proceeds normally.
+`mla codex install` prints "registered, execution not verified" and claims
+nothing stronger. Governance goes live when you run `/hooks` and grant trust.
+
+**Enforcement is advisory by default.** `mla` ships a four-rung ceiling
+(`observe`, `warn`, `ask`, `deny`) and clamps every rule to `warn`. That is a
+deliberate owner ruling: ship warn first, ramp to blocking as adoption earns
+trust. Raise the cap for a session with `MEETLESS_ACTION_INTERCEPT_MAX=deny`.
+Today exactly one rule family hard-denies before execution (the notes-location
+rule); every other family surfaces evidence and warns. Nothing reverts a write
+after the fact. This is a governance control, not a security boundary.
+
+Codex `0.144.6` does not support `permissionDecision: "ask"` on `PreToolUse` and
+treats it as a hook failure, so the connector converts an `ask` result into a
+deny that carries the explanatory reason. `warn` and `deny` behave normally, and
+Claude Code still receives the native `ask`.
+
+Denied and warned attempts are captured as enforcement incidents and surfaced by
+`mla enforcement --all`.
+
 ## MCP server
 
-`mla` ships an MCP server (`meetless-mcp`) so any MCP-capable agent (Claude Code
-and others) can read governed memory directly. It exposes the retrieval surface
+`mla` ships an MCP server (`meetless-mcp`) so any MCP-capable agent (Claude Code,
+Codex, and others) can read governed memory directly. It exposes the retrieval surface
 your agent needs: pull raw evidence with citations, open the full text behind a
 citation, and run a synthesized lookup when you want an answer rather than the
 sources. Point your agent at it once and grounding happens on every turn.
@@ -152,6 +221,39 @@ Local-first by default: crash reporting is off unless a Sentry DSN is configured
 and run traces (when a backend enables them) go only to your own control server,
 never to Meetless. Disable both with `MEETLESS_TELEMETRY=off`. Full details in
 [TELEMETRY.md](TELEMETRY.md).
+
+## Built with Codex
+
+The Codex connector in this repository was built with Codex, running GPT-5.6.
+Stated precisely, because "built with" is easy to hand-wave:
+
+**What Codex wrote.** The net-new connector surface: the `UserPromptSubmit`
+wrapper (`mla _internal codex-hook`), the static Codex plugin package that ships
+`mla mcp`, the `mla codex install` / `uninstall` commands that manage
+`$CODEX_HOME/hooks.json`, the response adapter that maps Codex's unsupported
+`ask` onto a supported deny, the `mla doctor` connector health checks, and the
+reproducible fixture.
+
+**What it reused rather than rebuilt.** The neutral core, which predates this
+work and already governed Claude Code: the hook input parser, the deny decision
+core, the envelope renderer, enforcement-incident capture, the `mla mcp`
+retrieval server, and `.meetless.json` binding. GPT-5.6's useful contribution
+here was largely negative space. The connector is registration plus one thin
+wrapper because the model was steered to extend the existing core instead of
+forking a Codex-specific decision path. One decision core, two surfaces.
+
+**What the human owner decided.** Design ratification, the scope ceiling, the
+hook-trust UX, and this repository's public visibility.
+
+| Field | Value |
+|---|---|
+| Codex model | GPT-5.6 (exact string: `TODO(owner): capture from the build thread`) |
+| Codex CLI | `0.144.6` |
+| `/feedback` Session ID | `TODO(owner): capture from the build thread` |
+
+Full submission notes, the honest enforcement claim, and the demo walkthrough are
+in [`codex/README.md`](codex/README.md). The reproducible fixture is in
+[`examples/codex-governed-change/`](examples/codex-governed-change/).
 
 ## Community
 

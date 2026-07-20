@@ -38,6 +38,7 @@ export const KNOWN_COMMANDS = new Set<string>([
   "uninstall",
   "whoami",
   "activate",
+  "codex",
   "deactivate",
   "mute",
   "unmute",
@@ -135,6 +136,7 @@ export const KNOWN_SUBCOMMANDS: Record<string, Set<string>> = {
   // `mla docs <topic>` is a POSITIONAL (the slug), so only the two reserved
   // subcommand keywords are emitted; a topic slug never reaches the wire.
   docs: new Set(["search", "ask"]),
+  codex: new Set(["install", "uninstall"]),
   stats: new Set(["evidence"]),
   _internal: new Set(["finalize-session", "active-review", "auto-index"]),
 };

@@ -1,4 +1,9 @@
-import { deriveWriteTargets, isWriteCapableTool, shellWriteTargets } from "../../src/lib/rules/write-targets";
+import {
+  applyPatchWriteTargets,
+  deriveWriteTargets,
+  isWriteCapableTool,
+  shellWriteTargets,
+} from "../../src/lib/rules/write-targets";
 
 describe("shellWriteTargets", () => {
   it("catches the bypass our own benchmark caught", () => {
@@ -46,6 +51,36 @@ describe("shellWriteTargets", () => {
   });
 });
 
+describe("applyPatchWriteTargets", () => {
+  it("extracts Codex add, update, delete, and move targets", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Add File: notes/new file.md",
+      "+new",
+      "*** Update File: src/old.ts",
+      "*** Move to: src/new.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** Delete File: notes/retired.md",
+      "*** End Patch",
+    ].join("\n");
+    expect(applyPatchWriteTargets(patch)).toEqual([
+      "notes/new file.md",
+      "src/old.ts",
+      "notes/retired.md",
+      "src/new.ts",
+    ]);
+  });
+
+  it("deduplicates targets and ignores malformed input", () => {
+    expect(applyPatchWriteTargets("*** Update File: notes/a.md\n*** Update File: notes/a.md")).toEqual([
+      "notes/a.md",
+    ]);
+    expect(applyPatchWriteTargets(undefined as unknown as string)).toEqual([]);
+  });
+});
+
 describe("deriveWriteTargets", () => {
   it("reads the declared path for the direct file tools (unchanged behaviour)", () => {
     expect(deriveWriteTargets({ toolName: "Write", toolInput: { file_path: "notes/a.md" } })).toEqual(["notes/a.md"]);
@@ -62,13 +97,25 @@ describe("deriveWriteTargets", () => {
     expect(deriveWriteTargets({ toolName: "Bash", toolInput: { command: "echo x > notes/a.md" } })).toEqual(["notes/a.md"]);
   });
 
+  it("derives Codex apply_patch targets from the command", () => {
+    expect(
+      deriveWriteTargets({
+        toolName: "apply_patch",
+        toolInput: {
+          command: "*** Begin Patch\n*** Add File: notes/a.md\n+x\n*** End Patch",
+        },
+      }),
+    ).toEqual(["notes/a.md"]);
+  });
+
   it("returns nothing for read-only tools", () => {
     expect(deriveWriteTargets({ toolName: "Read", toolInput: { file_path: "notes/a.md" } })).toEqual([]);
     expect(deriveWriteTargets({ toolName: "Grep", toolInput: { pattern: "x" } })).toEqual([]);
   });
 
   it("knows which tools can write", () => {
-    for (const t of ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]) expect(isWriteCapableTool(t)).toBe(true);
+    for (const t of ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "apply_patch"])
+      expect(isWriteCapableTool(t)).toBe(true);
     for (const t of ["Read", "Grep", "Glob", "WebFetch"]) expect(isWriteCapableTool(t)).toBe(false);
   });
 });

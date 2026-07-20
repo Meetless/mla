@@ -2,7 +2,7 @@ import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
 import * as fs from "fs";
-import { HOME, QUEUE_DIR, userHomeDir } from "../lib/config";
+import { HOME, QUEUE_DIR, codexHooksPath, userHomeDir } from "../lib/config";
 import {
   RemoveHooksResult,
   RemoveMcpResult,
@@ -14,6 +14,7 @@ import {
   removeMeetlessMcp,
   resolveMlaBinary,
 } from "../lib/unwire";
+import { removeCodexHooks } from "../connectors/codex/wire";
 import { runFlush } from "./flush";
 
 // `mla uninstall`: remove the entire local Meetless footprint. Scope is
@@ -28,6 +29,7 @@ export interface UninstallDeps {
   home?: string;
   settingsPath?: string;
   claudeJsonPath?: string;
+  codexHooksPath?: string;
   skillDir?: string;
   queueDir?: string;
   log?: (msg: string) => void;
@@ -41,6 +43,7 @@ export interface UninstallDeps {
   resolveBinary?: (env: NodeJS.ProcessEnv) => { binPath: string | null; realPath: string | null };
   removeHooks?: (settingsPath: string) => RemoveHooksResult;
   removeMcp?: (claudeJsonPath: string) => RemoveMcpResult;
+  removeCodexHooks?: (opts: { hooksPathOverride?: string }) => { changed: boolean; filePath: string };
   removeDir?: (dir: string) => { removed: boolean; error?: string };
   confirm?: (prompt: string) => Promise<boolean>;
   choose?: (prompt: string) => Promise<UnflushedChoice>;
@@ -89,6 +92,7 @@ export async function runUninstall(argv: string[], deps: UninstallDeps = {}): Pr
   const home = deps.home ?? HOME;
   const settingsPath = deps.settingsPath ?? path.join(userHomeDir(), ".claude", "settings.json");
   const claudeJsonPath = deps.claudeJsonPath ?? path.join(userHomeDir(), ".claude.json");
+  const codexHooksFile = deps.codexHooksPath ?? codexHooksPath();
   const skillDir = deps.skillDir ?? path.join(userHomeDir(), ".claude", "skills", "mla");
   const queueDir = deps.queueDir ?? QUEUE_DIR;
   const isTTY = deps.isTTY ?? Boolean(process.stdin.isTTY);
@@ -101,6 +105,7 @@ export async function runUninstall(argv: string[], deps: UninstallDeps = {}): Pr
   const resolveBinary = deps.resolveBinary ?? resolveMlaBinary;
   const removeHooks = deps.removeHooks ?? removeMeetlessHooks;
   const removeMcp = deps.removeMcp ?? removeMeetlessMcp;
+  const removeCodex = deps.removeCodexHooks ?? removeCodexHooks;
   const removeDir = deps.removeDir ?? removeDirImpl;
   const confirm = deps.confirm ?? defaultConfirm;
   const choose = deps.choose ?? defaultChoose;
@@ -115,6 +120,7 @@ export async function runUninstall(argv: string[], deps: UninstallDeps = {}): Pr
   log(`  - ${home}  (config, credentials, queue, hooks, logs, telemetry)`);
   log(`  - the Meetless hook entries in ${settingsPath}`);
   log(`  - the "meetless" MCP server in ${claudeJsonPath}`);
+  log(`  - the Meetless Codex hook entries in ${codexHooksFile}`);
   if (skillExists(skillDir)) log(`  - ${skillDir}  (the /mla skill)`);
   log("");
   log("Left in place on purpose:");
@@ -203,6 +209,23 @@ export async function runUninstall(argv: string[], deps: UninstallDeps = {}): Pr
     );
   } else {
     log(`No "meetless" MCP server found in ${claudeJsonPath}.`);
+  }
+
+  // Strip the Codex connector's registration too, so whole-CLI uninstall never
+  // leaves a dangling $CODEX_HOME/hooks.json entry pointing at a binary we are
+  // about to remove. Best-effort: a malformed hooks.json is left untouched.
+  try {
+    const codexRes = removeCodex({ hooksPathOverride: codexHooksFile });
+    if (codexRes.changed) {
+      log(`Removed Meetless Codex hooks from ${codexRes.filePath}.`);
+    } else {
+      log(`No Meetless Codex hooks found in ${codexRes.filePath}.`);
+    }
+  } catch (err) {
+    errlog(
+      `Could not update ${codexHooksFile}: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Remove the Meetless entries by hand if present.`,
+    );
   }
 
   if (skillExists(skillDir)) {

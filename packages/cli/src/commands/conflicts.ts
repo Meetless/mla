@@ -17,7 +17,7 @@
 //                                    ('current' / 'latest' / a literal sid).
 //   mla conflicts --json          -> machine-readable mirror of the server read.
 //   mla conflicts resolve <case-id> --outcome <uphold-subject|uphold-counterparty|
-//                         dismiss|reject-both> --rationale <text>
+//                         dismiss|discard-both> --rationale <text>
 //                                 -> record ONE of the four D1 verdicts on a case.
 //   mla conflicts dismiss <case-id> --rationale <text>
 //                                 -> shorthand for `resolve ... --outcome dismiss`
@@ -89,23 +89,39 @@ export type D1ConflictOutcome =
   | "UPHOLD_SUBJECT"
   | "UPHOLD_COUNTERPARTY"
   | "DISMISS"
-  | "REJECT_BOTH";
+  | "DISCARD_BOTH";
 
 // The kebab-case `--outcome` flag values, in the order the help string lists them.
 const OUTCOME_BY_FLAG: Record<string, D1ConflictOutcome> = {
   "uphold-subject": "UPHOLD_SUBJECT",
   "uphold-counterparty": "UPHOLD_COUNTERPARTY",
   dismiss: "DISMISS",
-  "reject-both": "REJECT_BOTH",
+  "discard-both": "DISCARD_BOTH",
 };
 
 const OUTCOME_FLAGS = Object.keys(OUTCOME_BY_FLAG).join(", ");
 
+// Retired outcomes and where they went. Kept as a named table rather than folded
+// into the unknown-value branch: an operator who types `reject-both` used a verb
+// that WORKED for months, and telling them it is merely "unknown" reads like a
+// typo. They need to know it is gone, why, and what replaced it.
+const RETIRED_OUTCOME_HELP: Record<string, string> = {
+  "reject-both":
+    "`reject-both` is retired. It promised a follow-up decision that nothing " +
+    "ever picked up, so the conflict just sat there. Use `--outcome discard-both` " +
+    "to remove both claims from current knowledge, or leave the case open.",
+};
+
 // Accept either the kebab flag (`uphold-subject`) or the raw enum (`UPHOLD_SUBJECT`),
 // case-insensitively. Throws on anything else so a typo fails loud, never resolves
-// to a silent default.
+// to a silent default, and never sends a retired verdict control would 410.
 function normalizeOutcome(raw: string): D1ConflictOutcome {
-  const outcome = OUTCOME_BY_FLAG[raw.trim().toLowerCase().replace(/_/g, "-")];
+  const key = raw.trim().toLowerCase().replace(/_/g, "-");
+  const retired = RETIRED_OUTCOME_HELP[key];
+  if (retired) {
+    throw new Error(retired);
+  }
+  const outcome = OUTCOME_BY_FLAG[key];
   if (!outcome) {
     throw new Error(`Unknown outcome "${raw}". Use one of: ${OUTCOME_FLAGS}.`);
   }
@@ -117,7 +133,11 @@ export interface ResolveConflictResult {
   caseId: string;
   outcome: D1ConflictOutcome;
   resolution: string;
-  /** Set only for REJECT_BOTH: the escalation case that needs a human decision. */
+  /**
+   * Always null today. Still on control's response, but the only outcome that
+   * ever set it (the retired REJECT_BOTH) is gone, and DISCARD_BOTH opens no
+   * follow-up case.
+   */
   linkedCaseId: string | null;
 }
 
@@ -252,10 +272,11 @@ export function describeResolveResult(r: ResolveConflictResult): string {
       return `Resolved ${r.caseId}: upheld the counterparty (prior approved knowledge stands; the subject capture is dropped).`;
     case "DISMISS":
       return `Dismissed ${r.caseId}: not a real conflict, closed as a false positive.`;
-    case "REJECT_BOTH":
-      return r.linkedCaseId
-        ? `Resolved ${r.caseId}: rejected both sides, escalated to decision case ${r.linkedCaseId}.`
-        : `Resolved ${r.caseId}: rejected both sides.`;
+    case "DISCARD_BOTH":
+      // Present tense on purpose. The verdict is durable the moment this returns,
+      // but the claims leave current knowledge on intel's clock, not ours. Saying
+      // "removed" here would claim a landing this command cannot have observed.
+      return `Resolved ${r.caseId}: both claims are being removed from current knowledge; the conflicting session was notified.`;
   }
   // Exhaustive above; this keeps the compiler happy without exhaustiveness inference.
   return `Resolved ${r.caseId} (${r.outcome}).`;
@@ -463,7 +484,7 @@ export async function runConflicts(
   });
   out(
     "Resolve one here: `mla conflicts resolve <id> --outcome " +
-      "<uphold-subject|uphold-counterparty|dismiss|reject-both> --rationale " +
+      "<uphold-subject|uphold-counterparty|dismiss|discard-both> --rationale " +
       "<text>` (or `dismiss <id> --rationale <text>` if it is not a real " +
       `conflict). Full evidence + resolve in the console: ${queueUrl}`,
   );

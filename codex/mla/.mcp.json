@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "meetless": {
+      "command": "mla",
+      "args": ["mcp"],
+      "default_tools_approval_mode": "writes"
+    }
+  }
+}
