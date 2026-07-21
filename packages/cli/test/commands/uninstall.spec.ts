@@ -7,6 +7,12 @@ function baseDeps(over: Partial<UninstallDeps> = {}): { deps: UninstallDeps; out
     home: "/fake/.meetless",
     settingsPath: "/fake/.claude/settings.json",
     claudeJsonPath: "/fake/.claude.json",
+    // Both Codex deps must be injected together. Leaving EITHER one unset drops runUninstall back
+    // onto the real removeCodexHooks() and the real ~/.codex/hooks.json, so a green non-dry-run
+    // case silently strips the developer's own Codex governance hooks. jest.setup-home.js now also
+    // sandboxes $CODEX_HOME as a backstop; this keeps the spec honest about what it exercises.
+    codexHooksPath: "/fake/.codex/hooks.json",
+    removeCodexHooks: () => ({ changed: true, filePath: "/fake/.codex/hooks.json" }),
     skillDir: "/fake/.claude/skills/mla",
     queueDir: "/fake/.meetless/queue",
     log: (m) => out.push(m),

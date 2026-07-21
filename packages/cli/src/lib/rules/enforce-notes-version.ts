@@ -205,7 +205,7 @@ function buildArmRows(
   const evaluationInput: EvaluationInputV1 = {
     toolName: subject.toolName,
     target: subject.target,
-    forbiddenRootRelativePath: subject.payload.compliance.config.forbiddenRootRelativePath,
+    forbiddenRootRelativePath: legacyForbiddenRoot(subject.payload) ?? "",
     evaluatorContractVersion: EVALUATOR_CONTRACT_VERSION,
     matcherSchemaVersion: MATCHER_SCHEMA_VERSION,
     pathCanonicalizerVersion: PATH_CANONICALIZER_VERSION,
@@ -360,7 +360,7 @@ function describeTarget(target: EvaluationTarget): string {
  */
 function buildDenyReason(ruleId: string, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  const forbidden = payload.compliance.config.forbiddenRootRelativePath;
+  const forbidden = legacyForbiddenRoot(payload) ?? "";
   return (
     `Blocked by Meetless rule ${ruleId}. Writing ${where} under the forbidden ` +
     `"${forbidden}/" root is prohibited. ${payload.text}`
@@ -439,7 +439,7 @@ export async function evaluateAndEnforceNotesVersion(
   // deny, then run the pure admission kernel (slice 9).
   const inputAuthority = input.resolveInputAuthority();
   const pathRoot = resolveAttestedPathRoot({
-    configuredRelativeForbiddenPath: payload.compliance.config.forbiddenRootRelativePath,
+    configuredRelativeForbiddenPath: legacyForbiddenRoot(payload) ?? "",
     activeRuntimeProjectRoot: input.runtimeProjectRoot,
   });
   const admission = admitEnforcement({ eligibleEnforcement: eligible, inputAuthority, pathRoot });
@@ -515,8 +515,8 @@ function isProhibitForbiddenRootFamily(payload: RulePayloadV1): boolean {
   return (
     payload.effect === "PROHIBIT" &&
     payload.applicability.mode === "action" &&
-    typeof payload.compliance?.config?.forbiddenRootRelativePath === "string" &&
-    payload.compliance.config.forbiddenRootRelativePath.length > 0
+    legacyForbiddenRoot(payload) !== null &&
+    (legacyForbiddenRoot(payload)?.length ?? 0) > 0
   );
 }
 
@@ -671,4 +671,10 @@ export async function evaluateEnforceOrObserveNotesRule(
     classifyRuntime: input.classifyRuntime,
   });
   return { response: observed.response, outcome: observed.outcome };
+}
+function legacyForbiddenRoot(payload: RulePayloadV1): string | null {
+  const config = payload.compliance.config;
+  return "forbiddenRootRelativePath" in config
+    ? config.forbiddenRootRelativePath
+    : null;
 }

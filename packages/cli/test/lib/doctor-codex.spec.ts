@@ -1,6 +1,7 @@
 import {
   codexConnectorCompleteCheck,
   codexHookDoctorCheck,
+  codexLifecycleCoverageCheck,
   codexMcpDoctorCheck,
   doctorJson,
 } from "../../src/commands/doctor";
@@ -11,6 +12,21 @@ describe("Codex connector doctor checks", () => {
     expect(out.checks).toEqual([
       expect.objectContaining({ id: "codex.hooks.registered", status: "pass" }),
     ]);
+  });
+
+  it("reports the supported Codex lifecycle without claiming Claude parity", () => {
+    const out = doctorJson([codexLifecycleCoverageCheck(true)]);
+    expect(out.checks[0]).toEqual(
+      expect.objectContaining({
+        id: "codex.hooks.coverage",
+        status: "info",
+        message: expect.stringContaining(
+          "Codex hook coverage: PreToolUse + UserPromptSubmit",
+        ),
+      }),
+    );
+    expect(out.checks[0]?.message).toContain("PostToolUse");
+    expect(out.checks[0]?.message).toContain("Stop");
   });
 
   it("keeps an unused optional Codex connector informational", () => {
@@ -67,5 +83,6 @@ describe("Codex connector doctor checks", () => {
     expect(out.checks[0]).toEqual(
       expect.objectContaining({ id: "codex.connector.complete", status: "pass" }),
     );
+    expect(out.checks[0]?.message).toContain("supported surfaces");
   });
 });

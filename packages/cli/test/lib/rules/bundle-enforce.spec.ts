@@ -15,6 +15,13 @@ import {
   WARN_AGGREGATE_CAP,
 } from "../../../src/lib/rules/bundle-enforce";
 import type { EligibleEnforcement } from "../../../src/lib/rules/deny-admission";
+import {
+  NOTE_VAULT_EVALUATOR_CONTRACT_VERSION,
+  NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+  NOTE_VAULT_MATCHER_SCHEMA_VERSION,
+  NOTE_VAULT_PATH_CANONICALIZER_VERSION,
+  type NoteVaultClassification,
+} from "../../../src/lib/rules/notes-path";
 
 // P1G / G4 (notes/20260627-rules-store-unification-backend-sot-proposal.md §6.3, §6.4, §7): the
 // PreToolUse enforcement decision, faced over the principal-bound rule bundle instead of the
@@ -49,6 +56,21 @@ function pilotPayload(over: Partial<RulePayloadV1> = {}): RulePayloadV1 {
     canonicalSerializationVersion: "v1",
     ...over,
   };
+}
+
+function noteVaultPayload(): RulePayloadV1 {
+  return pilotPayload({
+    text: "Date-prefixed working notes must go in the standalone vault; ordinary markdown is allowed.",
+    compliance: {
+      evaluatorContractVersion: NOTE_VAULT_EVALUATOR_CONTRACT_VERSION,
+      matcherSchemaVersion: NOTE_VAULT_MATCHER_SCHEMA_VERSION,
+      pathCanonicalizerVersion: NOTE_VAULT_PATH_CANONICALIZER_VERSION,
+      config: {
+        allowedRootAbsolutePath: "/work/notes",
+        filenamePrefixPattern: NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+      },
+    },
+  });
 }
 
 // A real bundle entry: the carried canonicalPayloadHash is the actual v1 digest of the payload, exactly
@@ -122,6 +144,69 @@ describe("decideBundleEnforcement: no usable bundle (§6.3, acceptance 15)", () 
   it("is UNAVAILABLE defensively when status is not unavailable but the bundle is null", async () => {
     const read = { status: "fresh", bundle: null, ageMs: 0, droppedForIntegrity: 0, reason: null } as BundleCacheRead;
     expect((await decide(read, writeMd("notes/x.md"))).kind).toBe("UNAVAILABLE");
+  });
+});
+
+describe("decideBundleEnforcement: date-prefixed note vault v2", () => {
+  async function decideVault(
+    path: string,
+    classification: NoteVaultClassification,
+  ) {
+    return decideBundleEnforcement({
+      call: writeMd(path),
+      read: fresh([entry("node_vault", noteVaultPayload())]),
+      runtimeProjectRoot: "/runtime/root",
+      runtimeScopeId: PILOT_SCOPE,
+      classifyRuntime,
+      classifyNoteVault: async () => classification,
+      maxEnforcement: "WARN",
+    });
+  }
+
+  it("warns for a date-prefixed working note outside the vault", async () => {
+    const result = await decideVault(
+      "notes/20260721-proposal.md",
+      "DATE_PREFIXED_OUTSIDE_ALLOWED_ROOT",
+    );
+    expect(result.kind).toBe("WARN");
+    if (result.kind === "WARN") {
+      expect(result.reason).toContain("outside the required note vault");
+      expect(result.warnings[0].ruleNodeId).toBe("node_vault");
+    }
+  });
+
+  it.each([
+    {
+      toolName: "Bash",
+      toolInput: { command: "printf x > notes/20260721-proposal.md" },
+    },
+    {
+      toolName: "apply_patch",
+      toolInput: {
+        command:
+          "*** Begin Patch\n*** Add File: notes/20260721-proposal.md\n+x\n*** End Patch",
+      },
+    },
+  ])("cannot bypass the vault rule through $toolName", async (call) => {
+    const result = await decideBundleEnforcement({
+      call,
+      read: fresh([entry("node_vault", noteVaultPayload())]),
+      runtimeProjectRoot: "/runtime/root",
+      runtimeScopeId: PILOT_SCOPE,
+      classifyRuntime,
+      classifyNoteVault: async () =>
+        "DATE_PREFIXED_OUTSIDE_ALLOWED_ROOT",
+      maxEnforcement: "WARN",
+    });
+    expect(result.kind).toBe("WARN");
+  });
+
+  it.each([
+    ["README.md", "NOT_DATE_PREFIXED_NOTE"],
+    ["/work/notes/20260721-proposal.md", "DATE_PREFIXED_UNDER_ALLOWED_ROOT"],
+    ["notes/20260721-proposal.md", "INDETERMINATE"],
+  ] as const)("passes %s when classified %s", async (path, classification) => {
+    expect((await decideVault(path, classification)).kind).toBe("PASS");
   });
 });
 

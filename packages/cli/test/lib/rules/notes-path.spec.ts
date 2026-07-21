@@ -3,7 +3,13 @@ import * as os from "os";
 import * as path from "path";
 
 import { NotesPathScope } from "../../../src/lib/rules/notes-path";
-import { classifyRuntimeTarget, classifyTargetPath, isUnderRoot } from "../../../src/lib/rules/notes-path";
+import {
+  classifyDatePrefixedNoteVaultTarget,
+  classifyRuntimeTarget,
+  classifyTargetPath,
+  isUnderRoot,
+  NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+} from "../../../src/lib/rules/notes-path";
 import { EvaluationTarget } from "../../../src/lib/rules/evaluation-input-hash";
 
 // R0 notes-location path matcher. Classifies a concrete target path against a
@@ -74,6 +80,61 @@ describe("classifyTargetPath - existing files", () => {
   it("does not treat a sibling sharing the root prefix as UNDER", async () => {
     const target = makeFile("notes-archive/old.md");
     expect(await classifyTargetPath(target, scope())).toBe("OUTSIDE_FORBIDDEN_ROOT");
+  });
+});
+
+describe("classifyDatePrefixedNoteVaultTarget", () => {
+  it("governs date-prefixed notes outside the required vault", async () => {
+    const vault = makeDir("vault");
+    expect(
+      await classifyDatePrefixedNoteVaultTarget(
+        "notes/20260721-proposal.md",
+        projectRoot,
+        vault,
+        NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+        { caseProbe: sensitiveProbe },
+      ),
+    ).toBe("DATE_PREFIXED_OUTSIDE_ALLOWED_ROOT");
+  });
+
+  it("allows date-prefixed notes inside the required vault", async () => {
+    const vault = makeDir("vault");
+    expect(
+      await classifyDatePrefixedNoteVaultTarget(
+        path.join(vault, "20260721-proposal.md"),
+        projectRoot,
+        vault,
+        NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+        { caseProbe: sensitiveProbe },
+      ),
+    ).toBe("DATE_PREFIXED_UNDER_ALLOWED_ROOT");
+  });
+
+  it.each(["README.md", "docs/architecture.md", "/tmp/plain.md"])(
+    "does not govern ordinary markdown: %s",
+    async (target) => {
+      const vault = makeDir("vault");
+      expect(
+        await classifyDatePrefixedNoteVaultTarget(
+          target,
+          projectRoot,
+          vault,
+          NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+          { caseProbe: sensitiveProbe },
+        ),
+      ).toBe("NOT_DATE_PREFIXED_NOTE");
+    },
+  );
+
+  it("fails open when the config is not the pinned v1 discriminator", async () => {
+    expect(
+      await classifyDatePrefixedNoteVaultTarget(
+        "20260721-proposal.md",
+        projectRoot,
+        projectRoot,
+        ".*",
+      ),
+    ).toBe("INDETERMINATE");
   });
 });
 

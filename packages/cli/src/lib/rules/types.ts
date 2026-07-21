@@ -129,7 +129,10 @@ export type VerdictReasonCode =
   // eval, or $VAR expansion could still perform the operation without the tokens.
   | "FORBIDDEN_COMMAND_MATCH"
   | "COMMAND_NO_MATCH_OPAQUE"
-  | "COMMAND_INDETERMINATE";
+  | "COMMAND_INDETERMINATE"
+  | "NOTE_OUTSIDE_REQUIRED_VAULT"
+  | "COMPLIANT_REQUIRED_VAULT"
+  | "COMPLIANT_NOT_GOVERNED_NOTE";
 
 /**
  * The normalized OBSERVED rule: the ephemeral, un-attested spec the scanner
@@ -188,9 +191,24 @@ export type DeliveryChannel = "nativeRule" | "runtimeInject" | "preToolUse";
  * to the runtime-scope root), never a mutable id, so repointing an id can never silently
  * change a rule's meaning.
  */
-export interface ComplianceEvaluatorConfig {
+export interface ForbiddenRootComplianceEvaluatorConfig {
   forbiddenRootRelativePath: string;
 }
+
+/**
+ * v2 notes-location policy. Only date-prefixed working notes are governed;
+ * ordinary markdown (README.md, docs/*.md) remains outside the rule. The root
+ * is absolute because the allowed vault intentionally lives outside the active
+ * repository and therefore cannot be represented relative to runtimeScopeId.
+ */
+export interface DatePrefixedNoteVaultComplianceEvaluatorConfig {
+  allowedRootAbsolutePath: string;
+  filenamePrefixPattern: "^\\d{8}-";
+}
+
+export type ComplianceEvaluatorConfig =
+  | ForbiddenRootComplianceEvaluatorConfig
+  | DatePrefixedNoteVaultComplianceEvaluatorConfig;
 
 /**
  * The evaluator SEMANTICS that produce a verdict, version-bound so a later MLA build cannot

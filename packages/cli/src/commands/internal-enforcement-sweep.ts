@@ -84,7 +84,11 @@ function forbiddenRoots(p: BundlePrincipal): string[] {
     if (payload.effect !== "PROHIBIT" || payload.applicability?.mode !== "action") continue;
     if (payload.enforcementCeiling !== "DENY") continue;
     if (!payload.deliveryChannels?.includes("preToolUse")) continue;
-    const root = payload.compliance?.config?.forbiddenRootRelativePath;
+    const config = payload.compliance?.config;
+    const root =
+      config && "forbiddenRootRelativePath" in config
+        ? config.forbiddenRootRelativePath
+        : null;
     if (typeof root === "string" && root.length > 0) roots.push(root);
   }
   return [...new Set(roots)];

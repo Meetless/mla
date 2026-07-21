@@ -1934,7 +1934,10 @@ describe("runRulesAttestBackend", () => {
     expect(calls[0].path).toBe("/internal/v1/rules");
     const payload = body!.payload as RulePayloadV1;
     expect(payload.enforcementCeiling).toBe("WARN");
-    expect(payload.compliance.config.forbiddenRootRelativePath).toBe("references");
+    expect("forbiddenRootRelativePath" in payload.compliance.config).toBe(true);
+    if ("forbiddenRootRelativePath" in payload.compliance.config) {
+      expect(payload.compliance.config.forbiddenRootRelativePath).toBe("references");
+    }
     // The wire key is the canonical hash of the admitted payload, round-tripped verbatim.
     expect(body!.requestIdempotencyKey).toBe(ruleVersionHash(payload));
     expect(body!.canonicalPayloadHash).toBe(ruleVersionHash(payload));
@@ -1942,6 +1945,34 @@ describe("runRulesAttestBackend", () => {
     expect(rec.out.join("\n")).toContain("forbidden-root:references");
     expect(rec.out.join("\n")).toContain("WARN");
     expect(rec.out.join("\n")).toContain("INV-8");
+  });
+
+  it("mints the date-prefixed note-vault rule with a canonical absolute allowlist", async () => {
+    let body: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      post: (_p, b) => {
+        body = b as Record<string, unknown>;
+        return node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID });
+      },
+    });
+    const { rec, deps } = attestDeps({ http });
+    const vault = fs.realpathSync(process.cwd());
+    const code = await runRulesAttestBackend(
+      ["--note-vault", vault, "--agent-on-user-request", "--yes"],
+      deps,
+    );
+
+    expect(code).toBe(0);
+    const payload = body!.payload as RulePayloadV1;
+    expect(payload.enforcementCeiling).toBe("WARN");
+    expect("allowedRootAbsolutePath" in payload.compliance.config).toBe(true);
+    if ("allowedRootAbsolutePath" in payload.compliance.config) {
+      expect(payload.compliance.config).toEqual({
+        allowedRootAbsolutePath: vault,
+        filenamePrefixPattern: "^\\d{8}-",
+      });
+    }
+    expect(rec.out.join("\n")).toContain(`note-vault:${vault}`);
   });
 
   it("arms at OBSERVE under --forbidden-root <path> --ceiling observe (watch-only rung)", async () => {
@@ -2024,7 +2055,10 @@ describe("runRulesAttestBackend", () => {
     const payload = body!.payload as RulePayloadV1;
     // Same observed snapshot as the DENY pilot, but --ceiling flips it to the generic WARN family.
     expect(payload.enforcementCeiling).toBe("WARN");
-    expect(payload.compliance.config.forbiddenRootRelativePath).toBe("notes");
+    expect("forbiddenRootRelativePath" in payload.compliance.config).toBe(true);
+    if ("forbiddenRootRelativePath" in payload.compliance.config) {
+      expect(payload.compliance.config.forbiddenRootRelativePath).toBe("notes");
+    }
     // Labelled as the generic family, NOT notes-location-v1 (that id is reserved for the earned DENY pilot).
     expect(rec.out.join("\n")).toContain("forbidden-root:notes");
     expect(rec.out.join("\n")).not.toContain("notes-location-v1");
@@ -2058,6 +2092,47 @@ describe("runRulesAttestBackend", () => {
   it("flags a dangling --forbidden-root (no value) with the usage (exit 2)", async () => {
     const { deps } = attestDeps();
     expect(await runRulesAttestBackend(["--forbidden-root", "--agent-on-user-request", "--yes"], deps)).toBe(2);
+  });
+
+  // The confirmation prompt and the enforcement block must name a root IDENTICALLY: an operator who
+  // confirms "references" and is later blocked for "references/" has no way to tell the two apart.
+  // Nothing pinned that before, which is exactly how the prompt silently lost the trailing slash when
+  // it was generalized to serve both families. These two pin the spelling per family.
+  function promptCapture(http: unknown) {
+    let prompt: string | undefined;
+    const { deps } = attestDeps({
+      http,
+      isInteractive: () => true,
+      confirm: (p: string) => {
+        prompt = p;
+        return true;
+      },
+    });
+    return { deps, read: () => prompt };
+  }
+
+  it("names a forbidden root in the confirm prompt exactly as enforcement blocks it (trailing slash)", async () => {
+    const { http } = fakeHttp({
+      post: () => node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID }),
+    });
+    const { deps, read } = promptCapture(http);
+    const code = await runRulesAttestBackend(["--forbidden-root", "references"], deps);
+
+    expect(code).toBe(0);
+    expect(read()).toContain('"references/"');
+  });
+
+  it("names a note vault in the confirm prompt as its bare absolute path (no trailing slash)", async () => {
+    const { http } = fakeHttp({
+      post: () => node({ authorityScopeId: "PERSONAL", ownerUserId: OPERATOR_ID }),
+    });
+    const { deps, read } = promptCapture(http);
+    const vault = fs.realpathSync(process.cwd());
+    const code = await runRulesAttestBackend(["--note-vault", vault], deps);
+
+    expect(code).toBe(0);
+    expect(read()).toContain(`"${vault}"`);
+    expect(read()).not.toContain(`"${vault}/"`);
   });
 });
 

@@ -61,6 +61,11 @@ import {
   type ReconcileIO,
 } from "../connectors/claude-code/plugin-migrate";
 import { codexHooksInstalled } from "../connectors/codex/wire";
+import {
+  readRuleBundleCache,
+  type BundleCacheRead,
+} from "../lib/rules/bundle-cache";
+import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 
 // `mla doctor` (§4.9, §6.4 step 14, Acceptance §11.14)
 //
@@ -258,6 +263,85 @@ export function codexHookDoctorCheck(installed: boolean, hooksPath: string): Che
       };
 }
 
+/**
+ * Codex intentionally exposes a smaller managed lifecycle than Claude Code.
+ * Keep that boundary visible in doctor so a healthy install is not mistaken
+ * for feature parity: grounding and pre-write governance are live, while the
+ * Stop/PostToolUse-dependent capture and correlation paths are unavailable.
+ */
+export function codexLifecycleCoverageCheck(installed: boolean): Check {
+  return installed
+    ? {
+        id: "codex.hooks.coverage",
+        ok: true,
+        level: "info",
+        label: "Codex hook coverage: PreToolUse + UserPromptSubmit",
+        detail:
+          "SessionStart, PostToolUse, and Stop are not installed on Codex; Claude-only session capture, decision capture, and end-of-turn correlation do not run here",
+      }
+    : {
+        id: "codex.hooks.coverage",
+        ok: true,
+        level: "info",
+        label: "Codex hook coverage inactive",
+        detail: "no Meetless Codex hooks are installed",
+      };
+}
+
+export function ruleBundleDoctorChecks(read: BundleCacheRead): Check[] {
+  if (read.status === "unavailable" || !read.bundle) {
+    return [
+      {
+        id: "rules.bundle",
+        ok: true,
+        level: "info",
+        label: "governed rule bundle unavailable",
+        detail: read.reason ?? "run `mla scan` to refresh it",
+      },
+    ];
+  }
+
+  const checks: Check[] = [
+    {
+      id: "rules.bundle",
+      ok: read.status === "fresh" && read.droppedForIntegrity === 0,
+      label: `governed rule bundle ${read.status}`,
+      detail:
+        `revision ${read.bundle.bundleRevision}, ${read.bundle.rules.length} active rule(s)` +
+        (read.droppedForIntegrity
+          ? `; ${read.droppedForIntegrity} rule(s) failed integrity validation`
+          : ""),
+    },
+  ];
+
+  const noteVaultRule = read.bundle.rules.find((entry) => {
+    const payload = entry.payload as RulePayloadV1 | undefined;
+    const config = payload?.compliance?.config;
+    return !!config && "allowedRootAbsolutePath" in config;
+  });
+  if (!noteVaultRule) {
+    checks.push({
+      id: "rules.notes-vault",
+      ok: true,
+      level: "info",
+      label: "date-prefixed notes vault rule not configured",
+    });
+    return checks;
+  }
+
+  const payload = noteVaultRule.payload as RulePayloadV1;
+  const config = payload.compliance.config;
+  checks.push({
+    id: "rules.notes-vault",
+    ok: true,
+    label: "date-prefixed notes vault rule active",
+    detail:
+      `${"allowedRootAbsolutePath" in config ? config.allowedRootAbsolutePath : "unknown vault"}; ` +
+      `${payload.enforcementCeiling} via rule ${noteVaultRule.ruleNodeId}; receipts: \`mla enforcement --json\``,
+  });
+  return checks;
+}
+
 export type CodexMcpProbe =
   | { kind: "configured"; detail: string }
   | { kind: "absent"; detail: string }
@@ -307,8 +391,9 @@ export function codexConnectorCompleteCheck(
     return {
       id: "codex.connector.complete",
       ok: true,
-      label: "Codex connector complete",
-      detail: "governed hooks and MCP tools are both installed",
+      label: "Codex connector complete for supported surfaces",
+      detail:
+        "governed retrieval, prompt grounding, and pre-write governance are installed; see codex.hooks.coverage for lifecycle limits",
     };
   }
   return {
@@ -866,6 +951,13 @@ export async function runDoctor(argv: string[]): Promise<number> {
   // null means "this folder is not activated" and the workspace-scoped probes
   // (whoami, kb/health) report that instead of calling control with no id.
   const markerWorkspaceId = tryResolveWorkspaceId();
+  if (markerWorkspaceId) {
+    checks.push(
+      ...ruleBundleDoctorChecks(
+        readRuleBundleCache(resolveBundlePrincipal(markerWorkspaceId)),
+      ),
+    );
+  }
 
   // 2. whoami
   //
@@ -1090,6 +1182,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
       liveCodexHooksPath,
     ),
   );
+  checks.push(codexLifecycleCoverageCheck(liveCodexHooksInstalled));
   checks.push(codexMcpDoctorCheck(liveCodexMcpProbe));
   checks.push(
     codexConnectorCompleteCheck(liveCodexHooksInstalled, liveCodexMcpProbe),
@@ -1579,15 +1672,24 @@ export async function runDoctor(argv: string[]): Promise<number> {
             const payload = JSON.parse(
               liveVersion.rulePayload,
             ) as RulePayloadV1;
-            checks.push(
-              attestedPathRootCheck(
-                resolveAttestedPathRoot({
-                  configuredRelativeForbiddenPath:
-                    payload.compliance.config.forbiddenRootRelativePath,
-                  activeRuntimeProjectRoot: runtimeRoot,
-                }),
-              ),
-            );
+            const config = payload.compliance.config;
+            if ("forbiddenRootRelativePath" in config) {
+              checks.push(
+                attestedPathRootCheck(
+                  resolveAttestedPathRoot({
+                    configuredRelativeForbiddenPath:
+                      config.forbiddenRootRelativePath,
+                    activeRuntimeProjectRoot: runtimeRoot,
+                  }),
+                ),
+              );
+            } else {
+              checks.push({
+                ok: true,
+                level: "info",
+                label: `notes vault rule uses ${config.allowedRootAbsolutePath}`,
+              });
+            }
           } else {
             checks.push({
               ok: true,

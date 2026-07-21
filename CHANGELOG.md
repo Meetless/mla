@@ -1,14 +1,17 @@
 # Changelog
 
-## 0.2.24 (2026-07-20)
+## 0.2.24 (2026-07-21)
 
 This release brings Meetless to Codex. `mla codex install` wires the connector in, hooks and
 wrapper included, so the governance you already get in Claude Code runs there too: governed paths
 are enforced on `apply_patch`, MCP reads and governed writes are classified correctly, and because
 Codex has no ASK response in its PreToolUse seam the connector resolves the decision itself instead
 of stalling. `mla doctor` now reports connector health and fails loudly on a half-finished install
-rather than looking fine. On the conflict side, `mla conflicts resolve` takes a new
-`--outcome discard-both` for contradictions where neither side survives.
+rather than looking fine. Enforcement also grows a second rule family: an allowlist for a
+date-prefixed note vault that deliberately lives outside your checkout, so working notes can be
+governed by where they belong rather than only by where they are forbidden. On the conflict side,
+`mla conflicts resolve` takes a new `--outcome discard-both` for contradictions where neither side
+survives.
 
 - `mla codex install` and `mla codex uninstall` wire the Meetless connector into Codex
 - a static Codex plugin package ships `mla mcp`, so governed memory is reachable in-session
@@ -16,7 +19,11 @@ rather than looking fine. On the conflict side, `mla conflicts resolve` takes a 
 - MCP reads and governed writes are classified correctly on the Codex seam
 - the connector resolves its own decision where Codex cannot return ASK from PreToolUse
 - `mla doctor` reports Codex connector health and fails on a partial setup
-- `mla conflicts resolve` accepts `--outcome discard-both`; the `reject-both` spelling is retired
+- a second enforcement rule family: an allowlist for a date-prefixed note vault outside the checkout
+- only `YYYYMMDD-*` notes are governed by that rule; `README.md` and ordinary docs stay outside it
+- one helper now names a governed root everywhere, so the attest prompt and the block can never disagree
+- `mla doctor` reports rule bundle health alongside the Codex connector checks
+- `mla conflicts resolve` accepts `--outcome discard-both`; the `reject-both` spelling is retired. Hosted backends serve `discard-both` from the next `control` release
 
 ## 0.2.23 (2026-07-19)
 

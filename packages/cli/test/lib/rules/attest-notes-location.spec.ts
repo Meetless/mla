@@ -198,7 +198,10 @@ describe("convertForbiddenRootSnapshot defaults a newly-armed rule to the WARN r
     expect(result.admitted).toBe(true);
     if (!result.admitted) return;
     expect(result.payload.enforcementCeiling).toBe("WARN");
-    expect(result.payload.compliance.config.forbiddenRootRelativePath).toBe("references");
+    expect("forbiddenRootRelativePath" in result.payload.compliance.config).toBe(true);
+    if ("forbiddenRootRelativePath" in result.payload.compliance.config) {
+      expect(result.payload.compliance.config.forbiddenRootRelativePath).toBe("references");
+    }
   });
 
   it("honors an explicit DENY ceiling (the earned-authority promotion path)", () => {

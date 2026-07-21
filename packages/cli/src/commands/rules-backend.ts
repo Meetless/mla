@@ -77,12 +77,13 @@ import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 import { openCe0Store, closeCe0Store, type Ce0Store } from "../lib/rules/ce0-store";
 import { resolveObservedSnapshotInScope } from "../lib/rules/interception-store";
 import {
+  buildDatePrefixedNoteVaultPayload,
   convertForbiddenRootSnapshot,
   convertNotesLocationSnapshot,
   NOTES_LOCATION_RULE_ID,
 } from "../lib/rules/attest-notes-location";
 import { serializeObservedRule } from "../lib/rules/observed-rule-hash";
-import { normalizeForbiddenRoot } from "../lib/rules/durable-observation";
+import { displayComplianceRoot, normalizeForbiddenRoot } from "../lib/rules/durable-observation";
 import { defaultCe0StorePath } from "./evidence";
 import { deliverRuleChange, deliveryLine, type DeliveryOutcome } from "./rule-delivery";
 import { Strength } from "../lib/scanner/types";
@@ -166,13 +167,14 @@ export const RULES_REVOKE_BACKEND_USAGE =
   "  Revokes a rule on the backend (the kill switch). Already-revoked is a no-op.";
 
 export const RULES_ATTEST_BACKEND_USAGE =
-  "usage: mla rules attest (--from-observed <hash> | --forbidden-root <path>) [--ceiling observe|warn]\n" +
+  "usage: mla rules attest (--from-observed <hash> | --forbidden-root <path> | --note-vault <absolute-path>) [--ceiling observe|warn]\n" +
   "                        [--text <rationale>] [--scope team|personal] [--agent-on-user-request --yes] [--workspace <id>]\n" +
   "  Mints a forbidden-root PROHIBIT rule on the backend.\n" +
   "  --from-observed <hash>   mint from a recorded R0 observed snapshot. With NO --ceiling this is the\n" +
   "                           armed notes-location DENY pilot (the only DENY arming surface).\n" +
   "  --forbidden-root <path>  author a rule for <path> directly, no observation needed. Defaults to the\n" +
   "                           WARN ceiling (a non-blocking advisory; a freshly armed rule warns, INV-8).\n" +
+  "  --note-vault <path>      govern only YYYYMMDD-*.md working notes and require this absolute vault.\n" +
   "  --ceiling observe|warn   the enforcement authority to arm at. ask/deny are refused here: a new rule\n" +
   "                           must earn DENY end to end before it blocks.\n" +
   "  --text <rationale>       the rule statement shown to the agent (direct authoring only; defaulted).\n" +
@@ -1097,9 +1099,10 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // notes-location pilot, whose EARNED DENY authority is preserved for backward compatibility.
   const observed = attestFlagValue(rest, "--from-observed");
   const forbiddenRoot = attestFlagValue(rest, "--forbidden-root");
+  const noteVault = attestFlagValue(rest, "--note-vault");
   const ceilingFlag = attestFlagValue(rest, "--ceiling");
   const textFlag = attestFlagValue(rest, "--text");
-  if (observed.dangling || forbiddenRoot.dangling || ceilingFlag.dangling || textFlag.dangling) {
+  if (observed.dangling || forbiddenRoot.dangling || noteVault.dangling || ceilingFlag.dangling || textFlag.dangling) {
     err(RULES_ATTEST_BACKEND_USAGE);
     return 2;
   }
@@ -1110,12 +1113,20 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // Normalizing at the writer means no new rule is born inert; normalizeForbiddenRoot is the same
   // function the evaluator applies, so the two can never drift apart.
   const directRoot = forbiddenRoot.value === undefined ? undefined : normalizeForbiddenRoot(forbiddenRoot.value);
-  if (observedRuleHash !== undefined && directRoot !== undefined) {
-    err(`pass either --from-observed <hash> or --forbidden-root <path>, not both\n${RULES_ATTEST_BACKEND_USAGE}`);
+  const directNoteVault = noteVault.value;
+  const sourceCount = [observedRuleHash, directRoot, directNoteVault].filter(
+    (value) => value !== undefined,
+  ).length;
+  if (sourceCount > 1) {
+    err(`pass exactly one rule source, not both\n${RULES_ATTEST_BACKEND_USAGE}`);
     return 2;
   }
-  if (observedRuleHash === undefined && directRoot === undefined) {
+  if (sourceCount === 0) {
     err(RULES_ATTEST_BACKEND_USAGE);
+    return 2;
+  }
+  if (directNoteVault !== undefined && !path.isAbsolute(directNoteVault)) {
+    err(`--note-vault must be an absolute path\n${RULES_ATTEST_BACKEND_USAGE}`);
     return 2;
   }
 
@@ -1133,7 +1144,10 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   }
   // Any --ceiling arming, and every --forbidden-root arming, is the GENERIC family (never the notes
   // DENY pilot, which is reached only by --from-observed with no --ceiling).
-  const genericArming = directRoot !== undefined || requestedCeiling !== undefined;
+  const genericArming =
+    directRoot !== undefined ||
+    directNoteVault !== undefined ||
+    requestedCeiling !== undefined;
   if (genericArming && (requestedCeiling === "ASK" || requestedCeiling === "DENY")) {
     err(
       `--ceiling ${requestedCeiling.toLowerCase()} is refused when arming a new forbidden-root rule: a ` +
@@ -1199,7 +1213,23 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // notesPilot marks the one EARNED-DENY, notes-pinned arming (--from-observed, no --ceiling), used
   // only for the display label; every other arming is the generic forbidden-root family.
   let notesPilot = false;
-  if (directRoot !== undefined) {
+  if (directNoteVault !== undefined) {
+    let canonicalVault: string;
+    try {
+      canonicalVault = fs.realpathSync(directNoteVault);
+    } catch (e) {
+      err(`rules attest: cannot resolve note vault ${directNoteVault}: ${(e as Error).message}`);
+      return 2;
+    }
+    payload = buildDatePrefixedNoteVaultPayload({
+      allowedRootAbsolutePath: canonicalVault,
+      runtimeScopeId,
+      ceiling: genericCeiling,
+      text:
+        textFlag.value ??
+        `Date-prefixed working notes (YYYYMMDD-*.md) must be written under ${canonicalVault}; ordinary markdown is not governed by this rule.`,
+    });
+  } else if (directRoot !== undefined) {
     // Direct authoring: synthesize the exact observed-rule-v1 spec the scanner would emit for a
     // whole-root Write/Edit PROHIBIT, then run it through the SAME production admission gate as the
     // observed path (serialize -> convertForbiddenRootSnapshot). No CE0 store is touched: authoring a
@@ -1270,8 +1300,16 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // Read the armed authority + root back off the frozen payload, so the display is always accurate
   // regardless of which converter ran.
   const ceiling = payload.enforcementCeiling;
-  const forbiddenRootLabel = payload.compliance.config.forbiddenRootRelativePath;
-  const ruleLabel = notesPilot ? NOTES_LOCATION_RULE_ID : `forbidden-root:${forbiddenRootLabel}`;
+  const complianceConfig = payload.compliance.config;
+  const forbiddenRootLabel =
+    "forbiddenRootRelativePath" in complianceConfig
+      ? complianceConfig.forbiddenRootRelativePath
+      : complianceConfig.allowedRootAbsolutePath;
+  const ruleLabel = notesPilot
+    ? NOTES_LOCATION_RULE_ID
+    : "allowedRootAbsolutePath" in complianceConfig
+      ? `note-vault:${forbiddenRootLabel}`
+      : `forbidden-root:${forbiddenRootLabel}`;
 
   const audienceNote =
     authorityScope === "TEAM"
@@ -1296,8 +1334,12 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
     }
     const confirm = deps.confirm ?? defaultConfirm;
     const ok = await confirm(
-      `Attest this ${ceiling} forbidden-root rule for "${forbiddenRootLabel}/" as a ${scopeLabel} rule ` +
-        `(runtime scope ${runtimeScopeId})?`,
+      // Name the root exactly as enforcement will later name it. Generalizing this prompt to serve
+      // both rule families dropped the trailing slash a forbidden root is always blocked under, so
+      // the operator confirmed "legacy" and every later block said "legacy/". displayComplianceRoot
+      // restores it for a forbidden root and correctly omits it for an absolute vault path.
+      `Attest this ${ceiling} path rule for "${displayComplianceRoot(complianceConfig)}" ` +
+        `as a ${scopeLabel} rule (runtime scope ${runtimeScopeId})?`,
     );
     if (!ok) {
       err("attestation not confirmed; nothing minted");

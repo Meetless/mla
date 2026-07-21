@@ -13,6 +13,12 @@ import {
   RulePayloadV1,
   RuleStrength,
 } from "./types";
+import {
+  NOTE_VAULT_EVALUATOR_CONTRACT_VERSION,
+  NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+  NOTE_VAULT_MATCHER_SCHEMA_VERSION,
+  NOTE_VAULT_PATH_CANONICALIZER_VERSION,
+} from "./notes-path";
 
 // The pilot's mint-or-supersede outcome is the canonical writer's outcome, re-exported so the command
 // shell keeps importing a single name regardless of which writer produced it.
@@ -253,11 +259,53 @@ export function convertNotesLocationSnapshot(snapshotJson: string, runtimeScopeI
   // The notes pilot keeps its EARNED DENY authority, passed explicitly, not the generic WARN default.
   const generic = convertForbiddenRootSnapshot(snapshotJson, runtimeScopeId, PILOT_ENFORCEMENT_CEILING);
   if (!generic.admitted) return generic;
-  const root = generic.payload.compliance.config.forbiddenRootRelativePath;
+  const config = generic.payload.compliance.config;
+  if (!("forbiddenRootRelativePath" in config)) {
+    return reject("FORBIDDEN_ROOT_UNSUPPORTED", "notes pilot requires the legacy forbidden-root config");
+  }
+  const root = config.forbiddenRootRelativePath;
   if (root !== PILOT_FORBIDDEN_ROOT) {
     return reject("FORBIDDEN_ROOT_UNSUPPORTED", `forbidden root '${root}' is not 'notes'`);
   }
   return generic;
+}
+
+/**
+ * Author the corrected notes-location rule: only YYYYMMDD-* markdown working
+ * notes are governed, and they are allowed exclusively under one absolute
+ * sibling vault. The caller validates/realpaths the root before minting.
+ */
+export function buildDatePrefixedNoteVaultPayload(input: {
+  allowedRootAbsolutePath: string;
+  runtimeScopeId: string;
+  text: string;
+  ceiling?: EligibleEnforcement;
+}): RulePayloadV1 {
+  return {
+    text: input.text,
+    applicability: {
+      mode: "action",
+      tools: ["Write", "Edit"],
+      matcher: { field: "file_path", glob: "*.md" },
+    },
+    compliance: {
+      evaluatorContractVersion: NOTE_VAULT_EVALUATOR_CONTRACT_VERSION,
+      matcherSchemaVersion: NOTE_VAULT_MATCHER_SCHEMA_VERSION,
+      pathCanonicalizerVersion: NOTE_VAULT_PATH_CANONICALIZER_VERSION,
+      config: {
+        allowedRootAbsolutePath: input.allowedRootAbsolutePath,
+        filenamePrefixPattern: NOTE_VAULT_FILENAME_PREFIX_PATTERN,
+      },
+    },
+    effect: PILOT_EFFECT,
+    strength: PILOT_STRENGTH,
+    deliveryChannels: PILOT_DELIVERY_CHANNELS,
+    enforcementCeiling: input.ceiling ?? DEFAULT_FORBIDDEN_ROOT_CEILING,
+    infrastructureFailurePolicy: PILOT_INFRASTRUCTURE_FAILURE_POLICY,
+    runtimeScopeId: input.runtimeScopeId,
+    payloadSchemaVersion: PILOT_PAYLOAD_SCHEMA_VERSION,
+    canonicalSerializationVersion: PILOT_CANONICAL_SERIALIZATION_VERSION,
+  };
 }
 
 /** The inputs the command shell hands the mint after it has converted, confirmed, and resolved. */

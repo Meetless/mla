@@ -66,6 +66,9 @@ export interface VersionBackedVerdict {
  */
 export function versionBackedVerdict(payload: RulePayloadV1, target: EvaluationTarget): VersionBackedVerdict {
   const c = payload.compliance;
+  if (!("forbiddenRootRelativePath" in c.config)) {
+    return { result: "UNKNOWN", verdictReasonCode: "EVALUATOR_UNSUPPORTED" };
+  }
   const supported =
     c.evaluatorContractVersion === EVALUATOR_CONTRACT_VERSION &&
     c.matcherSchemaVersion === MATCHER_SCHEMA_VERSION &&
@@ -133,7 +136,10 @@ export function recordVersionEvaluation(
   const evaluationInput: EvaluationInputV1 = {
     toolName: subject.toolName,
     target: subject.target,
-    forbiddenRootRelativePath: payload.compliance.config.forbiddenRootRelativePath,
+    forbiddenRootRelativePath:
+      "forbiddenRootRelativePath" in payload.compliance.config
+        ? payload.compliance.config.forbiddenRootRelativePath
+        : "",
     evaluatorContractVersion: EVALUATOR_CONTRACT_VERSION,
     matcherSchemaVersion: MATCHER_SCHEMA_VERSION,
     pathCanonicalizerVersion: PATH_CANONICALIZER_VERSION,

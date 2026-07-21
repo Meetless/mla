@@ -29,11 +29,18 @@
 import type { BundleCacheRead } from "./bundle-cache";
 import type { RuleBundleEntry } from "./control-rule-client";
 import { type EligibleEnforcement, projectEligibleEnforcement } from "./deny-admission";
-import { normalizeForbiddenRoot } from "./durable-observation";
+import { displayComplianceRoot } from "./durable-observation";
 import type { EvaluationTarget } from "./evaluation-input-hash";
 import { selectRule, type ToolCall } from "./evaluator";
 import { matchesGlob } from "./glob-match";
-import { classifyRuntimeTarget } from "./notes-path";
+import {
+  classifyDatePrefixedNoteVaultTarget,
+  classifyRuntimeTarget,
+  NOTE_VAULT_EVALUATOR_CONTRACT_VERSION,
+  NOTE_VAULT_MATCHER_SCHEMA_VERSION,
+  NOTE_VAULT_PATH_CANONICALIZER_VERSION,
+  type NoteVaultClassification,
+} from "./notes-path";
 import type { RulePayloadV1 } from "./types";
 import { versionBackedVerdict } from "./version-evaluation";
 import { deriveWriteTargets, isWriteCapableTool } from "./write-targets";
@@ -105,6 +112,13 @@ export interface BundleEnforceInput {
   runtimeScopeId: string;
   /** Runtime-scope path classifier; defaults to the real filesystem canonicalizer. Injected in tests. */
   classifyRuntime?: (rawFilePath: unknown, runtimeProjectRoot: string) => Promise<EvaluationTarget>;
+  /** v2 vault classifier seam; production uses the canonical filesystem classifier. */
+  classifyNoteVault?: (
+    rawFilePath: unknown,
+    runtimeProjectRoot: string,
+    allowedRootAbsolutePath: string,
+    filenamePrefixPattern: string,
+  ) => Promise<NoteVaultClassification>;
   /**
    * The session's ceiling cap (the `MEETLESS_ACTION_INTERCEPT_MAX` kill switch). Every rule's eligible
    * enforcement is clamped to at most this rung, so a `WARN`-capped session can never ASK or DENY and an
@@ -129,29 +143,30 @@ function runtimeRelativePath(target: EvaluationTarget): string | null {
   return target.kind === "RUNTIME_RELATIVE" ? target.path : null;
 }
 
-/**
- * The root as the operator should READ it, which is not always how it was stored.
- *
- * Every reason string below renders the root as `"<root>/"`, so a payload holding the trailing slash
- * a human naturally types ("legacy/") prints `"legacy//"`. The evaluator already normalizes before it
- * matches (normalizeForbiddenRoot), so rendering the raw string would show the operator a root that is
- * not the one they were actually judged against. Name the same thing in both places.
- */
+/** The root as the operator should READ it, which is not always how it was stored. Shared with the
+ * mint-time attestation prompt so a rule is confirmed under the same name it is later blocked under;
+ * the full reasoning lives on displayComplianceRoot. */
 function displayRoot(payload: RulePayloadV1): string {
-  return normalizeForbiddenRoot(payload.compliance.config.forbiddenRootRelativePath);
+  return displayComplianceRoot(payload.compliance.config);
+}
+
+function policyPhrase(payload: RulePayloadV1): string {
+  return "forbiddenRootRelativePath" in payload.compliance.config
+    ? `under the forbidden "${displayRoot(payload)}" root`
+    : `outside the required note vault "${displayRoot(payload)}"`;
 }
 
 /** The hard-block reason. Same prose shape as the legacy CE0 deny so the operator sees one block voice. */
 function buildBundleDenyReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  return `Blocked by Meetless rule ${entry.ruleNodeId}. Writing ${where} under the forbidden "${displayRoot(payload)}/" root is prohibited. ${payload.text}`;
+  return `Blocked by Meetless rule ${entry.ruleNodeId}. Writing ${where} ${policyPhrase(payload)} is prohibited. ${payload.text}`;
 }
 
 /** The degrade-to-ASK reason: a DENY that cannot be enforced on a stale lease, asking for one confirmation. */
 function buildDegradedAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
   return (
-    `Meetless rule ${entry.ruleNodeId} would block writing ${where} under the forbidden "${displayRoot(payload)}/" root, ` +
+    `Meetless rule ${entry.ruleNodeId} would block writing ${where} ${policyPhrase(payload)}, ` +
     `but its rule bundle is stale (offline past its lease), so this needs your explicit confirmation. ${payload.text}`
   );
 }
@@ -159,14 +174,14 @@ function buildDegradedAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, 
 /** The native-ASK reason: a ceiling the human attested as ASK, surfacing one confirmation prompt. */
 function buildAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  return `Meetless rule ${entry.ruleNodeId} asks you to confirm writing ${where} under the "${displayRoot(payload)}/" root. ${payload.text}`;
+  return `Meetless rule ${entry.ruleNodeId} asks you to confirm writing ${where} ${policyPhrase(payload)}. ${payload.text}`;
 }
 
 /** The non-blocking WARN reason: a VIOLATION whose attested ceiling is WARN. Advises but never gates,
  * so the copy names the concern and leaves the correction to the agent (INV-8: no false-positive block). */
 function buildWarnReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  return `Meetless rule ${entry.ruleNodeId}: writing ${where} under the "${displayRoot(payload)}/" root is discouraged. ${payload.text}`;
+  return `Meetless rule ${entry.ruleNodeId}: writing ${where} ${policyPhrase(payload)} is discouraged. ${payload.text}`;
 }
 
 // The authority ladder as an ordinal so eligibility can be clamped to the session ceiling cap. The
@@ -204,9 +219,22 @@ type EntryDecision =
 
 /**
  * Evaluate ONE bundle entry against the call. Returns null unless the entry is an enforceable PROHIBIT
- * forbidden-root action rule that (a) is delivered to the preToolUse surface, (b) selects this call, and
- * (c) projects (through the rule's evaluation result and attested ceiling) to a DENY or ASK. The PROHIBIT
- * forbidden-root family is conflict-free by construction (§2.0), so collapsing across entries is sound.
+ * action rule that (a) is delivered to the preToolUse surface, (b) selects this call, and (c) projects
+ * (through the rule's evaluation result and attested ceiling) to a DENY or ASK.
+ *
+ * TWO rule families reach this function, and they are distinguished only by the shape of the compliance
+ * config: forbidden-root (`forbiddenRootRelativePath`, a denylist of one root) and note-vault
+ * (`allowedRootAbsolutePath`, an allowlist of one vault). The note-vault family is additionally gated on
+ * an exact match of all three of its version constants, so a payload minted against a different
+ * evaluator contract is not enforced rather than being enforced under the wrong semantics.
+ *
+ * Collapsing across entries is sound for BOTH families, and the reason is the family-independent gate
+ * below: an entry whose effect is not PROHIBIT returns null before either family is inspected. Every
+ * surviving entry therefore says "block", so two entries can restrict but never contradict, and taking
+ * the strongest cannot misrepresent any of them. (§2.0 states this for forbidden-root specifically; the
+ * argument never depended on which family the config came from, only on the PROHIBIT gate.) A third
+ * family may be added on the same footing, but a non-PROHIBIT effect would break this and needs a real
+ * conflict resolution rather than a collapse.
  */
 async function evaluateEntry(
   entry: RuleBundleEntry,
@@ -214,6 +242,12 @@ async function evaluateEntry(
   runtimeProjectRoot: string,
   currentRuntimeScopeId: string,
   classify: (rawFilePath: unknown, runtimeProjectRoot: string) => Promise<EvaluationTarget>,
+  classifyNoteVault: (
+    rawFilePath: unknown,
+    runtimeProjectRoot: string,
+    allowedRootAbsolutePath: string,
+    filenamePrefixPattern: string,
+  ) => Promise<NoteVaultClassification>,
   stale: boolean,
   maxEnforcement: EligibleEnforcement,
 ): Promise<EntryDecision> {
@@ -240,8 +274,30 @@ async function evaluateEntry(
   }
   const app = payload.applicability;
   if (payload.effect !== "PROHIBIT" || app.mode !== "action") return null;
-  const forbidden = payload.compliance?.config?.forbiddenRootRelativePath;
-  if (typeof forbidden !== "string" || forbidden.length === 0) return null;
+  const compliance = payload.compliance;
+  const config = compliance?.config;
+  if (!config) return null;
+  const forbidden =
+    "forbiddenRootRelativePath" in config
+      ? config.forbiddenRootRelativePath
+      : null;
+  const noteVault =
+    "allowedRootAbsolutePath" in config
+      ? config
+      : null;
+  if (
+    (typeof forbidden !== "string" || forbidden.length === 0) &&
+    !(
+      noteVault &&
+      compliance.evaluatorContractVersion ===
+        NOTE_VAULT_EVALUATOR_CONTRACT_VERSION &&
+      compliance.matcherSchemaVersion === NOTE_VAULT_MATCHER_SCHEMA_VERSION &&
+      compliance.pathCanonicalizerVersion ===
+        NOTE_VAULT_PATH_CANONICALIZER_VERSION
+    )
+  ) {
+    return null;
+  }
   // The preToolUse surface enforces only rules delivered to it. A rule routed solely to nativeRule /
   // runtimeInject must never produce an action-time block; the safe direction is PASS (do not enforce).
   if (!Array.isArray(payload.deliveryChannels) || !payload.deliveryChannels.includes("preToolUse")) return null;
@@ -275,16 +331,49 @@ async function evaluateEntry(
   let verdict: ReturnType<typeof versionBackedVerdict> | null = null;
   for (const raw of candidates) {
     const t = await classify(raw, runtimeProjectRoot);
-    const v = versionBackedVerdict(payload, t);
-    if (v.result === "VIOLATION") {
+    let resolvedVerdict: ReturnType<typeof versionBackedVerdict>;
+    if (noteVault) {
+      resolvedVerdict = await classifyNoteVault(
+          raw,
+          runtimeProjectRoot,
+          noteVault.allowedRootAbsolutePath,
+          noteVault.filenamePrefixPattern,
+        ).then((classification) => {
+          if (classification === "DATE_PREFIXED_OUTSIDE_ALLOWED_ROOT") {
+            return {
+              result: "VIOLATION" as const,
+              verdictReasonCode: "NOTE_OUTSIDE_REQUIRED_VAULT" as const,
+            };
+          }
+          if (classification === "DATE_PREFIXED_UNDER_ALLOWED_ROOT") {
+            return {
+              result: "COMPLIANT" as const,
+              verdictReasonCode: "COMPLIANT_REQUIRED_VAULT" as const,
+            };
+          }
+          if (classification === "NOT_DATE_PREFIXED_NOTE") {
+            return {
+              result: "COMPLIANT" as const,
+              verdictReasonCode: "COMPLIANT_NOT_GOVERNED_NOTE" as const,
+            };
+          }
+          return {
+            result: "UNKNOWN" as const,
+            verdictReasonCode: "CANONICALIZATION_FAILED" as const,
+          };
+        });
+    } else {
+      resolvedVerdict = versionBackedVerdict(payload, t);
+    }
+    if (resolvedVerdict.result === "VIOLATION") {
       target = t;
-      verdict = v;
+      verdict = resolvedVerdict;
       break;
     }
     // Remember the first evaluated target so a non-violating call still reports coherently.
     if (target === null) {
       target = t;
-      verdict = v;
+      verdict = resolvedVerdict;
     }
   }
   if (target === null || verdict === null) return null;
@@ -336,6 +425,8 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
 
   const stale = read.status === "stale";
   const classify = input.classifyRuntime ?? classifyRuntimeTarget;
+  const classifyNoteVault =
+    input.classifyNoteVault ?? classifyDatePrefixedNoteVaultTarget;
   // The session ceiling cap (MEETLESS_ACTION_INTERCEPT_MAX). Absent => DENY (uncapped): the pure kernel
   // stays uncapped by default; the IO shell reads the env var and passes WARN for headless callers.
   const maxEnforcement = input.maxEnforcement ?? "DENY";
@@ -347,7 +438,16 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
   for (const entry of entries) {
     let decided: EntryDecision;
     try {
-      decided = await evaluateEntry(entry, input.call, input.runtimeProjectRoot, input.runtimeScopeId, classify, stale, maxEnforcement);
+      decided = await evaluateEntry(
+        entry,
+        input.call,
+        input.runtimeProjectRoot,
+        input.runtimeScopeId,
+        classify,
+        classifyNoteVault,
+        stale,
+        maxEnforcement,
+      );
     } catch {
       // One unparseable / faulty entry must never block the hook nor mask the rest of the bundle.
       continue;

@@ -16,7 +16,7 @@ import { buildObservedNotesRuleSpec, selectNotesLocationDirective } from "./note
 import { classifyRuntimeTarget } from "./notes-path";
 import { ObserveHookResponse, parsePreToolUseInput } from "./observe-adapter";
 import { selectRule, ToolCall } from "./evaluator";
-import { ObservedRuleSpec, VerdictReasonCode } from "./types";
+import { ComplianceEvaluatorConfig, ObservedRuleSpec, VerdictReasonCode } from "./types";
 import { RandInt32, ulid } from "./ulid";
 import { Directive } from "../scanner/types";
 
@@ -63,6 +63,25 @@ export const PATH_CANONICALIZER_VERSION = "notes-path-v1";
  */
 export function normalizeForbiddenRoot(forbiddenRootRelativePath: string): string {
   return forbiddenRootRelativePath.trim().replace(/^\.\/+/, "").replace(/\/+$/, "");
+}
+
+/**
+ * The ONE operator-facing spelling of a rule's root, for BOTH families.
+ *
+ * A forbidden root renders normalized and slash-suffixed ("legacy/"): the evaluator normalizes before
+ * it matches, so rendering the stored string would show the operator a root that is not the one they
+ * were actually judged against. A note vault renders as its bare absolute path, where a trailing slash
+ * would be noise.
+ *
+ * Every surface that names a root to a human goes through here: the mint-time attestation prompt and
+ * every enforcement reason string. That is the point. These two drifted once already, so the prompt
+ * asked the operator to confirm "legacy" while every later block said "legacy/". One helper means the
+ * confirmation and the block can never again name the root differently.
+ */
+export function displayComplianceRoot(config: ComplianceEvaluatorConfig): string {
+  return "forbiddenRootRelativePath" in config
+    ? `${normalizeForbiddenRoot(config.forbiddenRootRelativePath)}/`
+    : config.allowedRootAbsolutePath;
 }
 
 /** The snapshot-pure verdict: the SOLE rule by which a stored observation (and its later replay)

@@ -1,7 +1,7 @@
 // Test-home containment (setupFiles: runs once per test FILE, in the worker, BEFORE the file and
 // therefore before any module that reads MEETLESS_HOME at import time, e.g. config.HOME).
 //
-// One job: no spec may write into the operator's REAL ~/.meetless. Until now every macOS run of
+// One job: no spec may write into the operator's REAL agent-host state. Until now every macOS run of
 // this suite dropped scan caches, verdicts, projection receipts and assemble audits for fake
 // workspace ids (ws_test, ws_1, ws_from_marker, ...) straight into the developer's live Meetless
 // state. The trap: os.homedir() on Darwin reads getpwuid and IGNORES $HOME (Linux/libuv honors
@@ -22,6 +22,22 @@ const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 
 const root = process.env.MLA_TEST_HOME_ROOT || tmpdir();
-const home = join(mkdtempSync(join(root, "home-")), ".meetless");
+const sandbox = mkdtempSync(join(root, "home-"));
+const home = join(sandbox, ".meetless");
 mkdirSync(home, { recursive: true });
 process.env.MEETLESS_HOME = home;
+
+// Same containment, second agent host. MEETLESS_HOME alone does NOT cover the Codex connector:
+// its registration file is $CODEX_HOME/hooks.json (default ~/.codex), which resolveCodexHome()
+// derives from the real passwd home, not from MEETLESS_HOME. That gap was not theoretical. The
+// `mla uninstall` spec injected fakes for the Claude removers but not for the Codex one, so every
+// non-dry-run case called the REAL removeCodexHooks() against the operator's REAL ~/.codex/hooks.json
+// and silently stripped their Codex governance hooks. The suite stayed green the whole time: the
+// wipe is invisible to assertions because nothing asserts on a file the spec never meant to touch.
+//
+// resolveCodexHome() reads process.env.CODEX_HOME at CALL time (not frozen at import), so setting it
+// here contains every spec, including ones written later that forget to inject a path override. A
+// spec that sets its own CODEX_HOME still wins, since this runs first.
+const codexHome = join(sandbox, ".codex");
+mkdirSync(codexHome, { recursive: true });
+process.env.CODEX_HOME = codexHome;

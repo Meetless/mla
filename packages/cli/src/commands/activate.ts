@@ -779,10 +779,32 @@ function healActorIdentityAfterRebind(ownerUserId: string): boolean {
   return true;
 }
 
+// The folder path we send to control as this activation's re-activation key.
+//
+// `realpathSync.native` rather than the plain resolve, for two reasons that both
+// show up on a normal Mac: it resolves symlinks (so `/tmp/x` and `/private/tmp/x`
+// are one key, not two), and it returns the path in the filesystem's canonical
+// CASE, so `~/Projects/app` and `~/projects/app` cannot mint two workspaces for
+// the same case-insensitive directory. Falls back to the plain resolved path if
+// the syscall fails (a path we cannot canonicalize is still a usable key, and a
+// failure here must never block activation).
+export function canonicalRepoPath(cwd: string): string {
+  try {
+    return fs.realpathSync.native(cwd);
+  } catch {
+    return path.resolve(cwd);
+  }
+}
+
 // Provision a fresh workspace server-side and write its id into the marker at
 // cwd. The owner is the authenticated caller (resolved server-side from the
 // actor identity), never the request body, so a caller cannot mint a workspace
 // owned by someone else.
+//
+// Control makes this idempotent per folder: it keys on the path we send, so a
+// re-activation after `mla deactivate` (which deletes the marker but leaves the
+// workspace alive) resolves the SAME workspace instead of minting a twin. The
+// response's `isNew` distinguishes the two outcomes.
 async function runProvision(
   cwd: string,
   flags: ActivateFlags,
@@ -799,7 +821,7 @@ async function runProvision(
     resp = await post<ProvisionResponse>(
       cfg,
       "/internal/v1/workspaces",
-      { name },
+      { name, repoPath: canonicalRepoPath(cwd) },
     );
   } catch (e) {
     const err = e as HttpError;
@@ -831,7 +853,17 @@ async function runProvision(
   });
 
   if (!isMachineMode()) {
-    console.log(`Provisioned workspace ${resp.id} (${resp.name}).`);
+    // isNew === false means control matched `repoPath` and handed back the
+    // workspace this folder was activated under before (`mla deactivate` removes
+    // the marker but leaves the workspace). Say so plainly: silently reporting
+    // "Provisioned" for a workspace that already holds the human's history is a
+    // lie they would only catch by counting rows in the switcher.
+    if (resp.isNew) {
+      console.log(`Provisioned workspace ${resp.id} (${resp.name}).`);
+    } else {
+      console.log(`Re-activated workspace ${resp.id} (${resp.name}).`);
+      console.log("  This folder was activated before; its existing workspace and history are intact.");
+    }
     console.log(`  marker:      ${markerPath}`);
     console.log(`  workspaceId: ${resp.id}`);
     if (healed) console.log("  identity:    signed-in session bound to this workspace as OWNER.");
@@ -841,8 +873,10 @@ async function runProvision(
     for (const line of commitGuidanceLines(cwd)) console.log(line);
   }
 
-  // Fresh workspace = empty governed KB: invite onboarding (one-time per workspace).
-  return finishActivate(cwd, resolveBootstrapTier(flags), true);
+  // A fresh workspace has an empty governed KB, so invite onboarding (one-time).
+  // A reused one already ran it, and re-inviting would read as "your history is
+  // gone" at exactly the moment we kept it.
+  return finishActivate(cwd, resolveBootstrapTier(flags), resp.isNew);
 }
 
 // Bind to an already-resolved marker. Provisions nothing; the marker is local

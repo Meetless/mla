@@ -34,6 +34,19 @@ export interface ClassifyOptions {
   caseCache?: Map<number, boolean>;
 }
 
+export const NOTE_VAULT_EVALUATOR_CONTRACT_VERSION =
+  "date-prefixed-note-vault-evaluator-v1";
+export const NOTE_VAULT_MATCHER_SCHEMA_VERSION =
+  "date-prefixed-markdown-action-v1";
+export const NOTE_VAULT_PATH_CANONICALIZER_VERSION = "note-vault-path-v1";
+export const NOTE_VAULT_FILENAME_PREFIX_PATTERN = "^\\d{8}-" as const;
+
+export type NoteVaultClassification =
+  | "DATE_PREFIXED_UNDER_ALLOWED_ROOT"
+  | "DATE_PREFIXED_OUTSIDE_ALLOWED_ROOT"
+  | "NOT_DATE_PREFIXED_NOTE"
+  | "INDETERMINATE";
+
 const moduleCaseCache = new Map<number, boolean>();
 
 /** A tail component must be a single, safe, lexical name (no FS lookup). */
@@ -99,6 +112,47 @@ async function canonicalize(absPath: string): Promise<Canonical | null> {
     }
     return { canonical, existingDir };
   }
+}
+
+/**
+ * Classify the v2 notes-location rule without leaking an absolute target path.
+ * The fixed discriminator deliberately governs only YYYYMMDD-* working notes;
+ * README.md and ordinary docs are compliant wherever they live.
+ */
+export async function classifyDatePrefixedNoteVaultTarget(
+  rawFilePath: unknown,
+  runtimeProjectRoot: string,
+  allowedRootAbsolutePath: string,
+  filenamePrefixPattern: string,
+  opts: ClassifyOptions = {},
+): Promise<NoteVaultClassification> {
+  if (
+    typeof rawFilePath !== "string" ||
+    rawFilePath.length === 0 ||
+    rawFilePath.includes("\0") ||
+    !path.isAbsolute(allowedRootAbsolutePath) ||
+    filenamePrefixPattern !== NOTE_VAULT_FILENAME_PREFIX_PATTERN
+  ) {
+    return "INDETERMINATE";
+  }
+  if (!/^\d{8}-/.test(path.basename(rawFilePath))) {
+    return "NOT_DATE_PREFIXED_NOTE";
+  }
+
+  const absTarget = path.isAbsolute(rawFilePath)
+    ? rawFilePath
+    : path.join(runtimeProjectRoot, rawFilePath);
+  const [target, allowedRoot] = await Promise.all([
+    canonicalize(absTarget),
+    canonicalize(allowedRootAbsolutePath),
+  ]);
+  if (!target || !allowedRoot) return "INDETERMINATE";
+
+  const caseInsensitive = resolveCasePolicy(allowedRoot.existingDir, opts);
+  if (caseInsensitive === null) return "INDETERMINATE";
+  return isUnderRoot(target.canonical, allowedRoot.canonical, caseInsensitive)
+    ? "DATE_PREFIXED_UNDER_ALLOWED_ROOT"
+    : "DATE_PREFIXED_OUTSIDE_ALLOWED_ROOT";
 }
 
 /**
