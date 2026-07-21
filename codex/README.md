@@ -176,7 +176,12 @@ Prerequisites: the `mla` CLI on your `PATH` and authenticated (`mla login` or
 `mla init`), and Codex CLI `0.144.6`.
 
 ```sh
-# 1. Register the MCP plugin so Codex can retrieve governed knowledge.
+# 1. Register the marketplace, then the MCP plugin so Codex can retrieve
+#    governed knowledge. The marketplace line is required, not optional:
+#    `codex plugin add` fails outright if nothing resolves `mla@meetless`.
+#    (A local checkout registers its own marketplace, which is exactly why
+#    this step is easy to omit on a machine where it already works.)
+codex plugin marketplace add Meetless/mla
 codex plugin add mla@meetless
 
 # 2. Install the Codex connector (writes $CODEX_HOME/hooks.json; separate from

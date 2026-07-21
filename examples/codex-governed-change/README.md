@@ -51,7 +51,8 @@ codex-governed-change/
   with `/hooks`. Until you grant trust, hooks are skipped and governance is
   inactive (fail-open).
 - The Meetless MCP plugin registered so Codex can retrieve
-  (`codex plugin add mla@meetless`), and the repo bound with `mla activate`.
+  (`codex plugin marketplace add Meetless/mla`, then `codex plugin add
+  mla@meetless`), and the repo bound with `mla activate`.
 - A reachable backend: the hosted judge environment, or local Control + Intel.
 - The **notes-location** rule active in the workspace (see
   `governance/notes-location.md`). In the hosted judge environment it is

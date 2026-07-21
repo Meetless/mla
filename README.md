@@ -57,7 +57,10 @@ than in either connector.
 Tested against Codex CLI `0.144.6`.
 
 ```bash
-# 1. Register the MCP server so Codex can retrieve governed knowledge.
+# 1. Register the marketplace, then the MCP server so Codex can retrieve
+#    governed knowledge. The marketplace line is required, not optional:
+#    `codex plugin add` fails outright if nothing resolves `mla@meetless`.
+codex plugin marketplace add Meetless/mla
 codex plugin add mla@meetless
 
 # 2. Register the Codex hooks (writes $CODEX_HOME/hooks.json). Idempotent.
