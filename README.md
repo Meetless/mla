@@ -218,11 +218,35 @@ it is a hard error**: `readConfig()` throws before issuing any request rather th
 silently downgrade your audited identity to the anonymous shared key. Run
 `mla logout` (or `unset MEETLESS_CONTROL_TOKEN`) first.
 
+## License
+
+`mla` is open source under [Apache-2.0](LICENSE). The client that runs on your
+machine, watches your agent session, and talks to a backend is the code in this
+repository. Read it rather than taking the section below on faith.
+
 ## Telemetry & privacy
 
-Local-first by default: crash reporting is off unless a Sentry DSN is configured,
-and run traces (when a backend enables them) go only to your own control server,
-never to Meetless. Disable both with `MEETLESS_TELEMETRY=off`. Full details in
+There are **three** outbound planes, and they do not share a default:
+
+| Plane | Default | What leaves |
+| --- | --- | --- |
+| Crash reporting (Sentry) | **off** (open-source builds bake no DSN) | run id, command name, exit code, platform, version |
+| Run traces | **off** unless your own server opts in | redacted argv, route names, timings, to your control only |
+| Product-health analytics | **on**, opt-out | ids, counts, rates, enums, booleans, durations, one-way hashes |
+
+The analytics plane is the one that is on, so it is the one worth being precise
+about: every forwarded field is an id, a count, a rate, a closed enum, a boolean,
+a duration, or a one-way hash. Your prompt text, file paths, command arguments,
+query strings, error messages, and document contents are not in it. It is sent to
+the control backend you point the CLI at.
+
+`MEETLESS_TELEMETRY=off` turns off all three at once. Local recording for
+`mla stats` keeps working either way.
+
+What we do **not** claim: that nothing leaves your machine. Session capture sends
+the prompts, decisions, tool calls, and documents from the sessions you chose to
+govern, because that material is the thing your workspace governs. It is not a
+scrape of your source tree. Exact fields, plane by plane, in
 [TELEMETRY.md](TELEMETRY.md).
 
 ## Built with Codex
