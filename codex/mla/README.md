@@ -54,12 +54,17 @@ backend.
 
 ## Full governance (hooks)
 
-To also get grounding injection (UserPromptSubmit) and the pre-execution deny
-gate (PreToolUse), install the Codex connector's hooks:
+To also get session capture (SessionStart, UserPromptSubmit, PostToolUse, Stop),
+grounding injection, and the pre-execution deny gate (PreToolUse), install the
+Codex connector's hooks:
 
 ```sh
 mla codex install       # writes $CODEX_HOME/hooks.json, prints the trust step
 ```
+
+The Console session uses Codex's real `session_id`. Tool and file events are
+captured from PostToolUse, and Stop records the stable final-assistant-message
+field without depending on Codex's unstable transcript format.
 
 Then start Codex, run `/hooks`, review the MLA commands, and grant trust. Until
 you grant trust, Codex fails open: hooks are skipped, governance is inactive,

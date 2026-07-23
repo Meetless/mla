@@ -43,6 +43,7 @@ import {
   runVerdict,
 } from "./relationship_actions.js";
 import { runDismissConflict } from "./dismiss_conflict_action.js";
+import { runDecisionRecord } from "./decision_record_action.js";
 import { randomUUID } from "node:crypto";
 import { makeIntelFetch, runKbDocDetail } from "./kb_actions.js";
 import { runRetrieveKnowledge } from "./evidence_actions.js";
@@ -157,6 +158,37 @@ export async function dispatchTool(name, args, deps) {
             text: JSON.stringify({
               tool: "meetless__relationship_verdict",
               error: String(err.message || err),
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === "meetless__decision_record") {
+    try {
+      const result = await runDecisionRecord(args || {}, {
+        controlFetch,
+        defaultWorkspaceId,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      // The action already maps 404 / 422 / 400 to a sentence the agent can act
+      // on. Anything reaching here is untyped (a 500, a network fault) and is
+      // surfaced as-is rather than being dressed up as an empty record: an agent
+      // that reads a missing decision as "no such decision" would draw exactly
+      // the wrong conclusion about the governed graph.
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              tool: "meetless__decision_record",
+              error: String(err.message || err),
+              status: err && err.status ? err.status : undefined,
             }),
           },
         ],

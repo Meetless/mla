@@ -14,19 +14,21 @@ describe("Codex connector doctor checks", () => {
     ]);
   });
 
-  it("reports the supported Codex lifecycle without claiming Claude parity", () => {
+  it("reports the full Codex capture lifecycle without claiming transcript parity", () => {
     const out = doctorJson([codexLifecycleCoverageCheck(true)]);
     expect(out.checks[0]).toEqual(
       expect.objectContaining({
         id: "codex.hooks.coverage",
         status: "info",
         message: expect.stringContaining(
-          "Codex hook coverage: PreToolUse + UserPromptSubmit",
+          "Codex hook coverage: full session capture lifecycle",
         ),
       }),
     );
+    expect(out.checks[0]?.message).toContain("SessionStart");
     expect(out.checks[0]?.message).toContain("PostToolUse");
     expect(out.checks[0]?.message).toContain("Stop");
+    expect(out.checks[0]?.message).toContain("transcript replay remains limited");
   });
 
   it("keeps an unused optional Codex connector informational", () => {
@@ -83,6 +85,7 @@ describe("Codex connector doctor checks", () => {
     expect(out.checks[0]).toEqual(
       expect.objectContaining({ id: "codex.connector.complete", status: "pass" }),
     );
-    expect(out.checks[0]?.message).toContain("supported surfaces");
+    expect(out.checks[0]?.message).toContain("fully registered");
+    expect(out.checks[0]?.message).toContain("/hooks trust");
   });
 });

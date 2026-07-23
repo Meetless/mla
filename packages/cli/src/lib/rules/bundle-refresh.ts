@@ -8,11 +8,23 @@
 // (commands/rule-delivery.ts, for the verbs that mutate the authority) and the PULL side
 // (commands/scan-context.ts, for `mla scan`) both need to fetch, but only the push side needs the
 // rescan that follows, and the scanner must never import a command.
+//
+// It also hosts the SECOND pull that rides the same scan-refresh moment: the §3.5 reconciliation
+// findings. Two pulls, one moment, deliberately independent outcomes. A findings failure must not
+// make the bundle look stale (rules would be wrongly disclaimed) and a bundle failure must not
+// suppress findings (a governed decision would silently stop being surfaced), so they are separate
+// functions with separate try/catch rather than one combined fetch.
 import { getBundle, type RuleClientHttp } from "./control-rule-client";
 import { writeRuleBundleCache } from "./bundle-cache";
 import { recordBundlePrincipal } from "./bundle-principal";
 import { loadWorkspaceConfig, type WorkspaceCliConfig } from "../config";
 import type { RuleBundle } from "./control-rule-client";
+import {
+  listReconciliationFindings,
+  toCacheFinding,
+  type ReconciliationClientHttp,
+} from "./reconciliation-client";
+import type { ReconciliationFinding } from "../scanner/types";
 
 /**
  * What actually reached the agent-visible caches. `delivered: false` NEVER means the authority
@@ -66,5 +78,44 @@ export async function refreshBundleForScan(
     return { delivered: true };
   } catch (e) {
     return { delivered: false, error: (e as Error).message };
+  }
+}
+
+/**
+ * What a findings pull produced. `findings: null` means the pull did not happen or did not
+ * succeed, which is NOT the same as "this workspace has no findings" (an empty array). The
+ * distinction is the whole point: a failed pull must leave the previous findings in the scan
+ * cache alone, while a successful empty pull must CLEAR them, because a finding that control
+ * no longer serves has been dismissed, resolved, or had its decision retracted, and continuing
+ * to inject it under trust="governed" is precisely the failure this ADR exists to prevent.
+ */
+export type ReconciliationPull =
+  | { findings: ReconciliationFinding[]; truncated: boolean }
+  | { findings: null; error: string };
+
+/**
+ * Pull this viewer's ACTIVE reconciliation findings at the scan-refresh moment.
+ *
+ * BEST EFFORT, on the same terms as the bundle pull: an unbound repo, a logged-out CLI, or an
+ * offline laptop must still scan. Control is the only authority on which findings are live (it
+ * re-checks visibility, live ACCEPTED acceptance, and a non-tombstoned artifact per read), so
+ * there is nothing local to fall back to: we either got a fresh answer or we did not.
+ */
+export async function fetchReconciliationForScan(
+  workspaceId: string,
+  deps: {
+    loadConfig?: (override?: string) => WorkspaceCliConfig;
+    http?: ReconciliationClientHttp;
+  } = {},
+): Promise<ReconciliationPull> {
+  try {
+    const cfg = (deps.loadConfig ?? loadWorkspaceConfig)(workspaceId);
+    const res = await listReconciliationFindings(cfg, deps.http);
+    return {
+      findings: (res.findings ?? []).map(toCacheFinding),
+      truncated: Boolean(res.truncated),
+    };
+  } catch (e) {
+    return { findings: null, error: (e as Error).message };
   }
 }

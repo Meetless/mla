@@ -226,9 +226,17 @@ function truncate(s: string): string {
 // One-line descriptor for a side: who is on it. A SESSION side names its external
 // session (and flags the queried session); an APPROVED_KNOWLEDGE side names the
 // approved artifact it contradicts.
+//
+// A null `sessionId` is NOT "we have a run id instead". Control resolves it by
+// matching `refId` against BOTH `AgentRun.id` and `AgentRun.externalSessionId`
+// (and falling back to `ref.sessionId`), so null means every one of those missed
+// and the ref names nothing we can still look up. `refId` itself is either shape
+// (both openers write `run?.runId ?? sessionId`), so calling it a run here was a
+// coin flip printed as a fact. Show the raw ref, labeled as a ref, and say
+// plainly that it did not resolve.
 export function describeSide(s: ConflictSideView): string {
   if (s.refType === "SESSION") {
-    const who = s.sessionId ?? `run ${shortId(s.refId)}`;
+    const who = s.sessionId ?? `unresolved (ref ${shortId(s.refId)})`;
     return `session ${who}${s.isCurrentSession ? " (this session)" : ""}`;
   }
   if (s.refType === "APPROVED_KNOWLEDGE") {

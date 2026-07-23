@@ -3,7 +3,7 @@ import * as path from "path";
 import { createHash } from "crypto";
 import { readKbConfig, KbCliConfig, consoleDeepLink, HOME } from "../lib/config";
 import { resolveVaultRootForFile } from "../lib/notes-root";
-import { intelGet, intelPost } from "../lib/http";
+import { intelGet, intelPost, HttpError } from "../lib/http";
 import { verifyKbActorIsOwner, KbOwnerCheckError } from "../lib/kb_acl";
 import { KbAddReceipt, renderKbAddReceipt } from "../lib/render";
 import { openUrl } from "../lib/open-url";
@@ -11,6 +11,7 @@ import { findWorkspaceContext } from "../lib/workspace";
 import { governedPathEntryForReceipt, writeGovernedPath } from "../lib/governed-path-cache";
 import { recordKbWriteBlocked } from "../lib/failure-telemetry";
 import { getRunTraceId, canonicalizeSessionId } from "../lib/observability";
+import { INGEST_BATCH_SIZE, INGEST_TIMEOUT_MS } from "../lib/intel-ingest-budget";
 
 // `mla kb add <path> --mode file|corpus --provenance <kind> [flags]`
 // (proposal §4.1).
@@ -40,6 +41,18 @@ import { getRunTraceId, canonicalizeSessionId } from "../lib/observability";
 // as it did on the receipts the worker used to print.
 
 const CORPUS_MARKER = ".meetless-kb-corpus.json";
+
+// The server's immutable lineage labels (intel `app/core/ingest_provenance.py`, PROVENANCE_LABELS).
+// Kept in sync by hand: the CLI and the server are two sides of one contract, so a kind accepted
+// here that the server does not know is a silent mismatch, which is why this list is validated
+// rather than passed through.
+const PROVENANCE_KINDS = [
+  "human_authored",
+  "agent_distilled",
+  "tool_emitted",
+  "external_imported",
+  "external_scraped",
+] as const;
 const DEFAULT_GLOB = "*.md";
 const DEFAULT_PROFILE = "markdown_atomic_v1";
 
@@ -165,7 +178,28 @@ export function parseKbAddArgs(argv: string[]): KbAddFlags {
     throw new Error("--mode file|corpus is required");
   }
   if (!out.provenance) {
-    throw new Error("--provenance <kind> is required");
+    throw new Error(
+      `--provenance <kind> is required. The server's lineage kinds are: ${PROVENANCE_KINDS.join(", ")}\n` +
+        "  Hand-written notes are usually `human_authored`; anything pulled in from another system\n" +
+        "  is `external_imported`. The flag is free-form and the server derives the stored label\n" +
+        "  itself, so the receipt may show a different value than you pass.",
+    );
+  }
+  if (!(PROVENANCE_KINDS as readonly string[]).includes(out.provenance)) {
+    // Deliberately a WARNING, not an error. The flag is free-form by design and the test suite
+    // pins that (`dogfood_archive`), because the server owns the immutable lineage label:
+    // intel derives it and may record something other than what was passed. Rejecting unknown
+    // kinds here would break shipped invocations for no gain.
+    //
+    // What WAS wrong is the silence: `--provenance research` came back recorded as
+    // `external_imported` with nothing said, so the caller had no idea their value was not the
+    // one stored. Warn at the boundary instead of coercing quietly.
+    console.warn(
+      `warning: --provenance ${JSON.stringify(out.provenance)} is not one of the server's lineage ` +
+        `kinds (${PROVENANCE_KINDS.join(", ")}).\n` +
+        `         The server derives the stored label itself, so the receipt may show a different ` +
+        `value than you passed.`,
+    );
   }
   return {
     path: positional,
@@ -231,6 +265,8 @@ interface CorpusMarker {
   corpusName: string;
   allowedGlob: string | null;
   allowedProvenance: string[] | null;
+  /** true when no marker file existed and a permissive one was synthesized in memory. */
+  synthesized?: boolean;
 }
 
 // Read + validate `.meetless-kb-corpus.json`. Mirrors the worker's
@@ -239,9 +275,25 @@ interface CorpusMarker {
 export function readCorpusMarker(folder: string, workspaceId: string): CorpusMarker {
   const markerPath = path.join(folder, CORPUS_MARKER);
   if (!fs.existsSync(markerPath) || !fs.statSync(markerPath).isFile()) {
-    throw new Error(
-      `corpus mode requires ${markerPath}; create one with the workspaceId and an optional allowedGlob / allowedProvenance guardrail`,
-    );
+    // A missing marker used to be a hard stop, which made corpus mode effectively unusable: the
+    // error named a file but not its schema, so every first-time caller had to read this source to
+    // learn the shape. Synthesize the permissive marker in memory instead.
+    //
+    // Synthesized, NOT written to disk on purpose. Creating a temp file inside the caller's corpus
+    // folder and deleting it afterwards would litter that folder on any crash or Ctrl-C, and would
+    // mean writing into a directory the caller only asked us to READ.
+    //
+    // The guardrails the marker exists to provide (pinning to one workspace, restricting glob and
+    // provenance) are opt-in by design: committing a marker still enforces them. Without one the
+    // caller gets no restriction, and `runKbAdd` prints what it is about to do so the absence is
+    // visible rather than silent.
+    return {
+      workspaceId,
+      corpusName: path.basename(folder),
+      allowedGlob: null,
+      allowedProvenance: null,
+      synthesized: true,
+    };
   }
   let raw: unknown;
   try {
@@ -271,6 +323,7 @@ export function readCorpusMarker(folder: string, workspaceId: string): CorpusMar
     corpusName: (typeof obj.corpusName === "string" && obj.corpusName) || path.basename(folder),
     allowedGlob: allowedGlob as string | null,
     allowedProvenance: allowedProvenance as string[] | null,
+    synthesized: false,
   };
 }
 
@@ -334,21 +387,87 @@ interface KbAddDocument {
   content: string;
 }
 
+/**
+ * A file the client refused to put on the wire.
+ *
+ * It is NOT a transport failure: it never reached the server, so it is no
+ * evidence about the server's health and must never influence the batching
+ * loop's consecutive-failure abort. It IS a per-file receipt, because "this
+ * note is missing from your KB" is precisely the thing the operator has to be
+ * told, by name.
+ */
+export interface SkippedDocument {
+  relPath: string;
+  /** Position in the FULL enumeration order, so its receipt splices back into place. */
+  index: number;
+  reason: string;
+}
+
+export interface EnumeratedDocuments {
+  documents: KbAddDocument[];
+  skipped: SkippedDocument[];
+}
+
+/** The failure code stamped on a file this client declined to send. */
+export const EMPTY_FILE_FAILURE_CODE = "empty_file";
+
+/**
+ * Can this body legally be sent at all?
+ *
+ * `KbAddDocument.content` is declared `min_length=1` on the server (intel
+ * `app/api/routes/kb_add.py:119`) and that field sits inside the REQUEST model,
+ * so an empty body is a pydantic REQUEST-validation error: FastAPI rejects the
+ * ENTIRE POST with 422 before the route function ever runs. One 0-byte note in
+ * a vault therefore took down every healthy sibling sharing its batch, and the
+ * CLI stamped all of them `ingest_post_failed` quoting a reason that named a
+ * DIFFERENT file. Two 0-byte notes cost ten real notes their ingest.
+ *
+ * So refuse them here, where we still hold the filesystem and can name the
+ * actual file. Whitespace-only bodies go the same way: they clear `min_length=1`
+ * but carry nothing governable, and would mint a chunk-less revision that no
+ * retrieval path can ever return — a document that exists and answers nothing.
+ */
+export function isIngestableContent(content: string): boolean {
+  return content.trim().length > 0;
+}
+
+function skipReasonFor(content: string): string {
+  return content.length === 0
+    ? "the file is 0 bytes; the ingest route requires a non-empty body (content min_length=1), and sending it would 422 the whole batch"
+    : "the file has no non-whitespace content; it would mint a revision with zero chunks that no retrieval path can return";
+}
+
+/** Split an enumeration into what may be sent and what must be reported as skipped. */
+function partitionIngestable(entries: KbAddDocument[]): EnumeratedDocuments {
+  const documents: KbAddDocument[] = [];
+  const skipped: SkippedDocument[] = [];
+  entries.forEach((doc, index) => {
+    if (isIngestableContent(doc.content)) {
+      documents.push(doc);
+      return;
+    }
+    skipped.push({ relPath: doc.relPath, index, reason: skipReasonFor(doc.content) });
+  });
+  return { documents, skipped };
+}
+
 // Build the per-document upload list (relative path + body). File mode is the
 // single target; corpus mode globs the marker-pinned set under the folder.
+// Unsendable files are partitioned out rather than dropped: they come back as
+// `skipped` so the caller can emit a named receipt for each one.
 export function enumerateDocuments(
   flags: KbAddFlags,
   resolvedPath: string,
   vaultRoot: string,
   marker: CorpusMarker | null,
-): KbAddDocument[] {
+): EnumeratedDocuments {
   if (flags.mode === "file") {
-    return [
+    return partitionIngestable([
       {
         relPath: vaultRelPath(vaultRoot, resolvedPath),
         content: fs.readFileSync(resolvedPath, "utf8"),
       },
-    ];
+    ]);
   }
   // corpus
   let effectiveGlob = flags.glob ?? DEFAULT_GLOB;
@@ -364,10 +483,12 @@ export function enumerateDocuments(
   if (files.length === 0) {
     throw new Error(`--mode corpus: no files matched ${effectiveGlob} under ${resolvedPath}`);
   }
-  return files.map((f) => ({
-    relPath: vaultRelPath(vaultRoot, f),
-    content: fs.readFileSync(f, "utf8"),
-  }));
+  return partitionIngestable(
+    files.map((f) => ({
+      relPath: vaultRelPath(vaultRoot, f),
+      content: fs.readFileSync(f, "utf8"),
+    })),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -528,44 +649,44 @@ function printPreflight(flags: KbAddFlags, cfg: KbCliConfig): void {
   );
 }
 
-// Scale the request timeout by document count: a single file is fast (one
-// inline LDM body + embeds), but a corpus holds the connection while the server
-// ingests every doc sequentially. 120s floor for the common single-file/seed
-// case, ~20s/doc above that.
-function ingestTimeoutMs(docCount: number): number {
-  return Math.max(120_000, docCount * 20_000);
-}
-
 // A corpus ingest is not one atomic act, and this client used to pretend it was.
 //
-// Every document went out in ONE POST whose timeout was 20s * n. Intel sits behind a
-// HARD 300s Cloud Run ceiling that no client setting can raise, so a corpus of 16+ docs
-// asked for longer than the server is ever allowed to take. Past the ceiling the
-// connection dies mid-write and the CLI printed `kb add failed` and returned 1, throwing
-// away every receipt in the response, INCLUDING the documents the server had already
-// committed. The operator was told nothing landed. Documents had landed. There was no
-// record of which, and no way to resume: a corpus over ~15 files was structurally
-// unshippable, and got less shippable the more notes you wrote.
+// Every document went out in ONE POST whose timeout was 20s * n, so a corpus of any size
+// asked for longer than the request is ever allowed to take. Past the wall the connection
+// dies mid-write and the CLI printed `kb add failed` and returned 1, throwing away every
+// receipt in the response, INCLUDING the documents the server had already committed. The
+// operator was told nothing landed. Documents had landed. There was no record of which, and
+// no way to resume: a corpus over ~15 files was structurally unshippable, and got less
+// shippable the more notes you wrote.
 //
-// So: send the corpus in batches. 10 documents is a 200s request against a 300s ceiling,
-// which leaves 100s of margin for a slow doc without ever approaching the wall.
-export const KB_ADD_BATCH_SIZE = 10;
+// So: send the corpus in batches. Which wall, how big a batch, and why the number here used
+// to be derived against a ceiling that never fires, are all documented once in
+// `../lib/intel-ingest-budget`.
+export const KB_ADD_BATCH_SIZE = INGEST_BATCH_SIZE;
 
-// Two in a row is a down server, not a bad batch. Proving that costs a full 200s timeout
-// per remaining batch, so a 100-doc corpus against a dead intel would hang for half an
-// hour before telling the operator anything. Stop, and report what did not land.
+// Two in a row is a down server, not a bad batch. Proving that costs a full request budget
+// per remaining batch, so a 100-doc corpus against a dead intel would hang for many minutes
+// before telling the operator anything. Stop, and report what did not land.
 const MAX_CONSECUTIVE_BATCH_FAILURES = 2;
 
 // The POST seam, injected so the batching logic is testable without a server (the same
 // idiom `pollReceiptsToTerminal` uses for its fetcher).
 export type KbAddPoster = (body: unknown, timeoutMs: number) => Promise<{ receipts?: KbAddReceipt[] }>;
 
-// A document that never reached the server. It is a receipt, not a silence: the operator
-// must be able to read WHICH files are missing from their KB, and `outcome: "failed"`
-// carries that into the corpus rollup and the non-zero exit for free.
-function transportFailureReceipt(
-  doc: KbAddDocument,
-  ctx: { mode: "file" | "corpus"; workspaceId: string; provenance: string; failedAt: string },
+interface FailureStamp {
+  mode: "file" | "corpus";
+  workspaceId: string;
+  provenance: string;
+  failedAt: string;
+}
+
+// A document that never got governed. It is a receipt, not a silence: the operator must
+// be able to read WHICH files are missing from their KB, and `outcome: "failed"` carries
+// that into the corpus rollup and the non-zero exit for free. Used for every client-side
+// verdict — never reached the wire, batch died in transit, server rejected the request.
+function failedDocumentReceipt(
+  doc: { relPath: string },
+  ctx: FailureStamp,
   code: string,
   reason: string,
 ): KbAddReceipt {
@@ -582,9 +703,208 @@ function transportFailureReceipt(
 }
 
 /**
+ * Splice one `empty_file` receipt per skipped file back into enumeration order.
+ *
+ * Kept OUT of `postDocumentsInBatches` on purpose: a file the client never sent is not
+ * evidence about the server, so it must not reach the batching loop at all and therefore
+ * cannot contribute to MAX_CONSECUTIVE_BATCH_FAILURES. It still gets a named receipt, so
+ * the operator reads "20251202-chunking-engine-v0.md [failed] failure=empty_file" instead
+ * of a silence, or — the old behavior — instead of nine healthy siblings blamed for it.
+ */
+export function mergeSkippedReceipts(
+  posted: KbAddReceipt[],
+  skipped: SkippedDocument[],
+  ctx: { mode: "file" | "corpus"; workspaceId: string; provenance: string; now: () => string },
+): KbAddReceipt[] {
+  if (skipped.length === 0) return posted;
+  const out = [...posted];
+  const stamp: FailureStamp = { mode: ctx.mode, workspaceId: ctx.workspaceId, provenance: ctx.provenance, failedAt: ctx.now() };
+  for (const s of [...skipped].sort((a, b) => a.index - b.index)) {
+    const at = Math.min(Math.max(s.index, 0), out.length);
+    out.splice(at, 0, failedDocumentReceipt({ relPath: s.relPath }, stamp, EMPTY_FILE_FAILURE_CODE, s.reason));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Batch-failure isolation, and the trace that bounds it.
+//
+// RETRY POLICY. Exactly two cases, and the second one is the default:
+//
+//   1. A pre-handler 422 is a pydantic REQUEST-validation rejection. FastAPI validates
+//      `KbAddRequest` (intel `app/api/routes/kb_add.py:126-148`) BEFORE the route
+//      function's body runs, so ZERO documents were processed and the server holds no
+//      state from the attempt. Re-POSTing the batch minus the named offenders is
+//      therefore provably side-effect-free, and we do it so the healthy siblings still
+//      land instead of being punished for a neighbour.
+//
+//   2. Everything else — 5xx, gateway timeout, severed connection, a short/garbled
+//      response — is AMBIGUOUS by construction, so we do NOT auto-retry or bisect. The
+//      route is NOT atomic: it loops the documents (`kb_add.py:595`) and each one runs
+//      its own `intake_delivery` + `execute_run_set` with per-document faults caught into
+//      a receipt (`kb_add.py:607-619`). Documents 0..k can be committed AND activated
+//      when the request dies at k+1. We report the batch failed and NAME the documents
+//      whose fate is unknown.
+//
+//      Per-document idempotency is real but not sufficient to license a silent retry:
+//      identity is a pure function of relPath (`kb_add.py:163-177`) and `intake_delivery`
+//      dedups an identical re-delivery on the normalized content hash
+//      (`kb_ingestion_service.py:228`, `_find_dedup_revision` at :501-508), so a re-run
+//      mints no duplicate document or revision. What it does NOT prove is convergence: a
+//      revision minted but never activated (the request died between
+//      `create_revision` and the activation CAS) dedups on the next delivery and comes
+//      back `noop_unchanged` — an automatic retry would report "already fine" over a
+//      document that is not actually serving. A human re-running `mla kb add` is the
+//      same operation with an operator watching the receipts, which is the difference.
+//
+// Widening this requires redoing that trace, not just raising the constant.
+// ---------------------------------------------------------------------------
+
+// Pydantic reports EVERY validation error in one response, so a single isolation round
+// names all the offenders. The second round exists only so a server that somehow answers
+// with fresh indices cannot loop us.
+const MAX_VALIDATION_ISOLATION_ROUNDS = 2;
+
+function httpStatusOf(err: unknown): number | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  return (err as Partial<HttpError>).status;
+}
+
+/**
+ * The batch-relative document indices a 422 body blames, or null when it blames none.
+ *
+ * Intel replaces FastAPI's default 422 body with a scrubbed projection that deliberately
+ * KEEPS `loc` (intel `app/api/validation_errors.py:32,52`), so the offending document's
+ * position survives: `loc = ["body", "documents", <i>, "content"]`. That is what makes
+ * precise isolation possible without bisection — one extra request, not log2(n) of them.
+ *
+ * Returns null (meaning "cannot isolate; treat as a whole-batch rejection") when the
+ * error is not a 422, the body is not the list-shaped detail (a route-level
+ * `HTTPException(422, detail="...")` is a string), no `documents` index appears (a
+ * request-level fault such as a bad `workspaceId` — dropping documents would not fix it),
+ * or an index falls outside the batch we actually sent.
+ */
+export function validationRejectedIndices(err: unknown, batchSize: number): number[] | null {
+  if (httpStatusOf(err) !== 422) return null;
+  const body = (err as Partial<HttpError>).body;
+  if (typeof body !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const detail = (parsed as { detail?: unknown } | null)?.detail;
+  if (!Array.isArray(detail)) return null;
+  const hits = new Set<number>();
+  for (const item of detail) {
+    const loc = (item as { loc?: unknown } | null)?.loc;
+    if (!Array.isArray(loc)) continue;
+    const at = loc.indexOf("documents");
+    if (at < 0) continue;
+    const idx = loc[at + 1];
+    if (typeof idx !== "number" || !Number.isInteger(idx)) continue;
+    // An index the batch does not contain means this body does not describe the request
+    // we sent. Refuse to guess rather than fail an innocent document.
+    if (idx < 0 || idx >= batchSize) return null;
+    hits.add(idx);
+  }
+  return hits.size > 0 ? [...hits].sort((a, b) => a - b) : null;
+}
+
+function ambiguousBatchReason(reason: string, paths: string[]): string {
+  const shown = paths.slice(0, 5).join(", ");
+  const more = paths.length > 5 ? `, +${paths.length - 5} more` : "";
+  return (
+    `${reason} (batch of ${paths.length}: ${shown}${more}). Not auto-retried: the ingest route commits ` +
+    "each document independently, so part of this batch may already be governed. Re-run the same " +
+    "`mla kb add` — an identical re-delivery dedups to noop_unchanged — and check `mla kb show` for these paths."
+  );
+}
+
+/**
+ * Send one batch, isolating pre-handler 422 offenders so their siblings still land.
+ *
+ * Returns one receipt per document in `batch` order, plus whether the failure (if any)
+ * was a transport/ambiguous one. A 422 is NOT a transport failure: the server answered,
+ * fast and deterministically, so it says nothing about server health and must not feed
+ * the "the server is down" abort.
+ */
+async function postBatchIsolatingRejected(
+  batch: KbAddDocument[],
+  baseBody: Record<string, unknown>,
+  stamp: FailureStamp,
+  post: KbAddPoster,
+): Promise<{ receipts: KbAddReceipt[]; errors: string[]; transportFailed: boolean }> {
+  const out: (KbAddReceipt | null)[] = new Array(batch.length).fill(null);
+  const errors: string[] = [];
+  let pending = batch.map((doc, index) => ({ doc, index }));
+
+  const settle = (code: string, reason: (paths: string[]) => string): void => {
+    const paths = pending.map((p) => p.doc.relPath);
+    for (const p of pending) out[p.index] = failedDocumentReceipt(p.doc, stamp, code, reason(paths));
+    pending = [];
+  };
+
+  for (let round = 0; round < MAX_VALIDATION_ISOLATION_ROUNDS; round++) {
+    try {
+      const res = await post({ ...baseBody, documents: pending.map((p) => p.doc) }, INGEST_TIMEOUT_MS);
+      const got = res.receipts ?? [];
+      // One receipt per document, in order, is the route's contract. A short response
+      // means we cannot say which document each receipt belongs to, and mis-attributing
+      // an "ingested" to the wrong file would report a document as governed when it is
+      // not. Fail the batch instead of guessing.
+      if (got.length !== pending.length) {
+        throw new Error(`kb add returned ${got.length} receipt(s) for ${pending.length} document(s)`);
+      }
+      pending.forEach((p, k) => {
+        out[p.index] = got[k];
+      });
+      return { receipts: out as KbAddReceipt[], errors, transportFailed: false };
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      errors.push(reason);
+      const rejected = validationRejectedIndices(e, pending.length);
+
+      if (rejected === null) {
+        // Case 2 above (or a 422 that blames the request, not a document): no auto-retry.
+        const isRejection = httpStatusOf(e) === 422;
+        settle(
+          isRejection ? "ingest_rejected_invalid" : "ingest_post_failed",
+          isRejection ? () => reason : (paths) => ambiguousBatchReason(reason, paths),
+        );
+        return { receipts: out as KbAddReceipt[], errors, transportFailed: !isRejection };
+      }
+
+      // Case 1: a pre-handler request-validation rejection. Nothing was committed, so
+      // naming the offenders and re-POSTing the survivors is safe.
+      const offenders = new Set(rejected);
+      for (const idx of rejected) {
+        const p = pending[idx];
+        out[p.index] = failedDocumentReceipt(
+          p.doc,
+          stamp,
+          "ingest_rejected_invalid",
+          `the ingest route rejected this document at request validation, which fails the whole POST: ${reason}`,
+        );
+      }
+      pending = pending.filter((_, k) => !offenders.has(k));
+      if (pending.length === 0) {
+        return { receipts: out as KbAddReceipt[], errors, transportFailed: false };
+      }
+    }
+  }
+
+  // Rounds exhausted: the server kept rejecting fresh documents. Stop rather than loop.
+  settle("ingest_rejected_invalid", () => `not sent: ${MAX_VALIDATION_ISOLATION_ROUNDS} request-validation isolation rounds did not yield an acceptable batch`);
+  return { receipts: out as KbAddReceipt[], errors, transportFailed: false };
+}
+
+/**
  * POST the documents in bounded batches, one receipt per document, in input order.
  *
- * A failed batch fails only ITS OWN documents. The server's front door is an idempotent
+ * A failed batch fails only ITS OWN documents, and a batch rejected at request validation
+ * fails only the documents actually named. The server's front door is an idempotent
  * per-document upsert with no reconciliation pass (it never removes a document just
  * because this request did not mention it), so a rerun re-delivers the survivors as
  * cheap `noop_unchanged` and retries only what is actually missing. That is the whole
@@ -602,33 +922,23 @@ export async function postDocumentsInBatches(
 
   for (let start = 0; start < documents.length; start += KB_ADD_BATCH_SIZE) {
     const batch = documents.slice(start, start + KB_ADD_BATCH_SIZE);
-    const stamp = { mode: ctx.mode, workspaceId: ctx.workspaceId, provenance: ctx.provenance, failedAt: ctx.now() };
+    const stamp: FailureStamp = { mode: ctx.mode, workspaceId: ctx.workspaceId, provenance: ctx.provenance, failedAt: ctx.now() };
 
     if (consecutiveFailures >= MAX_CONSECUTIVE_BATCH_FAILURES) {
       for (const d of batch) {
-        receipts.push(transportFailureReceipt(d, stamp, "ingest_not_attempted", "skipped: the preceding batches did not land, so the server is treated as down"));
+        receipts.push(failedDocumentReceipt(d, stamp, "ingest_not_attempted", "skipped: the preceding batches did not land, so the server is treated as down"));
       }
       continue;
     }
 
-    try {
-      const res = await ctx.post({ ...baseBody, documents: batch }, ingestTimeoutMs(batch.length));
-      const got = res.receipts ?? [];
-      // One receipt per document, in order, is the route's contract. A short response
-      // means we cannot say which document each receipt belongs to, and mis-attributing
-      // an "ingested" to the wrong file would report a document as governed when it is
-      // not. Fail the batch instead of guessing.
-      if (got.length !== batch.length) {
-        throw new Error(`kb add returned ${got.length} receipt(s) for ${batch.length} document(s)`);
-      }
-      receipts.push(...got);
-      consecutiveFailures = 0;
-    } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      errors.push(reason);
-      for (const d of batch) receipts.push(transportFailureReceipt(d, stamp, "ingest_post_failed", reason));
-      consecutiveFailures += 1;
-    }
+    const outcome = await postBatchIsolatingRejected(batch, baseBody, stamp, ctx.post);
+    receipts.push(...outcome.receipts);
+    errors.push(...outcome.errors);
+    // Only an ambiguous/transport failure is evidence the server is unhealthy. A 422 is a
+    // deterministic content verdict, answered fast, and proves the server is alive — so it
+    // neither trips the abort nor clears a real outage: it leaves the counter where it was.
+    if (outcome.transportFailed) consecutiveFailures += 1;
+    else if (outcome.errors.length === 0) consecutiveFailures = 0;
   }
 
   return { receipts, errors };
@@ -737,11 +1047,19 @@ export async function runKbAdd(argv: string[]): Promise<number> {
   // the only side that holds the filesystem). Marker read (corpus) + the
   // allowedProvenance guardrail run here, before the body bytes are read.
   let documents: KbAddDocument[];
+  let skipped: SkippedDocument[];
   let marker: CorpusMarker | null = null;
   let corpusRootDisplay: string | null = null;
   try {
     if (flags.mode === "corpus") {
       marker = readCorpusMarker(resolved, workspaceId);
+      if (marker.synthesized) {
+        console.error(
+          `note: no ${CORPUS_MARKER} in ${resolved} — ingesting the whole folder into workspace ${workspaceId}.\n` +
+            `      Commit a ${CORPUS_MARKER} there to pin the corpus to one workspace or restrict\n` +
+            `      allowedGlob / allowedProvenance.`,
+        );
+      }
       // The corpus-marker provenance guardrail still applies to the operator's
       // stated intent even though provenance is advisory at the governed layer.
       if (marker.allowedProvenance && !marker.allowedProvenance.includes(flags.provenance)) {
@@ -752,13 +1070,19 @@ export async function runKbAdd(argv: string[]): Promise<number> {
     }
     const vaultRoot = resolveVaultRoot(flags, resolved);
     if (flags.mode === "corpus") corpusRootDisplay = vaultRoot;
-    documents = enumerateDocuments(flags, resolved, vaultRoot, marker);
+    ({ documents, skipped } = enumerateDocuments(flags, resolved, vaultRoot, marker));
   } catch (e) {
     console.error((e as Error).message);
     return 2;
   }
 
   printPreflight(flags, cfg);
+
+  // Say it out loud before the (possibly slow) POSTs, so the operator does not have to
+  // find these in the rollup afterwards.
+  for (const s of skipped) {
+    console.error(`kb add: skipping ${s.relPath} — ${s.reason}`);
+  }
 
   // Relay the session UUID, canonicalized (defense in depth: a direct
   // `mla kb add --agent-session X` may carry a non-canonical value). The server
@@ -776,14 +1100,27 @@ export async function runKbAdd(argv: string[]): Promise<number> {
     corpusName: marker?.corpusName,
   };
 
-  const { receipts, errors } = await postDocumentsInBatches(documents, baseBody, {
+  const receiptCtx = {
     mode: flags.mode,
     workspaceId,
     provenance: flags.provenance,
-    post: (b, timeoutMs) => intelPost<{ receipts: KbAddReceipt[] }>(cfg, "/internal/v1/kb/add", b, timeoutMs),
     now: () => new Date().toISOString(),
-  });
+  };
+
+  // Never POST an empty `documents` array: it is itself a request-validation error
+  // (`documents: list[...] = Field(..., min_length=1)`), so an all-skipped run would
+  // trade a clean set of `empty_file` receipts for one opaque 422.
+  const posted =
+    documents.length > 0
+      ? await postDocumentsInBatches(documents, baseBody, {
+          ...receiptCtx,
+          post: (b, timeoutMs) => intelPost<{ receipts: KbAddReceipt[] }>(cfg, "/internal/v1/kb/add", b, timeoutMs),
+        })
+      : { receipts: [] as KbAddReceipt[], errors: [] as string[] };
+  const errors = posted.errors;
   for (const e of errors) console.error(`kb add: a batch did not land: ${e}`);
+
+  const receipts = mergeSkippedReceipts(posted.receipts, skipped, receiptCtx);
 
   if (receipts.length === 0) {
     console.error("kb add: the ingest route returned no receipts.");
@@ -800,15 +1137,18 @@ export async function runKbAdd(argv: string[]): Promise<number> {
 
   // A per-doc intake failure is reported in the receipt, not the HTTP status, and a batch
   // that never reached the server synthesizes one failed receipt per document it carried.
-  // Either way: any failed doc -> non-zero exit.
+  // A file this client refused to send is a failure too — it is missing from the KB, and
+  // reporting exit 0 over a hole is the lie this whole change exists to stop.
   const anyFailed = receipts.some((r) => r.outcome === "failed");
   if (anyFailed) {
+    // One deadletter per run, named for the dominant cause: a dead transport is an
+    // operator/infra problem, a server-side per-doc rejection is a content problem, and
+    // an unsendable file is a vault-hygiene problem the operator fixes in their editor.
+    const onlySkips = receipts.every((r) => r.outcome !== "failed" || r.failure?.code === EMPTY_FILE_FAILURE_CODE);
     recordKbWriteBlocked({
       traceId: getRunTraceId(),
       workspaceId,
-      // One deadletter per run, named for the dominant cause: a dead transport is an
-      // operator/infra problem, a server-side per-doc rejection is a content problem.
-      reasonCode: errors.length > 0 ? "ingest_post_failed" : "ingest_doc_failed",
+      reasonCode: errors.length > 0 ? "ingest_post_failed" : onlySkips ? EMPTY_FILE_FAILURE_CODE : "ingest_doc_failed",
       status: 1,
     });
   }

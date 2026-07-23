@@ -86,10 +86,23 @@ describe("describeSide", () => {
     ).toBe("session sess-other");
   });
 
-  it("SESSION with an unresolved session falls back to the short run id", () => {
+  it("SESSION with an unresolved session shows the ref without calling it a run", () => {
     expect(
       describeSide(sessionSide({ sessionId: null, refId: "run-1234567890" })),
-    ).toBe("session run ...34567890");
+    ).toBe("session unresolved (ref ...34567890)");
+  });
+
+  // The regression this copy exists for. A SESSION side whose ref DEGRADED to a
+  // bare external session id (control had no AgentRun at case-open, so the
+  // opener's `run?.runId ?? sessionId` fell through) used to render as
+  // "session run ...<8 chars of a session id>", asserting a run id that was
+  // never a run id. The ref must not be labeled with a kind we cannot prove.
+  it("SESSION whose ref degraded to a session id does not print it as a run", () => {
+    const out = describeSide(
+      sessionSide({ sessionId: null, refId: "sess-abc-1234567890" }),
+    );
+    expect(out).toBe("session unresolved (ref ...34567890)");
+    expect(out).not.toMatch(/\brun\b/);
   });
 
   it("APPROVED_KNOWLEDGE names the approved artifact", () => {

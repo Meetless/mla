@@ -11,8 +11,23 @@ import {
 } from "../../src/commands/scan-context";
 import { readScanCache, writeVerdicts } from "../../src/lib/scanner/cache";
 import type { DeliveryOutcome } from "../../src/lib/rules/bundle-refresh";
+import type { ReconciliationFinding } from "../../src/lib/scanner/types";
 
 function git(cwd: string, args: string[]) { execFileSync("git", args, { cwd, stdio: "ignore" }); }
+
+/** One §3.5 reconciliation finding in cache shape, shared by the rescan and the runScanContext specs. */
+const FINDING: ReconciliationFinding = {
+  path: "CLAUDE.md",
+  evaluatedDigest: "sha256:abc",
+  contentNormalizationVersion: "v1",
+  reason: "contradicts an accepted decision",
+  acceptedStatement: "Use 127.0.0.1, never localhost.",
+  sourceCaseId: "case_1",
+  supersedingCommitmentId: "cm_1",
+  currentSummary: "the file still says localhost",
+  detectorExplanation: "contradicts an accepted decision",
+  detectorVersion: "detector-v1",
+};
 
 describe("resolveScanTarget", () => {
   let repo: string;
@@ -153,6 +168,64 @@ describe("rescanAndCache", () => {
     rescanAndCache({ cwd, workspaceId: ws, home: h, now: () => "t" });
     return readScanCache(h, ws)!;
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // Reconciliation findings survive a LOCAL rescan (ADR §3.5, T11).
+  //
+  // `writeScanCache` overwrites the whole file, and `rescanAndCache` is called from four places:
+  // `mla scan` (which pulls), plus activate, `mla context`, and internal-steer-sync (which do not).
+  // Without carry-forward the feature blinks out: `mla scan` fetches findings and the very next
+  // `mla context` seconds later wipes them. So a rescan with nothing supplied must preserve what is
+  // there, and it must preserve the ORIGINAL stamp, because a purely local rescan is not evidence
+  // that control still serves the finding.
+  // ---------------------------------------------------------------------------------------------
+
+  it("stamps a supplied findings list with the time of the pull that produced it", () => {
+    rescanAndCache({
+      cwd: repo, workspaceId: "ws1", home, now: () => "2026-07-20T10:00:00.000Z",
+      reconciliation: [FINDING],
+    });
+
+    const cached = readScanCache(home, "ws1")!;
+    expect(cached.reconciliationFindings).toEqual([FINDING]);
+    expect(cached.reconciliationFetchedAt).toBe("2026-07-20T10:00:00.000Z");
+  });
+
+  it("carries findings forward through a local rescan WITHOUT refreshing their stamp", () => {
+    rescanAndCache({
+      cwd: repo, workspaceId: "ws1", home, now: () => "2026-07-20T10:00:00.000Z",
+      reconciliation: [FINDING],
+    });
+
+    // `mla context` an hour later: no pull, so nothing new is known about liveness.
+    rescanAndCache({ cwd: repo, workspaceId: "ws1", home, now: () => "2026-07-20T11:00:00.000Z" });
+
+    const cached = readScanCache(home, "ws1")!;
+    expect(cached.reconciliationFindings).toEqual([FINDING]);
+    // The anti-laundering assertion. If a local rescan could advance this stamp, an offline laptop
+    // would keep its findings looking freshly confirmed forever and the assembler's freshness gate
+    // would never fire, which is the entire failure mode that gate exists to stop.
+    expect(cached.reconciliationFetchedAt).toBe("2026-07-20T10:00:00.000Z");
+  });
+
+  it("CLEARS the findings when a pull explicitly returned none", () => {
+    rescanAndCache({
+      cwd: repo, workspaceId: "ws1", home, now: () => "2026-07-20T10:00:00.000Z",
+      reconciliation: [FINDING],
+    });
+
+    // An empty list is an ANSWER, not an absence: control no longer serves this finding, so it was
+    // dismissed, resolved, or its decision was retracted. Carrying it forward here would keep
+    // injecting a retracted decision under trust="governed".
+    rescanAndCache({
+      cwd: repo, workspaceId: "ws1", home, now: () => "2026-07-20T11:00:00.000Z",
+      reconciliation: [],
+    });
+
+    const cached = readScanCache(home, "ws1")!;
+    expect(cached.reconciliationFindings).toEqual([]);
+    expect(cached.reconciliationFetchedAt).toBe("2026-07-20T11:00:00.000Z");
+  });
 });
 
 // `mla scan` is the PULL half of rule delivery. A verb can only push what IT changed; the same
@@ -245,6 +318,61 @@ describe("runScanContext", () => {
     expect(readScanCache(home, "ws-scan")).not.toBeNull(); // scanned anyway
   });
 
+  // The SECOND pull that rides this same refresh moment. Two pulls, one moment, independent
+  // outcomes: a findings failure must not make the bundle look stale (rules would be wrongly
+  // disclaimed) and a bundle failure must not suppress findings (a governed decision would silently
+  // stop being surfaced).
+  it("pulls reconciliation findings for the same workspace and lands them in the cache", async () => {
+    const asked: string[] = [];
+    const { out, err, o, e } = sink();
+
+    const code = await runScanContext([], {
+      refreshBundle: async () => ({ delivered: true }),
+      fetchReconciliation: async (ws) => {
+        asked.push(ws);
+        return { findings: [FINDING], truncated: false };
+      },
+      home,
+      out: o, err: e,
+    });
+
+    expect(code).toBe(0);
+    expect(asked).toEqual(["ws-scan"]);
+    const cached = readScanCache(home, "ws-scan")!;
+    expect(cached.reconciliationFindings).toEqual([FINDING]);
+    expect(cached.reconciliationFetchedAt).toBeTruthy();
+    expect(err).toEqual([]);
+    expect(out[0]).toMatch(/^scanned: /);
+  });
+
+  it("still pulls findings when the bundle refresh failed, and vice versa", async () => {
+    const { o, e } = sink();
+
+    // Bundle down, findings up: the divergence is still real and must still be surfaced.
+    const code = await runScanContext([], {
+      refreshBundle: async (): Promise<DeliveryOutcome> => ({ delivered: false, error: "ECONNREFUSED" }),
+      fetchReconciliation: async () => ({ findings: [FINDING], truncated: false }),
+      home,
+      out: o, err: e,
+    });
+
+    expect(code).toBe(0);
+    expect(readScanCache(home, "ws-scan")!.reconciliationFindings).toEqual([FINDING]);
+
+    // Findings down, bundle up: the rules must land without a whisper of a findings problem, and
+    // the previous findings must survive rather than being cleared by a transport error.
+    const second = sink();
+    const code2 = await runScanContext([], {
+      refreshBundle: async () => ({ delivered: true }),
+      fetchReconciliation: async () => ({ findings: null, error: "ECONNREFUSED" }),
+      home,
+      out: second.o, err: second.e,
+    });
+
+    expect(code2).toBe(0);
+    expect(readScanCache(home, "ws-scan")!.reconciliationFindings).toEqual([FINDING]);
+  });
+
   it("fails with a usage error and never touches the network when no workspace can be resolved", async () => {
     const bare = mkdtempSync(join(tmpdir(), "mla-rsc-bare-"));
     const prevWs = process.env.MEETLESS_WORKSPACE_ID;
@@ -255,10 +383,13 @@ describe("runScanContext", () => {
     try {
       const code = await runScanContext([], {
         refreshBundle: async (ws) => { asked.push(ws); return { delivered: true }; },
+        fetchReconciliation: async (ws) => { asked.push(ws); return { findings: [], truncated: false }; },
         out: o, err: e,
       });
 
       expect(code).toBe(2);
+      // NEITHER pull may fire. They are concurrent now, so "we bailed before the network" has to be
+      // asserted across both doors or a resolution bug leaks out through the one nobody watched.
       expect(asked).toEqual([]);
       expect(out).toEqual([]);
       expect(err.join("\n")).toContain("no workspace id");

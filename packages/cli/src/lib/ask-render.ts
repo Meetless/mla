@@ -52,6 +52,8 @@ export function citationMeta(r: Record<string, unknown>): string {
  * Recognized fields (all optional):
  *   answer      string   the prose
  *   results     array    citations: { path | title, docType?, status?, hint? }
+ *   documentationImpact
+ *               array    §3.5 T11d: { path, sourceCaseId, acceptedStatement }
  *   warnings    array    printed verbatim, one per line
  *   workspace   string   \
  *   mode        string    > the footer, built ONLY from the fields present
@@ -78,6 +80,22 @@ export function renderPlain(result: Record<string, unknown>): string {
       lines.push(`  - ${String(p)}${citationMeta(r)}`);
       const hint = meaningful(r.hint);
       if (hint) lines.push(`      ${hint}`);
+    }
+  }
+
+  // ADR §3.5 T11d. Present only on `mla ask` (see lib/ask-documentation-impact.ts) and only when
+  // the answer cited a decision that a file in THIS repo still contradicts, so an empty or absent
+  // field renders nothing at all. Sits under the citations because it is about what the answer
+  // stood on, and above the warnings because it is a fact about the repo, not about the run.
+  const impact = Array.isArray(result.documentationImpact)
+    ? (result.documentationImpact as Record<string, unknown>[])
+    : [];
+  if (impact.length > 0) {
+    lines.push("");
+    lines.push(`Documentation impact (${impact.length}):`);
+    for (const i of impact) {
+      lines.push(`  - ${String(i.path)} contradicts [CC:${String(i.sourceCaseId)}]`);
+      lines.push(`      accepted: ${String(i.acceptedStatement)}`);
     }
   }
 

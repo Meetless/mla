@@ -152,17 +152,58 @@ beforeEach(() => {
 });
 
 describe("mla kb: arg parsing", () => {
-  it("summary defaults to no json, no markdown", () => {
-    expect(parseArgs(["summary"])).toEqual({ sub: "summary", json: false, markdown: false });
+  // These four are exact-equality, so every field parseArgs returns has to be
+  // spelled out here. f77d6ebee added --workspace to summary/dump and did not
+  // update them, which is what made this suite the only red one in mla-ci.
+  it("summary defaults to no json, no markdown, no workspace override", () => {
+    expect(parseArgs(["summary"])).toEqual({
+      sub: "summary",
+      json: false,
+      markdown: false,
+      workspace: null,
+    });
   });
-  it("dump defaults to no json, no markdown", () => {
-    expect(parseArgs(["dump"])).toEqual({ sub: "dump", json: false, markdown: false });
+  it("dump defaults to no json, no markdown, no workspace override", () => {
+    expect(parseArgs(["dump"])).toEqual({
+      sub: "dump",
+      json: false,
+      markdown: false,
+      workspace: null,
+    });
   });
   it("parses --json on summary", () => {
-    expect(parseArgs(["summary", "--json"])).toEqual({ sub: "summary", json: true, markdown: false });
+    expect(parseArgs(["summary", "--json"])).toEqual({
+      sub: "summary",
+      json: true,
+      markdown: false,
+      workspace: null,
+    });
   });
   it("parses --markdown on dump", () => {
-    expect(parseArgs(["dump", "--markdown"])).toEqual({ sub: "dump", json: false, markdown: true });
+    expect(parseArgs(["dump", "--markdown"])).toEqual({
+      sub: "dump",
+      json: false,
+      markdown: true,
+      workspace: null,
+    });
+  });
+  // The flag itself had no coverage at all, which is why nothing but an
+  // unrelated exact-equality assertion noticed it existed.
+  it("parses --workspace on summary", () => {
+    expect(parseArgs(["summary", "--workspace", "ws_123"])).toEqual({
+      sub: "summary",
+      json: false,
+      markdown: false,
+      workspace: "ws_123",
+    });
+  });
+  it("rejects --workspace with no value", () => {
+    expect(() => parseArgs(["summary", "--workspace"])).toThrow(/requires a workspace id/);
+  });
+  // The guard is startsWith("--"), so a following flag must not be swallowed as
+  // the workspace id.
+  it("rejects --workspace followed by another flag", () => {
+    expect(() => parseArgs(["dump", "--workspace", "--json"])).toThrow(/requires a workspace id/);
   });
   it("rejects an unknown subcommand", () => {
     expect(() => parseArgs(["sources"])).toThrow(/Usage/);

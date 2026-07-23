@@ -1,4 +1,15 @@
 import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
   AssembleContextDeps,
   runAssembleContext,
 } from "../../../src/commands/assemble-context";
@@ -7,7 +18,7 @@ import {
   ScanResult,
   SCAN_SCHEMA_VERSION,
 } from "../../../src/lib/scanner/types";
-import { PersistedAssembleAudit } from "../../../src/lib/scanner/cache";
+import { PersistedAssembleAudit, writeScanCache } from "../../../src/lib/scanner/cache";
 import { ArtifactByteReader } from "../../../src/lib/scanner/reconciliation-rehash";
 import {
   CONTENT_NORMALIZATION_V1,
@@ -43,6 +54,10 @@ function cache(over: Partial<ScanResult> = {}): ScanResult {
     scopedRules: [],
     staleContextXml: "",
     advisoryDirectives: [],
+    // 12h before the harness clock: inside the freshness window, so a test that cares about the
+    // rehash gate is not silently answering a freshness question instead. The stale/absent-stamp
+    // cases override this explicitly, and are asserted in their own describe below.
+    reconciliationFetchedAt: "2026-07-05T00:00:00.000Z",
     ...over,
   } as ScanResult;
 }
@@ -508,5 +523,371 @@ describe("assemble-context — prompt-time reconciliation rehash (ADR Phase 2A t
     );
     expect(plain.stdout).toBe(h.stdout);
     expect(plain.audits[0].reconciliation).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// ADR §8 test 18: the §3.5 reconciliation block leaves the head ALONE.
+//
+// The block is injected by the hook's TAIL region, not by this subcommand's stdout, precisely so
+// it can never compete with a floor or scoped MUST for the head's byte budget. That separation is
+// only real if it is asserted: these drive the subcommand with findings present and prove (a) the
+// block travels out-of-band through `reconcileFile`, (b) the head is BYTE-IDENTICAL to the same
+// turn with no findings at all, (c) the out-of-band channel survives both degraded branches, and
+// (d) the block is bound to the rehash gate's verdict rather than to the raw cache.
+// ---------------------------------------------------------------------------------------------
+
+describe("assemble-context — §3.5 reconciliation block is out-of-band (ADR §8 test 18)", () => {
+  const RECONCILE_FILE = "/tmp/mla-reconcile-test.xml";
+  const KEPT_PATH = "CLAUDE.md";
+  const DRIFT_PATH = "apps/control/CLAUDE.md";
+  const KEPT_BYTES = "# CLAUDE.md\n\nAlways prefer 127.0.0.1 over localhost.\n";
+  const DRIFT_NOW = "# CLAUDE.md\n\nEdited after the scan read it.\n";
+  const DRIFT_OLD = "# CLAUDE.md\n\nThe revision the finding was evaluated against.\n";
+
+  const FLOOR = [
+    { ruleId: "fm1", versionId: "v1", text: "never push without consent", strength: "MUST" as const },
+  ];
+  const SCOPED = [
+    {
+      ruleId: "sc1",
+      versionId: "sv1",
+      text: "control DTO fields carry @ApiProperty",
+      strength: "MUST" as const,
+      globs: ["apps/control/**"],
+    },
+  ];
+
+  const kept: ReconciliationFinding = {
+    path: KEPT_PATH,
+    evaluatedDigest: normalizedContentHash(KEPT_BYTES, CONTENT_NORMALIZATION_V1),
+    reason: "a scoped decision superseded this instruction",
+    acceptedStatement: "Localhost is banned in examples; use 127.0.0.1.",
+    sourceCaseId: "case-kept",
+    currentSummary: "the file still tells the reader to use localhost",
+    detectorExplanation: "the instruction contradicts an accepted decision",
+    detectorVersion: "detector-v1",
+  };
+  const drifted: ReconciliationFinding = {
+    path: DRIFT_PATH,
+    evaluatedDigest: normalizedContentHash(DRIFT_OLD, CONTENT_NORMALIZATION_V1),
+    reason: "a scoped decision superseded this instruction",
+    acceptedStatement: "Every control DTO field carries @ApiProperty.",
+    sourceCaseId: "case-drifted",
+    currentSummary: "the file says @ApiProperty is optional",
+    detectorExplanation: "the instruction contradicts an accepted decision",
+    detectorVersion: "detector-v1",
+  };
+
+  const reader: ArtifactByteReader = (p) =>
+    p === KEPT_PATH ? KEPT_BYTES : p === DRIFT_PATH ? DRIFT_NOW : null;
+
+  const block = (h: Harness): string | undefined =>
+    h.meters.find((m) => m.path === RECONCILE_FILE)?.json;
+
+  it("writes the block to reconcileFile and leaves stdout byte-identical to a no-findings turn", async () => {
+    const withFindings = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts", reconcileFile: RECONCILE_FILE }),
+      cache({ floorRules: FLOOR, scopedRules: SCOPED, reconciliationFindings: [kept] }),
+      [],
+      reader,
+    );
+
+    expect(withFindings.code).toBe(0);
+    // (a) The block exists, and it exists ONLY on the side channel. A single stray append into the
+    // head would silently start charging reconciliation noise against the rules budget.
+    const xml = block(withFindings);
+    expect(xml).toContain(`kind="decision-reconciliation"`);
+    expect(xml).toContain("Localhost is banned in examples");
+    expect(withFindings.stdout).not.toContain("decision-reconciliation");
+    expect(withFindings.stdout).not.toContain("Localhost is banned in examples");
+
+    // (b) The byte-identity control. Same cache, same prompt, findings removed: if the head differs
+    // by even one byte then the block is coupled to delivery and the separation above is a fiction.
+    const noFindings = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts", reconcileFile: RECONCILE_FILE }),
+      cache({ floorRules: FLOOR, scopedRules: SCOPED }),
+      [],
+      reader,
+    );
+    expect(noFindings.stdout).toBe(withFindings.stdout);
+    // Nothing to say means nothing written: "file absent or empty" is the hook's whole read, so an
+    // empty pass must not leave a zero-length file that a later turn could misread as a block.
+    expect(block(noFindings)).toBeUndefined();
+
+    // The floor and the scoped MUST both still rode in that identical head.
+    expect(withFindings.stdout).toContain("never push without consent");
+    expect(withFindings.stdout).toContain("@ApiProperty");
+  });
+
+  it("renders only gate-KEPT findings, never the raw cache", async () => {
+    const h = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts", reconcileFile: RECONCILE_FILE }),
+      cache({ floorRules: FLOOR, reconciliationFindings: [kept, drifted] }),
+      [],
+      reader,
+    );
+
+    // The drifted finding cites a file whose bytes changed since the detector read it, so its
+    // evidence is no longer a claim about the file as it is RIGHT NOW. Rendering it would inject a
+    // stale assertion under trust="governed", which is exactly what the digest binding exists to
+    // stop. It is held back for re-evaluation, not silently resolved.
+    const xml = block(h) ?? "";
+    expect(xml).toContain("Localhost is banned in examples");
+    expect(xml).not.toContain("@ApiProperty");
+    expect(xml).not.toContain("case-drifted");
+    expect(h.audits[0].reconciliation).toEqual({
+      kept: [{ path: KEPT_PATH, reason: "digest_match" }],
+      needsReevaluation: [{ path: DRIFT_PATH, reason: "digest_drift" }],
+    });
+  });
+
+  it("still delivers the block on both degraded branches", async () => {
+    // Row 5: no usable cache at all. There are no findings to render either (they live in the
+    // cache), so the contract here is that the side channel stays silent rather than throwing.
+    const noCache = await run(
+      stdin({ reconcileFile: RECONCILE_FILE }),
+      null,
+      [],
+      reader,
+    );
+    expect(noCache.code).toBe(0);
+    expect(noCache.stdout).toContain(INCOMPLETE_DELIVERY_MARKER_TEXT);
+    expect(block(noCache)).toBeUndefined();
+
+    // Rows 3/4: an old-schema cache cannot surface scoped rules, but a finding parked in it is
+    // still a live divergence. The block rides the side channel independently of scoped delivery,
+    // which is the whole reason it lives in the tail region and not in the assembler's head.
+    const oldSchema = await run(
+      stdin({ reconcileFile: RECONCILE_FILE }),
+      cache({ schemaVersion: 1, floorRulesXml: "<floor/>", reconciliationFindings: [kept] }),
+      [],
+      reader,
+    );
+    expect(oldSchema.code).toBe(0);
+    expect(oldSchema.stdout).toContain(SCOPED_UNAVAILABLE_MARKER_TEXT);
+    expect(block(oldSchema)).toContain("Localhost is banned in examples");
+    expect(oldSchema.stdout).not.toContain("decision-reconciliation");
+  });
+
+  it("writes nothing when the caller names no reconcileFile", async () => {
+    // The hook owns the temp path; a caller that does not want the block simply omits it. The
+    // subcommand must not invent a well-known destination, because a file nobody deletes is a
+    // stale block the next turn would inject as if it were fresh.
+    const h = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts" }),
+      cache({ floorRules: FLOOR, reconciliationFindings: [kept] }),
+      [],
+      reader,
+    );
+    expect(h.code).toBe(0);
+    expect(h.meters).toEqual([]);
+    expect(h.audits[0].reconciliation?.kept).toEqual([{ path: KEPT_PATH, reason: "digest_match" }]);
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // The freshness gate, which sits IN FRONT of the rehash gate and answers a different question.
+  //
+  // The rehash gate proves the cited file has not drifted. It cannot prove the DECISION is still
+  // live: dismissal, retraction, tombstoning, and this viewer's visibility are all decided in
+  // control per read. So a laptop that has not reached control since yesterday must stop asserting
+  // trust="governed", no matter how pristine the file's digest still is. These pin the direction
+  // of that failure: stale goes SILENT, and it goes silent WITHOUT reading a single artifact byte.
+  // -------------------------------------------------------------------------------------------
+
+  it("renders nothing once the pull ages out, and does not even read the artifact", async () => {
+    const reads: string[] = [];
+    const countingReader: ArtifactByteReader = (p) => {
+      reads.push(p);
+      return reader(p);
+    };
+    // 24h is the window; 24h + 1min is outside it. The digest still matches perfectly.
+    const h = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts", reconcileFile: RECONCILE_FILE }),
+      cache({
+        floorRules: FLOOR,
+        reconciliationFindings: [kept],
+        reconciliationFetchedAt: "2026-07-04T11:59:00.000Z",
+      }),
+      [],
+      countingReader,
+    );
+
+    expect(h.code).toBe(0);
+    expect(block(h)).toBeUndefined();
+    // Short-circuited, not filtered: a stale list costs zero file reads, so an agent working in a
+    // huge repo pays nothing for findings it will never be shown.
+    expect(reads).toEqual([]);
+    expect(h.audits[0].reconciliation).toBeUndefined();
+  });
+
+  it("treats an unstamped cache as infinitely stale rather than assuming it is fresh", async () => {
+    // A cache written by a pre-stamp CLI, or hand-edited. The findings look identical to a fresh
+    // pull; the difference is that nothing can date them. Trust that cannot be dated is not trust.
+    const h = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts", reconcileFile: RECONCILE_FILE }),
+      cache({
+        floorRules: FLOOR,
+        reconciliationFindings: [kept],
+        reconciliationFetchedAt: undefined,
+      }),
+      [],
+      reader,
+    );
+
+    expect(h.code).toBe(0);
+    expect(block(h)).toBeUndefined();
+  });
+
+  it("does not let a future-dated stamp buy trust", async () => {
+    // Clock skew, or a stamp someone edited forward to keep a finding alive. Either way it is not
+    // evidence of a recent pull, so it must not be treated as one.
+    const h = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts", reconcileFile: RECONCILE_FILE }),
+      cache({
+        floorRules: FLOOR,
+        reconciliationFindings: [kept],
+        reconciliationFetchedAt: "2026-07-06T12:00:00.000Z",
+      }),
+      [],
+      reader,
+    );
+
+    expect(h.code).toBe(0);
+    expect(block(h)).toBeUndefined();
+  });
+
+  it("still renders at the very edge of the window", async () => {
+    // Exactly 24h old. The boundary is inclusive on purpose: a scan from this time yesterday is
+    // the ordinary daily-driver case, and flipping it to silent one millisecond early would make
+    // the feature blink out for the operator who scans at the same time each morning.
+    const h = await run(
+      stdin({ prompt: "edit apps/control/outbox.ts", reconcileFile: RECONCILE_FILE }),
+      cache({
+        floorRules: FLOOR,
+        reconciliationFindings: [kept],
+        reconciliationFetchedAt: "2026-07-04T12:00:00.000Z",
+      }),
+      [],
+      reader,
+    );
+
+    expect(h.code).toBe(0);
+    expect(block(h)).toContain("Localhost is banned in examples");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The DEFAULT wiring, on a real filesystem, when the marker sits ABOVE the checkout.
+//
+// Every test above injects both `readCache` and `readArtifactBytes`, which is exactly why the
+// suite was blind to this: the two defaults resolved paths against two DIFFERENT roots and no
+// test ever ran both. A finding's `path` is scan-root relative (scan.ts enumerates via
+// `gitLsFiles(scanRoot)`), and a marker above the checkouts is an explicitly supported layout, so
+// rooting the byte reader at the turn's repoRoot (the git toplevel, one level DOWN) made every
+// finding read as unreadable. The gate then dropped it in silence: the hook said nothing while
+// `mla context list`, which already resolved against the scan root, still listed it as live.
+//
+// This drives the subcommand with NO reader and NO cache injected, so both defaults are the thing
+// under test.
+// ---------------------------------------------------------------------------------------------
+
+describe("assemble-context: the byte reader is rooted where the finding paths are", () => {
+  const ARTIFACT = "CLAUDE.md";
+  const BYTES = "# House rules\n\nUse localhost for every local service example.\n";
+  const ACCEPTED = "Use 127.0.0.1, never localhost.";
+
+  let markerDir: string;
+  let checkout: string;
+  let home: string;
+  let reconcileFile: string;
+  const origCwd = process.cwd();
+
+  beforeEach(() => {
+    markerDir = realpathSync(mkdtempSync(join(tmpdir(), "mla-asm-root-")));
+    checkout = join(markerDir, "checkout");
+    home = mkdtempSync(join(tmpdir(), "mla-asm-home-"));
+    reconcileFile = join(home, "reconcile.xml");
+    mkdirSync(checkout, { recursive: true });
+    // The marker binds the workspace one level ABOVE the checkout, and the scan that produced the
+    // finding ran from there, so the artifact is addressed relative to markerDir.
+    writeFileSync(join(markerDir, ".meetless.json"), JSON.stringify({ workspaceId: WS }));
+    writeFileSync(join(markerDir, ARTIFACT), BYTES);
+    writeScanCache(
+      home,
+      WS,
+      cache({
+        scanRootPath: markerDir,
+        floorRules: [
+          { ruleId: "fm1", versionId: "v1", text: "never push without consent", strength: "MUST" as const },
+        ],
+        reconciliationFindings: [
+          {
+            path: ARTIFACT,
+            evaluatedDigest: normalizedContentHash(BYTES, CONTENT_NORMALIZATION_V1),
+            reason: "a governed decision superseded this instruction",
+            acceptedStatement: ACCEPTED,
+            sourceCaseId: "case_root",
+          },
+        ],
+      }),
+    );
+    // The session runs inside the checkout, which is what makes repoRoot and the scan root differ.
+    process.chdir(checkout);
+  });
+
+  afterEach(() => {
+    process.chdir(origCwd);
+    rmSync(markerDir, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("renders a finding whose path resolves under the scan root, not under repoRoot", async () => {
+    const code = await runAssembleContext([], {
+      readStdin: () =>
+        JSON.stringify({
+          base: BASE,
+          prompt: "",
+          workingSet: [],
+          workspaceId: WS,
+          safeTotal: 1800,
+          // The git toplevel the hook derives. It is NOT the root the finding path speaks about.
+          repoRoot: checkout,
+          reconcileFile,
+        }),
+      writeAudit: () => {},
+      home,
+      now: () => "2026-07-05T12:00:00.000Z",
+      log: () => {},
+    });
+
+    expect(code).toBe(0);
+    expect(readFileSync(reconcileFile, "utf8")).toContain(ACCEPTED);
+  });
+
+  it("still drops the finding when the artifact under the scan root has drifted", async () => {
+    // The negative control for the test above: proof it passes because the gate READ the file and
+    // the digest matched, not because containment was loosened into "resolve it anywhere".
+    writeFileSync(join(markerDir, ARTIFACT), BYTES + "\nAlso: use 127.0.0.1.\n");
+
+    const code = await runAssembleContext([], {
+      readStdin: () =>
+        JSON.stringify({
+          base: BASE,
+          prompt: "",
+          workingSet: [],
+          workspaceId: WS,
+          safeTotal: 1800,
+          repoRoot: checkout,
+          reconcileFile,
+        }),
+      writeAudit: () => {},
+      home,
+      now: () => "2026-07-05T12:00:00.000Z",
+      log: () => {},
+    });
+
+    expect(code).toBe(0);
+    expect(existsSync(reconcileFile)).toBe(false);
   });
 });

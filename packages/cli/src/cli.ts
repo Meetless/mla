@@ -75,6 +75,7 @@ import { runCodex } from "./commands/codex";
 import { runReview, runReviewById, reviewUsage } from "./commands/review";
 import { runEnforcement } from "./commands/enforcement";
 import { runConflicts } from "./commands/conflicts";
+import { runDecisions } from "./commands/decisions";
 import { runFlush } from "./commands/flush";
 import { runQueuePrune } from "./commands/queue-prune";
 import { runDoctor } from "./commands/doctor";
@@ -411,6 +412,17 @@ export const COMMANDS: CommandSpec[] = [
     // All verb + flag parsing lives in runConflicts so the dispatcher stays a
     // thin pass-through of everything after the command word.
     handler: (argv) => runConflicts(argv.slice(1)),
+  },
+  {
+    name: "decisions",
+    summary: "Export one governed decision as a DecisionRecord.",
+    usage: `  mla decisions show <decision-id> [--format md|json]
+                    (assemble the decision's record from the governed graph and
+                     print it: Markdown by default, the raw DTO with --format json.
+                     Sections with no native source read "Not captured"; nothing is
+                     inferred or remapped. Evidence you are not entitled to read is
+                     named as private rather than linked.)`,
+    handler: (argv) => runDecisions(argv.slice(1)),
   },
   {
     name: "cases",

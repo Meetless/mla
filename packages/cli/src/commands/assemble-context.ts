@@ -26,15 +26,17 @@ import {
   PersistedAssembleAudit,
   writeAssembleAudit,
 } from "../lib/scanner/cache";
+import { ArtifactByteReader } from "../lib/scanner/reconciliation-rehash";
 import {
-  ArtifactByteReader,
-  filterReconciliationFindings,
-} from "../lib/scanner/reconciliation-rehash";
-import { readScanCacheForRoot } from "./scan-context";
+  liveReconciliationFindings,
+  makeArtifactByteReader,
+} from "../lib/scanner/reconciliation-live";
+import { readScanCacheForRoot, resolveScanRoot } from "./scan-context";
 import { assembleContext } from "../lib/scanner/assemble";
 import { extractExplicitPaths } from "../lib/scanner/prompt-paths";
 import {
   renderIncompleteDeliveryMarker,
+  renderReconciliationBlock,
   renderScopedUnavailableMarker,
 } from "../lib/scanner/render";
 import { RuleMeterFile } from "../lib/analytics/envelope";
@@ -98,6 +100,13 @@ interface AssembleStdin {
   // concurrent sessions clobber it, so a meter read from there would be attributed to the wrong
   // turn. Absent key = no meter, which is the correct behavior for every non-hook caller.
   meterFile?: string;
+  // Optional caller-owned path for the §3.5 reconciliation block. Same per-call-temp contract as
+  // `meterFile`, and for a SHARPER reason than telemetry attribution: the block is only sound
+  // because the rehash gate re-verified it against the files as they are RIGHT NOW. A well-known
+  // per-workspace path would leave a stale block on disk whenever this process fail-softs, and the
+  // next turn would inject last turn's unverified findings under trust="governed". A temp path the
+  // caller creates and deletes makes that structurally impossible: no file means no block.
+  reconcileFile?: string;
 }
 
 function byteLength(s: string): number {
@@ -127,7 +136,9 @@ function parseInput(raw: string): AssembleStdin | null {
       ? Math.floor(j.safeTotal)
       : SAFE_TOTAL;
   const meterFile = typeof j.meterFile === "string" && j.meterFile ? j.meterFile : undefined;
-  return { base, prompt, workingSet, workspaceId, repoRoot, safeTotal, meterFile };
+  const reconcileFile =
+    typeof j.reconcileFile === "string" && j.reconcileFile ? j.reconcileFile : undefined;
+  return { base, prompt, workingSet, workspaceId, repoRoot, safeTotal, meterFile, reconcileFile };
 }
 
 // Sanitize the git working set to repo-relative, contained paths (§4.7 "full working set").
@@ -148,28 +159,6 @@ function normalizeWorkingSet(entries: string[]): string[] {
     out.push(n);
   }
   return out;
-}
-
-// The default artifact byte reader for the reconciliation rehash gate: read one
-// repo-relative instruction file's UTF-8 bytes, contained under `repoRoot`. It
-// mirrors normalizeWorkingSet's containment discipline exactly (reject absolute
-// paths and `..` escapes) so a finding can never coerce a read outside the repo,
-// and swallows every fs error to null so an unreadable path becomes
-// NEEDS_REEVALUATION rather than throwing. Pure-posix join, matching the rest of
-// this file's path handling.
-function makeArtifactByteReader(repoRoot: string | undefined): ArtifactByteReader {
-  const root = repoRoot ?? process.cwd();
-  return (rel: string): string | null => {
-    const t = rel.trim();
-    if (!t || t.startsWith("/")) return null;
-    const n = posix.normalize(t);
-    if (n === "" || n === "." || n === ".." || n.startsWith("../") || n.startsWith("/")) return null;
-    try {
-      return readFileSync(posix.join(root, n), "utf8");
-    } catch {
-      return null;
-    }
-  };
 }
 
 interface AssembleCtx {
@@ -198,6 +187,11 @@ interface AssembleResult {
   // branch; the null type is reserved for the dormant head-null path described above, where the bash
   // fallback owns delivery and metering a head we did not build would misreport what the model got.
   meter: RuleMeterFile | null;
+  // The §3.5 reconciliation block, or "" when nothing survived the rehash gate. Out-of-band by
+  // design: it rides beside the head, never inside it, so it shares none of the head's budget and
+  // is delivered even on the two degraded branches (a stale cache does not make a re-verified
+  // divergence any less true).
+  reconciliationBlock: string;
 }
 
 /**
@@ -225,15 +219,20 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
   // Prompt-time reconciliation rehash gate (ADR §3.3 item 9). Re-hash every cited instruction
   // file's current bytes and partition the findings into KEPT (digest still matches) vs
   // NEEDS_REEVALUATION (drifted / unreadable / normalization-refused). Computed ONCE from the
-  // cache and recorded in the out-of-band audit below (the sole Phase 2A consumer). This is the
-  // filter GATE only; rendering the kept findings into the head is Phase 3 (blocked), so KEPT has
-  // no head-side effect today and an empty partition (every Phase 2A cache) leaves the head
-  // byte-identical. `reconciliationFindings` is forward-only and absent in every 2A cache, so this
-  // is a clean no-op that costs zero file reads until the Phase 2B detector populates it.
-  const reconciliation = filterReconciliationFindings(
-    cache?.reconciliationFindings ?? [],
-    ctx.readArtifactBytes,
-  );
+  // cache and recorded in the out-of-band audit below.
+  //
+  // KEPT feeds the §3.5 injection block, rendered here so it is bound to the gate's verdict and
+  // NOT to the raw cache: a pre-rendered block read straight off disk would inject findings whose
+  // cited file has drifted since evaluation, which is exactly what the digest binding exists to
+  // stop. The block leaves the HEAD byte-identical in every branch (it travels out-of-band via
+  // `reconcileFile`, appended in the hook's tail region), so it can never evict a floor or scoped
+  // MUST. An empty cache renders "" and costs zero file reads.
+  //
+  // Both gates (freshness, then rehash) live in reconciliation-live.ts, shared verbatim with the
+  // human-facing surfaces (`mla context list`, the `mla ask` documentation-impact section) so that
+  // "still governed" means one thing across the product and cannot drift per surface.
+  const reconciliation = liveReconciliationFindings(cache, ctx.readArtifactBytes, ctx.now());
+  const reconciliationBlock = renderReconciliationBlock(reconciliation.kept.map((o) => o.finding));
   const reconciliationAudit =
     reconciliation.kept.length || reconciliation.needsReevaluation.length
       ? {
@@ -312,7 +311,13 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
   if (!cache) {
     const text = joinSegments([input.base, renderIncompleteDeliveryMarker()]);
     emitAudit("incomplete", text, false, [], []);
-    return { head: text, overflow: false, blockedVersions: [], meter: degradedMeter(text, 0) };
+    return {
+      head: text,
+      overflow: false,
+      blockedVersions: [],
+      meter: degradedMeter(text, 0),
+      reconciliationBlock,
+    };
   }
 
   // Rows 3/4: old schema. Post-activation, the bulk compat path is gone, so scoped rules cannot
@@ -334,6 +339,7 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
       // The pre-rendered floor XML DID ride, so its bytes are real always-on cost even though the
       // old cache cannot tell us how many rules are inside it.
       meter: degradedMeter(text, byteLength(cache.floorRulesXml ?? "")),
+      reconciliationBlock,
     };
   }
 
@@ -371,6 +377,7 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
     head: out.text,
     overflow: out.overflow,
     blockedVersions,
+    reconciliationBlock,
     meter: {
       base_bytes: m.baseBytes,
       always_on_bytes: m.ambientBytes,
@@ -440,9 +447,18 @@ export async function runAssembleContext(
     const ctx: AssembleCtx = {
       home: deps.home, // undefined = the cache module's state root (it honors MEETLESS_HOME)
       now: deps.now ?? (() => new Date().toISOString()),
-      // Repo-contained byte reader for the rehash gate, rooted at this turn's repoRoot (the hook
-      // passes it; absent -> process.cwd(), the session repo). Injected wholesale in tests.
-      readArtifactBytes: deps.readArtifactBytes ?? makeArtifactByteReader(input.repoRoot),
+      // Contained byte reader for the rehash gate, rooted at the SCAN ROOT rather than at this
+      // turn's repoRoot. A finding's `path` was recorded by the scan, which enumerates via
+      // `gitLsFiles(scanRoot)` (scan.ts), so it is scan-root relative; and readScanCacheForRoot
+      // below only hands us a cache whose scanRootPath IS that root. Rooting the reader anywhere
+      // else re-bases the path against a directory the finding never spoke about. The two are the
+      // same directory in the common layout, but a marker sitting above the checkouts is an
+      // explicitly supported state (scan.ts: "a non-git scan root is a supported state"), and
+      // there repoRoot is the git toplevel BELOW the root the paths are relative to. Every such
+      // finding then read as `unreadable` and was dropped in silence, which is the one failure
+      // mode this gate must never have: the hook went quiet while `mla context list` (which
+      // already resolves against the scan root) still listed the finding as live.
+      readArtifactBytes: deps.readArtifactBytes ?? makeArtifactByteReader(resolveScanRoot(process.cwd())),
       // Guarded read: the assembler injects locally-parsed scopedRules, which belong to ONE
       // checkout. A workspace shared by several checkouts writes one scan-cache.json, so an
       // unguarded read could inject a sibling checkout's scoped rules into this session. On a
@@ -467,6 +483,19 @@ export async function runAssembleContext(
         writeMeter(input.meterFile, JSON.stringify(result.meter));
       } catch {
         /* telemetry is never load-bearing */
+      }
+    }
+    // Drop the §3.5 reconciliation block where the caller asked for it. Same best-effort posture as
+    // the meter, and outside the delivery `try` for the same reason: a full disk must cost a
+    // reconciliation block, never the user's rules. An empty block writes nothing at all, so the
+    // hook's "file missing or empty = no block" read is the single source of truth for both the
+    // nothing-to-say case and the could-not-write case.
+    if (input.reconcileFile && result.reconciliationBlock) {
+      const writeMeter = deps.writeMeter ?? ((p: string, j: string) => writeFileSync(p, j, "utf8"));
+      try {
+        writeMeter(input.reconcileFile, result.reconciliationBlock);
+      } catch {
+        /* an undelivered divergence notice is never worth failing a turn over */
       }
     }
     if (result.overflow) {

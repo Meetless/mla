@@ -434,4 +434,32 @@ describe("stop.sh: end_turn-gated closing message (Bug: stale mid-turn block on 
       cleanup();
     }
   });
+
+  it("uses Codex last_assistant_message without parsing its unstable transcript format", () => {
+    const { h, cleanup } = mkHarness();
+    try {
+      h.seedTurn("codex-stop-1", 1);
+      const transcript = h.writeTranscript([
+        userPrompt("old prompt"),
+        assistantTurn("WRONG_TRANSCRIPT_MESSAGE", false),
+      ]);
+
+      const status = h.fire(
+        {
+          session_id: "codex-stop-1",
+          transcript_path: transcript,
+          last_assistant_message: "Codex supplied final answer",
+        },
+        { MEETLESS_CONNECTOR: "codex" },
+      );
+      expect(status).toBe(0);
+
+      const events = h.events("codex-stop-1");
+      const stopped = events.find((event) => event.event === "session_stopped");
+      expect(stopped.payload.finalMessage).toBe("Codex supplied final answer");
+      expect(events.some((event) => event.event === "assistant_message")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
 });

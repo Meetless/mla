@@ -91,6 +91,7 @@ interface KbInspectArgs {
   sub: "summary" | "dump";
   json: boolean;
   markdown: boolean;
+  workspace: string | null;
 }
 
 // Legacy inspect parser. Only handles `mla kb summary` and `mla kb dump`; the
@@ -101,15 +102,22 @@ export function parseArgs(argv: string[]): KbInspectArgs {
   const sub = argv[0];
   if (sub !== "summary" && sub !== "dump") {
     throw new Error(
-      `Usage: mla kb summary [--json] | mla kb dump [--markdown] [--json]`,
+      `Usage: mla kb summary [--json] [--workspace <id>] | mla kb dump [--markdown] [--json] [--workspace <id>]`,
     );
   }
-  const out: KbInspectArgs = { sub, json: false, markdown: false };
+  const out: KbInspectArgs = { sub, json: false, markdown: false, workspace: null };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json") out.json = true;
     else if (a === "--markdown") out.markdown = true;
-    else throw new Error(`Unknown flag for \`mla kb ${sub}\`: ${a}`);
+    // Every sibling (kb claims / show / add / dump, and ask) accepts --workspace. summary silently
+    // reporting the ACTIVATED workspace instead was actively misleading while debugging an ingest
+    // into some OTHER workspace: it printed "0 chunks" for a corpus that had just landed elsewhere.
+    else if (a === "--workspace") {
+      const v = argv[++i];
+      if (!v || v.startsWith("--")) throw new Error("--workspace requires a workspace id");
+      out.workspace = v;
+    } else throw new Error(`Unknown flag for \`mla kb ${sub}\`: ${a}`);
   }
   return out;
 }
@@ -487,7 +495,8 @@ export async function runKb(argv: string[]): Promise<number> {
   }
 
   const intelUrl = cfg.intelUrl || DEFAULT_INTEL_URL;
-  const qs = new URLSearchParams({ workspaceId: cfg.workspaceId }).toString();
+  const workspaceId = args.workspace || cfg.workspaceId;
+  const qs = new URLSearchParams({ workspaceId }).toString();
 
   let counts: SubstrateCounts;
   try {

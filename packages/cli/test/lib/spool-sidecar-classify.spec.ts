@@ -13,14 +13,14 @@ function write(dir: string, name: string, body: string, ageSecAgo: number): void
   fs.utimesSync(full, t, t);
 }
 
-describe("queue sidecar classification (hb + narration-cursor)", () => {
+describe("queue sidecar classification", () => {
   let dir: string;
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-classify-"));
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  it("reaps .hb/.hb.lock/.narration-cursor/.narration-cursor.lock under the SAME session as .lock", () => {
+  it("reaps lifecycle sidecars under the SAME session as .lock", () => {
     const sid = "sess-cuid-xyz";
     write(dir, `${sid}.jsonl`, "", 2 * DAY); // 0-byte drained spool
     write(dir, `${sid}.lock`, "", 2 * DAY);
@@ -29,13 +29,14 @@ describe("queue sidecar classification (hb + narration-cursor)", () => {
     write(dir, `${sid}.hb.lock`, "", 2 * DAY);
     write(dir, `${sid}.narration-cursor`, "42", 2 * DAY);
     write(dir, `${sid}.narration-cursor.lock`, "", 2 * DAY);
+    write(dir, `${sid}.codexStarted`, "", 2 * DAY);
 
     const r = reapQueue({ queueDir: dir, maxAgeSec: DAY, now: NOW });
 
     // One session reaped (not three phantom ".hb" / ".narration-cursor" sessions),
-    // all seven files gone.
+    // all eight files gone.
     expect(r.reaped).toEqual([sid]);
-    expect(r.removedFiles).toBe(7);
+    expect(r.removedFiles).toBe(8);
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 

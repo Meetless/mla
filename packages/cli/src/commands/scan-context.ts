@@ -10,7 +10,7 @@ import {
   writeProjectionReceipt,
   type PersistedProjectionReceipt,
 } from "../lib/scanner/cache";
-import { Directive, FloorMeta, ScanResult } from "../lib/scanner/types";
+import { Directive, FloorMeta, ReconciliationFinding, ScanResult } from "../lib/scanner/types";
 import { findWorkspaceContext } from "../lib/workspace";
 import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 import { readRuleBundleCache, type BundlePrincipal } from "../lib/rules/bundle-cache";
@@ -19,13 +19,29 @@ import {
   removeOwnedProjection,
 } from "../lib/scanner/floor-projection-writer";
 import { renderProjectionBody, projectionBodyHash } from "../lib/scanner/floor-projection";
-import { refreshBundleForScan, type DeliveryOutcome } from "../lib/rules/bundle-refresh";
+import {
+  fetchReconciliationForScan,
+  refreshBundleForScan,
+  type DeliveryOutcome,
+  type ReconciliationPull,
+} from "../lib/rules/bundle-refresh";
 
 export interface RescanArgs {
   cwd: string;
   workspaceId: string;
   home?: string;
   now?: () => string;
+  /**
+   * A SUCCESSFUL §3.5 findings pull from control, or undefined when this rescan did not pull.
+   *
+   * The two cases must stay distinguishable, which is why this is not just an array. Supplying
+   * one (INCLUDING an empty one) makes it authoritative: control no longer serving a finding
+   * means it was dismissed, resolved, or its decision retracted, and that must clear the cache.
+   * Omitting it carries the previous list forward, because most rescan callers (`mla context`,
+   * activate, steer-sync) are local operations with no network round trip, and dropping the
+   * findings on every one of those would make the feature blink out between scans.
+   */
+  reconciliation?: ReconciliationFinding[];
 }
 
 // Pure-ish core: scan, apply current verdicts, persist. Returns the applied result.
@@ -55,7 +71,12 @@ export function rescanAndCache(args: RescanArgs): ScanResult {
   // tell it is holding checkout A's repo-specific scan and decline to render/inject it. Derived
   // via resolveScanRoot (not raw args.cwd) so every caller, including activate which passes a raw
   // cwd, stamps the SAME canonical marker-dir identity the readers compute.
-  const withMeta: ScanResult = { ...applied, floorMeta, scanRootPath: resolveScanRootIdentity(args.cwd) };
+  const withMeta: ScanResult = {
+    ...applied,
+    floorMeta,
+    scanRootPath: resolveScanRootIdentity(args.cwd),
+    ...resolveReconciliation(args, home, now),
+  };
   writeScanCache(home, args.workspaceId, withMeta);
   // One producer, two projections (matrix doc, "the same successful scan"): the scan that
   // just wrote scan-cache.json.floorRulesXml for the main-agent hook ALSO materializes the
@@ -67,6 +88,46 @@ export function rescanAndCache(args: RescanArgs): ScanResult {
     // Defense in depth: the writer is already throw-free; this guards the receipt path too.
   }
   return withMeta;
+}
+
+/**
+ * Decide what §3.5 findings this scan writes, and how fresh they are.
+ *
+ * `scanWorkspace` is a local filesystem walk: it cannot know about findings, which come from
+ * control. So the findings fields are the one part of the cache a rescan does not regenerate,
+ * and this is where the two paths meet:
+ *
+ *  - A rescan that PULLED supplies the list. It is authoritative even when empty, and gets a
+ *    fresh stamp. This is the only way a finding is ever cleared.
+ *  - A rescan that did NOT pull carries the previous list and its ORIGINAL stamp forward. Reusing
+ *    the old stamp is the whole trick: a local rescan must not be able to launder stale findings
+ *    into looking freshly confirmed, so `mla context` can rescan all day without ever extending
+ *    the window control's answer is trusted for.
+ *
+ * Returns a partial so an absent list stays ABSENT (not `undefined`-valued) in the written JSON,
+ * matching the "absent when unknown" idiom the rest of the cache uses.
+ */
+function resolveReconciliation(
+  args: RescanArgs,
+  home: string | undefined,
+  now: () => string,
+): Pick<ScanResult, "reconciliationFindings" | "reconciliationFetchedAt"> {
+  if (args.reconciliation) {
+    return { reconciliationFindings: args.reconciliation, reconciliationFetchedAt: now() };
+  }
+  let prior: ScanResult | null = null;
+  try {
+    prior = readScanCache(home, args.workspaceId);
+  } catch {
+    // A corrupt or unreadable prior cache simply means nothing to carry forward. Never fail a
+    // scan over it: the scan's own output is what the operator asked for.
+  }
+  const findings = prior?.reconciliationFindings;
+  if (!findings?.length) return {};
+  return {
+    reconciliationFindings: findings,
+    ...(prior?.reconciliationFetchedAt ? { reconciliationFetchedAt: prior.reconciliationFetchedAt } : {}),
+  };
 }
 
 // Currency + provenance for the floor block, from the SAME principal-bound bundle cache
@@ -223,6 +284,8 @@ export function resolveScanTarget(opts: {
 
 export interface ScanContextDeps {
   refreshBundle?: (workspaceId: string) => Promise<DeliveryOutcome>;
+  /** The §3.5 findings pull, injectable on the same terms as `refreshBundle` (no network in tests). */
+  fetchReconciliation?: (workspaceId: string) => Promise<ReconciliationPull>;
   /**
    * Where the caches live. Defaults to the real home, as everywhere else. A test SHOULD override it
    * (or set MEETLESS_HOME) to contain a scan.
@@ -261,11 +324,22 @@ export async function runScanContext(argv: string[], deps: ScanContextDeps = {})
   }
   const refreshBundle =
     deps.refreshBundle ?? ((ws: string) => refreshBundleForScan(ws, { home: deps.home }));
-  const refreshed = await refreshBundle(target.workspaceId);
+  const fetchReconciliation = deps.fetchReconciliation ?? fetchReconciliationForScan;
+  // Two independent pulls at one refresh moment (see lib/rules/bundle-refresh.ts). Run them
+  // concurrently: they share auth and a backend but nothing else, and serializing them would
+  // charge `mla scan` a second round trip for no ordering it needs.
+  const [refreshed, pulled] = await Promise.all([
+    refreshBundle(target.workspaceId),
+    fetchReconciliation(target.workspaceId),
+  ]);
   const result = rescanAndCache({
     cwd: target.scanRoot,
     workspaceId: target.workspaceId,
     home: deps.home,
+    // Only a SUCCESSFUL pull is passed through. A failed one leaves the field undefined so the
+    // previous findings carry forward under their original stamp: a backend blip must not clear
+    // a live divergence, and must not refresh its trust window either.
+    ...(pulled.findings ? { reconciliation: pulled.findings } : {}),
   });
   out(
     `scanned: ${result.inventory.instructionFiles} instruction files, ` +

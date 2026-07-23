@@ -154,6 +154,84 @@ describe("normalizePostToolUseInput", () => {
     bad.tool_response = { questions: [] };
     expect(normalizePostToolUseInput(bad, { providerSessionId: "sess", occurredAt: "t" })).toEqual([]);
   });
+
+  it("normalizes a Codex request_user_input answer keyed by question id", () => {
+    const decisions = normalizePostToolUseInput(
+      {
+        session_id: "codex-session",
+        hook_event_name: "PostToolUse",
+        tool_name: "request_user_input",
+        tool_use_id: "request-1",
+        tool_input: {
+          questions: [
+            {
+              id: "rollout",
+              header: "Rollout",
+              question: "How should we ship this?",
+              options: [
+                { label: "Canary", description: "Start small." },
+                { label: "All at once", description: "Ship everywhere." },
+              ],
+            },
+          ],
+        },
+        tool_response: { answers: { rollout: "Canary" } },
+      },
+      { providerSessionId: "codex-session", occurredAt: "2026-07-21T00:00:00.000Z" },
+    );
+
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toEqual(
+      expect.objectContaining({
+        provider: "codex",
+        providerSource: "codex_hook",
+        providerToolName: "request_user_input",
+        providerEventId: "request-1#0",
+        providerSessionId: "codex-session",
+        decisionKind: "choice",
+        capturedBy: "post_tool_use",
+      }),
+    );
+    expect(decisions[0].answer).toEqual(
+      expect.objectContaining({
+        type: "choice_label",
+        value: "Canary",
+        choiceId: "choice_0",
+        choiceMatchStatus: "exact_unique",
+      }),
+    );
+  });
+
+  it("accepts Codex's JSON-string response and preserves an Other answer as free text", () => {
+    const decisions = normalizePostToolUseInput(
+      {
+        tool_name: "request_user_input",
+        tool_use_id: "request-2",
+        tool_input: {
+          questions: [
+            {
+              id: "target",
+              header: "Target",
+              question: "Where should this go?",
+              options: [{ label: "Console", description: "Use the Console." }],
+            },
+          ],
+        },
+        tool_response: JSON.stringify({ answers: { target: "A new surface" } }),
+      },
+      { providerSessionId: "codex-session", occurredAt: "t" },
+    );
+
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].decisionKind).toBe("free_text");
+    expect(decisions[0].answer).toEqual(
+      expect.objectContaining({
+        type: "free_text",
+        value: "A new surface",
+        choiceMatchStatus: "no_match",
+      }),
+    );
+  });
 });
 
 describe("scanTranscriptForDecisions", () => {
@@ -252,6 +330,35 @@ describe("runCaptureDecisions (IO wrapper)", () => {
     expect(events).toHaveLength(2);
     expect(events.map((e) => e.payload.providerEventId)).toEqual([`${TOOL_USE_ID}#0`, `${TOOL_USE_ID}#1`]);
     expect(events.every((e) => e.payload.capturedBy === "post_tool_use")).toBe(true);
+  });
+
+  it("post_tool_use: emits a provider-scoped Codex decision spool event", async () => {
+    const { deps, out } = makeDeps({
+      stdin: JSON.stringify({
+        tool_name: "request_user_input",
+        tool_use_id: "request-io-1",
+        tool_input: {
+          questions: [
+            {
+              id: "choice",
+              header: "Choice",
+              question: "Choose one",
+              options: [{ label: "First", description: "The first option." }],
+            },
+          ],
+        },
+        tool_response: { answers: { choice: "First" } },
+      }),
+    });
+    const code = await runCaptureDecisions(
+      ["--source", "post_tool_use", "--session", "codex-session"],
+      deps,
+    );
+    expect(code).toBe(0);
+    const events = parseLines(out);
+    expect(events).toHaveLength(1);
+    expect(events[0].eventKey).toBe("agent_decision_captured:codex:request-io-1#0");
+    expect(events[0].payload.providerSource).toBe("codex_hook");
   });
 
   it("stop_transcript_scan: reads the transcript file and emits decisions", async () => {

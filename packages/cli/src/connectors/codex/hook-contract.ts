@@ -22,12 +22,14 @@ import type { WantedHook } from "../../lib/hook-reconcile";
 // Grep/Glob never spawn the deny seam, and `deriveWriteTargets` (inside
 // pretool-observe) still decides what a given call actually writes.
 export const CODEX_PRE_TOOL_USE_MATCHER = "^(Write|Edit|apply_patch|Bash)$";
+export const CODEX_POST_TOOL_USE_MATCHER = "*";
 
 // UserPromptSubmit carries the same 30s ceiling as the Claude wiring: the
 // grounding assembly (~/.meetless/hooks/user-prompt-submit.sh) injects the
 // Layer-1 floor with zero network and best-effort appends a Layer-2 pull whose
 // curl deadline sits well under this, so WE own the timeout, not a SIGKILL.
 export const CODEX_USER_PROMPT_SUBMIT_TIMEOUT = 30;
+export const CODEX_LIFECYCLE_TIMEOUT = 30;
 
 // A managed Codex hook, expressed as a stable subcommand token sequence rather
 // than a command string, so identity is independent of the mla path prefix.
@@ -44,11 +46,18 @@ export type CodexManagedHook = {
 // entries from the SAME list, so a hook added to install can never be silently
 // missed by uninstall.
 //
-//   PreToolUse       -> `mla _internal pretool-observe` (DIRECT reuse of the
-//                       existing deny seam; zero new decision code)
-//   UserPromptSubmit -> `mla _internal codex-hook user-prompt-submit` (a thin
-//                       wrapper that shells into the shared grounding script)
+//   SessionStart     -> shared AgentRun/session bootstrap
+//   UserPromptSubmit -> shared prompt capture + grounding
+//   PreToolUse       -> existing deny seam (direct reuse)
+//   PostToolUse      -> shared tool/file/MCP/decision capture
+//   Stop             -> shared turn close + finalization
 export const CODEX_MANAGED_HOOKS: CodexManagedHook[] = [
+  {
+    event: "SessionStart",
+    subcommand: ["_internal", "codex-hook", "session-start"],
+    matcher: "startup|resume|clear|compact",
+    timeout: CODEX_LIFECYCLE_TIMEOUT,
+  },
   {
     event: "PreToolUse",
     // Codex does not support permissionDecision:"ask" on PreToolUse: it marks
@@ -62,6 +71,17 @@ export const CODEX_MANAGED_HOOKS: CodexManagedHook[] = [
     event: "UserPromptSubmit",
     subcommand: ["_internal", "codex-hook", "user-prompt-submit"],
     timeout: CODEX_USER_PROMPT_SUBMIT_TIMEOUT,
+  },
+  {
+    event: "PostToolUse",
+    subcommand: ["_internal", "codex-hook", "post-tool-use"],
+    matcher: CODEX_POST_TOOL_USE_MATCHER,
+    timeout: CODEX_LIFECYCLE_TIMEOUT,
+  },
+  {
+    event: "Stop",
+    subcommand: ["_internal", "codex-hook", "stop"],
+    timeout: CODEX_LIFECYCLE_TIMEOUT,
   },
 ];
 

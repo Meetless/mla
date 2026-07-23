@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# post-tool-use.sh: Claude Code PostToolUse hook (Bash + meetless MCP).
+# post-tool-use.sh: PostToolUse hook (Claude Code and Codex).
 #
 # Two routes, selected by tool name:
 #   Bash                       -> tool_used_bash event (command, exit code,
@@ -69,7 +69,7 @@ heartbeat_flush "$SESSION_ID"
 # jq error skips capture and never disturbs the tool spool below. Narration is the
 # default now (no kill switch): the timeline is wrong without it.
 NARR_TRANSCRIPT="$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
-if [[ -n "$NARR_TRANSCRIPT" && -f "$NARR_TRANSCRIPT" ]]; then
+if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "$NARR_TRANSCRIPT" && -f "$NARR_TRANSCRIPT" ]]; then
   mkdir -p "$QUEUE_DIR"
   NARR_CURSOR_FILE="$QUEUE_DIR/$SESSION_ID.narration-cursor"
   (
@@ -255,12 +255,12 @@ if [[ "$TOOL" == mcp__meetless__meetless__* ]]; then
   exit 0
 fi
 
-# ---- AskUserQuestion agent-decision capture (provider-neutral) -----------
-# Claude's AskUserQuestion bundles N questions in one tool call; each ANSWERED
-# question becomes one first-class, auditable agent-human decision. Hand the raw
-# hook payload (tool_input.questions + tool_response.answers + tool_use_id) to the
-# `mla _internal capture-decisions` Claude normalizer, which emits one
-# `agent_decision_captured` spool event per answered question (providerEventId =
+# ---- Agent-human decision capture (provider-neutral) ---------------------
+# Claude's AskUserQuestion and Codex's request_user_input bundle questions in a
+# tool call; each ANSWERED question becomes one first-class, auditable decision.
+# Hand the raw hook payload to `mla _internal capture-decisions`, whose provider
+# adapter emits one `agent_decision_captured` spool event per answered question
+# (providerEventId =
 # "<tool_use_id>#<questionIndex>"). The command is an IO-light PURE transform and
 # touches NO spool itself; ALL spool locking stays HERE so the single-writer
 # invariant lives in one place. Passing --spool lets the command dedup against
@@ -268,7 +268,7 @@ fi
 # the same keys), so a re-fired PostToolUse never double-spools the same decision.
 # Capture is assistive: every failure is swallowed and never breaks the session.
 # See notes/20260608-agent-decision-capture-design.md section 5.
-if [[ "$TOOL" == "AskUserQuestion" ]]; then
+if [[ "$TOOL" == "AskUserQuestion" || "$TOOL" == "request_user_input" ]]; then
   if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
     DECISION_LINES="$(printf '%s' "$INPUT" | "$MLA_PATH" _internal capture-decisions \
       --source post_tool_use --session "$SESSION_ID" \
@@ -278,6 +278,36 @@ if [[ "$TOOL" == "AskUserQuestion" ]]; then
       spool_append "$SESSION_ID" "$DECISION_LINE"
     done <<< "$DECISION_LINES"
   fi
+  exit 0
+fi
+
+# Codex's structured file editor is `apply_patch`. Its hook payload carries the
+# unified patch text rather than Claude's single `tool_input.file_path`, so
+# extract every declared path and emit the same metadata-only file events the
+# Console Files rail already consumes. A multi-file patch intentionally mints
+# one event per path. The patch body itself is never spooled.
+if [[ "$TOOL" == "apply_patch" ]]; then
+  PATCH_TEXT="$(printf '%s' "$INPUT" | jq -r '
+    if (.tool_input | type) == "string" then .tool_input
+    else (.tool_input.patch // .tool_input.input // "")
+    end
+  ' 2>/dev/null || true)"
+  PATCH_PATHS="$(printf '%s\n' "$PATCH_TEXT" | sed -nE \
+    -e 's/^\*\*\* (Add|Update|Delete) File: (.*)$/\2/p' \
+    -e 's/^\*\*\* Move to: (.*)$/\1/p' \
+    | awk 'NF && !seen[$0]++')"
+  while IFS= read -r PATCH_PATH; do
+    [[ -z "$PATCH_PATH" ]] && continue
+    TS="$(date -u +%FT%TZ)"
+    EVENT_KEY="$(gen_event_key)"
+    PATCH_STORY="$(story_category_for_path "$PATCH_PATH")"
+    LINE="$(jq -c -n \
+      --arg ts "$TS" --arg event "tool_used_file" --arg key "$EVENT_KEY" \
+      --arg sessionId "$SESSION_ID" --arg tool "$TOOL" --arg fp "$PATCH_PATH" \
+      --arg story "$PATCH_STORY" \
+      '{ts: $ts, event: $event, eventKey: $key, sessionId: $sessionId, payload: {tool: $tool, filePath: $fp, storyCategory: $story}}')"
+    spool_append "$SESSION_ID" "$LINE"
+  done <<< "$PATCH_PATHS"
   exit 0
 fi
 
@@ -486,7 +516,15 @@ fi
 [[ "$TOOL" != "Bash" ]] && exit 0
 
 CMD="$(echo "$INPUT" | jq -r '.tool_input.command // ""')"
-EXIT_CODE="$(echo "$INPUT" | jq -r '.tool_result.exit_code // .tool_response.exit_code // empty')"
+# Claude returns an object-shaped tool_result/tool_response. Codex returns the
+# successful Bash stdout as a plain string. Branch on JSON type before indexing:
+# jq treats indexing a string as an error, and common.sh's `set -e` would abort
+# the hook before the event was spooled.
+EXIT_CODE="$(echo "$INPUT" | jq -r '
+  if (.tool_result | type) == "object" then (.tool_result.exit_code // empty)
+  elif (.tool_response | type) == "object" then (.tool_response.exit_code // empty)
+  else empty end
+')"
 # Smaller-C: normalize empty/non-numeric to 0 BEFORE --argjson (jq dies on non-numeric).
 if ! [[ "${EXIT_CODE:-}" =~ ^[0-9]+$ ]]; then EXIT_CODE=0; fi
 # Truncate inside jq (codepoint-aware) so multibyte UTF-8 in tool output (e.g.
@@ -494,8 +532,17 @@ if ! [[ "${EXIT_CODE:-}" =~ ^[0-9]+$ ]]; then EXIT_CODE=0; fi
 # mid-sequence. `tail -c 2000` cuts on bytes, which on a 3-byte vi character
 # produces invalid UTF-8 that downstream jq --arg + Prisma JSON storage may
 # silently corrupt or reject.
-STDOUT_TAIL="$(echo "$INPUT" | jq -r '(.tool_result.stdout // .tool_response.stdout // "")[-2000:]')"
-STDERR_TAIL="$(echo "$INPUT" | jq -r '(.tool_result.stderr // .tool_response.stderr // "")[-2000:]')"
+STDOUT_TAIL="$(echo "$INPUT" | jq -r '
+  (if (.tool_result | type) == "object" then (.tool_result.stdout // .tool_result.aggregated_output // "")
+   elif (.tool_response | type) == "object" then (.tool_response.stdout // .tool_response.aggregated_output // .tool_response.output // "")
+   elif (.tool_response | type) == "string" then .tool_response
+   else "" end)[-2000:]
+')"
+STDERR_TAIL="$(echo "$INPUT" | jq -r '
+  (if (.tool_result | type) == "object" then (.tool_result.stderr // "")
+   elif (.tool_response | type) == "object" then (.tool_response.stderr // "")
+   else "" end)[-2000:]
+')"
 TS="$(date -u +%FT%TZ)"
 EVENT_KEY="$(gen_event_key)"
 

@@ -858,10 +858,11 @@ describe("ingestRun — orchestration", () => {
 // A run's persistence is NOT atomic, and the client used to pretend it was.
 //
 // Every candidate went out in ONE kb-add POST, on the reasoning that one POST gives the run
-// "a single persistence outcome". It also gives it a single TIMEOUT. Intel runs behind a hard
-// 300s Cloud Run ceiling and the CLI asks for 20s per document, so a full-cap run (20 docs)
-// requests 400s: past the ceiling, the connection dies mid-write, and the client throws away
-// every document in the POST, including the ones intel had already indexed. That is how a
+// "a single persistence outcome". It also gives it a single TIMEOUT, and the CLI asked for
+// 20s per document against a wall that does not move: past it the connection dies mid-write
+// and the client throws away every document in the POST, including the ones intel had already
+// indexed. (Which wall, and why the code named the wrong one for a week, is in
+// `src/lib/intel-ingest-budget.ts`.) That is how a
 // pilot user's onboarding produced a workspace with ZERO governed rules on 2026-07-13: the
 // run had no partial state to resume from, so his rules died in the client and he had to
 // start over from nothing.
@@ -908,10 +909,18 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
 
     const res = await ingestRun(batchArgs(persist, nDocs(25)));
 
-    // 25 documents, batches of 10: three POSTs, none of them larger than the cap. The cap is
-    // the whole point (it keeps each request's 20s-per-doc budget under intel's 300s ceiling),
-    // so assert against PERSIST_BATCH_SIZE rather than a copied literal.
-    expect(sizes).toEqual([PERSIST_BATCH_SIZE, PERSIST_BATCH_SIZE, 5]);
+    // 25 documents split into full batches plus a remainder, none larger than the cap. Derive
+    // the expected split from PERSIST_BATCH_SIZE instead of writing the batch layout out by
+    // hand: the cap is a measured number that has already moved once (10 -> 5, when the real
+    // ceiling turned out to be Cloudflare's 100s and not Cloud Run's 300s), and an assertion
+    // that hardcodes today's layout fails the next time the measurement says to move it.
+    const expected = [
+      ...Array(Math.floor(25 / PERSIST_BATCH_SIZE)).fill(PERSIST_BATCH_SIZE),
+      ...(25 % PERSIST_BATCH_SIZE ? [25 % PERSIST_BATCH_SIZE] : []),
+    ];
+    expect(sizes).toEqual(expected);
+    expect(sizes.reduce((a, b) => a + b, 0)).toBe(25);
+    expect(sizes.length).toBeGreaterThan(1); // it batched at all
     expect(sizes.every((s) => s <= PERSIST_BATCH_SIZE)).toBe(true);
     expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(25);
     expect(res.state?.scouts.documentation.status).toBe("complete");
@@ -952,7 +961,7 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
     const res = await ingestRun(batchArgs(persist, nDocs(15)));
 
     // A user who is told only "persistence failed" cannot tell a timeout from a rejected
-    // payload. That silence is how a 300s ceiling stayed undiagnosed for a day.
+    // payload. That silence is how a severed request stayed undiagnosed for a day.
     const partial = res.outcomes
       .find((o) => o.scout === "documentation")!
       .errors.find((e) => e.code === "persistence_partial")!;
@@ -981,9 +990,9 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
       throw new Error("intel unreachable");
     });
 
-    // 40 documents is four batches. Once two in a row have failed, the server is down, not the
-    // batch: spending another 200s timeout per remaining batch to rediscover that would hang
-    // the CLI for many minutes before telling the operator anything.
+    // 30 documents is several batches. Once two in a row have failed, the server is down, not
+    // the batch: spending another full request budget per remaining batch to rediscover that
+    // would hang the CLI for many minutes before telling the operator anything.
     await ingestRun(batchArgs(persist, nDocs(30)));
 
     expect(persist).toHaveBeenCalledTimes(2);
@@ -991,19 +1000,25 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
 
   it("keeps trying past a SINGLE poison batch, or a bad document would strand every batch behind it", async () => {
     seedRun(home, { limits: wideLimits });
+    // The MIDDLE batch is poison: some document in it trips a server-side bug, forever. Derive
+    // which document that is from the batch size so the poison keeps landing mid-run when the
+    // size moves; a hardcoded index quietly becomes a FIRST-batch or LAST-batch test, and
+    // neither of those exercises "a failure in the middle did not strand what was behind it".
+    const batchCount = Math.ceil(25 / PERSIST_BATCH_SIZE);
+    const poisonDoc = `Convention number ${Math.floor(batchCount / 2) * PERSIST_BATCH_SIZE}:`;
     const persist: Persister = jest.fn(async (docs) => {
-      // The middle batch is poison: some document in it trips a server-side bug, forever.
-      if (docs[0].content.includes("Convention number 10:")) throw new Error("kb-add 500");
+      if (docs[0].content.includes(poisonDoc)) throw new Error("kb-add 500");
       return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
     });
 
     const res = await ingestRun(batchArgs(persist, nDocs(25)));
 
-    // If a failed batch aborted the run, batch 3 would never be attempted, and it would never
-    // be attempted on ANY rerun either: every run would die at the same poison batch and the
-    // documents behind it would be permanently unreachable. Keep going.
-    expect(persist).toHaveBeenCalledTimes(3);
-    expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(15);
+    // If a failed batch aborted the run, every batch after the poison one would never be
+    // attempted, and never on ANY rerun either: each run would die at the same poison batch and
+    // the documents behind it would be permanently unreachable. Keep going: attempt them all,
+    // and land everything except the one batch that is genuinely poison.
+    expect(persist).toHaveBeenCalledTimes(batchCount);
+    expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(25 - PERSIST_BATCH_SIZE);
   });
 
   it("records ONLY what landed in the accept sidecar", async () => {

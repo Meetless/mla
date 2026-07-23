@@ -34,6 +34,7 @@ import {
   type ScoutRunStatus,
 } from "./protocol";
 import { loadRunRecord, runsDir, defaultGitRunner, type GitRunner } from "./plan";
+import { INGEST_BATCH_SIZE } from "../intel-ingest-budget";
 
 // One inline document for the kb-add POST. relPath is vault-relative; the server prefixes
 // the `notes/` identity root and forces reviewOutcome=PENDING (verified in kb_add.py).
@@ -62,22 +63,19 @@ export type Persister = (docs: PersistDocument[]) => Promise<{ docs: PersistedDo
 
 // How many documents ride in ONE kb-add POST.
 //
-// This number is a deadline, not a taste. Every document in a POST is embedded and
-// indexed server-side before the response is written, so the request's cost scales with
-// the batch; intel runs on Cloud Run behind a HARD `timeoutSeconds = 300`, which no
-// client setting can extend. The CLI's own budget (`ingestTimeoutMs` in commands/enrich.ts)
-// is `max(120s, 20s * docCount)`, so an unbatched run of 15 documents already asks for
-// 300s: exactly the ceiling, and past it the connection is severed mid-write no matter
-// what either side intended.
+// This number is a deadline, not a taste. Every document in a POST is embedded and indexed
+// server-side before the response is written, so the request's cost scales with the batch,
+// and past the wall the connection is severed mid-write no matter what either side intended.
 //
-// That is not hypothetical. On 2026-07-13 a pilot user's `mla onboard` sent every one of
-// his documents in a single POST, hit the ceiling, and took a 504. The run had no partial
-// state to fall back on, so his rules died IN THE CLIENT and his workspace ended up with
-// zero governed rules. He had to start over from nothing.
+// That is not hypothetical. On 2026-07-13 a pilot user's `mla onboard` sent every one of his
+// documents in a single POST, hit the wall, and got nothing back. The run had no partial state
+// to fall back on, so his rules died IN THE CLIENT and his workspace ended up with zero
+// governed rules. He had to start over from nothing.
 //
-// 10 keeps each POST's budget at 200s, a full 100s under the ceiling, and it bounds the
-// blast radius of any single failure to ten documents instead of the whole run.
-export const PERSIST_BATCH_SIZE = 10;
+// The wall itself, and why this file used to name the wrong one, is documented once in
+// `../intel-ingest-budget`. Do not re-derive it here: this constant was wrong for exactly as
+// long as it carried its own copy of the reasoning.
+export const PERSIST_BATCH_SIZE = INGEST_BATCH_SIZE;
 
 // Two consecutive failed batches is the line between "one batch is poison" and "the
 // server is down", and the two want opposite handling.
@@ -87,11 +85,11 @@ export const PERSIST_BATCH_SIZE = 10;
 // them again at the same place. The run would never make progress. So we keep going, land
 // what we can, and let the failed documents come back on the next run.
 //
-// But if intel really is down, "keep going" spends 200s per batch discovering the same
-// outage over and over, and a large run would hang the CLI for many minutes before saying
-// anything. Stop after the second consecutive failure and mark the remainder failed: they
-// are retryable either way, and the operator gets the truth in minutes instead of tens of
-// minutes.
+// But if intel really is down, "keep going" spends a full request budget per batch
+// discovering the same outage over and over, and a large run would hang the CLI for many
+// minutes before saying anything. Stop after the second consecutive failure and mark the
+// remainder failed: they are retryable either way, and the operator gets the truth in minutes
+// instead of tens of minutes.
 const MAX_CONSECUTIVE_BATCH_FAILURES = 2;
 
 export interface IngestEnv {
@@ -783,9 +781,10 @@ export async function ingestRun(input: {
       batchesLanded += 1;
       consecutiveFailures = 0;
     } catch (e) {
-      // Carry the REAL message (the 504, the timeout, the connection reset). The user who
-      // lost his rules was told nothing at all about why; a generic "persistence failed" is
-      // how a 300s Cloud Run ceiling stays invisible for a day.
+      // Carry the REAL message (the 524, the 504, the timeout, the connection reset). The
+      // user who lost his rules was told nothing at all about why; a generic "persistence
+      // failed" is how a request ceiling stays invisible for a day. Which ceiling it was is
+      // the whole diagnosis: a 524 is the edge, a 504 is the origin, and they are 200s apart.
       persistErrors.push(e instanceof Error ? e.message : String(e));
       for (const d of batch) outcomeByPath.set(d.relPath, "failed");
       consecutiveFailures += 1;
@@ -857,7 +856,7 @@ export async function ingestRun(input: {
         // Append the transport cause when there was one. A batch that timed out and a
         // document the server refused both land here, and they are not the same problem:
         // the first is ours to fix, the second is the payload's. Saying only "could not
-        // persist" is what left a 504 against a 300s ceiling undiagnosed for a day.
+        // persist" is what left a severed request undiagnosed for a day.
         message:
           `${docFailed} document(s) the server could not persist; rerun ingest to retry` +
           (persistErrorMessage ? ` (${persistErrorMessage})` : ""),

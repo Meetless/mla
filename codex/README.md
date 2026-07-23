@@ -132,7 +132,7 @@ The decision logic never moves. The connector is registration plus one wrapper.
 | camelCase deny and inject envelope renderer | Neutral core (Codex honors the same envelopes) |
 | Enforcement-incident capture (fork off the deny path) | Neutral core, pre-existing |
 | **PreToolUse entry point** | Reuses `mla _internal pretool-observe --codex`; the decision core is unchanged and the Codex response adapter maps unsupported ASK to DENY |
-| **UserPromptSubmit entry point** | **New**: one thin wrapper, `mla _internal codex-hook user-prompt-submit` |
+| **Lifecycle capture entry points** | Thin `mla _internal codex-hook` wrappers for SessionStart, UserPromptSubmit, PostToolUse, and Stop; PreToolUse stays direct |
 | **Static Codex plugin package** (ships `mla mcp`) | **New**: static files (`codex/mla/`) |
 | **Codex connector install command** | **New**: writes `$CODEX_HOME/hooks.json`, prints the trust instruction |
 
@@ -259,10 +259,12 @@ framing (the notes-location hard deny, no separate warn scene).
 
 ---
 
-## Scope for Build Week
+## Scope evolution
 
-Cut on purpose (not built): SessionStart hook, PostToolUse hook and any
-file-revert sweep, per-repo `.codex/hooks.json` overrides, a programmatic
-hook-health `doctor`, a generic multi-event dispatcher, any `--codex` branch on
-`mla activate`, and a `codexProvider` session-memory adapter. The build model is
-a build tool, not a new product runtime dependency.
+The Build Week cut originally managed only UserPromptSubmit and PreToolUse.
+Current Codex exposes the full local lifecycle, so the connector now also
+registers SessionStart, PostToolUse, and Stop. Those events drive real Codex
+session identity, tool/file capture, final-message capture, and finalization in
+Console. Codex transcript replay remains intentionally limited because its
+transcript format is not a stable hook interface; stable hook fields are used
+instead.

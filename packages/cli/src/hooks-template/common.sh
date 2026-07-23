@@ -255,9 +255,18 @@ warn_capture_auth() {
 # (test/jest.global-setup.js): 39 specs pinned mlaPath to "/bin/true", which does not
 # exist on macOS, so the -x guard fired and this fallback reached for the developer's
 # real global binary mid-test.
-MLA_PATH="$(jq -r '.mlaPath // empty' "$CFG" 2>/dev/null || true)"
-if [[ -z "${MLA_PATH:-}" || ! -x "$MLA_PATH" ]]; then
-  MLA_PATH="$(command -v mla 2>/dev/null || true)"
+# The Codex wrapper pins nested helper calls to the same CLI executable that
+# received the hook. This prevents a newly registered hook from delegating its
+# inner capture work to an older globally installed binary during upgrades (or
+# while running a source-checkout build). Other connectors retain the persisted
+# mlaPath -> PATH fallback contract below.
+if [[ "${MEETLESS_CONNECTOR:-}" == "codex" && "${MEETLESS_CODEX_MLA_PATH:-}" == /* && -x "${MEETLESS_CODEX_MLA_PATH:-}" ]]; then
+  MLA_PATH="$MEETLESS_CODEX_MLA_PATH"
+else
+  MLA_PATH="$(jq -r '.mlaPath // empty' "$CFG" 2>/dev/null || true)"
+  if [[ -z "${MLA_PATH:-}" || ! -x "$MLA_PATH" ]]; then
+    MLA_PATH="$(command -v mla 2>/dev/null || true)"
+  fi
 fi
 
 # T1.2 hard cutover (folder = workspace): the marker is the ONLY source of the

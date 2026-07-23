@@ -232,6 +232,30 @@ build_floor_rules() {
   jq -r '.floorRulesXml // empty' "$cache" 2>/dev/null || true
 }
 
+# ADR §3.5 decision-reconciliation block: the files in THIS checkout that still assert something a
+# governed decision superseded. A sibling of build_floor_rules above, and deliberately as dumb: it
+# reads an already-rendered block and echoes it, nothing more.
+#
+# It reads a per-call TEMP written by `mla _internal assemble-context`, NOT the scan cache. That is
+# the load-bearing difference from the floor. The floor block is pre-rendered at scan time and is
+# true for as long as the bundle is; a reconciliation finding is only true if the cited file still
+# says what was evaluated, so it has to survive a prompt-time rehash against the bytes on disk.
+# Rendering from the cache here would inject findings the gate had already dropped, and would do it
+# under a trust="governed" label. So the assembler runs the gate and renders; this only carries.
+#
+# Consequences of the split, both intended: on the bash fallback path (assembler hard-failed) there
+# is no temp and no block, which is correct because nothing re-verified the findings; and the block
+# rides the tail, appended separately from the head, so it can never displace a floor or scoped MUST
+# out of the head's asserted budget.
+#
+# $1 = the temp path. Absent, unwritten, or empty all mean the same honest thing (nothing to say)
+# and produce no output. MUST exit 0: a divergence notice is never worth failing a turn over.
+build_reconciliation_block() {
+  local drop="$1"
+  [[ -n "$drop" && -s "$drop" ]] || return 0
+  cat "$drop" 2>/dev/null || true
+}
+
 # Floor delivery receipt (matrix doc, Phase 2 observability). Records whether THIS turn's
 # hook actually emitted the floor block, and if so its currency + identity, so the async
 # flush can prove the load-bearing global rules are reaching the model turn over turn.
@@ -1031,6 +1055,10 @@ intercept_main() {
   # the bash fallback below (LAYER1 + floor XML) still delivers the floor. Best-effort and
   # fully isolated: any error leaves ASSEMBLE_HEAD empty and the fallback owns delivery.
   local ASSEMBLE_HEAD=""
+  # ADR §3.5 decision-reconciliation block. Declared out here, next to ASSEMBLE_HEAD, so the tail
+  # region can append it unconditionally: when the assembler never ran (no MLA_PATH) this stays
+  # empty and the append is a no-op, exactly as if there were no divergence to report.
+  local RECONCILE_BLOCK=""
   # Run-level delivery verdict (INV-DELIVERY / §7.6): INJECTED unless the subcommand signals a
   # fail-closed overflow (rc==3), in which case an applicable MUST could not be delivered and this
   # flips to DELIVERY_FAILED, which blocks the prompt below. Read by spool_injection_trace (dynamic
@@ -1040,7 +1068,7 @@ intercept_main() {
   if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
     # Full dirty set, NOT the 50-capped telemetry array: matching must see every touched path.
     # The env override is scoped to this subshell so it never leaks to TOUCHED_FILES_JSON above.
-    local _asm_ws _asm_root _asm_input _asm_meter
+    local _asm_ws _asm_root _asm_input _asm_meter _asm_reconcile
     _asm_ws="$(MEETLESS_TOUCHED_FILES_MAX=1000000 collect_touched_files 2>/dev/null || printf '[]')"
     [[ -z "$_asm_ws" ]] && _asm_ws="[]"
     # Repo root for repo-relative path resolution, coordinate-consistent with the working set
@@ -1054,6 +1082,14 @@ intercept_main() {
     # last-write-wins and concurrent sessions clobber it, so the meter would land on another
     # session's turn. An empty _asm_meter (mktemp failed) just means no meter this turn.
     _asm_meter="$(mktemp 2>/dev/null || printf '')"
+    # ADR §3.5 reconciliation drop. A PER-CALL temp, following the meter's precedent above for a
+    # sharper reason than concurrency. The rehash gate runs inside the assembler, so a well-known
+    # path would keep serving the LAST turn's rendered block after any turn where the assembler
+    # failed before writing, and that block would arrive on the next prompt still labelled
+    # trust="governed" without anything having re-verified it. A fresh temp per call means "no
+    # file" and "no findings" are the same observable state, which is the honest one. An empty
+    # _asm_reconcile (mktemp failed) simply means no reconciliation block this turn.
+    _asm_reconcile="$(mktemp 2>/dev/null || printf '')"
     _asm_input="$(jq -cn \
       --arg base "$LAYER1" \
       --arg prompt "$PROMPT" \
@@ -1061,9 +1097,11 @@ intercept_main() {
       --arg workspaceId "${WORKSPACE_ID:-}" \
       --arg repoRoot "$_asm_root" \
       --arg meterFile "$_asm_meter" \
+      --arg reconcileFile "$_asm_reconcile" \
       '{base:$base, prompt:$prompt, workingSet:$workingSet, workspaceId:$workspaceId}
         + (if $repoRoot == "" then {} else {repoRoot:$repoRoot} end)
-        + (if $meterFile == "" then {} else {meterFile:$meterFile} end)' 2>/dev/null || true)"
+        + (if $meterFile == "" then {} else {meterFile:$meterFile} end)
+        + (if $reconcileFile == "" then {} else {reconcileFile:$reconcileFile} end)' 2>/dev/null || true)"
     if [[ -n "$_asm_input" ]]; then
       # Capture rc AND stderr. rc==3 is the fail-closed signal (§7.5): the head still prints on
       # stdout (base + floor + marker), the undelivered RuleVersions ride on stderr. `|| _asm_rc=$?`
@@ -1090,10 +1128,17 @@ intercept_main() {
         _asm_meter_json="$(cat "$_asm_meter" 2>/dev/null || true)"
         spawn_rule_meter "$_asm_meter_json" "$TRACE_ID" "${WORKSPACE_ID:-}" "$SESSION_ID" "$TURN_INDEX"
       fi
+      # Lift the §3.5 block into a variable NOW, while the temp is still ours, and append it far
+      # below in the tail region. Reading here and appending there is what keeps the block outside
+      # the byte-asserted assemble-context head: the head's internal budget was closed by the
+      # subcommand, and a divergence notice must never be the thing that pushes a MUST out of it.
+      RECONCILE_BLOCK="$(build_reconciliation_block "$_asm_reconcile")"
     fi
-    # Outside the _asm_input guard: a jq failure above still leaves the temp file behind, and the
-    # spawn already has the JSON by value, so nothing downstream reads this path.
+    # Outside the _asm_input guard: a jq failure above still leaves the temp files behind, and both
+    # payloads are already held by value (the meter by the spawn, the block by RECONCILE_BLOCK), so
+    # nothing downstream reads either path.
     [[ -n "$_asm_meter" && -f "$_asm_meter" ]] && rm -f "$_asm_meter" 2>/dev/null || true
+    [[ -n "$_asm_reconcile" && -f "$_asm_reconcile" ]] && rm -f "$_asm_reconcile" 2>/dev/null || true
   fi
 
   # §7.5 FAIL-CLOSED (INV-DELIVERY, acceptance tests 30/32): an applicable MUST could not be
@@ -1440,6 +1485,30 @@ Informational only (shown once). Open any with meetless__kb_doc_detail; verify a
     _gov_count="$(printf '%s' "${GOVERNANCE_JSON:-null}" | jq -r '.pending_count // empty' 2>/dev/null || true)"
     [[ "$_gov_count" =~ ^[0-9]+$ ]] || _gov_count="null"
     append_context_block "$GOV_BLOCK" "[]" "$_gov_count"
+  fi
+
+  # ADR §3.5 decision reconciliation. Tail region, alongside governance and steer, and NOT folded
+  # into the assemble-context head. Two reasons, both load-bearing. It is a separate read and a
+  # separate append, so it survives assembler degradation independently of scoped-rule delivery.
+  # And it is uncoupled from the head's byte assertion, so a divergence notice can never be the
+  # thing that evicts a MUST. It shares only the session-level master switches every block here
+  # obeys (meetless_activated, pull_only, SUPPRESS_ENRICH); there is deliberately no per-feature
+  # flag, because the rollout gate for this is the phase/scope of the detector (§7), not a toggle
+  # that would let a noisy detector look configured-away instead of fixed.
+  #
+  # Placed BEFORE the steer block so a human decision keeps the last word, and AFTER the governance
+  # nudge because a concrete "this file contradicts an accepted decision" outranks a pending-count
+  # reminder when the agent is skimming the tail.
+  if [[ -n "${RECONCILE_BLOCK:-}" ]]; then
+    # itemCount = findings that actually survived the rehash gate and fit the byte cap, counted off
+    # the rendered block rather than off the cache, so the trace records what was DELIVERED. No
+    # citations array: the case ids live inside the governed band as text, and lifting them into the
+    # trace's citation set would put them through the evidence-block ACL render gate, which is for
+    # retrieved evidence, not for a locally-computed divergence.
+    local _rec_count
+    _rec_count="$(printf '%s' "$RECONCILE_BLOCK" | grep -c '<reconciliation-finding' 2>/dev/null || printf 0)"
+    [[ "$_rec_count" =~ ^[0-9]+$ ]] || _rec_count=0
+    append_context_block "$RECONCILE_BLOCK" "[]" "$_rec_count"
   fi
 
   # Human steer rides at the very end of the turn's context: a human decision is

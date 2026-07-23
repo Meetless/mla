@@ -84,6 +84,7 @@ const SIDECAR_SUFFIXES = [
   ".narration-cursor.lock",
   ".narration-cursor",
   ".hb",
+  ".codexStarted",
   ".repoPath",
   ".gitBaseline",
   ".workspaceId",

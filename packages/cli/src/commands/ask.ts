@@ -1,12 +1,18 @@
 import * as path from "path";
 import { pathToFileURL } from "url";
 import { renderPlain } from "../lib/ask-render";
+import { documentationImpact } from "../lib/ask-documentation-impact";
 import { loadWorkspaceConfig } from "../lib/config";
 import { DEFAULT_INTEL_URL } from "../lib/http";
 import { bestEffortNotesRoot } from "../lib/notes-root";
+import {
+  liveReconciliationFindings,
+  makeArtifactByteReader,
+} from "../lib/scanner/reconciliation-live";
 import { parseAsOf } from "../lib/temporal";
 import { isPackagedBinary } from "../lib/packaged";
 import { findWorkspaceContext } from "../lib/workspace";
+import { readScanCacheForRoot } from "./scan-context";
 
 // `mla ask`: the CLI front-end over the shared @meetless/ask-core ask
 // implementation (proposal 20260529 T5 / D-D). It reuses the SAME mode routing
@@ -184,6 +190,33 @@ function isUngroundedAnswer(result: Record<string, unknown>): boolean {
   return results.length === 0;
 }
 
+// ADR §3.5 T11d. Attach the documentation-impact list when the answer cited a decision that an
+// instruction file in THIS checkout still contradicts.
+//
+// The gate is the SHARED one (lib/scanner/reconciliation-live.ts), so a finding the hook has gone
+// quiet about (stale pull, drifted file) cannot still be asserted here. The cache read is the
+// checkout-guarded one, so a sibling checkout's findings never surface as this repo's.
+//
+// STRICTLY best-effort and never load-bearing: the ask already succeeded and its answer is already
+// computed by the time we get here. A missing cache, an unscanned workspace, an unreadable file, or
+// a throw anywhere in the chain costs one optional line, never the answer.
+function attachDocumentationImpact(result: Record<string, unknown>, workspaceId: string): void {
+  try {
+    const repoRoot = findWorkspaceContext()?.markerDir;
+    const cache = readScanCacheForRoot(undefined, workspaceId);
+    if (!cache) return;
+    const live = liveReconciliationFindings(
+      cache,
+      makeArtifactByteReader(repoRoot),
+      new Date().toISOString(),
+    );
+    const impact = documentationImpact(result.answer, live.kept.map((o) => o.finding));
+    if (impact.length > 0) result.documentationImpact = impact;
+  } catch {
+    /* an advisory cross-check is never worth failing an answer over */
+  }
+}
+
 // The ask-core loader is injectable so the glue (workspace resolution, mode
 // routing, render, error->exit-code mapping) can be unit-tested without the
 // true runtime import(): jest's VM sandbox rejects native dynamic import
@@ -276,6 +309,8 @@ export async function runAsk(
   // impossible to miss).
   if (result && typeof result === "object") {
     result.workspace = effectiveWorkspace;
+    // Before the render, so BOTH the --json and the plain path carry it (§3.5 T11d).
+    attachDocumentationImpact(result, effectiveWorkspace);
   }
 
   if (args.json) {

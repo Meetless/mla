@@ -54,6 +54,7 @@ export const KNOWN_COMMANDS = new Set<string>([
   "enforcement",
   "conflicts",
   "cases",
+  "decisions",
   "session",
   "ask",
   "kb",
@@ -121,6 +122,9 @@ export const KNOWN_SUBCOMMANDS: Record<string, Set<string>> = {
   review: new Set(["latest", "by-session"]),
   enforcement: new Set(["list", "confirm", "dismiss"]),
   conflicts: new Set(["list", "resolve", "dismiss"]),
+  // `mla decisions show <id>` is the only form. The id is a POSITIONAL and must never reach the
+  // wire, so only the keyword is listed.
+  decisions: new Set(["show"]),
   enrich: new Set(["plan", "brief", "ingest", "materialize", "accept"]),
   graph: GRAPH_SUBS,
   cg: GRAPH_SUBS,

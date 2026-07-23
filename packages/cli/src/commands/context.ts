@@ -3,6 +3,11 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readVerdicts, reviewCardsPath, writeVerdicts } from "../lib/scanner/cache";
+import {
+  liveReconciliationFindings,
+  makeArtifactByteReader,
+  type ReconciliationCacheView,
+} from "../lib/scanner/reconciliation-live";
 import { resolveWorkspaceIdWithEnv } from "../lib/workspace";
 import {
   readScanCacheForRoot,
@@ -44,6 +49,34 @@ export function advisoryLines(home: string | undefined, workspaceId: string): st
   const cache = readScanCacheForRoot(home, workspaceId);
   const advisory = cache?.advisoryDirectives ?? [];
   return advisory.map((d) => `${d.id}  [${d.strength}]  ${d.text}  (${d.source})`);
+}
+
+// The full set of live reconciliation findings for THIS checkout (ADR §3.5 T11).
+//
+// This is the "full set" the injected block's `<omitted>` notice points at, and the wider view the
+// deliberately narrow `mla ask` documentation-impact section leaves room for. It runs the SAME two
+// gates the injection surface runs (shared, in reconciliation-live.ts), so what this prints and what
+// an agent is told are the same list by construction. A finding the hook has gone quiet about must
+// not still be listed here as live.
+//
+// Only the GOVERNED band is printed. `currentSummary` is attacker-or-accident-controlled file bytes:
+// the injected block can carry it because it labels the band, plain stdout cannot.
+export function reconciliationLines(
+  cache: ReconciliationCacheView | null,
+  repoRoot: string,
+  nowIso: string,
+): string[] {
+  const kept = liveReconciliationFindings(cache, makeArtifactByteReader(repoRoot), nowIso).kept;
+  const lines: string[] = [];
+  for (const { finding } of kept) {
+    const statement = finding.acceptedStatement?.trim();
+    // No governed band, nothing to assert. Same rule the injection renderer applies.
+    if (!statement) continue;
+    const cite = finding.sourceCaseId ? `  [CC:${finding.sourceCaseId}]` : "";
+    lines.push(`${finding.path}${cite}`);
+    lines.push(`    accepted: ${statement}`);
+  }
+  return lines;
 }
 
 export interface ReviewItem { id: string; detail: string; source: string; }
@@ -90,10 +123,20 @@ export async function runContext(argv: string[]): Promise<number> {
     // Guarded read: a cache stomped by a sibling checkout must read as "no scan for THIS repo"
     // so we fall through to this checkout's own review card, not the sibling's stale signals.
     const cache = readScanCacheForRoot(home, workspaceId);
+    // Decision reconciliation first: a file that contradicts an ACCEPTED decision outranks a stale
+    // signal, because an agent is being told the governed version on every turn while the file says
+    // the opposite. Printed alongside the stale signals, never instead of them.
+    const recon = reconciliationLines(cache, resolveScanRoot(process.cwd()), new Date().toISOString());
+    if (recon.length) {
+      console.log("Decision reconciliation: instruction files that contradict an accepted decision.");
+      for (const l of recon) console.log(`  ${l}`);
+    }
     if (cache && cache.staleSignals.length) {
+      if (recon.length) console.log("");
       for (const s of cache.staleSignals) console.log(`${s.id}  ${s.detail}`);
       return 0;
     }
+    if (recon.length) return 0;
     if (!cache) {
       // No live scan cache (workspace not scanned yet, or cache cleared). Fall back to
       // the last session's review card as a degraded, clearly-labelled view, filtered to

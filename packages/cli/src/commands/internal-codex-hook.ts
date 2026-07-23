@@ -2,34 +2,43 @@
 //
 // Codex's PreToolUse is wired DIRECTLY at `mla _internal pretool-observe` (that
 // command already reads the Claude-shaped snake_case payload Codex sends and
-// emits the byte-identical deny envelope, so it needs no shim). UserPromptSubmit
-// is the one event that DOES need a wrapper: the grounding assembly is a ~92 KB
-// bash script at `~/.meetless/hooks/user-prompt-submit.sh`, and this command's
-// only job is to hand Codex's stdin to that shared script and relay whatever it
-// prints back to Codex as the hook's `additionalContext`. It does NOT
-// re-implement grounding, and it is NOT a generic multi-event dispatcher: it
-// carries exactly the events with a real translation need (today: one).
+// emits the byte-identical deny envelope, so it needs no shim). The other
+// lifecycle events enter through this wrapper, which marks the connector and
+// delegates to the shared capture scripts. UserPromptSubmit keeps a session
+// bootstrap fallback in case an already-running Codex host has not loaded the
+// newly installed SessionStart entry yet.
 //
-// Fail-OPEN on everything. A UserPromptSubmit hook must never block or error the
-// prompt; grounding is assistive. Any failure (unknown event, unreadable stdin,
-// a missing or throwing script) emits nothing and exits 0 so the turn proceeds.
+// Fail-OPEN on everything. Capture is assistive: any failure emits nothing and
+// exits 0 so the Codex lifecycle proceeds.
 
 import * as fs from "fs";
 import * as path from "path";
 import { spawnSync } from "child_process";
 
-import { HOOKS_DIR } from "../lib/config";
+import { ensureCodexRuntimeHooks } from "../connectors/codex/runtime-hooks";
 
-// Event name (as Codex passes it on argv) -> the shared hook script that owns it.
-// A 1-entry allowlist, not a dispatcher: an event absent here is a silent no-op.
-const EVENT_SCRIPT: Record<string, string> = {
-  "user-prompt-submit": "user-prompt-submit.sh",
+interface ScriptStep {
+  script: string;
+  relayOutput: boolean;
+}
+
+// Event name (as Codex passes it on argv) -> ordered shared-script plan. Only
+// scripts whose output is valid and useful for that Codex event are relayed.
+const EVENT_SCRIPTS: Record<string, ScriptStep[]> = {
+  "session-start": [{ script: "session-start.sh", relayOutput: false }],
+  "user-prompt-submit": [
+    { script: "session-start.sh", relayOutput: false },
+    { script: "user-prompt-submit.sh", relayOutput: true },
+  ],
+  "post-tool-use": [{ script: "post-tool-use.sh", relayOutput: true }],
+  stop: [{ script: "stop.sh", relayOutput: false }],
 };
 
 export interface CodexHookDeps {
   readStdin?: () => Promise<string>;
   writeOut?: (s: string) => void;
   hooksDir?: string;
+  resolveHooksDir?: () => string;
   runScript?: (scriptPath: string, input: string) => string;
 }
 
@@ -42,16 +51,25 @@ function readStdinReal(): Promise<string> {
   });
 }
 
-// Run the shared grounding script with `input` on its stdin and return its
-// stdout. `bash <script>` explicitly (not exec-bit dependent). Env is inherited
-// so the script resolves HOOKS_DIR and its bash dependencies the same way it
-// does under Claude; MEETLESS_CONNECTOR marks the surface for telemetry without
-// altering the Claude-shaped payload the script parses.
+// Run a shared hook script with `input` on stdin and return stdout. `bash
+// <script>` explicitly (not exec-bit dependent). Env is inherited so the script
+// resolves its co-located bash dependencies the same way it does under Claude;
+// MEETLESS_CONNECTOR enables the few transcript-shape adaptations the shared
+// scripts need for Codex.
 function runScriptReal(scriptPath: string, input: string): string {
+  const invokedCli = process.argv[1];
+  const codexMlaPath =
+    typeof invokedCli === "string" && invokedCli.length > 0
+      ? path.resolve(invokedCli)
+      : undefined;
   const res = spawnSync("bash", [scriptPath], {
     input,
     encoding: "utf8",
-    env: { ...process.env, MEETLESS_CONNECTOR: "codex" },
+    env: {
+      ...process.env,
+      MEETLESS_CONNECTOR: "codex",
+      ...(codexMlaPath ? { MEETLESS_CODEX_MLA_PATH: codexMlaPath } : {}),
+    },
     maxBuffer: 32 * 1024 * 1024,
   });
   return typeof res.stdout === "string" ? res.stdout : "";
@@ -63,20 +81,27 @@ export async function runInternalCodexHook(
 ): Promise<number> {
   const readStdin = deps.readStdin ?? readStdinReal;
   const writeOut = deps.writeOut ?? ((s: string) => process.stdout.write(s));
-  const hooksDir = deps.hooksDir ?? HOOKS_DIR;
   const runScript = deps.runScript ?? runScriptReal;
 
   try {
     const event = argv[0];
-    const scriptName = event ? EVENT_SCRIPT[event] : undefined;
-    if (!scriptName) return 0; // unknown/absent event: nothing to translate
+    const steps = event ? EVENT_SCRIPTS[event] : undefined;
+    if (!steps) return 0; // unknown/absent event: nothing to translate
+    const hooksDir =
+      deps.hooksDir ??
+      (deps.resolveHooksDir ?? ensureCodexRuntimeHooks)();
 
     const input = await readStdin();
-    const scriptPath = path.join(hooksDir, scriptName);
-    if (!fs.existsSync(scriptPath)) return 0; // scripts not provisioned yet
-
-    const stdout = runScript(scriptPath, input);
-    if (stdout) writeOut(stdout);
+    for (const step of steps) {
+      try {
+        const scriptPath = path.join(hooksDir, step.script);
+        if (!fs.existsSync(scriptPath)) continue; // fail open per missing step
+        const stdout = runScript(scriptPath, input);
+        if (step.relayOutput && stdout) writeOut(stdout);
+      } catch {
+        continue; // one failed behavior must not suppress the next one
+      }
+    }
     return 0;
   } catch {
     return 0;

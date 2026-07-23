@@ -1,6 +1,6 @@
 {
   "name": "mla",
-  "version": "0.2.24",
+  "version": "0.2.25",
   "description": "Meetless (mla) change-governance connector for Codex. Ships the governed-memory MCP server so Codex can retrieve accepted decisions, superseding rulings, and cited evidence mid-session.",
   "author": { "name": "Meetless", "url": "https://meetless.ai" },
   "homepage": "https://meetless.ai",

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# stop.sh: Claude Code Stop hook. Writes session_stopped + finalize_requested
-# events to the spool and spawns the flusher. Stop must return in <1s.
+# stop.sh: Stop hook. Writes session_stopped + finalize_requested events to the
+# spool and spawns the flusher. Stop must return in <1s. Claude's final message
+# is read from its transcript; Codex supplies it directly on the hook payload.
 #
 # Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
 source "$(dirname "$0")/common.sh"
@@ -63,7 +64,7 @@ _settle_verdict_jq='
      | length) as $closed
   | if $modern > 0 then (if $closed > 0 then "ready" else "wait" end) else "legacy" end
 '
-if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
+if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
   _settle_poll="${MEETLESS_FINALMSG_POLL_SEC:-0.06}"
   _settle_max="${MEETLESS_FINALMSG_MAX_ATTEMPTS:-10}"
   _settle_prev="-1"
@@ -101,8 +102,8 @@ fi
 # last assistant entry whose stop_reason is "end_turn" (the semantic turn
 # boundary), and only fall back to the last text block for LEGACY transcripts
 # with no stop_reason at all. Join its text blocks.
-FINAL_MSG=""
-if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
+FINAL_MSG="$(printf '%s' "$INPUT" | jq -r '.last_assistant_message // empty' 2>/dev/null || true)"
+if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
   FINAL_MSG="$(tail -n 400 "$TRANSCRIPT" 2>/dev/null \
     | jq -rR --slurp '
         split("\n")
@@ -131,7 +132,7 @@ fi
 # the default now (no kill switch); the post-tool-use hook captures it LIVE and
 # this Stop pass is the compaction-safe backstop.
 NARRATION=""
-if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
+if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
   NARRATION="$(tail -n 400 "$TRANSCRIPT" 2>/dev/null \
     | jq -rR --slurp '
         split("\n")
@@ -269,7 +270,7 @@ spool_append "$SESSION_ID" "$LINE_FINALIZE"
 # Fail-soft: a missing mla binary, an unreadable transcript, or a command error
 # is swallowed and never delays or fails Stop (<1s budget).
 # See notes/20260608-agent-decision-capture-design.md section 5.
-if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] \
+if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "${MLA_PATH:-}" && -x "$MLA_PATH" && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] \
   && grep -q "AskUserQuestion" "$TRANSCRIPT" 2>/dev/null; then
   DECISION_LINES="$("$MLA_PATH" _internal capture-decisions \
     --source stop_transcript_scan --transcript "$TRANSCRIPT" \
@@ -308,7 +309,9 @@ spawn_evidence_correlate
 # forward if telemetry is on. Detached, fail-soft, and kill-switchable
 # (MEETLESS_ENFORCEMENT_OUTCOME=0), so it never blocks Stop. Session-scoped (a deny's
 # follow-through is same-session), so it takes the session id AND the transcript path.
-spawn_enforcement_correlate "$SESSION_ID" "$TRANSCRIPT"
+if [[ "${MEETLESS_CONNECTOR:-}" != "codex" ]]; then
+  spawn_enforcement_correlate "$SESSION_ID" "$TRANSCRIPT"
+fi
 
 # Layer D per-turn recap -> Langfuse: post THIS just-finished turn's assist recap
 # to intel so it attaches the mla_ran / mla_assist scores + the full recap metadata

@@ -8,3 +8,4 @@ export * from "./types";
 export * from "./validate";
 export * from "./keys";
 export * from "./normalize-claude";
+export * from "./normalize-codex";

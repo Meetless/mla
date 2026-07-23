@@ -130,9 +130,31 @@ describe("readCorpusMarker", () => {
     expect(() => readCorpusMarker(folder, "ws_1")).toThrow(/does NOT match/);
   });
 
-  test("missing marker is refused", () => {
+  // Behaviour change (2026-07-21): a missing marker used to be refused, which made corpus mode
+  // unusable for a first-time caller — the error named a file but not its schema. It now
+  // synthesizes a permissive marker IN MEMORY (never written to the caller's folder, so a crash
+  // cannot litter it). The guardrails remain opt-in: committing a marker still enforces them,
+  // which the two tests below cover.
+  test("missing marker synthesizes a permissive in-memory marker", () => {
     const folder = mkTmp("mla-marker-none-");
-    expect(() => readCorpusMarker(folder, "ws_1")).toThrow(/corpus mode requires/);
+    const marker = readCorpusMarker(folder, "ws_1");
+    expect(marker.synthesized).toBe(true);
+    expect(marker.workspaceId).toBe("ws_1");
+    expect(marker.allowedGlob).toBeNull();
+    expect(marker.allowedProvenance).toBeNull();
+    // nothing is written into the caller's folder
+    expect(fs.existsSync(path.join(folder, ".meetless-kb-corpus.json"))).toBe(false);
+  });
+
+  test("an explicit marker is still honoured and is not flagged synthesized", () => {
+    const folder = mkTmp("mla-marker-explicit-");
+    fs.writeFileSync(
+      path.join(folder, ".meetless-kb-corpus.json"),
+      JSON.stringify({ workspaceId: "ws_1", allowedGlob: "**/*.md" }),
+    );
+    const marker = readCorpusMarker(folder, "ws_1");
+    expect(marker.synthesized).toBe(false);
+    expect(marker.allowedGlob).toBe("**/*.md");
   });
 });
 
@@ -141,13 +163,14 @@ describe("enumerateDocuments", () => {
     const vault = mkTmp("mla-enum-file-");
     const file = path.join(vault, "note.md");
     fs.writeFileSync(file, "hello body\n");
-    const docs = enumerateDocuments(
+    const { documents, skipped } = enumerateDocuments(
       { mode: "file", path: file, provenance: "human_authored", allowProvenanceChange: false, queue: false, open: false, reingestIfActive: false },
       file,
       vault,
       null,
     );
-    expect(docs).toEqual([{ relPath: "note.md", content: "hello body\n" }]);
+    expect(documents).toEqual([{ relPath: "note.md", content: "hello body\n" }]);
+    expect(skipped).toEqual([]);
   });
 
   test("corpus mode globs the marker-pinned set under the folder", () => {
@@ -155,14 +178,14 @@ describe("enumerateDocuments", () => {
     fs.writeFileSync(path.join(folder, "a.md"), "AAA\n");
     fs.writeFileSync(path.join(folder, "b.md"), "BBB\n");
     const marker = { workspaceId: "ws_1", corpusName: "C", allowedGlob: "*.md", allowedProvenance: null };
-    const docs = enumerateDocuments(
+    const { documents } = enumerateDocuments(
       { mode: "corpus", path: folder, provenance: "human_authored", allowProvenanceChange: false, queue: false, open: false, reingestIfActive: false },
       folder,
       folder,
       marker,
     );
-    expect(docs.map((d) => d.relPath).sort()).toEqual(["a.md", "b.md"]);
-    expect(docs.find((d) => d.relPath === "a.md")?.content).toBe("AAA\n");
+    expect(documents.map((d) => d.relPath).sort()).toEqual(["a.md", "b.md"]);
+    expect(documents.find((d) => d.relPath === "a.md")?.content).toBe("AAA\n");
   });
 
   test("corpus mode rejects a --glob that fights the marker's allowedGlob", () => {

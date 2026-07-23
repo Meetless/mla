@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.26 (2026-07-23)
+
+0.2.25 captured your Codex work; 0.2.26 puts governed reconciliation in front of the agent while it
+works. When a decision has superseded or drifted from what your working tree still assumes, `mla` now
+pulls the matching reconciliation findings, gates them by trust, and injects them inline from the hook
+tail, so the agent meets the conflict at the moment it edits rather than after the rework has already
+landed. `mla ask` surfaces the documentation impact of a change in the same pass. This release also
+adds `mla decisions show`, a read-time export that assembles a decision's full governed record as
+Markdown or JSON and names the evidence you are not entitled to read as private rather than linking to
+it. And ingest no longer fails as a batch: a malformed or empty document is isolated and skipped, so
+one bad file no longer sinks the rest.
+
+- reconciliation findings are pulled, gated by trust, and rendered
+- the reconciliation block is injected from the hook tail
+- `mla decisions show`: read-time DecisionRecord export across CLI, MCP, and control
+- documentation impact on `mla ask`, and the rehash gate is rooted at the scan root
+- repair the three drift pins `mla decisions` broke
+- escape the dedupe-key delimiter instead of embedding a raw NUL byte
+- isolate ingest failures per document, skip empty files
+
+## 0.2.25 (2026-07-22)
+
+0.2.24 wired Codex up; this release makes the wiring actually carry your work. Codex sessions now
+reach Console with their full lifecycle captured, not just their opening, and the decisions a human
+makes inside a Codex session are captured and normalized alongside the ones from Claude Code. Hook
+helpers stay version-aligned with the binary that installed them, and each hook runtime is isolated
+so one agent's hooks cannot be answered by another's. On the ingest side, `mla kb add --mode corpus`
+no longer demands a marker file before it will do anything, `--provenance` stops silently recording
+something other than what you passed, and `kb summary` / `kb dump` accept the `--workspace` flag
+every sibling command already took. Ingesting a large corpus is also no longer a coin flip: a
+request that outran the edge used to come back as an opaque gateway timeout claiming nothing had
+persisted while documents were in fact still landing, so the budget is now sized against the ceiling
+that actually fires and a failed batch names the files it lost.
+
+- Codex sessions surface in Console, with the full session lifecycle captured rather than only the start
+- human decisions made inside a Codex session are captured and normalized
+- Codex hook helpers stay aligned with the version of `mla` that installed them
+- each Codex hook runtime is isolated, so concurrent agents cannot answer each other's hooks
+- Codex gets equal billing with Claude Code across the site, docs, and install flow
+- `mla kb add --mode corpus` works without a `.meetless-kb-corpus.json`; it synthesizes a permissive marker in memory and says so, and nothing is written into the folder you asked it to read
+- an explicit corpus marker is still honoured, and the error for a malformed one now prints a paste-ready manifest with your workspaceId filled in
+- `--provenance` no longer accepts a value in silence and records a different one; an unrecognized kind warns, names the server's kinds, and says the receipt may differ. The server still owns the immutable lineage label
+- `mla kb summary` and `mla kb dump` accept `--workspace`, instead of silently reporting the activated workspace and printing "0 chunks" for a corpus that landed elsewhere
+- large corpus ingests stop failing opaquely: documents ride in batches of 5, the client aborts before the edge severs the request, and a failed batch names every file it did not persist
+- a retried ingest is safe and converges: documents that already landed come back unchanged rather than duplicating
+
 ## 0.2.24 (2026-07-21)
 
 This release brings Meetless to Codex. `mla codex install` wires the connector in, hooks and

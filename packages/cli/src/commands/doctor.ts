@@ -264,10 +264,10 @@ export function codexHookDoctorCheck(installed: boolean, hooksPath: string): Che
 }
 
 /**
- * Codex intentionally exposes a smaller managed lifecycle than Claude Code.
- * Keep that boundary visible in doctor so a healthy install is not mistaken
- * for feature parity: grounding and pre-write governance are live, while the
- * Stop/PostToolUse-dependent capture and correlation paths are unavailable.
+ * Codex exposes the five load-bearing lifecycle events needed for session
+ * capture. Keep the remaining transcript-format caveat visible: Codex supplies
+ * the final assistant message directly, while Claude-only transcript replay
+ * features (such as intra-turn narration reconstruction) stay disabled.
  */
 export function codexLifecycleCoverageCheck(installed: boolean): Check {
   return installed
@@ -275,9 +275,9 @@ export function codexLifecycleCoverageCheck(installed: boolean): Check {
         id: "codex.hooks.coverage",
         ok: true,
         level: "info",
-        label: "Codex hook coverage: PreToolUse + UserPromptSubmit",
+        label: "Codex hook coverage: full session capture lifecycle",
         detail:
-          "SessionStart, PostToolUse, and Stop are not installed on Codex; Claude-only session capture, decision capture, and end-of-turn correlation do not run here",
+          "SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop are registered; Codex transcript replay remains limited to stable hook fields",
       }
     : {
         id: "codex.hooks.coverage",
@@ -391,9 +391,9 @@ export function codexConnectorCompleteCheck(
     return {
       id: "codex.connector.complete",
       ok: true,
-      label: "Codex connector complete for supported surfaces",
+      label: "Codex connector fully registered",
       detail:
-        "governed retrieval, prompt grounding, and pre-write governance are installed; see codex.hooks.coverage for lifecycle limits",
+        "retrieval, the five capture/governance hooks, and prompt grounding are installed; command-hook execution still requires Codex /hooks trust",
     };
   }
   return {

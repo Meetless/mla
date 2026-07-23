@@ -8,8 +8,8 @@
     "build": "pnpm -r run build",
     "test": "pnpm -r run build && pnpm -r run test",
     "typecheck": "pnpm -r run typecheck",
-    "plugin:sync": "pnpm --filter @meetless/mla build && node scripts/sync-plugin.mjs",
-    "plugin:check": "pnpm --filter @meetless/mla build && node scripts/sync-plugin.mjs --check",
+    "plugin:sync": "pnpm --filter @meetless/mla... build && node scripts/sync-plugin.mjs",
+    "plugin:check": "pnpm --filter @meetless/mla... build && node scripts/sync-plugin.mjs --check",
     "plugin:validate": "pnpm plugin:check && node scripts/validate-plugin.mjs"
   },
   "engines": {

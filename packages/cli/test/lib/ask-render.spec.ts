@@ -81,6 +81,40 @@ describe("renderPlain", () => {
     expect(out).toContain("(workspace: ws_1)");
   });
 
+  it("places Documentation impact between the citations and the warnings", () => {
+    // ADR §3.5 T11d. Under the citations because it is about what the answer stood on; above the
+    // warnings because it is a fact about the repo, not about the run. The section is absent from
+    // every other case in this file, which is the render-only-if-present contract `mla docs ask`
+    // depends on: it never sets the field and its output above is byte-identical without it.
+    const out = renderPlain({
+      answer: "Use the loopback IP [CC:case_1].",
+      results: [{ path: "notes/x.md", docType: "note" }],
+      documentationImpact: [
+        { path: "CLAUDE.md", sourceCaseId: "case_1", acceptedStatement: "Use 127.0.0.1, never localhost." },
+      ],
+      warnings: ["stub:answer"],
+      workspace: "ws_test",
+    });
+
+    expect(out).toBe(
+      [
+        "Use the loopback IP [CC:case_1].",
+        "",
+        "Citations (1):",
+        "  - notes/x.md [note]",
+        "",
+        "Documentation impact (1):",
+        "  - CLAUDE.md contradicts [CC:case_1]",
+        "      accepted: Use 127.0.0.1, never localhost.",
+        "",
+        "Warnings:",
+        "  ! stub:answer",
+        "",
+        "(workspace: ws_test)",
+      ].join("\n"),
+    );
+  });
+
   it("renders citations with no answer (search mode) and no hint noise", () => {
     const out = renderPlain({
       results: [{ title: "a.md" }, { path: "b.md" }],

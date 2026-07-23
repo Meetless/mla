@@ -33,7 +33,7 @@ interface Harness {
   home: string;
   queueDir: string;
   workdir: string;
-  fire: (input: object) => FireResult;
+  fire: (input: object, extraEnv?: NodeJS.ProcessEnv) => FireResult;
   queueLines: (sessionId: string) => Record<string, unknown>[];
 }
 
@@ -70,12 +70,17 @@ function mkHarness(): { h: Harness; cleanup: () => void } {
     home,
     queueDir,
     workdir,
-    fire: (input: object) => {
+    fire: (input: object, extraEnv: NodeJS.ProcessEnv = {}) => {
       const r = spawnSync("bash", [path.join(tmp, HOOK)], {
         input: JSON.stringify(input),
         encoding: "utf8",
         cwd: workdir,
-        env: { ...process.env, MEETLESS_HOME: home, MEETLESS_DEBUG: "0" },
+        env: {
+          ...process.env,
+          MEETLESS_HOME: home,
+          MEETLESS_DEBUG: "0",
+          ...extraEnv,
+        },
         timeout: 5000,
       });
       return {
@@ -250,6 +255,41 @@ describe("post-tool-use.sh: tool_used_file governed spool", () => {
     }
   });
 
+  it("Codex apply_patch spools one metadata event per patched file", () => {
+    const { h, cleanup } = mkHarness();
+    try {
+      const r = h.fire({
+        session_id: "codex-patch-1",
+        hook_event_name: "PostToolUse",
+        tool_name: "apply_patch",
+        tool_input: {
+          patch: [
+            "*** Begin Patch",
+            "*** Update File: src/service.ts",
+            "*** Add File: docs/decision.md",
+            "*** End Patch",
+          ].join("\n"),
+        },
+        tool_response: { success: true },
+      });
+
+      expect(r.status).toBe(0);
+      const events = h
+        .queueLines("codex-patch-1")
+        .filter((line) => line.event === "tool_used_file");
+      expect(events.map((event) => event.payload)).toEqual([
+        { tool: "apply_patch", filePath: "src/service.ts", storyCategory: "other" },
+        {
+          tool: "apply_patch",
+          filePath: "docs/decision.md",
+          storyCategory: "markdown",
+        },
+      ]);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("NEVER ships tool I/O: Write content is absent from the spooled line", () => {
     const { h, cleanup } = mkHarness();
     try {
@@ -361,6 +401,75 @@ describe("post-tool-use.sh: tool_used_file governed spool", () => {
       const lines = h.queueLines("s6");
       expect(lines.filter((l) => l.event === "tool_used_bash")).toHaveLength(1);
       expect(lines.filter((l) => l.event === "tool_used_file")).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("captures Codex Bash when tool_response is the stdout string", () => {
+    const { h, cleanup } = mkHarness();
+    try {
+      const r = h.fire({
+        session_id: "codex-bash-1",
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "pwd" },
+        tool_response: "/workspace/meetless\n",
+        tool_use_id: "exec-1",
+      });
+      expect(r.status).toBe(0);
+      const bashEvents = h
+        .queueLines("codex-bash-1")
+        .filter((line) => line.event === "tool_used_bash");
+      expect(bashEvents).toHaveLength(1);
+      expect(bashEvents[0].payload).toEqual({
+        categoryHint: "unknown_bash",
+        storyCategory: "other",
+        command: "pwd",
+        exitCode: 0,
+        stdoutTail: "/workspace/meetless",
+        stderrTail: "",
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("uses the invoking Codex CLI for request_user_input decision capture", () => {
+    const { h, cleanup } = mkHarness();
+    const fakeMla = path.join(h.home, "codex-mla");
+    try {
+      fs.writeFileSync(
+        fakeMla,
+        [
+          "#!/bin/bash",
+          "cat >/dev/null",
+          "printf '%s\\n' '{\"ts\":\"2026-07-21T00:00:00Z\",\"event\":\"agent_decision_captured\",\"eventKey\":\"agent_decision_captured:codex:request-1#0\",\"sessionId\":\"codex-decision-1\",\"payload\":{}}'",
+        ].join("\n"),
+        "utf8",
+      );
+      fs.chmodSync(fakeMla, 0o755);
+
+      const r = h.fire(
+        {
+          session_id: "codex-decision-1",
+          tool_name: "request_user_input",
+          tool_use_id: "request-1",
+          tool_input: { questions: [] },
+          tool_response: { answers: {} },
+        },
+        {
+          MEETLESS_CONNECTOR: "codex",
+          MEETLESS_CODEX_MLA_PATH: fakeMla,
+        },
+      );
+
+      expect(r.status).toBe(0);
+      expect(
+        h.queueLines("codex-decision-1").filter(
+          (line) => line.event === "agent_decision_captured",
+        ),
+      ).toHaveLength(1);
     } finally {
       cleanup();
     }

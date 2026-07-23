@@ -8,7 +8,12 @@
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { refreshBundleCache, refreshBundleForScan } from "../../../src/lib/rules/bundle-refresh";
+import {
+  fetchReconciliationForScan,
+  refreshBundleCache,
+  refreshBundleForScan,
+} from "../../../src/lib/rules/bundle-refresh";
+import type { ReconciliationFindingWire } from "../../../src/lib/rules/reconciliation-client";
 import { ruleBundleCachePath } from "../../../src/lib/rules/bundle-cache";
 import type { RuleBundle, RuleClientHttp } from "../../../src/lib/rules/control-rule-client";
 import type { WorkspaceCliConfig } from "../../../src/lib/config";
@@ -124,5 +129,134 @@ describe("refreshBundleForScan", () => {
     });
 
     expect(outcome).toEqual({ delivered: false, error: "not logged in" });
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// The SECOND pull that rides the same scan-refresh moment (ADR §3.5 / §3.7, T11).
+//
+// Everything here turns on one distinction: `findings: null` (the pull did not succeed) is NOT
+// `findings: []` (control says there are none). The caller uses exactly that difference to decide
+// between carrying the previous findings forward and CLEARING them, so a test suite that only
+// checked "did we get an array back" would let the two collapse into each other and let a backend
+// blip erase a live divergence.
+// ------------------------------------------------------------------------------------------------
+
+function wireFinding(over: Partial<ReconciliationFindingWire> = {}): ReconciliationFindingWire {
+  return {
+    id: "rf_1",
+    path: "CLAUDE.md",
+    evaluatedDigest: "sha256:abc",
+    contentNormalizationVersion: "v1",
+    acceptedStatement: "Use 127.0.0.1, never localhost.",
+    sourceCaseId: "case_1",
+    supersedingCommitmentId: "cm_1",
+    currentSummary: "the file still says localhost",
+    detectorExplanation: "contradicts an accepted decision",
+    detectorVersion: "detector-v1",
+    detectedAt: "2026-07-13T00:00:00.000Z",
+    ...over,
+  };
+}
+
+describe("fetchReconciliationForScan", () => {
+  it("pulls this viewer's findings and narrows them to the cache shape", async () => {
+    const { http, calls } = fakeHttp(() => ({ findings: [wireFinding()], truncated: false }));
+
+    const pull = await fetchReconciliationForScan(WS, { loadConfig: cfg, http });
+
+    expect(calls).toEqual([`get /internal/v1/reconciliation/findings?workspaceId=${WS}`]);
+    expect(pull).toEqual({
+      truncated: false,
+      findings: [
+        {
+          path: "CLAUDE.md",
+          evaluatedDigest: "sha256:abc",
+          contentNormalizationVersion: "v1",
+          reason: "contradicts an accepted decision",
+          acceptedStatement: "Use 127.0.0.1, never localhost.",
+          sourceCaseId: "case_1",
+          supersedingCommitmentId: "cm_1",
+          currentSummary: "the file still says localhost",
+          detectorExplanation: "contradicts an accepted decision",
+          detectorVersion: "detector-v1",
+        },
+      ],
+    });
+  });
+
+  it("drops backend bookkeeping instead of persisting it into an agent-read file", async () => {
+    // `id`, `detectedAt`, and `evidenceSpans` are control's, not the renderer's. The scan cache is
+    // read by an agent on every turn; putting backend identifiers in it buys no rendering and
+    // widens what a copied cache leaks.
+    const { http } = fakeHttp(() => ({
+      findings: [wireFinding({ evidenceSpans: [{ start: 0, end: 10 }] })],
+      truncated: false,
+    }));
+
+    const pull = await fetchReconciliationForScan(WS, { loadConfig: cfg, http });
+
+    const got = pull.findings?.[0] as Record<string, unknown> | undefined;
+    expect(got).toBeDefined();
+    expect(Object.keys(got!)).not.toContain("id");
+    expect(Object.keys(got!)).not.toContain("detectedAt");
+    expect(Object.keys(got!)).not.toContain("evidenceSpans");
+  });
+
+  it("falls back to a readable reason when the detector offered no explanation", async () => {
+    // `reason` predates the trust bands and is what the rehash audit and `mla context` print. An
+    // empty string there reads as "no reason given" when a governed reason exists one field over.
+    const { http } = fakeHttp(() => ({
+      findings: [wireFinding({ detectorExplanation: null })],
+      truncated: false,
+    }));
+
+    const pull = await fetchReconciliationForScan(WS, { loadConfig: cfg, http });
+
+    expect(pull.findings?.[0].reason).toBe("a governed decision superseded this instruction");
+    expect(pull.findings?.[0].detectorExplanation).toBeNull();
+  });
+
+  it("returns an EMPTY list (not null) when control says this workspace has none", async () => {
+    // Load-bearing: this is the signal that CLEARS the cache. A finding control no longer serves
+    // was dismissed, resolved, or had its decision retracted, and must stop being injected.
+    const { http } = fakeHttp(() => ({ findings: [], truncated: false }));
+
+    const pull = await fetchReconciliationForScan(WS, { loadConfig: cfg, http });
+
+    expect(pull.findings).toEqual([]);
+    expect(pull.findings).not.toBeNull();
+  });
+
+  it("returns findings: null (not an empty list) when the pull fails", async () => {
+    // The mirror of the case above, and the reason they cannot share a shape: if a transport error
+    // came back as `[]`, an offline laptop would silently clear every live finding it had.
+    const { http } = fakeHttp(() => {
+      throw new Error("getaddrinfo ENOTFOUND control");
+    });
+
+    const pull = await fetchReconciliationForScan(WS, { loadConfig: cfg, http });
+
+    expect(pull).toEqual({ findings: null, error: "getaddrinfo ENOTFOUND control" });
+  });
+
+  it("never throws when the CLI is not logged in / the repo is unbound", async () => {
+    const pull = await fetchReconciliationForScan(WS, {
+      loadConfig: () => {
+        throw new Error("not logged in");
+      },
+    });
+
+    expect(pull).toEqual({ findings: null, error: "not logged in" });
+  });
+
+  it("tolerates a response with no findings key at all", async () => {
+    // An older control, or a proxy that trimmed the body. Treat it as "none", never as a crash on
+    // the scan path.
+    const { http } = fakeHttp(() => ({ truncated: false }));
+
+    const pull = await fetchReconciliationForScan(WS, { loadConfig: cfg, http });
+
+    expect(pull).toEqual({ findings: [], truncated: false });
   });
 });

@@ -29,6 +29,7 @@ import {
   codexHooksInstalled,
 } from "../../src/connectors/codex/wire";
 import { codexManagedEventOf } from "../../src/connectors/codex/hook-contract";
+import { ensureCodexRuntimeHooks } from "../../src/connectors/codex/runtime-hooks";
 import { runCodexInstall } from "../../src/commands/codex";
 import { runInternalCodexHook } from "../../src/commands/internal-codex-hook";
 import {
@@ -41,6 +42,13 @@ import { removeMeetlessHooks } from "../../src/lib/unwire";
 import { HOOKS_DIR } from "../../src/lib/config";
 
 const MLA = "/opt/mla/bin/mla";
+const MANAGED_EVENTS = [
+  "PostToolUse",
+  "PreToolUse",
+  "SessionStart",
+  "Stop",
+  "UserPromptSubmit",
+];
 
 function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -104,7 +112,7 @@ describe("Codex connector: Phase-1 gate (§7)", () => {
 
     const res = ensureCodexHooks({ hooksPathOverride: hooks, mlaPath: MLA });
     expect(res.changed).toBe(true);
-    expect(res.added.sort()).toEqual(["PreToolUse", "UserPromptSubmit"]);
+    expect(res.added.sort()).toEqual(MANAGED_EVENTS);
 
     const doc = readJson(hooks);
     // Every user hook survives untouched, on every event.
@@ -116,6 +124,9 @@ describe("Codex connector: Phase-1 gate (§7)", () => {
     // And our managed hooks are now registered alongside them.
     expect(managedEntryCount(doc, "PreToolUse")).toBe(1);
     expect(managedEntryCount(doc, "UserPromptSubmit")).toBe(1);
+    expect(managedEntryCount(doc, "SessionStart")).toBe(1);
+    expect(managedEntryCount(doc, "PostToolUse")).toBe(1);
+    expect(managedEntryCount(doc, "Stop")).toBe(1);
     expect(commandsFor(doc, "PreToolUse")).toEqual(
       expect.arrayContaining([
         expect.stringContaining("_internal pretool-observe --codex"),
@@ -144,7 +155,7 @@ describe("Codex connector: Phase-1 gate (§7)", () => {
 
     const first = ensureCodexHooks({ hooksPathOverride: hooks, mlaPath: MLA });
     expect(first.changed).toBe(true);
-    expect(first.added.sort()).toEqual(["PreToolUse", "UserPromptSubmit"]);
+    expect(first.added.sort()).toEqual(MANAGED_EVENTS);
 
     const second = ensureCodexHooks({ hooksPathOverride: hooks, mlaPath: MLA });
     expect(second.changed).toBe(false);
@@ -153,6 +164,9 @@ describe("Codex connector: Phase-1 gate (§7)", () => {
     let doc = readJson(hooks);
     expect(managedEntryCount(doc, "PreToolUse")).toBe(1);
     expect(managedEntryCount(doc, "UserPromptSubmit")).toBe(1);
+    expect(managedEntryCount(doc, "SessionStart")).toBe(1);
+    expect(managedEntryCount(doc, "PostToolUse")).toBe(1);
+    expect(managedEntryCount(doc, "Stop")).toBe(1);
 
     // Managed identity is the subcommand token run, NOT the exact path. A CLI
     // that has since moved (e.g. reinstalled to a new prefix) must reconcile the
@@ -166,6 +180,9 @@ describe("Codex connector: Phase-1 gate (§7)", () => {
     doc = readJson(hooks);
     expect(managedEntryCount(doc, "PreToolUse")).toBe(1);
     expect(managedEntryCount(doc, "UserPromptSubmit")).toBe(1);
+    expect(managedEntryCount(doc, "SessionStart")).toBe(1);
+    expect(managedEntryCount(doc, "PostToolUse")).toBe(1);
+    expect(managedEntryCount(doc, "Stop")).toBe(1);
 
     cleanup(dir);
   });
@@ -326,12 +343,18 @@ describe("Codex connector: Phase-1 gate (§7)", () => {
 
     it("UserPromptSubmit wrapper: no-op on an unknown event", async () => {
       const out: string[] = [];
+      let resolved = 0;
       const code = await runInternalCodexHook(["NotARealEvent"], {
         readStdin: async () => "{}",
         writeOut: (s) => out.push(s),
+        resolveHooksDir: () => {
+          resolved++;
+          throw new Error("unknown events must not provision hooks");
+        },
       });
       expect(code).toBe(0);
       expect(out).toEqual([]);
+      expect(resolved).toBe(0);
     });
 
     it("UserPromptSubmit wrapper: no-op when the grounding script is not provisioned", async () => {
@@ -371,6 +394,125 @@ describe("Codex connector: Phase-1 gate (§7)", () => {
       expect(ran).toBe(1);
       expect(out).toEqual([]);
       cleanup(scriptDir);
+    });
+
+    it("UserPromptSubmit wrapper: bootstraps the session before grounding and relays only grounding output", async () => {
+      const scriptDir = mkTmp("mla-codex-5d-");
+      fs.writeFileSync(path.join(scriptDir, "session-start.sh"), "#!/bin/bash\n", "utf8");
+      fs.writeFileSync(path.join(scriptDir, "user-prompt-submit.sh"), "#!/bin/bash\n", "utf8");
+      const calls: string[] = [];
+      const out: string[] = [];
+
+      const code = await runInternalCodexHook(["user-prompt-submit"], {
+        readStdin: async () => JSON.stringify({ session_id: "codex-1", prompt: "hello" }),
+        writeOut: (s) => out.push(s),
+        hooksDir: scriptDir,
+        runScript: (scriptPath: string) => {
+          const script = path.basename(scriptPath);
+          calls.push(script);
+          return script === "session-start.sh" ? "internal-bootstrap-output" : "grounding-output";
+        },
+      });
+
+      expect(code).toBe(0);
+      expect(calls).toEqual(["session-start.sh", "user-prompt-submit.sh"]);
+      expect(out).toEqual(["grounding-output"]);
+      cleanup(scriptDir);
+    });
+
+    it("UserPromptSubmit wrapper: keeps grounding fail-open when session bootstrap throws", async () => {
+      const scriptDir = mkTmp("mla-codex-5e-");
+      fs.writeFileSync(path.join(scriptDir, "session-start.sh"), "#!/bin/bash\n", "utf8");
+      fs.writeFileSync(path.join(scriptDir, "user-prompt-submit.sh"), "#!/bin/bash\n", "utf8");
+      const out: string[] = [];
+
+      const code = await runInternalCodexHook(["user-prompt-submit"], {
+        readStdin: async () => JSON.stringify({ session_id: "codex-2", prompt: "hello" }),
+        writeOut: (s) => out.push(s),
+        hooksDir: scriptDir,
+        runScript: (scriptPath: string) => {
+          if (path.basename(scriptPath) === "session-start.sh") throw new Error("boom");
+          return "grounding-still-runs";
+        },
+      });
+
+      expect(code).toBe(0);
+      expect(out).toEqual(["grounding-still-runs"]);
+      cleanup(scriptDir);
+    });
+
+    it.each([
+      ["session-start", "session-start.sh", "ignored"],
+      ["post-tool-use", "post-tool-use.sh", "post-context"],
+      ["stop", "stop.sh", "ignored"],
+    ])("%s wrapper delegates to %s", async (event, script, stdout) => {
+      const scriptDir = mkTmp(`mla-codex-${event}-`);
+      fs.writeFileSync(path.join(scriptDir, script), "#!/bin/bash\n", "utf8");
+      const calls: string[] = [];
+      const out: string[] = [];
+
+      const code = await runInternalCodexHook([event], {
+        readStdin: async () => JSON.stringify({ session_id: "codex-lifecycle" }),
+        writeOut: (value) => out.push(value),
+        hooksDir: scriptDir,
+        runScript: (scriptPath) => {
+          calls.push(path.basename(scriptPath));
+          return stdout;
+        },
+      });
+
+      expect(code).toBe(0);
+      expect(calls).toEqual([script]);
+      expect(out).toEqual(event === "post-tool-use" ? ["post-context"] : []);
+      cleanup(scriptDir);
+    });
+  });
+
+  describe("Codex runtime hook isolation", () => {
+    it("materializes executable templates under a content-addressed directory", () => {
+      const root = mkTmp("mla-codex-runtime-root-");
+      const template = mkTmp("mla-codex-runtime-template-");
+      fs.writeFileSync(path.join(template, "common.sh"), "common-v1\n", "utf8");
+      fs.writeFileSync(path.join(template, "post-tool-use.sh"), "post-v1\n", "utf8");
+
+      const first = ensureCodexRuntimeHooks({ templateDir: template, runtimeRoot: root });
+      const second = ensureCodexRuntimeHooks({ templateDir: template, runtimeRoot: root });
+
+      expect(second).toBe(first);
+      expect(path.dirname(first)).toBe(root);
+      expect(path.basename(first)).toMatch(/^[0-9a-f]{64}$/);
+      expect(fs.readFileSync(path.join(first, "common.sh"), "utf8")).toBe("common-v1\n");
+      expect(fs.statSync(path.join(first, "post-tool-use.sh")).mode & 0o111).not.toBe(0);
+      cleanup(root, template);
+    });
+
+    it("keeps an older bundle intact when template bytes change", () => {
+      const root = mkTmp("mla-codex-runtime-root-");
+      const template = mkTmp("mla-codex-runtime-template-");
+      const script = path.join(template, "post-tool-use.sh");
+      fs.writeFileSync(script, "post-v1\n", "utf8");
+      const oldRuntime = ensureCodexRuntimeHooks({ templateDir: template, runtimeRoot: root });
+
+      fs.writeFileSync(script, "post-v2\n", "utf8");
+      const newRuntime = ensureCodexRuntimeHooks({ templateDir: template, runtimeRoot: root });
+
+      expect(newRuntime).not.toBe(oldRuntime);
+      expect(fs.readFileSync(path.join(oldRuntime, "post-tool-use.sh"), "utf8")).toBe("post-v1\n");
+      expect(fs.readFileSync(path.join(newRuntime, "post-tool-use.sh"), "utf8")).toBe("post-v2\n");
+      cleanup(root, template);
+    });
+
+    it("fails open if the runtime bundle cannot be provisioned", async () => {
+      const out: string[] = [];
+      const code = await runInternalCodexHook(["stop"], {
+        readStdin: async () => "{}",
+        writeOut: (s) => out.push(s),
+        resolveHooksDir: () => {
+          throw new Error("read-only runtime root");
+        },
+      });
+      expect(code).toBe(0);
+      expect(out).toEqual([]);
     });
   });
 

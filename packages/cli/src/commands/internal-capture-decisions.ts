@@ -13,6 +13,11 @@ import {
   type ClaudeQuestion,
   normalizeClaudeAskUserQuestion,
 } from "../lib/agent-decision/normalize-claude";
+import {
+  CODEX_REQUEST_USER_INPUT_TOOL,
+  codexAnswersFromToolResponse,
+  normalizeCodexRequestUserInput,
+} from "../lib/agent-decision/normalize-codex";
 
 // `mla _internal capture-decisions` (spec notes/20260608-agent-decision-capture-design.md
 // section 5). The ONE place the raw provider input becomes canonical
@@ -110,19 +115,34 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-// PostToolUse path: one hook payload -> canonical payloads. Returns [] (never
-// throws) when the tool is not AskUserQuestion or the payload is structurally
+// PostToolUse path: one provider hook payload -> canonical payloads. Returns []
+// (never throws) when the tool is unsupported or the payload is structurally
 // unusable, so the hook it rides on is never crashed by a surprise shape.
 export function normalizePostToolUseInput(
   hookPayload: unknown,
   opts: { providerSessionId: string; occurredAt: string },
 ): CanonicalDecisionPayload[] {
   if (!isPlainObject(hookPayload)) return [];
-  if (hookPayload.tool_name !== CLAUDE_TOOL_NAME) return [];
-
   const toolUseId = hookPayload.tool_use_id;
   const toolInput = hookPayload.tool_input;
   const toolResponse = hookPayload.tool_response;
+  if (typeof toolUseId !== "string" || !isPlainObject(toolInput)) return [];
+
+  if (hookPayload.tool_name === CODEX_REQUEST_USER_INPUT_TOOL) {
+    const questions = toolInput.questions;
+    const answers = codexAnswersFromToolResponse(toolResponse);
+    if (!Array.isArray(questions) || answers === null) return [];
+    return normalizeCodexRequestUserInput(
+      { toolUseId, questions, answers },
+      {
+        providerSessionId: opts.providerSessionId,
+        capturedBy: "post_tool_use",
+        occurredAt: opts.occurredAt,
+      },
+    );
+  }
+
+  if (hookPayload.tool_name !== CLAUDE_TOOL_NAME) return [];
   const questions = isPlainObject(toolInput) ? toolInput.questions : undefined;
   // tool_response.answers is an object keyed on the EXACT question text (verified
   // against a real PostToolUse payload and a real transcript sidecar). A missing
@@ -130,7 +150,7 @@ export function normalizePostToolUseInput(
   // captured human decision, which the normalizer already enforces per-question.
   const answers = isPlainObject(toolResponse) ? toolResponse.answers : undefined;
 
-  if (typeof toolUseId !== "string" || !Array.isArray(questions) || !isPlainObject(answers)) {
+  if (!Array.isArray(questions) || !isPlainObject(answers)) {
     return [];
   }
 

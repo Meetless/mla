@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# session-start.sh: Claude Code SessionStart hook.
-# Writes a session_started event to the spool and spawns a detached flush.
+# session-start.sh: session lifecycle bootstrap.
+# Claude calls it directly on SessionStart. Codex calls it internally on
+# UserPromptSubmit; a marker makes that path once-per-session.
 #
 # Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
 source "$(dirname "$0")/common.sh"
@@ -58,6 +59,17 @@ if [[ -z "$INPUT" ]] || ! printf '%s' "$INPUT" | jq -e . >/dev/null 2>&1; then
   exit 0
 fi
 SESSION_ID="$(echo "$INPUT" | jq -r '.session_id // empty')"
+[[ -z "$SESSION_ID" ]] && exit 0
+
+# Codex UserPromptSubmit also calls this script as a fallback for hosts that
+# were already running when the connector was installed. Skip only that
+# fallback after the real SessionStart has run; genuine resume/clear/compact
+# events must continue through so their lifecycle semantics are preserved.
+CODEX_STARTED_MARKER="$QUEUE_DIR/$SESSION_ID.codexStarted"
+CODEX_HOOK_EVENT="$(printf '%s' "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null || true)"
+if [[ "${MEETLESS_CONNECTOR:-}" == "codex" && "$CODEX_HOOK_EVENT" != "SessionStart" && -e "$CODEX_STARTED_MARKER" ]]; then
+  exit 0
+fi
 
 # Enforcement backstop (2026-07-11): snapshot the governed forbidden roots BEFORE the
 # agent can touch anything, so the PostToolUse sweep can tell a file the AGENT created
@@ -67,7 +79,6 @@ SESSION_ID="$(echo "$INPUT" | jq -r '.session_id // empty')"
 if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
   printf '%s' "$INPUT" | "$MLA_PATH" _internal enforcement-baseline >/dev/null 2>&1 || true
 fi
-[[ -z "$SESSION_ID" ]] && exit 0
 # Per-session OFF override (`mla deactivate`). Silences this one session even in
 # an activated folder. See meetless_session_disabled in common.sh.
 meetless_session_disabled "$SESSION_ID" && exit 0
@@ -98,6 +109,10 @@ CWD="$PWD"
 BRANCH="$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 TS="$(date -u +%FT%TZ)"
 EVENT_KEY="$(gen_event_key)"
+ADAPTER="claude_code"
+if [[ "${MEETLESS_CONNECTOR:-}" == "codex" ]]; then
+  ADAPTER="codex"
+fi
 
 # Best-effort current session name. A RESUMED session (`--resume` / `--continue`)
 # starts with a transcript that already carries a title, so SessionStart is the
@@ -111,7 +126,8 @@ LINE="$(jq -c -n \
   --arg ts "$TS" --arg event "session_started" --arg key "$EVENT_KEY" \
   --arg sessionId "$SESSION_ID" --arg transcript "$TRANSCRIPT" \
   --arg cwd "$CWD" --arg branch "$BRANCH" --arg title "$SESSION_TITLE" \
-  '{ts: $ts, event: $event, eventKey: $key, sessionId: $sessionId, payload: {transcriptPath: $transcript, repoPath: $cwd, branch: $branch, sessionTitle: $title}}')"
+  --arg adapter "$ADAPTER" \
+  '{ts: $ts, event: $event, eventKey: $key, sessionId: $sessionId, payload: {adapter: $adapter, transcriptPath: $transcript, repoPath: $cwd, branch: $branch, sessionTitle: $title}}')"
 
 # Wedge v6 Epoch 35: repoPath sidecar. flush.sh is nohup-spawned by hooks,
 # so its cwd is whatever nohup ran in (often $HOME) -- NOT the repo. Without
@@ -159,6 +175,15 @@ if [[ ! -e "$QUEUE_DIR/$SESSION_ID.gitBaseline" ]]; then
 fi
 
 spool_append "$SESSION_ID" "$LINE"
+
+# The immediately following Codex grounding step appends prompt_submitted and
+# starts one flush. Mark the session started and return without launching a
+# competing flush (which could PATCH the prompt before the AgentRun POST lands).
+if [[ "${MEETLESS_CONNECTOR:-}" == "codex" ]]; then
+  : > "$CODEX_STARTED_MARKER"
+  exit 0
+fi
+
 spawn_flush "$SESSION_ID"
 
 # Sweep for Claude Code sessions whose transcript was deleted on disk and archive

@@ -151,6 +151,32 @@ export interface ReconciliationFinding {
   // Advisory human-readable "why stale" summary. Carried through for the Phase 3
   // renderer; the rehash gate never reads it (it gates on digest identity only).
   reason: string;
+
+  // ---- §3.5 trust bands ---------------------------------------------------
+  // Everything below feeds `renderReconciliationBlock`. All optional, for two
+  // reasons: every pre-Phase-3 on-disk cache was written without them and must
+  // still parse, and the rehash gate reads NONE of them (it gates on digest
+  // identity alone), so a finding missing a band is still correctly gated. The
+  // renderer, not the parser, decides a bandless finding is unrenderable.
+  //
+  // GOVERNED band: the superseding decision's CURRENT statement, as served by
+  // control (which re-reads it live and drops the finding if it is no longer
+  // ACCEPTED). This is the truth to act on, so it is the one band whose absence
+  // makes a finding unrenderable.
+  acceptedStatement?: string;
+  // Citation for the governed band. `CC:` is the coordination-case prefix.
+  sourceCaseId?: string | null;
+  supersedingCommitmentId?: string;
+
+  // UNTRUSTED-DATA band: the stale text `path` still asserts. Attacker- or
+  // accident-controlled (it is file bytes), so the renderer escapes it and
+  // labels it as data. Never an instruction.
+  currentSummary?: string;
+
+  // ADVISORY band: the detector's probabilistic read of the divergence. A
+  // candidate for the human to judge, never a command.
+  detectorExplanation?: string | null;
+  detectorVersion?: string;
 }
 
 export interface ScanResult {
@@ -202,10 +228,20 @@ export interface ScanResult {
   // Phase 2B). Readers guard with `?? []`.
   artifactDigests?: ArtifactDigest[];
   // Prompt-time reconciliation findings the assembler rehashes and gates on (ADR §3.3 item 9,
-  // see ReconciliationFinding). Forward-only: the detector that produces these is Phase 2B
-  // (blocked), so this is absent in every Phase 2A cache and the rehash gate is a clean no-op.
-  // Readers guard with `?? []`.
+  // see ReconciliationFinding). Absent in every pre-Phase-3 cache; readers guard with `?? []`.
+  // Written by the scan-time pull from control, which is the only authority on which findings
+  // are live. A rescan that did not pull carries the previous list forward unchanged.
   reconciliationFindings?: ReconciliationFinding[];
+  // When `reconciliationFindings` was last confirmed against control (ISO 8601).
+  //
+  // Load-bearing, not bookkeeping. Carry-forward means a list can outlive the pull that
+  // produced it, and control is where the three liveness filters run (visibility, still
+  // ACCEPTED, artifact not tombstoned). So the age of the last successful pull is exactly the
+  // age of the evidence that these findings are still governed, and the assembler refuses to
+  // render a band claiming trust="governed" on evidence older than its freshness window.
+  // Absent (a carried-forward pre-stamp cache, or a list that never came from a pull) is
+  // treated as infinitely stale, which fails toward silence.
+  reconciliationFetchedAt?: string;
 }
 
 export interface Verdicts {

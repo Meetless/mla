@@ -28,6 +28,7 @@ import {
 } from "../lib/config";
 import { resolveWorkspaceContext } from "../lib/workspace";
 import { intelGet, intelPost } from "../lib/http";
+import { INGEST_TIMEOUT_MS } from "../lib/intel-ingest-budget";
 import type { KbAddReceipt } from "../lib/render";
 import { buildPlan, persistPlan, loadRunRecord } from "../lib/enrichment/plan";
 import {
@@ -154,12 +155,6 @@ const USAGE = `mla enrich: agent-orchestrated onboarding enrichment.
       payload is already live is skipped, never minted twice. A mint failure writes nothing.
       --dry-run previews without minting or writing. Exit: 0 done (or nothing to do), 1 mint
       refused/failed, 2 bad input (unknown run, bad/ambiguous prefix).`;
-
-// Mirror kb_add's ingest timeout heuristic (it is module-private there). Generous,
-// scales with document count: the kb-add route runs the full atomic-claim pipeline.
-function ingestTimeoutMs(docCount: number): number {
-  return Math.max(120_000, docCount * 20_000);
-}
 
 // The git toplevel is the enrichment repository root: `git ls-files` / `git log` must
 // run from it so the paths the scouts cite are repo-root-relative and the realpath
@@ -728,7 +723,7 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
       cfg,
       "/internal/v1/kb/add",
       body,
-      ingestTimeoutMs(docs.length),
+      INGEST_TIMEOUT_MS,
     );
     const receipts = res.receipts ?? [];
     return {
