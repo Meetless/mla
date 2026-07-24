@@ -25,6 +25,11 @@ import {
   type DeliveryOutcome,
   type ReconciliationPull,
 } from "../lib/rules/bundle-refresh";
+import {
+  uploadSnapshotsForScan,
+  type SnapshotUploadArgs,
+  type SnapshotUploadOutcome,
+} from "../lib/rules/snapshot-upload";
 
 export interface RescanArgs {
   cwd: string;
@@ -287,6 +292,12 @@ export interface ScanContextDeps {
   /** The §3.5 findings pull, injectable on the same terms as `refreshBundle` (no network in tests). */
   fetchReconciliation?: (workspaceId: string) => Promise<ReconciliationPull>;
   /**
+   * The §4.2 snapshot PUSH (the producer half), injectable on the same terms as the pulls above.
+   * Takes the full arg envelope (not just a workspaceId) because it needs the scan's per-file paths
+   * and provenance, which only exist AFTER the rescan.
+   */
+  uploadSnapshots?: (args: SnapshotUploadArgs) => Promise<SnapshotUploadOutcome>;
+  /**
    * Where the caches live. Defaults to the real home, as everywhere else. A test SHOULD override it
    * (or set MEETLESS_HOME) to contain a scan.
    *
@@ -345,10 +356,42 @@ export async function runScanContext(argv: string[], deps: ScanContextDeps = {})
     `scanned: ${result.inventory.instructionFiles} instruction files, ` +
       `${result.directives.length} rules, ${result.inventory.staleSignals} stale signals`,
   );
+  // Publish a server-visible revision of every instruction file this scan saw (ADR §4.2, Phase 2B).
+  // This is the PRODUCER half of reconciliation: the pull above fetches findings, but without this
+  // push control's detector has no artifact to scan a superseded decision against and raises none.
+  // Best effort on the same terms as the pulls: a failure warns, never fails the scan. Sequenced
+  // after the rescan because it needs the scan's per-file paths and observed commit.
+  const uploadSnapshots = deps.uploadSnapshots ?? uploadSnapshotsForScan;
+  const uploaded = await uploadSnapshots({
+    workspaceId: target.workspaceId,
+    // Per-CHECKOUT identity, NOT the workspaceId: one workspace binds several checkouts that all
+    // write this workspace's artifacts, and control's unique key is (workspace, repo, path, digest).
+    // This is the same realpath-of-marker identity the scan cache is stamped with (scanRootPath).
+    repositoryId: resolveScanRootIdentity(target.scanRoot),
+    scanRoot: target.scanRoot,
+    paths: (result.artifactDigests ?? []).map((d) => d.relativePath),
+    observedCommitSha: result.commitSha,
+    observedAt: result.generatedAt,
+  });
   if (!refreshed.delivered) {
     err(
       `warning: could not refresh the rule bundle from the backend (${refreshed.error}); ` +
         `scanned against the last cached bundle, which may be stale.`,
+    );
+  }
+  // Only surface an upload failure when the bundle refresh SUCCEEDED. A not-delivered upload for the
+  // same reason the refresh failed (logged out, unbound repo) is already covered by the warning
+  // above; repeating it is noise. A refresh that worked proves auth + binding, so an upload that
+  // still could not start is a genuine, actionable surprise worth its own line.
+  if (refreshed.delivered && !uploaded.delivered) {
+    err(
+      `warning: could not publish instruction-file snapshots to the backend (${uploaded.error}); ` +
+        `reconciliation will not see this checkout's latest instruction files.`,
+    );
+  } else if (uploaded.delivered && uploaded.failed > 0) {
+    err(
+      `warning: ${uploaded.failed} of ${uploaded.attempted} instruction-file snapshot uploads ` +
+        `failed; reconciliation may be scanning stale content for those files.`,
     );
   }
   return 0;

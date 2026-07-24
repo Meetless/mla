@@ -30,6 +30,8 @@ function ask(opts: {
   fail_open?: string | null;
   not_run_reason?: string | null;
   error?: unknown;
+  // The governed-KB enrich trace the hook persists under governed_kb_trace (Item 4).
+  gkb?: { retrieved_count?: number; selected_count?: number; primary_no_offer_reason?: string };
 }): Record<string, unknown> {
   const offered = opts.offered ?? [];
   const hook: Record<string, unknown> = {
@@ -39,7 +41,7 @@ function ask(opts: {
     fail_open_reason: opts.fail_open ?? null,
   };
   if (opts.not_run_reason !== undefined) hook.not_run_reason = opts.not_run_reason;
-  return {
+  const line: Record<string, unknown> = {
     trace_id: opts.trace_id === undefined ? "a".repeat(32) : opts.trace_id,
     ts: "2026-06-09T00:00:00Z",
     session_id: opts.session ?? "s1",
@@ -56,6 +58,8 @@ function ask(opts: {
     hook,
     error: opts.error ?? null,
   };
+  if (opts.gkb) line.governed_kb_trace = opts.gkb;
+  return line;
 }
 
 function mcp(
@@ -114,6 +118,22 @@ describe("parseAskTrace", () => {
     ];
     const t = parseAskTrace(line);
     expect(t!.offered_source_ids).toEqual([]);
+  });
+
+  it("reads the governed_kb_trace counts + reason when present (Item 4)", () => {
+    const t = parseAskTrace(
+      ask({ offered: [], gkb: { retrieved_count: 5, selected_count: 0, primary_no_offer_reason: "all_failed_relevance" } }),
+    );
+    expect(t!.retrieved_count).toBe(5);
+    expect(t!.selected_count).toBe(0);
+    expect(t!.primary_no_offer_reason).toBe("all_failed_relevance");
+  });
+
+  it("leaves the governed_kb_trace fields null on lines that predate it", () => {
+    const t = parseAskTrace(ask({ offered: ["NT:a.md"] }));
+    expect(t!.retrieved_count).toBeNull();
+    expect(t!.selected_count).toBeNull();
+    expect(t!.primary_no_offer_reason).toBeNull();
   });
 });
 
@@ -219,6 +239,162 @@ describe("computeTurnRecap: verdict", () => {
     expect(r.coverage_gap_type).toBe("enrich_unauthorized");
   });
 
+  it("NO_OFFER: intel unreachable (connection refused) -> coverage_gap enrich_unreachable, evidence_layer_down", () => {
+    // The textbook outage: the hook could not reach intel at all, so it records
+    // fail_open_reason "intel_down" (arb "enrichment_intel_down"). This MUST read
+    // as a backend outage, never as "nothing matched" -- the friction An hit.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_intel_down", fail_open: "intel_down" })],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.coverage_gap_type).toBe("enrich_unreachable");
+    expect(r.evidence_layer_down).toBe(true);
+  });
+
+  it("NO_OFFER: enrich timeout and enrich error both flip evidence_layer_down", () => {
+    const timedOut = computeTurnRecap(
+      "s1",
+      8,
+      deps({ traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_timeout", fail_open: "timeout" })] }),
+    );
+    expect(timedOut.coverage_gap_type).toBe("enrich_timeout");
+    expect(timedOut.evidence_layer_down).toBe(true);
+
+    const errored = computeTurnRecap(
+      "s1",
+      9,
+      deps({ traces: [ask({ turn: 9, injected: true, layer2: false, offered: [], arb_reason: "enrichment_error", fail_open: "error" })] }),
+    );
+    expect(errored.coverage_gap_type).toBe("enrich_error");
+    expect(errored.evidence_layer_down).toBe(true);
+  });
+
+  it("NO_OFFER on the MERITS does NOT flip evidence_layer_down (looked, nothing matched)", () => {
+    const merits = computeTurnRecap(
+      "s1",
+      8,
+      deps({ traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "no_relevant_context" })] }),
+    );
+    expect(merits.verdict).toBe("NO_OFFER");
+    expect(merits.evidence_layer_down).toBe(false);
+
+    // A governed zero_candidates abstain is also a merits result, not an outage.
+    const zeroCandidates = computeTurnRecap(
+      "s1",
+      9,
+      deps({ traces: [ask({ turn: 9, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "zero_candidates" } })] }),
+    );
+    expect(zeroCandidates.evidence_layer_down).toBe(false);
+  });
+
+  it("NO_OFFER auth-expired is NOT evidence_layer_down (intel is UP; re-auth, not an outage)", () => {
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({ traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_unauthorized", fail_open: "unauthorized" })] }),
+    );
+    expect(r.coverage_gap_type).toBe("enrich_unauthorized");
+    expect(r.evidence_layer_down).toBe(false);
+  });
+
+  it("a USED turn is never evidence_layer_down", () => {
+    const r = computeTurnRecap(
+      "s1",
+      7,
+      deps({ traces: [ask({ turn: 7, offered: ["NT:a.md"] })], mcp: [mcp("s1", 7, "retrieve_knowledge", true, ["NT:a.md"])] }),
+    );
+    expect(r.verdict).toBe("USED");
+    expect(r.evidence_layer_down).toBe(false);
+  });
+
+  it("NO_OFFER (should have matched): candidates found but all dropped -> should_have_matched + counts", () => {
+    // retrieved > 0 && selected == 0 is the recall/ranking-debt signature: the
+    // score floor or cap dropped every candidate. This is the miss An wants split
+    // out from a correct abstain.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [
+          ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 5, selected_count: 0, primary_no_offer_reason: "all_failed_relevance" } }),
+        ],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("should_have_matched");
+    expect(r.retrieved_count).toBe(5);
+    expect(r.selected_count).toBe(0);
+    expect(r.coverage_gap_type).toBe("all_failed_relevance");
+  });
+
+  it("NO_OFFER (correct abstain): zero candidates -> correct_abstain, not a miss", () => {
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "zero_candidates" } })],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("correct_abstain");
+    expect(r.retrieved_count).toBe(0);
+    expect(r.coverage_gap_type).toBe("zero_candidates");
+  });
+
+  it("NO_OFFER (router low confidence): read as should_have_matched (router never retrieved)", () => {
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "router_low_confidence" } })],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("should_have_matched");
+  });
+
+  it("NO_OFFER (provider failure): a degraded surface -> provider_failure, not a recall gap", () => {
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "surface_provider_missing" } })],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("provider_failure");
+  });
+
+  it("NO_OFFER without a trace leaves abstain_class null (instrumentation absent, not a correct abstain)", () => {
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({ traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "no_relevant_context" })] }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBeNull();
+    expect(r.retrieved_count).toBeNull();
+  });
+
+  it("a trace on an offered (USED) turn does not manufacture an abstain_class", () => {
+    const r = computeTurnRecap(
+      "s1",
+      7,
+      deps({
+        traces: [ask({ turn: 7, offered: ["NT:a.md"], gkb: { retrieved_count: 4, selected_count: 1 } })],
+        mcp: [mcp("s1", 7, "retrieve_knowledge", true, ["NT:a.md"])],
+      }),
+    );
+    expect(r.verdict).toBe("USED");
+    expect(r.abstain_class).toBeNull();
+    expect(r.retrieved_count).toBe(4);
+    expect(r.selected_count).toBe(1);
+  });
+
   it("NOT_RUN: no ask-traces line for the turn -> reason unknown, trace_id null", () => {
     const r = computeTurnRecap("s1", 10, deps({ traces: [ask({ turn: 4 })] }));
     expect(r.verdict).toBe("NOT_RUN");
@@ -307,6 +483,10 @@ const used: TurnRecap = {
   offered_source_ids: ["NT:a.md", "NT:b.md", "NT:c.md"],
   zero_results: false,
   coverage_gap_type: null,
+  evidence_layer_down: false,
+  retrieved_count: null,
+  selected_count: null,
+  abstain_class: null,
   evidence_tools_pulled: ["retrieve_knowledge"],
   pull_count: 2,
   referenced_source_ids: ["DD:abc"],
@@ -326,9 +506,28 @@ describe("renderFooter", () => {
     expect(renderFooter(r)).toBe("🔎 mla · turn 8 · floor only · no candidate matched your prompt · NO_OFFER");
   });
 
+  it("NO_OFFER (should have matched) appends retrieved/selected counts + the class (Item 4)", () => {
+    const r: TurnRecap = { ...used, turn_index: 8, verdict: "NO_OFFER", evidence_offered: false, zero_results: true, coverage_gap_type: "all_failed_relevance", retrieved_count: 5, selected_count: 0, abstain_class: "should_have_matched", offered_source_ids: [], injected_evidence: false, pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
+    expect(renderFooter(r)).toBe(
+      "🔎 mla · turn 8 · floor only · candidates found but all fell below the score floor · retrieved 5, selected 0 · should_have_matched · NO_OFFER",
+    );
+  });
+
+  it("NO_OFFER (correct abstain, zero candidates) shows the counts and correct_abstain", () => {
+    const r: TurnRecap = { ...used, turn_index: 8, verdict: "NO_OFFER", evidence_offered: false, zero_results: true, coverage_gap_type: "zero_candidates", retrieved_count: 0, selected_count: 0, abstain_class: "correct_abstain", offered_source_ids: [], injected_evidence: false, pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
+    expect(renderFooter(r)).toBe(
+      "🔎 mla · turn 8 · floor only · retrieval found nothing to offer · retrieved 0, selected 0 · correct_abstain · NO_OFFER",
+    );
+  });
+
   it("NO_OFFER (auth expired) renders an actionable re-auth instruction, not a vague failure", () => {
     const r: TurnRecap = { ...used, turn_index: 12, verdict: "NO_OFFER", evidence_offered: false, zero_results: true, coverage_gap_type: "enrich_unauthorized", offered_source_ids: [], injected_evidence: false, pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
     expect(renderFooter(r)).toBe("🔎 mla · turn 12 · floor only · Meetless session expired, run `mla login` · NO_OFFER");
+  });
+
+  it("NO_OFFER (evidence layer DOWN) renders an unmistakable outage warning, not a merits phrase", () => {
+    const r: TurnRecap = { ...used, turn_index: 8, verdict: "NO_OFFER", evidence_offered: false, zero_results: true, coverage_gap_type: "enrich_unreachable", evidence_layer_down: true, offered_source_ids: [], injected_evidence: false, pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
+    expect(renderFooter(r)).toBe("🔎 mla · turn 8 · floor only · ⚠ evidence layer DOWN (could not reach intel) · NO_OFFER");
   });
 
   it("IGNORED renders pulled/cited counts", () => {
@@ -369,5 +568,24 @@ describe("renderBlock", () => {
   it("describes a suppressed turn as suppressed, not USED", () => {
     const r: TurnRecap = { ...used, ran: true, injected_floor: false, verdict: "NOT_RUN", not_run_reason: "suppressed", evidence_offered: false, offered_source_ids: [] };
     expect(renderBlock(r)).toMatch(/suppressed/);
+  });
+
+  it("expands retrieved/selected/class when the governed-KB trace is present (Item 4)", () => {
+    const r: TurnRecap = { ...used, turn_index: 8, verdict: "NO_OFFER", evidence_offered: false, zero_results: true, coverage_gap_type: "all_failed_relevance", retrieved_count: 5, selected_count: 0, abstain_class: "should_have_matched", offered_source_ids: [], injected_evidence: false, pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
+    const out = renderBlock(r);
+    expect(out).toMatch(/retrieved:\s+5/);
+    expect(out).toMatch(/selected:\s+0/);
+    expect(out).toMatch(/class:\s+should_have_matched/);
+  });
+
+  it("omits retrieved/selected/class on a turn with no trace (unchanged block)", () => {
+    expect(renderBlock(used)).not.toMatch(/retrieved:/);
+  });
+
+  it("surfaces the evidence-layer-DOWN outage callout in the expanded block", () => {
+    const r: TurnRecap = { ...used, turn_index: 8, verdict: "NO_OFFER", evidence_offered: false, zero_results: true, coverage_gap_type: "enrich_unreachable", evidence_layer_down: true, offered_source_ids: [], injected_evidence: false, pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
+    const out = renderBlock(r);
+    expect(out).toMatch(/evidence layer DOWN/);
+    expect(out).toMatch(/backend outage, not a merits result/);
   });
 });

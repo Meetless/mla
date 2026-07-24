@@ -87,7 +87,17 @@ export function makeIntelAsk({ intelBaseUrl, apiKey, fetchImpl = fetch }) {
     });
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`intel /v1/ask ${res.status}: ${body.slice(0, 400)}`);
+      // Attach .status + .body (aligning with http.ts buildError) so the shared
+      // MCP classifier (intel_error_mask.js) can discriminate this failure (a 402
+      // billing denial vs a 5xx blip vs auth) and mask it substrate-free at the
+      // server.js query boundary (SEC-3.2). The message keeps a body snippet for
+      // the legacy `mla ask` path, where a human operator reads it directly and
+      // nothing masks it; the MCP path never surfaces this message (it is replaced
+      // wholesale by the classifier), so the snippet cannot reach the model.
+      const err = new Error(`intel /v1/ask ${res.status}: ${body.slice(0, 400)}`);
+      err.status = res.status;
+      err.body = body;
+      throw err;
     }
     return await res.json();
   };

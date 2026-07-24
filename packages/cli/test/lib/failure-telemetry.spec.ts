@@ -8,6 +8,7 @@ import {
   DEADLETTER_TTL_MS,
   DeadletterRecord,
   FAILURE_KB_WRITE_BLOCKED,
+  FAILURE_MCP_EVIDENCE_UNAVAILABLE,
   FAILURE_TELEMETRY_UPLOAD_FAILED,
   TELEMETRY_SCHEMA_VERSION,
   appendDeadletter,
@@ -17,6 +18,7 @@ import {
   isAttemptDue,
   loadDeadletter,
   recordKbWriteBlocked,
+  recordMcpEvidenceUnavailable,
   recordTelemetryUploadFailure,
   sanitizeTelemetry,
 } from "../../src/lib/failure-telemetry";
@@ -129,6 +131,21 @@ describe("sanitizeTelemetry (INV-TELEMETRY-METADATA-CLASSIFICATION)", () => {
       },
     });
     expect(out.metadata_only_context).toEqual({ status: 401, reason_code: "unauthorized" });
+  });
+
+  it("keeps billing_reason (a bounded SCREAMING_SNAKE enum) but drops smuggled free text", () => {
+    // The MCP evidence-failure path echoes a billing sub-reason like NO_PAYER.
+    // It is allowlisted as a low-cardinality enum; a paragraph is not (only the
+    // classifier's SEC-3.2 guard admits a token here, but the sink stays defensive).
+    const kept = sanitizeTelemetry({
+      failure_class: "mcp_evidence_unavailable",
+      metadata_only_context: { status: 402, reason_code: "payment_required", billing_reason: "NO_PAYER" },
+    });
+    expect(kept.metadata_only_context).toEqual({
+      status: 402,
+      reason_code: "payment_required",
+      billing_reason: "NO_PAYER",
+    });
   });
 
   it("does not mutate the input event", () => {
@@ -421,5 +438,73 @@ describe("recordKbWriteBlocked (F5)", () => {
   it("never throws even if the home dir is unwritable", () => {
     const env = { MEETLESS_HOME: UNWRITABLE_HOME } as NodeJS.ProcessEnv;
     expect(() => recordKbWriteBlocked({ reasonCode: "owner_gate", status: 2 }, { env })).not.toThrow();
+  });
+});
+
+describe("recordMcpEvidenceUnavailable (mcp_evidence_unavailable, CLI-MCP-local)", () => {
+  it("writes an enum-only record with the tool, category, status, and billing sub-reason", () => {
+    const env = freshHomeEnv();
+    const now = 1_700_000_000_000;
+    const rec = recordMcpEvidenceUnavailable(
+      {
+        traceId: "1".repeat(32),
+        workspaceId: "ws_an_local",
+        sessionId: "sess_mcp",
+        surface: "mla-mcp",
+        tool: "meetless__query",
+        reasonCode: "payment_required",
+        status: 402,
+        billingReason: "NO_PAYER",
+      },
+      { env, now },
+    );
+    expect(rec).not.toBeNull();
+    expect(rec!.failure_class).toBe(FAILURE_MCP_EVIDENCE_UNAVAILABLE);
+    expect(FAILURE_MCP_EVIDENCE_UNAVAILABLE).toBe("mcp_evidence_unavailable");
+    expect(rec!.event.severity).toBe("warning");
+    expect(rec!.event.surface).toBe("mla-mcp");
+    expect(rec!.event.trace_id).toBe("1".repeat(32));
+    expect(rec!.event.workspace_id).toBe("ws_an_local");
+    expect(rec!.event.session_id).toBe("sess_mcp");
+    expect(rec!.event.metadata_only_context).toEqual({
+      tool: "meetless__query",
+      reason_code: "payment_required",
+      status: 402,
+      billing_reason: "NO_PAYER",
+    });
+  });
+
+  it("defaults the surface to mla-mcp and omits absent join keys / billing reason", () => {
+    const env = freshHomeEnv();
+    const rec = recordMcpEvidenceUnavailable(
+      { tool: "meetless__retrieve_knowledge", reasonCode: "unavailable", status: 503 },
+      { env, now: 1 },
+    );
+    expect(rec).not.toBeNull();
+    expect(rec!.event.surface).toBe("mla-mcp");
+    expect(rec!.event).not.toHaveProperty("trace_id");
+    expect(rec!.event).not.toHaveProperty("workspace_id");
+    expect(rec!.event.metadata_only_context).toEqual({
+      tool: "meetless__retrieve_knowledge",
+      reason_code: "unavailable",
+      status: 503,
+    });
+  });
+
+  it("is a no-op when telemetry is hard-disabled (kill switch)", () => {
+    const env = freshHomeEnv({ MEETLESS_TELEMETRY: "off" });
+    const rec = recordMcpEvidenceUnavailable(
+      { tool: "meetless__query", reasonCode: "payment_required", status: 402 },
+      { env },
+    );
+    expect(rec).toBeNull();
+    expect(fs.existsSync(deadletterPath(env))).toBe(false);
+  });
+
+  it("never throws even if the home dir is unwritable", () => {
+    const env = { MEETLESS_HOME: UNWRITABLE_HOME } as NodeJS.ProcessEnv;
+    expect(() =>
+      recordMcpEvidenceUnavailable({ tool: "meetless__query", reasonCode: "unavailable" }, { env }),
+    ).not.toThrow();
   });
 });

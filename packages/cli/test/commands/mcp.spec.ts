@@ -232,6 +232,10 @@ describe("mla mcp — closure wiring", () => {
     // A staleness probe is always wired so a server that outlives a rebuild can
     // warn instead of silently serving old code (the stale-dist footgun).
     expect(typeof d.staleCheck).toBe("function");
+    // The MCP-evidence-failure sink is wired so a masked intel failure lands as a
+    // sanitized local friction event (Item 5). server.js stays fs/env-pure; the
+    // command owns the sink closure.
+    expect(typeof d.recordFailure).toBe("function");
   });
 
   it("honors an injected makeStaleCheck and wires its probe onto the server deps", async () => {

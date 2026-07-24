@@ -261,6 +261,78 @@ test("403 is masked like 401", async () => {
   );
 });
 
+// ---------- Item 1: a 402 billing denial is NOT a generic outage ------------
+//
+// The keystone case. When a workspace has no payer bound, intel answers 402 with
+// {"detail":{"code":"BILLING_DENIED","reason":"NO_PAYER",...}}. The old mask
+// collapsed this to "retrieval unavailable" (a lie: the evidence exists, it is
+// gated). The mask must now say "billing denied", surface the bounded reason
+// enum, preserve .status/.billing, NOT retry, and still leak no raw body.
+test("402 billing denial: distinct message, NO_PAYER surfaced, not retried, no leak", async () => {
+  const body = JSON.stringify({
+    detail: {
+      code: "BILLING_DENIED",
+      category: "payment_required",
+      reason: "NO_PAYER",
+      topUpRequired: false,
+      // a hostile free-text field that must NOT escape the SAFE_ENUM guard
+      note: "workspace acme-corp owes $1234 at billing.internal:5432",
+    },
+  });
+  const err = new Error(`intel POST /v1/ask/retrieve 402: ${body}`);
+  err.status = 402;
+  err.body = body;
+  const cf = throwingFetch(err);
+  await assert.rejects(
+    () =>
+      runRetrieveKnowledge(
+        { query: "q" },
+        { intelFetch: cf, defaultWorkspaceId: WS, sleep: noSleep },
+      ),
+    (thrown) => {
+      assert.match(thrown.message, /billing denied/i);
+      assert.match(thrown.message, /NO_PAYER/);
+      assert.match(thrown.message, /not an outage/i);
+      assert.equal(thrown.status, 402);
+      assert.equal(thrown.billing, true);
+      assert.equal(thrown.reason, "NO_PAYER");
+      assert.equal(thrown.category, "payment_required");
+      // discriminated guidance rides along (Item 3): grep is NOT a substitute.
+      assert.match(thrown.guidance, /do not fall back to grep/i);
+      // no raw body / substrate leak
+      assert.ok(!thrown.message.includes("acme-corp"));
+      assert.ok(!thrown.message.includes("billing.internal"));
+      assert.ok(!thrown.message.includes("1234"));
+      assert.ok(!thrown.message.includes("BILLING_DENIED"));
+      return true;
+    },
+  );
+  assert.equal(cf.calls.length, 1); // 402 is permanent, never retried
+});
+
+test("402 with an unparseable body still masks (no reason, no leak, no retry)", async () => {
+  const err = new Error("intel POST /v1/ask/retrieve 402: <html>gateway</html>");
+  err.status = 402;
+  err.body = "<html>gateway</html>";
+  const cf = throwingFetch(err);
+  await assert.rejects(
+    () =>
+      runRetrieveKnowledge(
+        { query: "q" },
+        { intelFetch: cf, defaultWorkspaceId: WS, sleep: noSleep },
+      ),
+    (thrown) => {
+      assert.match(thrown.message, /billing denied/i);
+      assert.equal(thrown.status, 402);
+      assert.equal(thrown.reason, undefined); // nothing safe to surface
+      assert.ok(!thrown.message.includes("<html>"));
+      assert.ok(!thrown.message.includes("gateway"));
+      return true;
+    },
+  );
+  assert.equal(cf.calls.length, 1);
+});
+
 // ---------- resilience: transient retry (intel restart / 5xx blip) -----------
 
 test("retries a transient network error (ECONNREFUSED) then succeeds", async () => {
@@ -287,6 +359,65 @@ test("retries a 503 then succeeds", async () => {
   );
   assert.equal(cf.calls.length, 2);
   assert.equal(out.count, 0);
+});
+
+// ---------- 402 transient billing hold: RETRIED, unlike NO_PAYER -------------
+//
+// FULLY_RESERVED / NOT_PROVISIONED are self-clearing holds on a funded, payer-
+// bound workspace (its own in-flight jobs momentarily hold the balance). Unlike
+// NO_PAYER (terminal, one call only), the SAME retrieve can succeed once siblings
+// settle, so the loop MUST retry it, and a persistent hold must surface the
+// honest "billing hold; retry shortly", never the terminal "do not retry".
+function billingDeny(reason) {
+  const body = JSON.stringify({ detail: { code: "BILLING_DENIED", reason } });
+  const e = new Error(`intel POST /v1/ask/retrieve 402: ${body}`);
+  e.status = 402;
+  e.body = body;
+  return e;
+}
+
+test("402 FULLY_RESERVED is retried, then succeeds once the hold clears", async () => {
+  const cf = flakyFetch(2, billingDeny("FULLY_RESERVED"), { candidates: [DTO] });
+  const out = await runRetrieveKnowledge(
+    { query: "q" },
+    { intelFetch: cf, defaultWorkspaceId: WS, sleep: noSleep },
+  );
+  assert.equal(cf.calls.length, 3); // 2 holds + 1 success, unlike NO_PAYER's 1
+  assert.equal(out.count, 1);
+  assert.deepEqual(out.candidates, [DTO]);
+});
+
+test("402 NOT_PROVISIONED is retried too (payer entitlement mid-mint)", async () => {
+  const cf = flakyFetch(1, billingDeny("NOT_PROVISIONED"), { candidates: [] });
+  const out = await runRetrieveKnowledge(
+    { query: "q" },
+    { intelFetch: cf, defaultWorkspaceId: WS, sleep: noSleep },
+  );
+  assert.equal(cf.calls.length, 2); // 1 hold + 1 success
+  assert.equal(out.count, 0);
+});
+
+test("a persistent FULLY_RESERVED gives up with an honest transient message", async () => {
+  const cf = throwingFetch(billingDeny("FULLY_RESERVED"));
+  await assert.rejects(
+    () =>
+      runRetrieveKnowledge(
+        { query: "q" },
+        { intelFetch: cf, defaultWorkspaceId: WS, sleep: noSleep },
+      ),
+    (thrown) => {
+      assert.match(thrown.message, /billing hold \(FULLY_RESERVED\)/);
+      assert.match(thrown.message, /retry shortly/i);
+      assert.ok(!/do not retry/i.test(thrown.message));
+      assert.equal(thrown.status, 402);
+      assert.equal(thrown.billing, true);
+      assert.equal(thrown.transient, true);
+      assert.equal(thrown.reason, "FULLY_RESERVED");
+      assert.match(thrown.guidance, /retry shortly/i);
+      return true;
+    },
+  );
+  assert.equal(cf.calls.length, 3); // retried up to the attempt cap
 });
 
 test("gives up after the attempt cap on a persistent transient failure", async () => {

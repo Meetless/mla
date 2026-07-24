@@ -24,6 +24,12 @@
  *     can self-correct; only intel-side failures are masked.
  */
 
+import {
+  classifyIntelError,
+  isTransientIntelError,
+  isTransientBillingDenial,
+} from "./intel_error_mask.js";
+
 const RETRIEVE_PATH = "/v1/ask/retrieve";
 
 // SEC-2.4: a generous client-side ceiling. intel clamps further to its own
@@ -37,8 +43,10 @@ export const MAX_CLIENT_LIMIT = 50;
 // uvicorn). During that window a connection is refused or a 5xx is returned for
 // a few seconds; without a retry that transient blip became a hard
 // "retrieval unavailable" that stopped the dogfood loop dead. We retry only
-// TRANSIENT failures (transport errors + 5xx) a few times with short backoff;
-// deterministic failures (4xx: bad input, auth, not-found) are NEVER retried.
+// SELF-CLEARING failures a few times with short backoff: transport errors + 5xx
+// + 429, plus a transient billing hold (402 FULLY_RESERVED / NOT_PROVISIONED,
+// whose balance returns at settlement). Deterministic failures (bad input, auth,
+// not-found, and a TERMINAL 402 like NO_PAYER / EXHAUSTED) are NEVER retried.
 export const MAX_RETRIEVE_ATTEMPTS = 3;
 // Backoff between attempts: [after attempt 1, after attempt 2]. Short, because
 // a restart window is seconds, not minutes, and the agent is waiting.
@@ -49,20 +57,6 @@ export const RETRIEVE_BACKOFF_MS = [200, 500];
 export const RETRIEVE_TIMEOUT_MS = 8000;
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * A failure worth retrying. A numeric .status means intel answered: only 5xx is
- * transient (the instance hiccuped); every 4xx is the request's own fault and
- * deterministic. No .status at all means the transport failed (connection
- * refused mid-restart, DNS, an aborted/timed-out request): always transient.
- */
-function isTransient(err) {
-  const status = err && err.status;
-  if (typeof status === "number") {
-    return status >= 500 && status <= 599;
-  }
-  return true;
-}
 
 /**
  * One intel call with a hard per-attempt timeout. A fresh AbortController per
@@ -81,35 +75,36 @@ async function fetchOnce(intelFetch, init) {
 }
 
 /**
- * Re-throw an intel-side failure as a substrate-free error. SEC-3.2: the model
- * surface must never see intel's host/port, response body, or stack. A 401/403
- * gets a distinct (still leak-free) auth hint and preserves .status so server.js
- * can surface "re-auth needed". A transient failure (5xx / transport) becomes an
- * actionable "temporarily unavailable" line so the agent treats it as an infra
- * blip to retry, not a missing document to escalate. Everything else (a
- * deterministic 4xx) collapses to a single generic line.
+ * Re-throw an intel-side failure as a substrate-free, discriminated error.
+ * SEC-3.2: the model surface must never see intel's host/port, response body, or
+ * stack. The shared classifier (intel_error_mask.js) turns the raw error into a
+ * masked message plus a category the caller can act on:
+ *   - auth (401/403): a leak-free "re-auth needed" hint, .status preserved.
+ *   - payment_required (402), terminal (NO_PAYER / EXHAUSTED / ...): "billing
+ *     denied; not an outage, do not retry" so the agent escalates to bind a payer
+ *     or top up instead of treating the evidence as absent. The old generic line
+ *     was lying about this case.
+ *   - payment_required (402), transient (FULLY_RESERVED / NOT_PROVISIONED): a
+ *     funded workspace whose balance is briefly held by its own in-flight jobs.
+ *     "billing hold; retry shortly", with .transient set so the loop retries it
+ *     and the agent re-calls rather than grepping past evidence that exists.
+ *   - unavailable (429/5xx/transport): "temporarily unavailable; retry shortly"
+ *     so the agent treats it as an infra blip, not a missing document.
+ *   - error (other 4xx): a single generic "retrieval unavailable" line.
+ * The category, .transient/.billing flags, the sanitized billing .reason, and a
+ * one-line .guidance ride along on the masked error so server.js can surface
+ * discriminated fallback guidance (Item 3) without re-classifying.
  */
 function maskRetrievalError(err) {
-  const status = err && err.status;
-  if (status === 401 || status === 403) {
-    const e = new Error(
-      "retrieval unavailable: authentication failed (check MEETLESS_CONTROL_TOKEN)",
-    );
-    e.status = status;
-    e.masked = true;
-    return e;
-  }
-  if (isTransient(err)) {
-    const e = new Error(
-      "retrieval temporarily unavailable (intel unreachable); retry shortly",
-    );
-    if (typeof status === "number") e.status = status;
-    e.masked = true;
-    e.transient = true;
-    return e;
-  }
-  const e = new Error("retrieval unavailable");
+  const c = classifyIntelError(err, { noun: "retrieval" });
+  const e = new Error(c.message);
   e.masked = true;
+  e.category = c.category;
+  if (typeof c.status === "number") e.status = c.status;
+  if (c.transient) e.transient = true;
+  if (c.billing) e.billing = true;
+  if (c.reason) e.reason = c.reason;
+  e.guidance = c.guidance;
   return e;
 }
 
@@ -160,7 +155,17 @@ export async function runRetrieveKnowledge(args, deps) {
     } catch (err) {
       lastErr = err;
       const lastAttempt = attempt === MAX_RETRIEVE_ATTEMPTS - 1;
-      if (!isTransient(err) || lastAttempt) break;
+      // Retry the two self-clearing failure classes: an infra blip
+      // (transport/5xx/429) AND a transient billing hold (402 FULLY_RESERVED /
+      // NOT_PROVISIONED), whose balance returns at settlement. The short backoff
+      // below is deliberate for BOTH: a synchronous, human-facing tool must not
+      // block for a multi-second settlement, so we catch only fast clears here
+      // (an intel restart window, a payer mid-mint, a single sibling settling)
+      // and otherwise surface the honest "retry shortly" message for the agent
+      // to re-call. A TERMINAL 402 (NO_PAYER / EXHAUSTED) is never retried.
+      const retryable =
+        isTransientIntelError(err) || isTransientBillingDenial(err);
+      if (!retryable || lastAttempt) break;
       const backoff =
         RETRIEVE_BACKOFF_MS[attempt] ??
         RETRIEVE_BACKOFF_MS[RETRIEVE_BACKOFF_MS.length - 1];

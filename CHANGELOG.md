@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.27 (2026-07-24)
+
+0.2.27 makes `mla scan` a reconciliation producer and makes the CLI honest about why an answer
+came back thin. When you scan a checkout that carries governed instructions, `mla` now uploads a
+snapshot of them so the backend can reconcile what your working tree still assumes against what has
+since been decided, closing the loop that surfaces drift and supersession back to you. And when
+evidence is missing, the per-turn recap stops flattening every empty result into one shrug: it tells
+a real evidence-backend outage apart from a legitimate no-match, separates a correct abstain from a
+genuine should-have-matched miss, and treats a transient billing hold (a reserved or not-yet
+provisioned balance) as retryable rather than a hard failure. You can finally tell "nothing to say"
+from "something broke."
+
+- `mla scan` uploads repo-instruction snapshots so the backend can reconcile drift (reconciliation producer)
+- the per-turn recap distinguishes an evidence-backend outage from a merits-based no-match
+- NO_OFFER is split into a correct abstain versus a should-have-matched miss
+- intel evidence failures surface through a discriminated, leak-free classifier
+- a FULLY_RESERVED / NOT_PROVISIONED 402 is treated as a transient billing hold, not a hard failure
+
 ## 0.2.26 (2026-07-23)
 
 0.2.25 captured your Codex work; 0.2.26 puts governed reconciliation in front of the agent while it

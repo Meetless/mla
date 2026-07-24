@@ -54,6 +54,10 @@ const ALWAYS_SEND = new Set<string>([
   "status", // HTTP status code: low-cardinality integer, never content
   "http_status",
   "status_code",
+  // Billing sub-reason enum from a 402 (e.g. "NO_PAYER"). Bounded to a short
+  // SCREAMING_SNAKE token at the MCP boundary (intel_error_mask.js SAFE_ENUM)
+  // before it ever reaches here, so it is a low-cardinality enum, never content.
+  "billing_reason",
 ]);
 
 // Never sent: content and anything that can carry customer / security context.
@@ -403,6 +407,74 @@ export function recordTelemetryUploadFailure(
     failure_class: FAILURE_TELEMETRY_UPLOAD_FAILED,
     severity: "warning",
     surface: ctx.surface ?? "mla-cli",
+    metadata_only_context: context,
+  };
+  if (ctx.traceId) event.trace_id = ctx.traceId;
+  if (ctx.workspaceId) event.workspace_id = ctx.workspaceId;
+  if (ctx.sessionId) event.session_id = ctx.sessionId;
+  return appendDeadletter(event, opts);
+}
+
+// ---------------------------------------------------------------------------
+// MCP-evidence-unavailable detector: an MCP evidence tool (retrieve_knowledge /
+// query) called intel and the call failed for an intel-side reason (a 402
+// billing denial, an auth failure, a 5xx/transport blip). One structured record
+// per failure so the dogfood loop's friction is countable instead of vanishing
+// into a masked one-line string the agent reads and forgets.
+//
+// This is a CLI-MCP-LOCAL class (like F8 telemetry_upload_failed): the signal is
+// observed entirely on the operator's machine, at the MCP<->intel seam the CLI
+// owns, so it has NO intel twin to keep in lockstep. It routes to the LOCAL
+// deadletter, never straight to Sentry; a single billing denial is expected
+// friction (bind a payer), a recurrence is what an operator should escalate.
+//
+// The payload is enum/status/id ONLY: the tool name, the discriminated reason
+// (the failure category: auth | payment_required | unavailable | error), the
+// HTTP status, and the bounded billing sub-reason enum (NO_PAYER). It never
+// carries the query text or the raw intel error (INV-POSTHOG-PII-1); the MCP
+// boundary already stripped substrate, and sanitizeTelemetry re-checks here.
+// ---------------------------------------------------------------------------
+
+export const FAILURE_MCP_EVIDENCE_UNAVAILABLE = "mcp_evidence_unavailable";
+
+export interface McpEvidenceUnavailableCtx {
+  traceId?: string | null;
+  workspaceId?: string | null;
+  sessionId?: string | null;
+  surface?: string;
+  // The MCP tool that failed, e.g. "meetless__retrieve_knowledge". Low-cardinality
+  // tool name, allowlisted as `tool`.
+  tool?: string;
+  // The discriminated failure category from intel_error_mask.js: one of
+  // auth | payment_required | unavailable | error. Allowlisted as reason_code.
+  reasonCode?: string;
+  // The intel HTTP status (402, 503, ...). Numeric only; undefined for a pure
+  // transport failure (connection refused mid-restart).
+  status?: number;
+  // The bounded billing sub-reason enum (e.g. "NO_PAYER") for a 402. Already
+  // clamped to a SCREAMING_SNAKE token at the MCP boundary; allowlisted here as
+  // billing_reason. Absent for non-billing failures.
+  billingReason?: string;
+}
+
+// Record an MCP-evidence-unavailable failure to the deadletter. Returns the
+// record (for tests/logging) or null when the kill switch is on or the write
+// failed. Never throws: recording friction must not itself break the tool call.
+export function recordMcpEvidenceUnavailable(
+  ctx: McpEvidenceUnavailableCtx,
+  opts: { env?: NodeJS.ProcessEnv; now?: number } = {},
+): DeadletterRecord | null {
+  const env = opts.env ?? process.env;
+  if (telemetryDisabled(env)) return null;
+  const context: Record<string, unknown> = {};
+  if (ctx.tool) context.tool = ctx.tool;
+  if (ctx.reasonCode) context.reason_code = ctx.reasonCode;
+  if (typeof ctx.status === "number") context.status = ctx.status;
+  if (ctx.billingReason) context.billing_reason = ctx.billingReason;
+  const event: Record<string, unknown> = {
+    failure_class: FAILURE_MCP_EVIDENCE_UNAVAILABLE,
+    severity: "warning",
+    surface: ctx.surface ?? "mla-mcp",
     metadata_only_context: context,
   };
   if (ctx.traceId) event.trace_id = ctx.traceId;

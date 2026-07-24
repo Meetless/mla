@@ -11,9 +11,24 @@ import {
 } from "../../src/commands/scan-context";
 import { readScanCache, writeVerdicts } from "../../src/lib/scanner/cache";
 import type { DeliveryOutcome } from "../../src/lib/rules/bundle-refresh";
+import type { SnapshotUploadArgs, SnapshotUploadOutcome } from "../../src/lib/rules/snapshot-upload";
 import type { ReconciliationFinding } from "../../src/lib/scanner/types";
 
 function git(cwd: string, args: string[]) { execFileSync("git", args, { cwd, stdio: "ignore" }); }
+
+/**
+ * A no-op successful snapshot upload, injected wherever a runScanContext spec is not exercising the
+ * PUSH itself. The default `uploadSnapshots` hits the real config loader (delivered:false, "not
+ * logged in"), which would spuriously add the publish-failure warning to specs that assert a clean
+ * stderr. Those specs care about the pulls, not the push; this holds the push out of their way.
+ */
+const okUpload = async (): Promise<SnapshotUploadOutcome> => ({
+  delivered: true,
+  attempted: 0,
+  uploaded: 0,
+  skipped: 0,
+  failed: 0,
+});
 
 /** One §3.5 reconciliation finding in cache shape, shared by the rescan and the runScanContext specs. */
 const FINDING: ReconciliationFinding = {
@@ -266,6 +281,7 @@ describe("runScanContext", () => {
 
     const code = await runScanContext([], {
       refreshBundle: async (ws) => { asked.push(ws); return { delivered: true }; },
+      uploadSnapshots: okUpload,
       home,
       out: o, err: e,
     });
@@ -332,6 +348,7 @@ describe("runScanContext", () => {
         asked.push(ws);
         return { findings: [FINDING], truncated: false };
       },
+      uploadSnapshots: okUpload,
       home,
       out: o, err: e,
     });
@@ -371,6 +388,83 @@ describe("runScanContext", () => {
 
     expect(code2).toBe(0);
     expect(readScanCache(home, "ws-scan")!.reconciliationFindings).toEqual([FINDING]);
+  });
+
+  // The PRODUCER half (ADR §4.2): the scan uploads a server-visible revision of every instruction
+  // file it saw, so control's detector has an artifact to scan a superseded decision against. The
+  // args must carry the SCAN's provenance (paths, commit, timestamp) and the per-CHECKOUT identity.
+  it("uploads a snapshot for each scanned instruction file, keyed by the per-checkout id (not the workspaceId)", async () => {
+    const { o, e } = sink();
+    let captured: SnapshotUploadArgs | undefined;
+
+    const code = await runScanContext([], {
+      refreshBundle: async () => ({ delivered: true }),
+      uploadSnapshots: async (a) => {
+        captured = a;
+        return { delivered: true, attempted: a.paths.length, uploaded: a.paths.length, skipped: 0, failed: 0 };
+      },
+      home,
+      out: o, err: e,
+    });
+
+    expect(code).toBe(0);
+    expect(captured).toBeDefined();
+    expect(captured!.workspaceId).toBe("ws-scan");
+    // repositoryId is the realpath of the scan root, NOT the workspaceId: two checkouts of one
+    // workspace must not stomp each other's revisions under control's (workspace, repo, path) key.
+    expect(captured!.repositoryId).not.toBe("ws-scan");
+    expect(captured!.repositoryId).toContain("mla-rsc-repo");
+    expect(captured!.paths).toContain("CLAUDE.md");
+    expect(captured!.observedCommitSha).toBeTruthy();
+    expect(captured!.observedAt).toBeTruthy();
+  });
+
+  // Warn about a failed PUSH only when the PULL succeeded. A push that failed for the same reason
+  // the pull failed (logged out, unbound) is already covered by the refresh warning; repeating it is
+  // noise. A refresh that worked proves auth + binding, so a push that still could not start is a
+  // genuine surprise worth its own line.
+  it("warns when the refresh succeeded but the snapshot upload could not start", async () => {
+    const { err, o, e } = sink();
+
+    const code = await runScanContext([], {
+      refreshBundle: async () => ({ delivered: true }),
+      uploadSnapshots: async () => ({ delivered: false, error: "not logged in" }),
+      home,
+      out: o, err: e,
+    });
+
+    expect(code).toBe(0);
+    expect(err.join("\n")).toContain("could not publish instruction-file snapshots");
+    expect(err.join("\n")).toContain("not logged in");
+  });
+
+  it("does NOT add a snapshot warning when the refresh itself failed (no duplicate noise)", async () => {
+    const { err, o, e } = sink();
+
+    const code = await runScanContext([], {
+      refreshBundle: async (): Promise<DeliveryOutcome> => ({ delivered: false, error: "ECONNREFUSED" }),
+      uploadSnapshots: async () => ({ delivered: false, error: "not logged in" }),
+      home,
+      out: o, err: e,
+    });
+
+    expect(code).toBe(0);
+    expect(err.join("\n")).toContain("could not refresh the rule bundle");
+    expect(err.join("\n")).not.toContain("could not publish instruction-file snapshots");
+  });
+
+  it("warns when some snapshot uploads failed mid-pass", async () => {
+    const { err, o, e } = sink();
+
+    const code = await runScanContext([], {
+      refreshBundle: async () => ({ delivered: true }),
+      uploadSnapshots: async () => ({ delivered: true, attempted: 2, uploaded: 1, skipped: 0, failed: 1 }),
+      home,
+      out: o, err: e,
+    });
+
+    expect(code).toBe(0);
+    expect(err.join("\n")).toContain("1 of 2 instruction-file snapshot uploads failed");
   });
 
   it("fails with a usage error and never touches the network when no workspace can be resolved", async () => {

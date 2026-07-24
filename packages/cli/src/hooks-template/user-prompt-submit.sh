@@ -539,6 +539,7 @@ write_trace() {
     --argjson classification "${CLASSIFICATION_JSON:-null}" \
     --argjson steps "${STEPS_JSON:-[]}" \
     --argjson enrichment "${ENRICHMENT_JSON:-null}" \
+    --argjson governed_kb_trace "${GOVERNED_KB_TRACE_JSON:-null}" \
     --arg arb_decision "$ARB_DECISION" \
     --arg arb_reason "$ARB_REASON" \
     --argjson dac "${DISCARDED_AFTER_COMPUTE:-false}" \
@@ -564,6 +565,7 @@ write_trace() {
       classification: $classification,
       steps: $steps,
       enrichment: $enrichment,
+      governed_kb_trace: $governed_kb_trace,
       arbitration: {decision: $arb_decision, reason: $arb_reason, discarded_after_compute: $dac},
       hook: {intercept_latency_ms: $intercept_latency_ms,
         enrich_latency_ms: $enrich_latency_ms, deadline_ms: 30000,
@@ -1259,6 +1261,13 @@ ${PROMPT:$((PLEN - 500))}"
           ENRICH_STATUS="$(jq -r '.enrichment.status // "error"' "$ENRICH_OUT" 2>/dev/null || printf error)"
           ENRICH_CONFIDENCE="$(jq -r '.enrichment.confidence // empty' "$ENRICH_OUT" 2>/dev/null || true)"
           ENRICH_MARKDOWN="$(jq -r '.enrichment.markdown // empty' "$ENRICH_OUT" 2>/dev/null || true)"
+          # Item 4: persist intel's governed-KB enrich trace verbatim (EnrichResponse.trace).
+          # It carries the abstain-vs-miss discriminator (retrieved_count vs
+          # selected_count + primary_no_offer_reason) the per-turn recap needs to
+          # split a NO_OFFER into "correctly abstained" vs "should have matched".
+          # Absent on non-governed-KB strategies, so `// null` keeps the field typed.
+          GOVERNED_KB_TRACE_JSON="$(jq -c '.trace // null' "$ENRICH_OUT" 2>/dev/null || printf 'null')"
+          [[ -z "$GOVERNED_KB_TRACE_JSON" ]] && GOVERNED_KB_TRACE_JSON="null"
           # PE (§5.4.1): pull the typed coordination triggers off the enrichment and
           # HARD-FILTER them to the closed enum. A string element normalizes to
           # {type}; an object keeps {type, ref?, surface?}. Any element whose type is
@@ -1291,6 +1300,10 @@ ${PROMPT:$((PLEN - 500))}"
           elif [[ "$ENRICH_FAIL_REASON" == "unauthorized" ]]; then ENRICH_STATUS="unauthorized"
           else ENRICH_STATUS="error"; fi
           ENRICHMENT_JSON="$(synth_enrichment "$ENRICH_STATUS")"
+          # No governed-KB trace on a failed/absent enrich; reset so a prior
+          # call's value (parse_enrich runs again after a 401 refresh+retry)
+          # can never leak into this turn's line.
+          GOVERNED_KB_TRACE_JSON="null"
         fi
       }
 

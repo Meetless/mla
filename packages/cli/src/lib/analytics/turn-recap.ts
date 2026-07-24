@@ -25,6 +25,20 @@ export type Verdict = "USED" | "IGNORED" | "NO_OFFER" | "NOT_RUN";
 
 export type NotRunReason = "muted" | "not_activated" | "suppressed" | "timeout" | "error";
 
+// The Item 4 discriminator: when mla ran but offered nothing, WHY. intel already
+// classified the reason (enrich_no_offer.py) and rides it back on the enrich
+// trace; this collapses that taxonomy into the one distinction An asked for --
+// "correctly abstained" vs "should have matched but didn't" vs "the seam failed".
+//   correct_abstain    -- there was nothing to offer (zero_candidates) or a
+//                         deliberate safe abstain (unresolved_conflict).
+//   should_have_matched-- candidates existed but the score floor / cap / router
+//                         dropped them all (all_failed_relevance,
+//                         router_low_confidence). THIS is the recall/ranking debt.
+//   provider_failure   -- a surface was degraded or the budget was blown
+//                         (surface_provider_missing, over_budget); not a recall
+//                         gap, a plumbing gap.
+export type AbstainClass = "correct_abstain" | "should_have_matched" | "provider_failure" | null;
+
 export interface TurnRecap {
   session_id: string;
   turn_index: number;
@@ -43,6 +57,23 @@ export interface TurnRecap {
   offered_source_ids: string[];
   zero_results: boolean;
   coverage_gap_type: string | null; // why nothing was offered, if applicable
+
+  // A NO_OFFER is honest only if you can tell "we looked, nothing matched" from
+  // "we could not look because the evidence backend was down". This is true only
+  // for the second case: the enrich call could not get a usable answer from intel
+  // (unreachable / timed out / errored), so this NO_OFFER is a backend outage, NOT
+  // a merits result. False for a merits abstain and for enrich_unauthorized (intel
+  // is UP; the session just needs re-auth). See notes/20260514-dogfood-friction.md.
+  evidence_layer_down: boolean;
+
+  // Enrichment instrumentation (Item 4). These come from the governed-KB enrich
+  // trace intel returns; null on turns predating the trace or that never ran
+  // enrich. retrieved_count is the candidate count BEFORE the score-floor/cap;
+  // selected_count is how many survived to render. retrieved>0 && selected==0 is
+  // the "should have matched" signature: we found candidates and dropped them all.
+  retrieved_count: number | null;
+  selected_count: number | null;
+  abstain_class: AbstainClass;
 
   // Followthrough (answers "how useful was it?")
   evidence_tools_pulled: string[]; // distinct meetless evidence tools called this turn
@@ -73,6 +104,11 @@ export interface AskTrace {
   fail_open_reason: string | null;
   not_run_reason: NotRunReason | null;
   has_error: boolean;
+  // From the governed-KB enrich trace the hook now persists (Item 4). Null when
+  // the line predates the trace or enrich never produced one.
+  retrieved_count: number | null;
+  selected_count: number | null;
+  primary_no_offer_reason: string | null;
 }
 
 function asObj(v: unknown): Record<string, unknown> {
@@ -120,6 +156,10 @@ export function parseAskTrace(line: Record<string, unknown>): AskTrace | null {
   // explicitly; accept it from hook or top-level so the writer has either home.
   const explicitReason = asNotRunReason(hook.not_run_reason) ?? asNotRunReason(line.not_run_reason);
 
+  // The governed-KB enrich trace (Item 4). The hook writes it verbatim under
+  // governed_kb_trace; old lines simply lack the key and read as all-null.
+  const gkb = asObj(line.governed_kb_trace);
+
   return {
     session_id,
     turn_index,
@@ -132,6 +172,9 @@ export function parseAskTrace(line: Record<string, unknown>): AskTrace | null {
     fail_open_reason: failOpen || null,
     not_run_reason: explicitReason,
     has_error: line.error != null,
+    retrieved_count: asNum(gkb.retrieved_count),
+    selected_count: asNum(gkb.selected_count),
+    primary_no_offer_reason: asStr(gkb.primary_no_offer_reason) || null,
   };
 }
 
@@ -152,16 +195,60 @@ function deriveNotRunReason(t: AskTrace | null): NotRunReason | null {
 // Why nothing was OFFERED this turn though mla ran (floor injected, no evidence).
 // Feeds the NO_OFFER footer and the session-level "coverage gaps" vocabulary.
 function deriveCoverageGap(t: AskTrace): string | null {
+  // Prefer intel's own classification: enrich_no_offer.py already ranked the
+  // reason with a precedence the hook now persists verbatim. Old ask-traces
+  // lines predate the trace and fall back to the arb/fail-open heuristic below.
+  if (t.primary_no_offer_reason) return t.primary_no_offer_reason;
   const arb = t.arb_reason.toLowerCase();
   const fail = (t.fail_open_reason ?? "").toLowerCase();
   if (arb.includes("no_relevant_context")) return "no_relevant_context";
   // Auth rejection (expired/revoked CLI token) is checked before the generic
   // error so a dead session reads as "re-auth", not "enrichment failed".
   if (fail === "unauthorized" || arb.includes("unauthorized")) return "enrich_unauthorized";
+  // Connection refused / DNS / network: the hook records fail_open_reason
+  // "intel_down" (arb "enrichment_intel_down"). Without this branch it matched
+  // NEITHER "timeout" NOR "error" and fell through to null -> "nothing relevant
+  // offered", i.e. the textbook outage rendered exactly like a merits abstain.
+  if (fail === "intel_down" || arb.includes("intel_down")) return "enrich_unreachable";
   if (fail === "timeout" || arb.includes("timeout")) return "enrich_timeout";
   if (fail === "error" || arb.includes("error")) return "enrich_error";
   if (arb.includes("missing_token")) return "missing_token";
   return null;
+}
+
+// Map intel's no_offer_reason taxonomy to the one distinction that drives action
+// (see AbstainClass). Only the six governed-KB reasons classify; anything else
+// (the legacy arb/fail-open strings, or no trace at all) stays null, because we
+// cannot honestly say whether a pre-trace NO_OFFER was a correct abstain or a
+// missed match. Null here means "instrumentation absent", not "correct abstain".
+function deriveAbstainClass(reason: string | null): AbstainClass {
+  switch (reason) {
+    case "zero_candidates":
+    case "unresolved_conflict":
+      return "correct_abstain";
+    case "all_failed_relevance":
+    case "router_low_confidence":
+      return "should_have_matched";
+    case "surface_provider_missing":
+    case "over_budget":
+      return "provider_failure";
+    default:
+      return null;
+  }
+}
+
+// The coverage-gap types that mean "the enrich call could not GET a usable answer
+// from intel" (backend down, no response in budget, or an error body), as opposed
+// to a merits abstain (intel answered and offered nothing) or enrich_unauthorized
+// (intel is UP; re-auth). Only these flip evidence_layer_down.
+const EVIDENCE_DOWN_GAPS = new Set(["enrich_unreachable", "enrich_timeout", "enrich_error"]);
+
+// True only when a NO_OFFER is caused by a retrieval-backend OUTAGE, so an operator
+// never mistakes "we could not look" for "we looked, nothing matched". Keyed off
+// the coverage gap (not the verdict alone) so it stays null-safe on every other
+// verdict, where coverage_gap_type is null.
+function deriveEvidenceLayerDown(verdict: Verdict, coverageGap: string | null): boolean {
+  return verdict === "NO_OFFER" && coverageGap != null && EVIDENCE_DOWN_GAPS.has(coverageGap);
 }
 
 // --- the join ----------------------------------------------------------------
@@ -217,6 +304,11 @@ export function computeTurnRecap(sessionId: string, turnIndex: number, deps: Tur
   else if (referenced_source_ids.length === 0) verdict = "IGNORED";
   else verdict = "USED";
 
+  // The abstain class is only meaningful when mla ran and offered nothing; a
+  // turn that offered evidence has no NO_OFFER reason to classify.
+  const abstain_class = verdict === "NO_OFFER" ? deriveAbstainClass(trace?.primary_no_offer_reason ?? null) : null;
+  const evidence_layer_down = deriveEvidenceLayerDown(verdict, coverage_gap_type);
+
   return {
     session_id: sessionId,
     turn_index: turnIndex,
@@ -230,6 +322,10 @@ export function computeTurnRecap(sessionId: string, turnIndex: number, deps: Tur
     offered_source_ids,
     zero_results: !evidence_offered,
     coverage_gap_type,
+    evidence_layer_down,
+    retrieved_count: trace?.retrieved_count ?? null,
+    selected_count: trace?.selected_count ?? null,
+    abstain_class,
     evidence_tools_pulled: Array.from(toolSet),
     pull_count,
     referenced_source_ids,
@@ -242,8 +338,11 @@ export function computeTurnRecap(sessionId: string, turnIndex: number, deps: Tur
 
 function gapPhrase(t: string | null): string {
   switch (t) {
+    // Legacy arb/fail-open reasons (pre-Item-4 lines).
     case "no_relevant_context":
       return "no candidate matched your prompt";
+    case "enrich_unreachable":
+      return "could not reach intel";
     case "enrich_timeout":
       return "enrichment timed out";
     case "enrich_unauthorized":
@@ -252,9 +351,30 @@ function gapPhrase(t: string | null): string {
       return "enrichment failed";
     case "missing_token":
       return "no auth token";
+    // intel's governed-KB no_offer taxonomy (enrich_no_offer.py), persisted verbatim.
+    case "zero_candidates":
+      return "retrieval found nothing to offer";
+    case "all_failed_relevance":
+      return "candidates found but all fell below the score floor";
+    case "router_low_confidence":
+      return "router was not confident enough to retrieve";
+    case "unresolved_conflict":
+      return "abstained on an unresolved conflict";
+    case "surface_provider_missing":
+      return "a source surface was unavailable";
+    case "over_budget":
+      return "enrichment budget was exhausted";
     default:
       return "nothing relevant offered";
   }
+}
+
+// The counts+class tail appended to a NO_OFFER footer when the governed-KB trace
+// is present. "retrieved 5, selected 0 · should_have_matched" is the whole point
+// of Item 4: it makes a dropped-all-candidates miss visible at a glance.
+function abstainPhrase(r: TurnRecap): string {
+  const counts = `retrieved ${r.retrieved_count}, selected ${r.selected_count ?? 0}`;
+  return r.abstain_class ? `${counts} · ${r.abstain_class}` : counts;
 }
 
 function notRunPhrase(r: NotRunReason | null): string {
@@ -289,7 +409,18 @@ function citedPhrase(r: TurnRecap): string {
 export function renderFooter(r: TurnRecap): string {
   const head = `🔎 mla · turn ${r.turn_index}`;
   if (r.verdict === "NOT_RUN") return `${head} · ${notRunPhrase(r.not_run_reason)} · NOT_RUN`;
-  if (r.verdict === "NO_OFFER") return `${head} · floor only · ${gapPhrase(r.coverage_gap_type)} · NO_OFFER`;
+  if (r.verdict === "NO_OFFER") {
+    // Outage first: a NO_OFFER caused by the evidence backend being down must be
+    // unmistakable, never read as "we looked, nothing matched". No governed-KB
+    // trace rides an outage, so there are no counts to append here.
+    if (r.evidence_layer_down) {
+      return `${head} · floor only · ⚠ evidence layer DOWN (${gapPhrase(r.coverage_gap_type)}) · NO_OFFER`;
+    }
+    // Append the retrieved/selected counts + abstain class only when the
+    // governed-KB trace is present, so pre-Item-4 lines keep their exact format.
+    const tail = r.retrieved_count != null ? ` · ${abstainPhrase(r)}` : "";
+    return `${head} · floor only · ${gapPhrase(r.coverage_gap_type)}${tail} · NO_OFFER`;
+  }
   const latency = r.enrich_latency_ms != null ? `${r.enrich_latency_ms}ms` : "?ms";
   const offer = `evidence injected (${r.offered_source_ids.length} src, ${latency})`;
   return `${head} · ${offer} · pulled ${pulledPhrase(r)} · cited ${citedPhrase(r)} · ${r.verdict}`;
@@ -328,6 +459,18 @@ export function renderBlock(r: TurnRecap): string {
     `  referenced: ${r.referenced_source_ids.length ? r.referenced_source_ids.join(", ") : "none"}`,
     `  verdict:    ${r.verdict}`,
   ];
+  // Outage callout: make an evidence-backend-down NO_OFFER impossible to misread
+  // as a merits result in the expanded view too.
+  if (r.evidence_layer_down) {
+    lines.push(`  ⚠ evidence layer DOWN: this NO_OFFER is a backend outage, not a merits result`);
+  }
+  // Enrichment instrumentation (Item 4): only shown when the governed-KB trace
+  // rode back, so USED turns and pre-trace lines stay unchanged.
+  if (r.retrieved_count != null) {
+    lines.push(`  retrieved:  ${r.retrieved_count}`);
+    lines.push(`  selected:   ${r.selected_count ?? 0}`);
+    if (r.abstain_class) lines.push(`  class:      ${r.abstain_class}`);
+  }
   if (r.trace_id) lines.push(`  trace:      ${r.trace_id}`);
   return lines.join("\n");
 }

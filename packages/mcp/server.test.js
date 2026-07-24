@@ -222,6 +222,183 @@ test("dispatchTool reports unknown tools as isError", async () => {
   assert.ok(String(body.error).includes("unknown tool"));
 });
 
+// ---------- Item 1/3: meetless__query masks a real intel failure -------------
+//
+// The query path hits intel for every mode but compare. A real intel HTTP /
+// transport failure MUST be masked (SEC-3.2) and discriminated (Item 3), NOT
+// passed through raw with a blanket "grep is OK". A 402 billing denial is the
+// keystone: it is not an outage and grep is not a substitute.
+
+test("meetless__query masks a 402 billing denial (discriminated, no leak, no 'grep is OK')", async () => {
+  const body = JSON.stringify({
+    detail: { code: "BILLING_DENIED", reason: "NO_PAYER", note: "acme owes $ at billing.internal:5432" },
+  });
+  const askModes = stubAskModes({
+    runAnswer: async () => {
+      const e = new Error(`intel /v1/ask 402: ${body}`);
+      e.status = 402;
+      e.body = body;
+      throw e;
+    },
+  });
+  const result = await dispatchTool(
+    "meetless__query",
+    { mode: "answer", query: "what did we decide about X?" },
+    baseDeps({ askModes }),
+  );
+  assert.equal(result.isError, true);
+  const out = parseResult(result);
+  assert.match(out.error, /billing denied/i);
+  assert.match(out.error, /NO_PAYER/);
+  assert.equal(out.status, 402);
+  assert.equal(out.category, "payment_required");
+  assert.ok(Array.isArray(out.warnings) && out.warnings.length === 1);
+  assert.match(out.warnings[0], /do not fall back to grep/i);
+  // no substrate leak, and NOT the old blanket "falling back to grep is OK"
+  assert.ok(!out.error.includes("acme"));
+  assert.ok(!out.error.includes("billing.internal"));
+  assert.ok(!JSON.stringify(out).includes("falling back to grep is OK"));
+});
+
+test("meetless__query masks a 5xx as a transient outage (retryable, grep is a stopgap)", async () => {
+  const askModes = stubAskModes({
+    runAnswer: async () => {
+      const e = new Error("intel /v1/ask 503: weaviate at 127.0.0.1:8100");
+      e.status = 503;
+      throw e;
+    },
+  });
+  const result = await dispatchTool(
+    "meetless__query",
+    { mode: "answer", query: "q" },
+    baseDeps({ askModes }),
+  );
+  const out = parseResult(result);
+  assert.match(out.error, /temporarily unavailable/i);
+  assert.equal(out.status, 503);
+  assert.equal(out.category, "unavailable");
+  assert.ok(!out.error.includes("127.0.0.1"));
+  assert.ok(!out.error.includes("weaviate"));
+});
+
+test("meetless__query masks a transport failure (no status) as an outage", async () => {
+  const askModes = stubAskModes({
+    runAnswer: async () => {
+      throw new TypeError("fetch failed");
+    },
+  });
+  const result = await dispatchTool(
+    "meetless__query",
+    { mode: "answer", query: "q" },
+    baseDeps({ askModes }),
+  );
+  const out = parseResult(result);
+  assert.match(out.error, /temporarily unavailable/i);
+  assert.equal(out.category, "unavailable");
+});
+
+test("meetless__query PASSES THROUGH a deterministic error (unsupported mode) unmasked", async () => {
+  // Not an intel transport/HTTP failure: the agent must see the original wording
+  // so it can self-correct, and the legacy grep stopgap guidance is fine here.
+  const result = await dispatchTool(
+    "meetless__query",
+    { mode: "frobnicate", query: "q" },
+    baseDeps(),
+  );
+  const out = parseResult(result);
+  assert.match(String(out.error), /unsupported mode/i);
+  assert.equal(out.category, undefined); // not classified
+  assert.ok(JSON.stringify(out).includes("falling back to grep is OK"));
+});
+
+// ---------- Item 5: the sanitized friction sink fires on every MCP failure ----
+//
+// server.js stays pure (no fs/env); the CALLER injects recordFailure. On a masked
+// intel failure it must receive ONE enum-only record (tool, category, status,
+// billing sub-reason). A validation error must NOT fire it (no category).
+
+test("recordFailure fires for a query 402 with an enum-only payload", async () => {
+  const seen = [];
+  const askModes = stubAskModes({
+    runAnswer: async () => {
+      const e = new Error("intel /v1/ask 402");
+      e.status = 402;
+      e.body = JSON.stringify({ detail: { reason: "NO_PAYER" } });
+      throw e;
+    },
+  });
+  await dispatchTool(
+    "meetless__query",
+    { mode: "answer", query: "secret query text" },
+    baseDeps({ askModes, recordFailure: (rec) => seen.push(rec) }),
+  );
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0], {
+    tool: "meetless__query",
+    reasonCode: "payment_required",
+    status: 402,
+    billingReason: "NO_PAYER",
+  });
+  // the payload carries no query text (INV-POSTHOG-PII-1)
+  assert.ok(!JSON.stringify(seen[0]).includes("secret query text"));
+});
+
+test("recordFailure fires for a retrieve 402 (masked upstream), enum-only", async () => {
+  const seen = [];
+  const intelFetch = async () => {
+    const e = new Error("intel POST /v1/ask/retrieve 402");
+    e.status = 402;
+    e.body = JSON.stringify({ detail: { reason: "NO_PAYER" } });
+    throw e;
+  };
+  await dispatchTool(
+    "meetless__retrieve_knowledge",
+    { query: "q" },
+    baseDeps({ intelFetch, recordFailure: (rec) => seen.push(rec) }),
+  );
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].tool, "meetless__retrieve_knowledge");
+  assert.equal(seen[0].reasonCode, "payment_required");
+  assert.equal(seen[0].status, 402);
+  assert.equal(seen[0].billingReason, "NO_PAYER");
+});
+
+test("recordFailure does NOT fire for a deterministic validation error (no category)", async () => {
+  const seen = [];
+  await dispatchTool(
+    "meetless__query",
+    { mode: "frobnicate", query: "q" },
+    baseDeps({ recordFailure: (rec) => seen.push(rec) }),
+  );
+  assert.equal(seen.length, 0);
+});
+
+test("a throwing recordFailure never breaks the masked tool result", async () => {
+  const askModes = stubAskModes({
+    runAnswer: async () => {
+      const e = new Error("intel /v1/ask 503");
+      e.status = 503;
+      throw e;
+    },
+  });
+  let result;
+  await assert.doesNotThrow?.(async () => {});
+  result = await dispatchTool(
+    "meetless__query",
+    { mode: "answer", query: "q" },
+    baseDeps({
+      askModes,
+      recordFailure: () => {
+        throw new Error("sink boom");
+      },
+    }),
+  );
+  // the tool still returns a clean masked result despite the sink throwing
+  assert.equal(result.isError, true);
+  const out = parseResult(result);
+  assert.match(out.error, /temporarily unavailable/i);
+});
+
 // withStalenessWarning wraps every CallTool result: when the injected staleCheck
 // reports this long-lived server is running code older than the build on disk
 // (the stale-dist footgun behind the "This operation was aborted" reports), it

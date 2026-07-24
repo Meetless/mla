@@ -55,9 +55,40 @@ import { TOOLS, assertReadOnlyManifest } from "./tool_manifest.js";
 import { statusFallback } from "../ask-core/status_fallback.js";
 import { makeIntelAsk, makeAskModes } from "../ask-core/ask_modes.js";
 import { makeMatchCanonical } from "../ask-core/match_canonical.js";
+import {
+  classifyIntelError,
+  isIntelHttpOrTransportError,
+} from "./intel_error_mask.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/**
+ * Hand a masked intel failure to the optional friction sink (Item 5). Builds an
+ * enum-only payload (tool name, discriminated reason_code = the failure
+ * category, HTTP status, and the bounded billing sub-reason) so ONE structured
+ * record marks every MCP evidence failure. `source` is the masked retrieve error
+ * (which carries .category/.status/.reason) or the query path's classified
+ * result. A source with no `.category` is a validation error, not an intel
+ * failure, and is not recorded. Never throws: a friction-sink hiccup must not
+ * turn a cleanly-masked failure into an unmasked crash.
+ */
+function emitEvidenceFailure(recordFailure, tool, source) {
+  if (typeof recordFailure !== "function") return;
+  const category = source && source.category;
+  if (!category) return;
+  try {
+    recordFailure({
+      tool,
+      reasonCode: category,
+      status:
+        source && typeof source.status === "number" ? source.status : undefined,
+      billingReason: source && source.reason ? source.reason : undefined,
+    });
+  } catch {
+    // a friction-sink failure must never break the tool result
+  }
+}
 
 // ---------- Pure tool dispatch ----------------------------------------------
 //
@@ -71,7 +102,15 @@ const __dirname = path.dirname(__filename);
 //   defaultWorkspaceId,                            // the effective workspace
 //   operatorUserId,                                // verdict actorUserId default
 //   mintSubmissionId,                              // per-tool-call delivery key (injectable)
+//   recordFailure,                                 // optional sanitized friction sink (Item 5)
 // }
+//
+// A masked intel failure (billing denial, outage) is also handed to the optional
+// `recordFailure` sink so each MCP failure leaves ONE structured, discriminated
+// friction record. The sink is env/fs-bound, so the CALLER owns it (mla mcp wires
+// it to the failure-telemetry deadletter); server.js stays pure and tests pass no
+// sink at all. The payload is enum/status/id only, never query text or the raw
+// error, so it cannot leak substrate (INV-POSTHOG-PII-1); the sink re-sanitizes.
 export async function dispatchTool(name, args, deps) {
   const {
     controlFetch,
@@ -83,6 +122,7 @@ export async function dispatchTool(name, args, deps) {
     // agent-dismiss runtimeHint. Optional: the legacy env bin leaves it null.
     agentRuntime = null,
     mintSubmissionId = randomUUID,
+    recordFailure = null,
   } = deps;
 
   if (name === "meetless__kb_doc_detail") {
@@ -124,6 +164,10 @@ export async function dispatchTool(name, args, deps) {
       // err is already masked by runRetrieveKnowledge for intel-side failures
       // (SEC-3.2); validation errors (empty query, bad limit) surface as-is so
       // the LLM can self-correct. Either way, no intel substrate leaks here.
+      // For a masked intel failure we also surface the discriminated category +
+      // one-line guidance (Item 3) so the agent knows whether this is a billing
+      // denial to escalate or an infra blip where grep is an acceptable stopgap.
+      emitEvidenceFailure(recordFailure, "meetless__retrieve_knowledge", err);
       return {
         content: [
           {
@@ -132,6 +176,8 @@ export async function dispatchTool(name, args, deps) {
               tool: "meetless__retrieve_knowledge",
               error: String(err.message || err),
               status: err && err.status ? err.status : undefined,
+              category: err && err.category ? err.category : undefined,
+              warnings: err && err.guidance ? [err.guidance] : undefined,
             }),
           },
         ],
@@ -283,6 +329,35 @@ export async function dispatchTool(name, args, deps) {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
     };
   } catch (err) {
+    // meetless__query hits intel (/v1/ask) for every mode except compare. A real
+    // intel transport/HTTP failure MUST be masked (SEC-3.2) and discriminated so
+    // the agent gets the right fallback: a 402 billing denial is NOT an outage
+    // and grep is NOT a valid substitute (the evidence exists, it is gated),
+    // whereas a 5xx/transport blip is retryable. Before this, the query path
+    // surfaced the raw intel error string plus a blanket "falling back to grep is
+    // OK", which was both a substrate leak and wrong guidance for a billing gate.
+    // Deterministic errors (unsupported mode, the pre-shaped synthesis-timeout
+    // line) are NOT intel transport failures; they pass through untouched so the
+    // agent can self-correct on the original, already-safe wording.
+    if (isIntelHttpOrTransportError(err)) {
+      const c = classifyIntelError(err, { noun: "governed memory" });
+      emitEvidenceFailure(recordFailure, "meetless__query", c);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              mode,
+              error: c.message,
+              status: c.status,
+              category: c.category,
+              warnings: [c.guidance],
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
     return {
       content: [
         {
@@ -471,6 +546,11 @@ export function createMcpServer(deps) {
     onStaleRestart = null,
     staleCheckIntervalMs = DEFAULT_STALE_POLL_MS,
     schedule = defaultSchedule,
+    // Optional sanitized friction sink (Item 5). The CLI boot (mla mcp) wires this
+    // to the failure-telemetry deadletter; the legacy env bin and unit tests leave
+    // it null, so dispatchTool's emitEvidenceFailure is a no-op there. server.js
+    // itself never touches fs/env: the caller owns the sink.
+    recordFailure = null,
   } = deps;
 
   // §6.8.2 / §12.2.1: fail loudly if the read-only evidence manifest and the
@@ -493,6 +573,7 @@ export function createMcpServer(deps) {
     defaultWorkspaceId,
     operatorUserId,
     agentRuntime,
+    recordFailure,
   };
 
   const server = new Server(

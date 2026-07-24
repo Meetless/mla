@@ -19,6 +19,18 @@ import { makeMcpStaleCheck } from "../lib/staleness";
 import { MCP_RESTART_EXIT_CODE, isMcpChild } from "../lib/mcp-restart";
 import { installOrphanGuard } from "../lib/orphan-guard";
 import { isPackagedBinary } from "../lib/packaged";
+import { recordMcpEvidenceUnavailable } from "../lib/failure-telemetry";
+
+// The enum-only friction record the MCP server hands us when an evidence tool's
+// intel call fails (Item 5). Substrate is already stripped at the MCP boundary
+// (intel_error_mask.js): tool NAME, discriminated category, HTTP status, and a
+// bounded billing sub-reason enum. Nothing here is free text or query content.
+export interface McpEvidenceFailure {
+  tool: string;
+  reasonCode: string;
+  status?: number;
+  billingReason?: string;
+}
 
 // `mla mcp`: boot the Meetless MCP server authenticated as the logged-in human
 // (cli-config user-token, auto-refreshing) and scoped to the workspace resolved
@@ -61,6 +73,11 @@ export interface ActiveMcpServerDeps {
   // bare / kill-switched run (no parent to respawn it), where staleCheck only
   // warns inline.
   onStaleRestart: (() => void) | null;
+  // Sanitized friction sink (Item 5): the server calls this once per MCP evidence
+  // failure with an enum-only record. We route it to the local telemetry
+  // deadletter (recordMcpEvidenceUnavailable), stamped with this workspace. The
+  // server owns NO fs/env, so the wiring lives here; the closure never throws.
+  recordFailure: (rec: McpEvidenceFailure) => void;
 }
 
 /**
@@ -316,6 +333,20 @@ export async function runMcp(
     onStaleRestart: isMcpChild(argv, env)
       ? () => exit(MCP_RESTART_EXIT_CODE)
       : null,
+    // Item 5: fold every MCP evidence failure into ONE structured, sanitized
+    // deadletter record, stamped with the resolved workspace. recordMcpEvidence-
+    // Unavailable honors the telemetry kill switch and never throws, so this is a
+    // pure side effect that can never break a tool call.
+    recordFailure: (rec: McpEvidenceFailure) => {
+      recordMcpEvidenceUnavailable({
+        tool: rec.tool,
+        reasonCode: rec.reasonCode,
+        status: rec.status,
+        billingReason: rec.billingReason,
+        workspaceId: ctx.workspaceId,
+        surface: "mla-mcp",
+      });
+    },
   };
 
   // Install the worker's death backstops just before serving. The server below
