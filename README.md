@@ -1,14 +1,25 @@
-# mla: the coordination layer for your coding agents
+# mla: proactive project memory for Claude Code and Codex
 
-**Your coding agent owns code. `mla` owns coordination.**
+**`mla` hooks into your Claude Code and Codex sessions, injects approved project
+context before the agent acts, and surfaces contradictions before they become
+rework.**
 
-Works with **Claude Code** and **OpenAI Codex**.
+<p align="center">
+  <img src="docs/assets/mla-demo.gif" width="900"
+       alt="mla injecting governed project context into a Claude Code session and surfacing a conflicting decision before the agent edits code">
+</p>
 
-`mla` (short for **Meetless Agent**) is the command-line client for Meetless. It
-keeps your AI coding agents grounded in the architecture you approved, captures
-the decisions they make each session, flags when a new session contradicts a
-settled one, and lets you approve what becomes project truth for every run that
-follows.
+<p align="center"><em>
+  <a href="https://www.youtube.com/watch?v=N5Lboz7-3A8">Full walkthrough on YouTube</a>
+</em></p>
+
+`mla` (short for **Meetless Agent**) is the command-line client for Meetless. The
+load-bearing word is *proactive*: this is not a memory server your agent has to
+remember to query. It installs as a session hook, so governed context arrives on
+every turn whether the agent thinks to ask or not. It keeps your coding agents
+grounded in the architecture you approved, captures the decisions they make each
+session, flags when a new session contradicts a settled one, and lets you approve
+what becomes project truth for every run that follows.
 
 ## The problem
 
@@ -198,16 +209,21 @@ the distribution channel.
 
 ## Platforms
 
-`mla` is tested on **macOS** and **Linux**. Windows is **community-supported**: it
-runs under [WSL](https://learn.microsoft.com/windows/wsl/), and that is the
-recommended path. Inside your WSL distro, install and use it exactly as on Linux.
+`mla` is tested on **macOS** and **Linux**. Prebuilt binaries currently ship for
+**Apple Silicon macOS** and **x86_64 glibc Linux**. On any other target (Intel
+Mac, ARM Linux, Alpine/musl) the one-liner stops with a clear message and points
+you at `npm i -g @meetless/mla`, which works everywhere Node 22+ runs.
+
+Windows is **community-supported**: it runs under
+[WSL](https://learn.microsoft.com/windows/wsl/), and that is the recommended
+path. Inside your WSL distro, install and use it exactly as on Linux.
 
 If a coding agent drives `mla` from the **Windows** side (Git Bash / PowerShell)
 instead of from inside WSL, call it through WSL and single-quote the argument so
 the path is not rewritten to `C:/Program Files/...` before it reaches WSL:
 
 ```sh
-wsl -e bash -c '$HOME/.meetless/bin/mla <args>'
+wsl -e bash -c '$HOME/.meetless/bin/mla [args...]'
 ```
 
 The single quotes and literal `$HOME` matter: they expand inside WSL, and the
@@ -345,8 +361,9 @@ Building with coding agents and want them to stop drifting? Come talk to us.
 
 ## Where this is going
 
-The wedge is coordination between you and your coding agents. The same governed
-decisions extend to coordination across a team: when several people (and their
+Today the memory is yours: one operator, their agents, one approved architecture.
+The same governed decisions extend to a team. When several people (and their
 agents) work the same codebase, everyone builds on the same approved truth instead
-of re-litigating it in the next session, the next PR, or the next meeting. Less
-rework, fewer reversals, fewer meetings. That is the point of the name.
+of re-litigating it in the next session, the next PR, or the next meeting. Project
+memory at that scale is just coordination, which is where the name comes from:
+less rework, fewer reversals, fewer meetings.
