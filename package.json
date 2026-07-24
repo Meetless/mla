@@ -1,9 +1,8 @@
 {
   "name": "meetless-cli",
-  "version": "0.1.0",
   "license": "Apache-2.0",
   "private": true,
-  "description": "Meetless CLI (mla): extracted, self-contained codebase intended for open source. Seeded from the dogfood agent stack; single source of truth post-cutover.",
+  "description": "Workspace root for the Meetless CLI. This container is not published; the released package is packages/cli (@meetless/mla), which carries the shipped version.",
   "scripts": {
     "build": "pnpm -r run build",
     "test": "pnpm -r run build && pnpm -r run test",
@@ -13,7 +12,7 @@
     "plugin:validate": "pnpm plugin:check && node scripts/validate-plugin.mjs"
   },
   "engines": {
-    "node": ">=18.18.0"
+    "node": ">=22"
   },
   "packageManager": "pnpm@10.28.1",
   "pnpm": {
