@@ -10,7 +10,7 @@ rework.**
 </p>
 
 <p align="center"><em>
-  <a href="https://www.youtube.com/watch?v=N5Lboz7-3A8">Full walkthrough on YouTube</a>
+  <a href="https://youtu.be/xSeo5Ayj9aY">Full walkthrough on YouTube</a>
 </em></p>
 
 `mla` (short for **Meetless Agent**) is the command-line client for Meetless. The
