@@ -157,11 +157,14 @@ Denied and warned attempts are captured as enforcement incidents and surfaced by
 
 ## MCP server
 
-`mla` ships an MCP server (`meetless-mcp`) so any MCP-capable agent (Claude Code,
-Codex, and others) can read governed memory directly. It exposes the retrieval surface
-your agent needs: pull raw evidence with citations, open the full text behind a
-citation, and run a synthesized lookup when you want an answer rather than the
-sources. Point your agent at it once and grounding happens on every turn.
+`mla` ships an MCP server (`meetless-mcp`) so any MCP-capable agent can read
+governed memory directly. It exposes the retrieval surface your agent needs: pull
+raw evidence with citations, open the full text behind a citation, and run a
+synthesized lookup when you want an answer rather than the sources.
+
+Note the difference in how the two halves reach you. Claude Code and Codex get
+proactive per-turn grounding through hooks. MCP-only agents can retrieve governed
+memory directly when they call the server.
 
 ## Quickstart
 
@@ -171,7 +174,7 @@ Install with the one-liner:
 curl -fsSL https://meetless.ai/install.sh | sh
 ```
 
-Prefer a package manager? Every channel installs the same release build:
+Prefer a package manager? Every channel installs the same CLI version:
 
 ```bash
 npm install -g @meetless/mla            # npm (needs Node 22+)
@@ -180,6 +183,10 @@ brew install --cask meetless/tap/mla    # Homebrew (macOS, Apple Silicon)
 
 The one-liner and the Homebrew cask install a self-contained binary and **do not
 need Node at all**. Only the npm package does, and it needs **Node 22+**.
+
+The current macOS binary is ad-hoc signed and not notarized; the Homebrew cask
+removes quarantine as a temporary workaround until Developer-ID notarization is
+enabled.
 
 Then sign in and verify:
 

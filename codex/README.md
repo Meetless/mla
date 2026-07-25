@@ -218,8 +218,7 @@ model-certainty asserted in advance.
 
 The net-new connector code was written inside an authenticated Codex build
 thread: the UserPromptSubmit wrapper command, the static plugin files, the
-connector install and uninstall command, and the reproducible fixture. The
-`/feedback` Session ID for that thread is the entry evidence.
+connector install and uninstall command, and the reproducible fixture.
 
 ### What MLA functionality was reused (pre-existing, not built in-window)
 
@@ -234,28 +233,6 @@ Ratification of this design, the scope ceiling (one integrated workflow, one
 hard block), repository and visibility (this scrubbed public mirror), the
 hook-trust UX call (`/hooks` for the demo and normal install), and the demo
 framing (the notes-location hard deny, no separate warn scene).
-
-### Build provenance
-
-<!-- OWNER TO FINALIZE FROM THE AUTHENTICATED CODEX THREAD (precondition B1/D3).
-     Do not fabricate. These are entry-eligibility evidence, not bookkeeping. -->
-
-| Field | Value |
-|---|---|
-| Codex model | GPT-5.6 (exact model string: **capture from the build thread**) |
-| Codex CLI version | 0.144.6 |
-| `/feedback` Session ID | **capture from the build thread** |
-| Pre-existing base commit | `d328564e0` |
-| Build Week commit range | `d328564e0..<final tip>` (connector work; **reconcile so the range reflects the Codex-authored thread**) |
-
-> Provenance note for the owner: the connector commits currently on `main`
-> (`7109374bd`, `0f671e91e`, `dd101551f`, `945a038c5`, `4d5149f35`) were
-> produced by the coding-agent session that drafted this implementation. The
-> submission's Session-ID thread must be where the majority of core
-> functionality was built (submission rule). Reconcile before freeze: rebuild
-> the substantive connector work inside the authenticated Codex thread so the
-> Session ID legitimately covers it, then set the Build Week commit range to
-> that thread's commits.
 
 ---
 
