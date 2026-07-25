@@ -1,4 +1,4 @@
-# Meetless Codex connector (OpenAI Build Week)
+# Meetless Codex connector
 
 Governed coding for the OpenAI Codex CLI. This connector extends the governance
 loop `mla` already ships for Claude Code (grounding by floor injection plus
@@ -6,15 +6,11 @@ governed retrieval, pre-execution action denial, and enforcement audit) to the
 Codex CLI, with the neutral decision core reused unchanged and one narrow output
 compatibility adaptation for Codex's unsupported `ask` result.
 
-- **Track:** Developer Tools (an MCP plus agent-hooks governance plugin).
-- **Double alignment:** the connector is **built with** Codex and **governs**
-  Codex. The machinery that governs Codex here is the same neutral core that
-  already governs Claude Code.
+- **What it is:** an MCP server plus an agent-hooks governance plugin.
+- **The machinery is shared:** what governs Codex here is the same neutral core
+  that already governs Claude Code. The connector is also itself built with
+  Codex.
 - **Tested against:** Codex CLI `0.144.6`.
-
-> Judges: the hosted, pre-seeded test path and its disposable credentials are in
-> the Devpost **private** testing instructions, not in this public repo. This
-> README explains what the demo shows and how the connector is built and wired.
 
 ---
 
@@ -64,9 +60,9 @@ By default, even a rule that detects a decision contradiction only surfaces
 evidence and warns; it does not block. The demo raises the cap to `deny` for one
 session so the notes-location rule can hard-block visibly. This is deliberate:
 adoption ramps from "notify and acknowledge" to "block," and shipping silent
-hard blocks first would erode trust. The demo video does not show this ladder on
-camera (it crowds the story and advertises the gap); the honest one-sentence
-framing is in the demo narration below, and the full ceiling lives here.
+hard blocks first would erode trust. The demo shows one rung of this ladder in
+action rather than the ladder itself, so read the full ceiling here and treat it
+as part of the claim.
 
 Codex-specific behavior: Codex 0.144.6 does not support
 `permissionDecision: "ask"` on `PreToolUse`; it treats that response as a hook
@@ -105,10 +101,10 @@ property of the model, exercised live at demo time.
 6. Codex **writes to the approved location** (`docs/decisions/`) instead.
 7. The denied attempt **appears in `mla enforcement`** as an audited incident.
 
-**Demo narration (verbatim):**
+**What that demo does and does not prove:**
 
 > MLA surfaced the current decision through governed retrieval. The hard block
-> shown here enforces the approved documentation-location rule. General decision
+> shown enforces the approved documentation-location rule. General decision
 > contradictions are currently advisory by default.
 
 The reproducible fixture for this exact workflow is in
@@ -138,8 +134,8 @@ The decision logic never moves. The connector is registration plus one wrapper.
 
 Codex `0.144.6` registers hooks from a top-level `$CODEX_HOME/hooks.json` (the
 `plugin_hooks` field is gone). The plugin still ships the MCP server; it no
-longer ships hooks. Build-week support is the global `$CODEX_HOME/hooks.json`
-only; per-repo hook overrides are out of scope.
+longer ships hooks. Only the global `$CODEX_HOME/hooks.json` is supported today;
+per-repo hook overrides are not implemented.
 
 ### Governance loop
 
@@ -211,34 +207,33 @@ leaving your own hooks intact.
 
 ## Built with Codex
 
-Per the submission rules, this is stated precisely: no hand-waving, no
-model-certainty asserted in advance.
+Stated precisely, because "built with AI" usually is not.
 
-### What Codex implemented
+### What Codex wrote
 
-The net-new connector code was written inside an authenticated Codex build
-thread: the UserPromptSubmit wrapper command, the static plugin files, the
-connector install and uninstall command, and the reproducible fixture.
+The net-new connector code: the UserPromptSubmit wrapper command, the static
+plugin files, the connector install and uninstall commands, and the reproducible
+fixture.
 
-### What MLA functionality was reused (pre-existing, not built in-window)
+### What already existed
 
 The neutral core: the snake_case input parser, the deny decision core, the
 camelCase envelope renderer, the enforcement-incident capture, the `mla mcp`
 governed-retrieval server, and `.meetless.json` binding. The connector governs
 Codex using machinery that already governs Claude Code.
 
-### Decisions the human owner made
+### What a human decided
 
-Ratification of this design, the scope ceiling (one integrated workflow, one
-hard block), repository and visibility (this scrubbed public mirror), the
-hook-trust UX call (`/hooks` for the demo and normal install), and the demo
-framing (the notes-location hard deny, no separate warn scene).
+Ratification of the design, the scope ceiling (one integrated workflow, one hard
+block), repository and visibility (this scrubbed public mirror), the hook-trust
+UX call (`/hooks` for both the demo and normal install), and the demo framing
+(the notes-location hard deny, no separate warn scene).
 
 ---
 
 ## Scope evolution
 
-The Build Week cut originally managed only UserPromptSubmit and PreToolUse.
+The first cut of this connector managed only UserPromptSubmit and PreToolUse.
 Current Codex exposes the full local lifecycle, so the connector now also
 registers SessionStart, PostToolUse, and Stop. Those events drive real Codex
 session identity, tool/file capture, final-message capture, and finalization in

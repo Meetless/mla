@@ -355,8 +355,8 @@ hook-trust UX, and this repository's public visibility.
 
 Built with Codex CLI `0.144.6` running GPT-5.6.
 
-Full submission notes, the honest enforcement claim, and the demo walkthrough are
-in [`codex/README.md`](codex/README.md). The reproducible fixture is in
+The full connector notes, the honest enforcement claim, and the demo walkthrough
+are in [`codex/README.md`](codex/README.md). The reproducible fixture is in
 [`examples/codex-governed-change/`](examples/codex-governed-change/).
 
 ## Community

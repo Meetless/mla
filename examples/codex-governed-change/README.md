@@ -53,10 +53,9 @@ codex-governed-change/
 - The Meetless MCP plugin registered so Codex can retrieve
   (`codex plugin marketplace add Meetless/mla`, then `codex plugin add
   mla@meetless`), and the repo bound with `mla activate`.
-- A reachable backend: the hosted judge environment, or local Control + Intel.
+- A reachable backend: the hosted Meetless backend, or local Control + Intel.
 - The **notes-location** rule active in the workspace (see
-  `governance/notes-location.md`). In the hosted judge environment it is
-  pre-seeded.
+  `governance/notes-location.md`).
 
 ## Run it
 

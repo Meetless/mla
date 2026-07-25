@@ -20,12 +20,11 @@ contradiction surfaces evidence and warns, but does not block. The
 notes-location rule is the one family that can hard-deny **before execution**,
 and only when the session raises the ceiling with
 `MEETLESS_ACTION_INTERCEPT_MAX=deny`. The demo raises the ceiling for exactly
-this rule so the block is real and visible on camera. Everything else stays
-advisory. See the top-level `README.md` for the full enforcement-ceiling
-explanation.
+this rule so the block is real and visible. Everything else stays advisory. See
+the top-level `README.md` for the full enforcement-ceiling explanation.
 
-## Installing the rule (operator / hosted judge env, §7.1)
+## Installing the rule
 
-In the hosted judge workspace, register this rule so a Markdown write under
-`notes/` is denied and the reason points at `docs/decisions/`. The reset script
-does not touch this rule; it is part of the pre-seeded workspace state.
+A workspace operator registers this rule so a Markdown write under `notes/` is
+denied and the reason points at `docs/decisions/`. The reset script does not
+touch this rule; it is workspace state, not fixture state.
