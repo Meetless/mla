@@ -12,10 +12,13 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import { egressFetch } from "./egress/fetch";
+import { describeEgressRefusal } from "./egress/policy";
 
 import * as Sentry from "@sentry/node";
 import type { FlushFn, FlushPayload, Tracer, TracerOptions } from "@meetless/trace-core";
-import { redact, REDACTED } from "./redactor";
+import { redact } from "./redactor";
+import { redactStructured } from "./redact-structured";
 import { telemetryDisabled } from "./config";
 import { recordTelemetryUploadFailure } from "./failure-telemetry";
 
@@ -139,57 +142,22 @@ export { telemetryDisabled };
 
 let sentryAvailable = false;
 
-// Keys whose VALUE is always a credential regardless of entropy, redacted by
-// name in every Sentry event (breadcrumb data, contexts, extra, tags, request
-// headers, exception/stack vars). This is the §9 Sentry-redaction invariant
-// (Finding K / Patch P7): the observability layer must never ship an
-// Authorization header, access/refresh token, PKCE codeVerifier, control token,
-// or INTERNAL_API_KEY off the machine, even with telemetry enabled.
-//
-// Bare `code` is deliberately ABSENT: it collides with error/status/language
-// codes. The one-time login-grant `code` is 64-hex high-entropy, so it is
-// caught by the value-based redactor (entropy heuristic in redact()) instead.
-const SENTRY_SENSITIVE_KEY =
-  /(authorization|access[_-]?token|refresh[_-]?token|code[_-]?verifier|control[_-]?token|internal[_-]?api[_-]?key|\bapi[_-]?key\b|x-api-key|secret|passw(?:or)?d|\bbearer\b|cookie|\btoken\b)/i;
-
-// Keys carrying NON-secret high-entropy identifiers (trace/span/event/run ids,
-// git sha, build version, environment). These are exactly the strings the value
-// redactor's entropy heuristic would otherwise nuke, and they are the whole
-// point of the observability spine (the cross-plane trace-id join + release
-// correlation). Exempt them from value redaction; everything else high-entropy
-// stays conservatively redacted (over-redaction is the safe failure mode).
-const SENTRY_SAFE_IDENTIFIER_KEY =
-  /^(x-)?(trace|span|event|run)[_-]?id$|^trace_source$|^release$|^dist$|^sha$|^environment$|^mla_version$|^platform$/i;
-
-// One recursive scrub of a Sentry event. Per field: a credential KEY collapses
-// to [REDACTED]; a safe-identifier key passes its value verbatim; every other
-// string runs through the shared value redactor (Bearer/provider tokens, PEM,
-// cookies, and the high-entropy heuristic that catches the grant code +
-// codeVerifier even when they hide in a free-text body).
-function scrubEventNode(value: unknown, keyHint: string | undefined): unknown {
-  if (keyHint !== undefined && SENTRY_SENSITIVE_KEY.test(keyHint)) return REDACTED;
-  if (typeof value === "string") {
-    if (keyHint !== undefined && SENTRY_SAFE_IDENTIFIER_KEY.test(keyHint)) return value;
-    return redact(value);
-  }
-  if (Array.isArray(value)) return value.map((v) => scrubEventNode(v, keyHint));
-  if (value !== null && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = scrubEventNode(v, k);
-    }
-    return out;
-  }
-  return value;
-}
-
 // beforeSend hook: scrub every event before it leaves the process. On any
 // redaction error we DROP the event (return null) rather than risk shipping an
 // unscrubbed payload.
+//
+// The walk itself lives in redact-structured.ts and is no longer private to this
+// file. It was the only key-aware sanitizer in the CLI, which meant the Sentry
+// plane dropped `{"password": "Tr0ub4dor&3"}` while the egress plane shipped it:
+// same class of payload, two walkers, one of them value-blind. Ruling §3 said
+// to reuse this one rather than grow another, so the egress registry's telemetry
+// rows now call the same function with `keyAware: true`. Behavior here is
+// unchanged; egress-structured-sanitizer.spec.ts pins the two planes to the same
+// output for the same input so they cannot drift apart again.
 export function redactSentryEvent<T>(event: T): T | null {
   if (event === null || event === undefined) return event;
   try {
-    return scrubEventNode(event, undefined) as T;
+    return redactStructured(event, { keyAware: true, profile: "full" });
   } catch {
     return null;
   }
@@ -632,10 +600,10 @@ export function makeHttpFlush(opts: {
       if (opts.actorUserId && opts.actorUserId.trim().length > 0) {
         headers["X-Meetless-Actor"] = opts.actorUserId;
       }
-      const res = await fetch(url, {
+      const res = await egressFetch("control", url, {
         method: "POST",
         headers,
-        body: JSON.stringify({ ...payload, workspaceId: opts.workspaceId }),
+        body: { ...payload, workspaceId: opts.workspaceId },
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -874,9 +842,16 @@ export async function boundedTraceFlush(
     // expected, not a failure: stay silent (both fire on every command). Every
     // real failure (token/auth 403, 5xx, connection refused, timeout) still warns.
     if (!isSilencedTraceFlushError(flushErr)) {
+      // A policy refusal already reaches stderr through describeFlushErr, so §2 was
+      // satisfied here before this line existed. What it was NOT was actionable: an
+      // unregistered route reads exactly like a flaky endpoint, and only one of the
+      // two ever recovers. Prefer the refusal's own wording when that is what happened.
+      const refusal = describeEgressRefusal(flushErr, "trace upload");
       process.stderr.write(
-        `warn: trace upload failed (${describeFlushErr(flushErr)}); ` +
-          `Sentry event still carries trace_id\n`,
+        refusal
+          ? `${refusal} Sentry event still carries trace_id\n`
+          : `warn: trace upload failed (${describeFlushErr(flushErr)}); ` +
+              `Sentry event still carries trace_id\n`,
       );
       // F8 (telemetry-upload-failed): the trace upload itself failed on a real,
       // non-policy error. Record it to the local deadletter so the failure is

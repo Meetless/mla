@@ -13,11 +13,11 @@
 //   postWorkProductCapture -- the thin HTTP wrapper (control recomputes the hash, §10.6).
 //
 // WHY A POST BODY, NOT THE HASH. Per §10.6 the CLI never sends a trusted input_digest_hash:
-// it POSTs the sealed, canonically-ordered digest (as a JSON string, sidestepping the
-// ValidationPipe implicit-conversion coercion control's DTO documents) plus sealed_at, and
-// control recomputes the hash inside its intake transaction. Idempotency and 200/409/failed
-// resolution are entirely control's (durable-seal-first), so this module makes exactly one
-// best-effort call and never retries.
+// it POSTs the sealed, canonically-ordered digest plus sealed_at, and control recomputes the
+// hash inside its intake transaction. Idempotency and 200/409/failed resolution are entirely
+// control's (durable-seal-first), so this module makes exactly one best-effort call and never
+// retries. The hash is computed from the PARSED digest on both sides, so the wire encoding
+// was never a hash input; that is what made the string-to-object cutover hash-neutral.
 
 import { CliConfig } from "../config";
 import { post } from "../http";
@@ -44,8 +44,15 @@ export const SEAL_STATUS_SEALED = "sealed";
 export const SEAL_STATUS_FAILED = "failed";
 
 // The POST body: the WorkProductCaptureDto shape (camelCase to match the DTO). The digest
-// rides as a JSON STRING under workProductDigest, present iff status === sealed; a failed
+// rides as a real OBJECT under workProductDigest, present iff status === sealed; a failed
 // seal carries NO digest (seal event only, §6.4/§10.6 step 4).
+//
+// It used to be JSON.stringify'd. That was a credential leak: the egress boundary redacts
+// a body by walking it to its string leaves, and a packed digest is one leaf, so JSON
+// escaping destroyed the token boundaries the credential rules anchor on. A `ghp_` PAT one
+// newline into a captured hunk serialized as `\nghp_`, leaving a literal `n` before the
+// prefix, and the rule stopped matching. As an object every hunk is its own leaf and the
+// same PAT redacts. Proven both ways in egress-work-product-seal.spec.ts.
 export interface WorkProductCaptureBody {
   workspaceId: string;
   injectId: string;
@@ -55,7 +62,7 @@ export interface WorkProductCaptureBody {
   capturedTurnEnd: number;
   truncated: boolean;
   redactedSubstance: boolean;
-  workProductDigest?: string;
+  workProductDigest?: WorkProductDigest;
 }
 
 // The minimal inject view the seal needs, resolved from the closed inject event.
@@ -152,7 +159,7 @@ export function buildSealBody(args: BuildSealBodyArgs): WorkProductCaptureBody {
   return {
     ...base,
     status: SEAL_STATUS_SEALED,
-    workProductDigest: JSON.stringify(digest),
+    workProductDigest: digest,
   };
 }
 

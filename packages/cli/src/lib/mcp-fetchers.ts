@@ -10,6 +10,7 @@ import {
   intelPatch,
   refreshUserToken,
 } from "./http";
+import { redact } from "./redactor";
 
 // Slice 1 of the `mla mcp` refactor. The MCP server's tool handlers
 // (relationship_actions.js, kb_actions.js, evidence_actions.js, ask_modes.js)
@@ -183,10 +184,35 @@ export interface IntelAskParams {
 }
 
 /**
+ * Redact one free-text field on its way into the /v1/ask body, and FAIL CLOSED.
+ *
+ * The earlier form was `redact(x, "retrieval") ?? x`, which reads as a harmless
+ * default but is a raw-content fallback: if the redactor ever answered with
+ * anything other than a string, the ?? silently substituted the operator's raw
+ * text. Today `redact` cannot do that for a string input, so this changes no
+ * bytes; it removes the SHAPE, because a fallback to raw is exactly the failure
+ * mode this boundary exists to prevent. A failed ask beats a leaked key.
+ */
+function redactForWire(text: string, field: string): string {
+  const out = redact(text, "retrieval");
+  if (typeof out !== "string") {
+    throw new Error(
+      `intel /v1/ask: redaction of ${field} returned a non-string; refusing to send unredacted text`,
+    );
+  }
+  return out;
+}
+
+/**
  * /v1/ask closure, byte-compatible with ask_modes.js makeIntelAsk (same payload
  * keys + defaults: surface "mcp", mode "answer", filters {}, max 8 / min 3,
  * as_of omitted when absent/null), but posting through http.ts (intelPost) so it
  * carries the user-token bearer and inherits the same reactive refresh.
+ *
+ * This is the SECOND builder for the same route. Both redact identically, at
+ * the same bar, from parity-locked pattern sets; the duplication itself is the
+ * open item (one route should have one body builder), tracked in
+ * notes/20260726-mla-redaction-fidelity-and-egress-boundary-proposal.md §6.
  */
 export function makeIntelAskFromCli(
   cfg: CliConfig,
@@ -196,11 +222,25 @@ export function makeIntelAskFromCli(
   return (params) => {
     const payload: Record<string, unknown> = {
       workspace_id: params.workspaceId,
-      question: params.question,
+      // Redacted at the egress, not at the call site. This is the SAME route the
+      // hook's Layer 2 enrichment posts to (user-prompt-submit.sh), and that path
+      // has redacted since day one; this one shipped the question verbatim, so a
+      // credential pasted into `mla ask` or an MCP query landed in intel's
+      // Langfuse traces in the clear. Same destination must mean same policy.
+      //
+      // "retrieval", not "full", for the reason measured in
+      // notes/20260726-mla-redaction-fidelity-and-egress-boundary-proposal.md:
+      // this text IS the retrieval key, and the strict bar destroys it in 7 of 8
+      // realistic questions (deep paths, branch names, SCREAMING_SNAKE job names)
+      // while returning HTTP 200 and confidence "high", so the damage is silent.
+      question: redactForWire(params.question, "question"),
       surface: params.surface ?? "mcp",
       stream: false,
       language: params.language ?? "en",
-      thread_text: params.threadText ?? null,
+      thread_text:
+        typeof params.threadText === "string"
+          ? redactForWire(params.threadText, "thread_text")
+          : null,
       mode: params.mode ?? "answer",
       filters: params.filters ?? {},
       max_results: params.maxResults ?? 8,

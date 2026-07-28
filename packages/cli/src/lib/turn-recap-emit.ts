@@ -19,6 +19,7 @@
 import { CliConfig } from "./config";
 import { DEFAULT_INTEL_URL } from "./http";
 import { TurnRecap, renderFooter } from "./analytics/turn-recap";
+import { egressFetch } from "./egress/fetch";
 
 // Minimal structural fetch shape so the emitter is unit-testable with a plain
 // stub and never depends on the DOM/undici lib types. The live default is
@@ -52,7 +53,9 @@ export async function postTurnRecapToIntel(
 
   const base = cfg.intelUrl || DEFAULT_INTEL_URL;
   const url = `${base}/v1/observability/turn-recap`;
-  const fetchImpl = deps.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
+  // No local default: when nothing is injected the boundary supplies the real
+  // socket, so `globalThis.fetch` is named in exactly one file in the CLI.
+  const fetchImpl = deps.fetchImpl;
   const timeoutMs = deps.timeoutMs ?? EMIT_TIMEOUT_MS;
 
   const body = {
@@ -63,14 +66,50 @@ export async function postTurnRecapToIntel(
     // One-line footer rides as the score comment.
     footer: renderFooter(recap),
     notRunReason: recap.not_run_reason,
-    // Full recap -> trace metadata for drilldown.
-    recap,
+    // Recap -> trace metadata for drilldown. Projected FIELD BY FIELD on purpose,
+    // never `recap` whole. The egress rule for this route is `passthrough`, and
+    // passthrough only allowlists TOP-LEVEL body keys; a nested object rides
+    // whole. So `recap,` would mean "whatever anyone adds to TurnRecap next ships
+    // to intel automatically", which is precisely the forgetting the boundary
+    // exists to prevent. With the projection the failure direction flips: a new
+    // TurnRecap field is silently OMITTED (recoverable) instead of silently SENT
+    // (not recoverable). turn-recap-emit.spec.ts pins this list against the
+    // EMITTED BODY, so adding one is a visible decision, not a side effect.
+    recap: {
+      session_id: recap.session_id,
+      turn_index: recap.turn_index,
+      trace_id: recap.trace_id,
+      ran: recap.ran,
+      injected_floor: recap.injected_floor,
+      injected_evidence: recap.injected_evidence,
+      not_run_reason: recap.not_run_reason,
+      enrich_latency_ms: recap.enrich_latency_ms,
+      evidence_offered: recap.evidence_offered,
+      offered_source_ids: recap.offered_source_ids,
+      zero_results: recap.zero_results,
+      coverage_gap_type: recap.coverage_gap_type,
+      evidence_layer_down: recap.evidence_layer_down,
+      retrieved_count: recap.retrieved_count,
+      selected_count: recap.selected_count,
+      abstain_class: recap.abstain_class,
+      evidence_tools_pulled: recap.evidence_tools_pulled,
+      pull_count: recap.pull_count,
+      referenced_source_ids: recap.referenced_source_ids,
+      cited_source_ids: recap.cited_source_ids,
+      verdict: recap.verdict,
+    },
   };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(url, {
+    // Through the egress boundary, not straight to the socket. `fetchImpl` is
+    // the SOCKET seam only: the registry classifies this body every time and
+    // there is no argument that skips it, so an injected stub sees the wire
+    // bytes rather than replacing the check. This emitter is exactly the seam
+    // the first `\bfetch\(` audit missed, because the primitive was injected.
+    const res = await egressFetch<Awaited<ReturnType<FetchLike>>>("intel", url, {
+      socket: fetchImpl,
       method: "POST",
       headers: {
         Authorization: `Bearer ${cfg.controlToken}`,
@@ -78,7 +117,7 @@ export async function postTurnRecapToIntel(
         // Pinned to the just-finished turn's trace, not this run's.
         "X-Trace-ID": recap.trace_id,
       },
-      body: JSON.stringify(body),
+      body,
       signal: controller.signal,
     });
     if (!res.ok) {

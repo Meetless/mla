@@ -313,7 +313,7 @@ describe("mla enrich accept (end to end, real sidecar + mint + file write)", () 
         intelUrl: "http://127.0.0.1:1",
         controlToken: "ik-test",
         actorUserId: "user_test",
-        mlaPath: "/bin/true",
+        mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
       }),
     );
   });

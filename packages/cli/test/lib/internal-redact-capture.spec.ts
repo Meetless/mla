@@ -13,10 +13,10 @@ import { REDACTED } from "../../src/lib/redactor";
 // notes/20260627-session-detail-mla-actions-and-colored-injection-timeline-design.md §4.4.
 //
 // A known-redactable sample borrowed from redactor-parity.spec.ts so this test
-// stays anchored to the shared contract: an env-assignment secret collapses to
-// "export [REDACTED]".
+// stays anchored to the shared contract: an env-assignment secret loses its
+// VALUE and keeps its NAME, becoming "export OPENAI_API_KEY=[REDACTED]".
 const SECRET_LINE = "export OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUv";
-const SECRET_REDACTED = `export ${REDACTED}`;
+const SECRET_REDACTED = `export OPENAI_API_KEY=${REDACTED}`;
 
 describe("redactCapturePayload (pure)", () => {
   it("redacts a secret in block content and marks it redacted", () => {

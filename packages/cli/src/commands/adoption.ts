@@ -3,11 +3,14 @@ import * as path from "path";
 import {
   AdoptionAggregate,
   FollowthroughRow,
+  GovernedCatches,
   InjectTurn,
   McpCall,
   ReportCitation,
   buildAdoption,
   computeFollowthrough,
+  countGovernedCatches,
+  isGovernanceAction,
   parseInjectTurns,
   parseMcpCalls,
   parseReportCitations,
@@ -35,11 +38,14 @@ import { logsDir, readLogJsonl } from "../lib/analytics/logs";
 export {
   AdoptionAggregate,
   FollowthroughRow,
+  GovernedCatches,
   InjectTurn,
   McpCall,
   ReportCitation,
   buildAdoption,
   computeFollowthrough,
+  countGovernedCatches,
+  isGovernanceAction,
   parseInjectTurns,
   parseMcpCalls,
   parseReportCitations,
@@ -86,7 +92,7 @@ export function parseAdoptionArgs(argv: string[]): AdoptionArgs {
 function renderAdoption(a: AdoptionAggregate): string {
   const pct = (r: number) => (r * 100).toFixed(0) + "%";
   const frac = (x: number) => `${x}/${a.inject_turns}`;
-  return [
+  const lines = [
     `Evidence-followthrough (A1) over ${a.inject_turns} high-value inject turn(s):`,
     `  A1c any followthrough:    ${frac(a.a1c_any)} (${pct(a.a1c_rate)})`,
     `  A1a pull-followthrough:   ${frac(a.a1a_pull)} (${pct(a.a1a_rate)})`,
@@ -94,7 +100,21 @@ function renderAdoption(a: AdoptionAggregate): string {
     `  No followthrough:         ${frac(a.no_followthrough)} (${pct(
       a.inject_turns ? a.no_followthrough / a.inject_turns : 0,
     )})`,
-  ].join("\n");
+  ];
+  // A2 governed catches: the act side (see followthrough.ts). A floor, not a rate,
+  // so it renders as a raw count with its action-class breakdown, no denominator.
+  // Session-scoped (this session, or every session under --all), independent of
+  // the --last inject window that bounds the A1 block above.
+  const gc = a.governed_catches;
+  lines.push(`Governed catches (A2): ${gc.catches}`);
+  if (gc.catches > 0) {
+    const breakdown = Object.entries(gc.by_tool)
+      .sort((x, y) => y[1] - x[1] || (x[0] < y[0] ? -1 : 1))
+      .map(([tool, n]) => `${tool} ${n}`)
+      .join(", ");
+    lines.push(`  by action: ${breakdown}`);
+  }
+  return lines.join("\n");
 }
 
 export function runAdoption(argv: string[]): number {
@@ -138,8 +158,16 @@ export function runAdoption(argv: string[]): number {
   );
   injects = injects.slice(-args.last);
 
+  // A2 governed catches follow the same SESSION scope as the view (scoped -> this
+  // session, --all -> every session) but NOT the --last inject-turn window: a
+  // catch is a floor count of adjudications, not a per-inject-turn score, so
+  // slicing it by the inject denominator would silently drop a session's verdicts.
+  // The command is globally inject-gated above, so we only ever report catches in a
+  // run where governed memory was demonstrably in play.
+  const catchCalls = scoped ? calls.filter((c) => c.session_id === session) : calls;
+
   const rows = computeFollowthrough(injects, calls, citations, args.window);
-  const agg = buildAdoption(rows);
+  const agg = buildAdoption(rows, catchCalls);
   if (args.json) {
     console.log(JSON.stringify(agg, null, 2));
   } else {

@@ -190,7 +190,7 @@ describe("session-start.sh baseline is captured ONCE per session (continue/compa
         controlUrl: "http://127.0.0.1:1",
         controlToken: "test-token",
         workspaceId: "ws_test",
-        mlaPath: "/bin/true",
+        mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
       }),
     );
     return home;

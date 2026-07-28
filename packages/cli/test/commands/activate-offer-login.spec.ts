@@ -25,7 +25,7 @@ function stageHome(auth: Record<string, unknown> | null): string {
   if (auth !== null) {
     fs.writeFileSync(
       path.join(home, "cli-config.json"),
-      JSON.stringify({ controlUrl: "http://127.0.0.1:1", mlaPath: "/bin/true", auth }, null, 2),
+      JSON.stringify({ controlUrl: "http://127.0.0.1:1", mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true", auth }, null, 2),
     );
   }
   return home;

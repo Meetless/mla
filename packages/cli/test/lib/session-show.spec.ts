@@ -77,7 +77,7 @@ function writeCfg(overrides: Record<string, unknown> = {}): void {
       intelUrl: stubUrl(),
       controlToken: "ik-test",
       workspaceId: "ws_test",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
       ...overrides,
     }),
   );

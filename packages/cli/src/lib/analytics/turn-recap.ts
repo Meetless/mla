@@ -27,17 +27,62 @@ export type NotRunReason = "muted" | "not_activated" | "suppressed" | "timeout" 
 
 // The Item 4 discriminator: when mla ran but offered nothing, WHY. intel already
 // classified the reason (enrich_no_offer.py) and rides it back on the enrich
-// trace; this collapses that taxonomy into the one distinction An asked for --
+// trace; this collapses that taxonomy into the one distinction An asked for:
 // "correctly abstained" vs "should have matched but didn't" vs "the seam failed".
-//   correct_abstain    -- there was nothing to offer (zero_candidates) or a
-//                         deliberate safe abstain (unresolved_conflict).
-//   should_have_matched-- candidates existed but the score floor / cap / router
-//                         dropped them all (all_failed_relevance,
-//                         router_low_confidence). THIS is the recall/ranking debt.
-//   provider_failure   -- a surface was degraded or the budget was blown
-//                         (surface_provider_missing, over_budget); not a recall
-//                         gap, a plumbing gap.
-export type AbstainClass = "correct_abstain" | "should_have_matched" | "provider_failure" | null;
+//   correct_abstain:     there was nothing to offer (zero_candidates) or a
+//                        deliberate safe abstain (unresolved_conflict,
+//                        primary_surface_no_offer).
+//   should_have_matched: candidates existed but the score floor / cap dropped
+//                        them all (all_failed_relevance). THIS is the
+//                        recall/ranking debt.
+//   not_routed:          the intent router declined to route the prompt at all
+//                        (router_low_confidence), so retrieval never ran and no
+//                        candidate ever existed. Also recall debt, but ROUTER
+//                        recall, and it is fixed in a different place.
+//   provider_failure:    a surface was degraded or the budget was blown
+//                        (surface_provider_missing, over_budget); not a recall
+//                        gap, a plumbing gap.
+//
+// WHY not_routed IS ITS OWN CLASS (2026-07-27 pulse):
+// router_low_confidence used to land in should_have_matched, which contradicted
+// this file's own definition of that class (see retrieved_count below: "retrieved>0
+// && selected==0 is the should-have-matched signature"). intel emits
+// router_low_confidence from intent_router.py's final "Nothing matched. Do NOT
+// guess (P0): abstain" branch, at confidence 0.0 and BEFORE any retrieval call, so
+// retrieved_count is structurally 0 and no candidate was ever dropped.
+//
+// It was not a rounding error. intel's router enables exactly one live surface
+// (governed_kb, on narrow explicit governed phrasing) and abstains on everything
+// else by design, so every ordinary coding prompt lands here. Measured over 62
+// production turns: 58 were labelled should_have_matched, all 62 with
+// retrieved_count 0. The recall-debt gauge read ~94% purely by construction, which
+// is worse than no gauge: it buries the real all_failed_relevance misses in noise
+// the router is supposed to produce. Splitting the class keeps both numbers
+// readable and points each at the code that owns it.
+export type AbstainClass = "correct_abstain" | "should_have_matched" | "not_routed" | "provider_failure" | null;
+
+// intel's FULL no_offer vocabulary (models.py `NoOfferReason`), mirrored here so
+// the classifier is provably total over it. Every member MUST classify to a
+// non-null AbstainClass: null is reserved for "instrumentation absent" (a
+// pre-trace line, or no trace at all), and a live reason landing there reads as
+// "we have no idea" when in fact intel told us exactly what happened.
+//
+// This list exists because the classifier silently drifted from it. It handled
+// six of the nine and its own comment asserted six was the whole set, so
+// primary_surface_no_offer (deliberately routed, intent KNOWN, and live in the
+// local spool) came back as null on a NO_OFFER turn. Mirroring the vocabulary
+// turns the next divergence into a failing test instead of a silent null.
+export const INTEL_NO_OFFER_REASONS = [
+  "primary_surface_no_offer",
+  "router_low_confidence",
+  "surface_provider_missing",
+  "zero_candidates",
+  "all_failed_posture_freshness_supersession",
+  "all_failed_relevance",
+  "unresolved_conflict",
+  "would_require_uncited_synthesis",
+  "over_budget",
+] as const;
 
 export interface TurnRecap {
   session_id: string;
@@ -217,18 +262,40 @@ function deriveCoverageGap(t: AskTrace): string | null {
 }
 
 // Map intel's no_offer_reason taxonomy to the one distinction that drives action
-// (see AbstainClass). Only the six governed-KB reasons classify; anything else
-// (the legacy arb/fail-open strings, or no trace at all) stays null, because we
-// cannot honestly say whether a pre-trace NO_OFFER was a correct abstain or a
+// (see AbstainClass). Every member of INTEL_NO_OFFER_REASONS classifies; anything
+// else (the legacy arb/fail-open strings, or no trace at all) stays null, because
+// we cannot honestly say whether a pre-trace NO_OFFER was a correct abstain or a
 // missed match. Null here means "instrumentation absent", not "correct abstain".
 function deriveAbstainClass(reason: string | null): AbstainClass {
   switch (reason) {
     case "zero_candidates":
     case "unresolved_conflict":
+    // The router recognized the intent and policy routed it to no_offer on
+    // purpose (enrich_router_plan.py:144, the intent_type != "unknown" arm). In
+    // prod that is intent_type "generic_coding" at confidence 0.7, and the
+    // no_offer arm is there because it WON a pre-registered trial: the governed_kb
+    // arm lost B7 by 1.37x (intent_router.py). The most deliberate abstain we
+    // make, and it used to fall through to null.
+    case "primary_surface_no_offer":
+    // Answering would require synthesis the surface cannot cite, so we abstain
+    // rather than assert something uncitable. Same family as unresolved_conflict:
+    // the safe choice, not a miss.
+    case "would_require_uncited_synthesis":
+    // Candidates existed and the posture / freshness / supersession gates dropped
+    // them all. Withholding a superseded or posture-blocked doc is governance
+    // working, not recall debt, so it is NOT should_have_matched. It is the one
+    // correct_abstain member where retrieved_count can be > 0, which stays visible
+    // because the footer renders the counts next to the class. If this ever carries
+    // real volume, re-open whether a governance-withheld class earns its own name;
+    // today nothing in intel emits it (declared vocabulary, zero emit sites).
+    case "all_failed_posture_freshness_supersession":
       return "correct_abstain";
     case "all_failed_relevance":
-    case "router_low_confidence":
       return "should_have_matched";
+    // Retrieval never ran: the router abstained before it. Distinct from
+    // all_failed_relevance, which means we DID retrieve and dropped everything.
+    case "router_low_confidence":
+      return "not_routed";
     case "surface_provider_missing":
     case "over_budget":
       return "provider_failure";
@@ -356,8 +423,14 @@ function gapPhrase(t: string | null): string {
       return "retrieval found nothing to offer";
     case "all_failed_relevance":
       return "candidates found but all fell below the score floor";
+    case "all_failed_posture_freshness_supersession":
+      return "candidates found but all withheld by posture, freshness or supersession";
     case "router_low_confidence":
       return "router was not confident enough to retrieve";
+    case "primary_surface_no_offer":
+      return "the router offers nothing for this kind of prompt";
+    case "would_require_uncited_synthesis":
+      return "abstained rather than answer without a citation";
     case "unresolved_conflict":
       return "abstained on an unresolved conflict";
     case "surface_provider_missing":

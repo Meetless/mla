@@ -87,6 +87,7 @@ const SIDECAR_SUFFIXES = [
   ".codexStarted",
   ".repoPath",
   ".gitBaseline",
+  ".touched",
   ".workspaceId",
   ".turn",
   ".lock",

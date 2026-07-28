@@ -6,6 +6,8 @@ import { COMMANDS } from "../../src/cli";
 import {
   computeFollowthrough,
   buildAdoption,
+  countGovernedCatches,
+  isGovernanceAction,
   parseAdoptionArgs,
   runAdoption,
   type InjectTurn,
@@ -173,6 +175,67 @@ describe("buildAdoption: aggregate rates", () => {
     const agg = buildAdoption([]);
     expect(agg.inject_turns).toBe(0);
     expect(agg.a1c_rate).toBe(0);
+  });
+
+  it("with no calls, governed_catches is an empty floor (backward-compatible)", () => {
+    const agg = buildAdoption([]);
+    expect(agg.governed_catches).toEqual({ catches: 0, by_tool: {} });
+  });
+});
+
+// A2 governed-catch: the ACT side. It counts exactly the evidence_tool=false
+// action calls A1 discards as "never a Pull", tagged by action class.
+describe("isGovernanceAction / countGovernedCatches: the A2 catch floor", () => {
+  const mk = (tool: string | undefined, evidence_tool = false): McpCall => ({
+    session_id: "s1",
+    turn_index: 1,
+    evidence_tool,
+    source_ids: [],
+    query: "",
+    tool,
+  });
+
+  it("recognizes the three governance-action tools", () => {
+    expect(isGovernanceAction(mk("relationship_verdict"))).toBe(true);
+    expect(isGovernanceAction(mk("dismiss_conflict"))).toBe(true);
+    expect(isGovernanceAction(mk("decision_record"))).toBe(true);
+  });
+
+  it("rejects evidence tools and unknown/absent tool names", () => {
+    // An evidence pull is A1's business, not a catch; even though it is a real
+    // meetless call, it reads rather than adjudicates.
+    expect(isGovernanceAction(mk("retrieve_knowledge", true))).toBe(false);
+    expect(isGovernanceAction(mk("kb_doc_detail", true))).toBe(false);
+    expect(isGovernanceAction(mk("some_future_tool"))).toBe(false);
+    expect(isGovernanceAction(mk(undefined))).toBe(false);
+  });
+
+  it("counts catches and tags each by its action class", () => {
+    const gc = countGovernedCatches([
+      mk("relationship_verdict"),
+      mk("relationship_verdict"),
+      mk("dismiss_conflict"),
+      mk("retrieve_knowledge", true), // a Pull, not a catch
+      mk("decision_record"),
+      mk(undefined), // an unclassifiable line, ignored
+    ]);
+    expect(gc.catches).toBe(4);
+    expect(gc.by_tool).toEqual({
+      relationship_verdict: 2,
+      dismiss_conflict: 1,
+      decision_record: 1,
+    });
+  });
+
+  it("an empty call stream is an empty floor, never a divide-by-zero", () => {
+    expect(countGovernedCatches([])).toEqual({ catches: 0, by_tool: {} });
+  });
+
+  it("buildAdoption folds the (view-scoped) catch count into the aggregate", () => {
+    const rows = computeFollowthrough([{ session_id: "s1", turn_index: 1, injected_source_ids: ["NT:a.md"] }], [], []);
+    const agg = buildAdoption(rows, [mk("relationship_verdict"), mk("decision_record")]);
+    expect(agg.governed_catches.catches).toBe(2);
+    expect(agg.governed_catches.by_tool).toEqual({ relationship_verdict: 1, decision_record: 1 });
   });
 });
 
@@ -392,6 +455,101 @@ describe("runAdoption: end-to-end over the three local files", () => {
     );
     expect(res.code).toBe(0);
     expect(JSON.parse(res.stdout).a1a_pull).toBe(1);
+  });
+
+  // --- A2 governed catches over the same local files ------------------------
+
+  it("counts a relationship_verdict as an A2 catch even though it is NOT an A1 Pull", async () => {
+    const res = await withHome(
+      {
+        traces: [injectTrace("s1", 1, ["NT:doc-a.md"])],
+        mcp: [mcpCall("s1", 1, "relationship_verdict", false, ["NT:doc-a.md"])],
+      },
+      () => runAdoption(["--json"]),
+    );
+    const agg = JSON.parse(res.stdout);
+    // The exact call A1 throws away is the one A2 keeps; the two are complementary.
+    expect(agg.a1a_pull).toBe(0);
+    expect(agg.governed_catches.catches).toBe(1);
+    expect(agg.governed_catches.by_tool.relationship_verdict).toBe(1);
+  });
+
+  it("scores A1 and A2 on the same turn independently (a pull AND an adjudication)", async () => {
+    const res = await withHome(
+      {
+        traces: [injectTrace("s1", 1, ["NT:doc-a.md"])],
+        mcp: [
+          mcpCall("s1", 1, "retrieve_knowledge", true, ["NT:doc-a.md"]), // A1a pull
+          mcpCall("s1", 1, "dismiss_conflict", false, []), // A2 catch
+        ],
+      },
+      () => runAdoption(["--json"]),
+    );
+    const agg = JSON.parse(res.stdout);
+    expect(agg.a1a_pull).toBe(1);
+    expect(agg.governed_catches.catches).toBe(1);
+    expect(agg.governed_catches.by_tool.dismiss_conflict).toBe(1);
+  });
+
+  it("scopes A2 catches to the sessions in view (never inherits another session's verdict)", async () => {
+    const files = {
+      traces: [injectTrace("sA", 1, ["NT:x.md"]), injectTrace("sB", 1, ["NT:y.md"])],
+      mcp: [
+        mcpCall("sA", 1, "relationship_verdict", false, []),
+        mcpCall("sB", 1, "dismiss_conflict", false, []),
+      ],
+    };
+    // Scoped to sA: only sA's verdict counts, sB's is out of view.
+    const scoped = await withHome(files, () => runAdoption(["--json"]), "sA");
+    const aScoped = JSON.parse(scoped.stdout);
+    expect(aScoped.governed_catches.catches).toBe(1);
+    expect(aScoped.governed_catches.by_tool).toEqual({ relationship_verdict: 1 });
+    // --all: both sessions are in view, so both catches count.
+    const all = await withHome(files, () => runAdoption(["--all", "--json"]), "sA");
+    const aAll = JSON.parse(all.stdout);
+    expect(aAll.governed_catches.catches).toBe(2);
+    expect(aAll.governed_catches.by_tool).toEqual({ relationship_verdict: 1, dismiss_conflict: 1 });
+  });
+
+  it("--all counts a session's catch even when --last slices that session's inject turns out", async () => {
+    // Regression for the coupling bug: catches must follow the SESSION scope, not
+    // the --last inject window. s1 sorts first, so --last 1 keeps only s2's inject
+    // turn, yet s1's verdict is still a real governed catch and must be counted.
+    const res = await withHome(
+      {
+        traces: [injectTrace("s1", 1, ["NT:x.md"]), injectTrace("s2", 1, ["NT:y.md"])],
+        mcp: [mcpCall("s1", 1, "relationship_verdict", false, [])],
+      },
+      () => runAdoption(["--all", "--last", "1", "--json"]),
+    );
+    const agg = JSON.parse(res.stdout);
+    expect(agg.inject_turns).toBe(1); // only s2's inject turn survived --last 1
+    expect(agg.governed_catches.catches).toBe(1); // s1's verdict still counted
+    expect(agg.governed_catches.by_tool).toEqual({ relationship_verdict: 1 });
+  });
+
+  it("renders the A2 governed-catch line with its action breakdown", async () => {
+    const res = await withHome(
+      {
+        traces: [injectTrace("s1", 1, ["NT:doc-a.md"])],
+        mcp: [mcpCall("s1", 1, "relationship_verdict", false, [])],
+      },
+      () => runAdoption([]),
+    );
+    expect(res.stdout).toMatch(/Governed catches \(A2\): 1/);
+    expect(res.stdout).toMatch(/by action: relationship_verdict 1/);
+  });
+
+  it("omits the action breakdown line when there are zero catches", async () => {
+    const res = await withHome(
+      {
+        traces: [injectTrace("s1", 1, ["NT:doc-a.md"])],
+        mcp: [mcpCall("s1", 1, "retrieve_knowledge", true, ["NT:doc-a.md"])],
+      },
+      () => runAdoption([]),
+    );
+    expect(res.stdout).toMatch(/Governed catches \(A2\): 0/);
+    expect(res.stdout).not.toMatch(/by action:/);
   });
 });
 

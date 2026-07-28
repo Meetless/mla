@@ -97,6 +97,10 @@ function safeBillingReason(err) {
  *   payment_required 402                 no payer / billing denied (NOT an outage)
  *   unavailable      429 / 5xx / no-status  transient infra blip (retry)
  *   error            other 4xx           deterministic request fault
+ *
+ * `unavailable` is deliberately ONE category covering three different failures,
+ * because the retry contract is identical for all three and both the mask and the
+ * retrieve retry loop key on it. The COPY is not identical: see shapeOfUnavailable.
  */
 function categoryOf(err) {
   const status = err && err.status;
@@ -109,6 +113,28 @@ function categoryOf(err) {
   // No numeric status: the transport failed (connection refused mid-restart,
   // DNS, an aborted/timed-out request). Always transient.
   return "unavailable";
+}
+
+/**
+ * Which of the three `unavailable` failures this is. Same category, same retry
+ * contract, three MUTUALLY EXCLUSIVE facts about the world:
+ *
+ *   unreachable   no numeric status: the connection never completed (refused
+ *                 mid-restart, DNS, abort). Intel really is out of contact.
+ *   rate_limited  429: intel answered. It is up, healthy, and shedding load.
+ *   server_error  5xx: intel answered. It is up and faulted on this request.
+ *
+ * Collapsing these into one "intel unreachable" line (as this module did until
+ * now) is not a cosmetic sloppiness: it sends an operator to check DNS, ingress
+ * and the deploy when intel is plainly answering, and it hides a rate limit,
+ * which is the one shape where retrying WITHOUT backoff makes things worse. The
+ * status is already returned in the result's `status` field, so naming it in the
+ * message discloses nothing new (SEC-3.2 is about the body, host and stack).
+ */
+function shapeOfUnavailable(err) {
+  const status = err && err.status;
+  if (typeof status !== "number") return "unreachable";
+  return status === 429 ? "rate_limited" : "server_error";
 }
 
 /**
@@ -185,6 +211,17 @@ const GUIDANCE = {
     "Intel is temporarily unreachable (an infra blip), not a permanent " +
     "failure. Retry shortly. For pure code-shape questions, grep is an " +
     "acceptable stopgap.",
+  unavailable_rate_limited:
+    "Intel is UP and answering; it is shedding load (rate limit), not down. " +
+    "This is not an outage and the evidence is not absent. Back off before " +
+    "retrying: an immediate retry makes the limit worse. For pure code-shape " +
+    "questions, grep is an acceptable stopgap.",
+  unavailable_server_error:
+    "Intel is REACHABLE and faulted on this request (a server error), so this " +
+    "is not a connectivity problem: do not go chasing DNS, ingress or the " +
+    "deploy. Transient; retry shortly. If it persists, the fault is inside " +
+    "intel and belongs in its logs. For pure code-shape questions, grep is an " +
+    "acceptable stopgap.",
   error:
     "Governed memory rejected this request. Re-check the query shape; for " +
     "pure code-shape questions, grep is an acceptable fallback.",
@@ -209,6 +246,7 @@ export function classifyIntelError(err, opts = {}) {
   let message;
   let reason;
   let transientBilling = false;
+  let guidanceKey = category;
   if (category === "auth") {
     message = `${noun} unavailable: authentication failed (run 'mla login', or check MEETLESS_CONTROL_TOKEN)`;
   } else if (category === "payment_required") {
@@ -225,7 +263,19 @@ export function classifyIntelError(err, opts = {}) {
       message = `${noun} unavailable: billing denied${suffix}. This is not an outage and the evidence is not absent, only gated; it will not clear on its own, so do not retry.`;
     }
   } else if (category === "unavailable") {
-    message = `${noun} temporarily unavailable (intel unreachable); retry shortly`;
+    // Same category, same retry contract, three different facts. Say which one
+    // actually happened instead of asserting "unreachable" about an intel that
+    // just answered us.
+    const shape = shapeOfUnavailable(err);
+    if (shape === "rate_limited") {
+      guidanceKey = "unavailable_rate_limited";
+      message = `${noun} temporarily unavailable: intel is rate limiting this request (HTTP 429). Intel is up; back off before retrying.`;
+    } else if (shape === "server_error") {
+      guidanceKey = "unavailable_server_error";
+      message = `${noun} temporarily unavailable: intel answered with a server error (HTTP ${status}). Intel is reachable; this is not a connectivity fault. Retry shortly.`;
+    } else {
+      message = `${noun} temporarily unavailable: intel is unreachable (the connection failed); retry shortly`;
+    }
   } else {
     message = `${noun} unavailable`;
   }
@@ -239,6 +289,6 @@ export function classifyIntelError(err, opts = {}) {
     message,
     guidance: transientBilling
       ? GUIDANCE.payment_required_transient
-      : GUIDANCE[category],
+      : GUIDANCE[guidanceKey],
   };
 }

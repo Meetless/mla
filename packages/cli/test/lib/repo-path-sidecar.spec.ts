@@ -152,6 +152,9 @@ describe("repoPath sidecar (Wedge v6 Epoch 35)", () => {
       fs.writeFileSync(
         mlaPath,
         `#!/usr/bin/env bash
+# Short-circuit the redaction filters before the capture: they are stdin->stdout
+# filters flush.sh fails CLOSED on, and they are not the argv under test here.
+case "$2" in redact-events|redact-capture) exec cat ;; esac
 printf '%s\\n' "MEETLESS_REPO_PATH=\${MEETLESS_REPO_PATH:-<unset>}" > "${envCaptureFile}"
 printf '%s\\n' "argv=$*" >> "${envCaptureFile}"
 exit 0
@@ -245,6 +248,9 @@ exit 0
       fs.writeFileSync(
         mlaPath,
         `#!/usr/bin/env bash
+# Short-circuit the redaction filters before the capture: they are stdin->stdout
+# filters flush.sh fails CLOSED on, and they are not the argv under test here.
+case "$2" in redact-events|redact-capture) exec cat ;; esac
 printf '%s\\n' "MEETLESS_REPO_PATH=\${MEETLESS_REPO_PATH:-<unset>}" > "${envCaptureFile}"
 exit 0
 `,
@@ -306,10 +312,13 @@ exit 0
       const mlaPath = path.join(tmp, "fake-mla.sh");
       // Non-zero exit simulates any CLI finalize failure (e.g. the control POST
       // erroring out). flush.sh must re-spool finalize_requested AND preserve the
-      // sidecar so the next flush can still export the env.
+      // sidecar so the next flush can still export the env. Scoped to finalize:
+      // failing the redaction filters too would defer the batch before finalize
+      // is ever reached, which is a different branch than the one under test.
       fs.writeFileSync(
         mlaPath,
         `#!/usr/bin/env bash
+case "$2" in redact-events|redact-capture) exec cat ;; esac
 exit 1
 `,
         { mode: 0o755 },

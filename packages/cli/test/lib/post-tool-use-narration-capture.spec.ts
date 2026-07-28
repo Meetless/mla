@@ -59,7 +59,7 @@ function mkHarness(): { h: Harness; cleanup: () => void } {
       controlToken: "x",
       workspaceId: "ws_test",
       actorUserId: "user_a",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
   const workdir = path.join(tmp, "workdir");

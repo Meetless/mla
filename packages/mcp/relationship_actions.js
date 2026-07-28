@@ -102,9 +102,18 @@ export function makeControlFetch({ baseUrl, apiKey, fetchImpl = fetch }) {
  * This is the CLAIM-GRAIN relation-trust queue that Ask serves and that
  * meetless__relationship_verdict acts on: intel's
  * GET /internal/v1/relation-assertions/pending (reviewOutcome=PENDING AND
- * lifecycleStatus=ACTIVE, oldest first). Each row leads with the `assertionId`
- * you pass straight back to the verdict tool, plus the human-readable
- * proposition (subjectLabel -> relationType -> objectLabel).
+ * lifecycleStatus=ACTIVE). Each row leads with the `assertionId` you pass
+ * straight back to the verdict tool, plus the human-readable proposition
+ * (subjectLabel -> relationType -> objectLabel).
+ *
+ * ORDER IS ATTENTION, NOT FIFO. The route ranks by ReviewPriority:
+ * [lane asc (DETERMINISTIC first), score desc, createdAt DESC, assertionId desc]
+ * (kb_relation_assertion_service._rank_pending_assertions). Two consequences a
+ * caller must not get wrong: a consequential CONTRADICTS / SUPERSEDES outranks a
+ * footnote regardless of age, and the age tiebreaker is NEWEST-first. This
+ * comment previously said "oldest first", which was inverted on the tiebreaker
+ * AND silent about both primary keys; a reader who believed it would page the
+ * queue as a FIFO drain and conclude the front had been cleared when it had not.
  *
  * §10.x single-authority cutover: this used to enumerate control's
  * relationship_candidate rows -- the legacy whole-doc / artifact-grain graph

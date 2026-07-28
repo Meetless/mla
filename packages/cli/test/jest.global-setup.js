@@ -32,7 +32,36 @@ module.exports = async () => {
   const shimDir = join(root, "shim-bin");
   mkdirSync(shimDir, { recursive: true });
   const shim = join(shimDir, "mla");
-  writeFileSync(shim, "#!/bin/sh\nexit 0\n");
+  // `exit 0` is the no-op for a COMMAND. It is not the no-op for a FILTER: a
+  // stdin->stdout subcommand that exits 0 having written nothing has destroyed
+  // its input, not passed on it. Both redaction subcommands are JSON filters
+  // that rewrite strings in place and preserve shape, and both egress paths now
+  // fail CLOSED when the filter yields nothing -- flush.sh defers the batch
+  // rather than PATCH raw bodies, user-prompt-submit.sh skips Layer 2 rather
+  // than send a raw prompt to intel (redaction-egress.spec.ts). So a bare
+  // `exit 0` here would silently disable transport and enrichment in every spec
+  // that pins this shim, and read as a transport bug. `cat` is the honest no-op.
+  //
+  // It launders nothing: the real gate runs the real built CLI, pinned by
+  // redaction-egress.spec.ts + internal-redact-events.spec.ts. A spec asserting
+  // on redaction must not use this shim.
+  writeFileSync(
+    shim,
+    [
+      "#!/bin/sh",
+      'case "${2-}" in',
+      "  redact-events|redact-capture) exec cat ;;",
+      "esac",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
   chmodSync(shim, 0o755);
   process.env.PATH = shimDir + delimiter + (process.env.PATH || "");
+  // Specs pin mlaPath to a harmless sentinel to dodge the `command -v mla`
+  // fallback. 39 of them pin "/bin/true", which does not exist on macOS and DOES
+  // exist on Linux -- so the sentinel means two different things per platform,
+  // and now that one of them (`exit 0`) breaks the transport path, that
+  // divergence is load-bearing. Hand the specs the real shim instead.
+  process.env.MLA_TEST_MLA_SHIM = shim;
 };

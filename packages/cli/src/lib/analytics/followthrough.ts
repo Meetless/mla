@@ -68,6 +68,25 @@ export interface FollowthroughRow {
   cited_overlap: string[];
 }
 
+// A1 followthrough scores the READ side (did the agent pull or cite an injected
+// source_id). A2 governed-catch is the ACT side: the moments the agent did not
+// merely read governed memory but adjudicated it: a relationship_verdict on a
+// born-pending relation, a dismiss_conflict on a surfaced contradiction, a
+// decision_record. These are exactly the meetless MCP calls A1 throws away
+// (evidence_tool=false, "never a Pull"); here they are counted, because an
+// adjudication IS "the evidence changed what the agent did". by_tool tags each
+// catch with its action class (the closest honest proxy for an avoided-rework
+// class, since the class lives in the tool, not the trace line).
+//
+// INV-EVIDENCE-OBSERVATION applies here too and harder: this is a FLOOR. It sees
+// only catches that surfaced as an explicit governance action. A contradiction
+// the agent read and silently corrected around leaves no action call and is
+// invisible to this counter, so it undercounts and never over-claims.
+export interface GovernedCatches {
+  catches: number;
+  by_tool: Record<string, number>;
+}
+
 export interface AdoptionAggregate {
   inject_turns: number;
   a1a_pull: number;
@@ -78,6 +97,7 @@ export interface AdoptionAggregate {
   a1b_rate: number;
   a1c_rate: number;
   rows: FollowthroughRow[];
+  governed_catches: GovernedCatches;
 }
 
 // --- the join ---------------------------------------------------------------
@@ -170,7 +190,42 @@ export function computeFollowthrough(
   });
 }
 
-export function buildAdoption(rows: FollowthroughRow[]): AdoptionAggregate {
+// The meetless MCP calls that ADJUDICATE governed memory rather than read it.
+// These are precisely the evidence_tool=false action calls A1 excludes from a
+// Pull; A2 counts them as governed catches. The tool name is the authoritative
+// class signal (the write side in post-tool-use.sh marks all three
+// evidence_tool=false), so the match is on the name, not the flag.
+export const GOVERNANCE_ACTION_TOOLS = [
+  "relationship_verdict",
+  "dismiss_conflict",
+  "decision_record",
+] as const;
+
+const GOVERNANCE_ACTION_SET: ReadonlySet<string> = new Set(GOVERNANCE_ACTION_TOOLS);
+
+export function isGovernanceAction(call: McpCall): boolean {
+  return GOVERNANCE_ACTION_SET.has(call.tool ?? "");
+}
+
+// Count the governance-action calls (the A2 catch floor) and tag each by its
+// action class. Callers scope `calls` to the view before passing them in, so the
+// count matches the inject turns being shown.
+export function countGovernedCatches(calls: McpCall[]): GovernedCatches {
+  const by_tool: Record<string, number> = {};
+  let catches = 0;
+  for (const c of calls) {
+    if (!isGovernanceAction(c)) continue;
+    catches++;
+    const tool = c.tool ?? "";
+    by_tool[tool] = (by_tool[tool] ?? 0) + 1;
+  }
+  return { catches, by_tool };
+}
+
+// `calls` is optional so the pure rows->aggregate callers (and the parity spec)
+// keep working unchanged; a caller that wants the A2 catch count passes the
+// (already view-scoped) MCP calls and gets it folded into the same aggregate.
+export function buildAdoption(rows: FollowthroughRow[], calls: McpCall[] = []): AdoptionAggregate {
   const n = rows.length;
   const a1a = rows.filter((r) => r.a1a_pull).length;
   const a1b = rows.filter((r) => r.a1b_push_reference).length;
@@ -186,6 +241,7 @@ export function buildAdoption(rows: FollowthroughRow[]): AdoptionAggregate {
     a1b_rate: rate(a1b),
     a1c_rate: rate(a1c),
     rows,
+    governed_catches: countGovernedCatches(calls),
   };
 }
 

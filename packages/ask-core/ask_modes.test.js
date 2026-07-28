@@ -16,6 +16,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   makeIntelAsk,
@@ -233,6 +234,29 @@ test("makeIntelAsk posts workspace_id + bearer and parses JSON", async () => {
   assert.equal(body.stream, false);
 });
 
+test("makeIntelAsk serializes the parity fixture byte for byte", async () => {
+  // One route, two transports, one body. The CLI's makeIntelAskFromCli posts the
+  // same route through http.ts (user-token bearer plus reactive refresh) and is
+  // measured against this same file in packages/cli/test/lib/egress-ownership.spec.ts.
+  // Compared as a STRING so key order is pinned: the serialized body is what
+  // leaves the process.
+  const fixture = JSON.parse(
+    readFileSync(new URL("./ask_payload_parity.json", import.meta.url), "utf8"),
+  );
+  let sent = null;
+  const fetchImpl = async (_url, init) => {
+    sent = init.body;
+    return { ok: true, json: async () => ({}) };
+  };
+  const intelAsk = makeIntelAsk({
+    intelBaseUrl: "http://intel.test",
+    apiKey: "K",
+    fetchImpl,
+  });
+  await intelAsk(fixture.input);
+  assert.equal(sent, fixture.wire);
+});
+
 test("makeIntelAsk throws with status + body snippet on non-2xx", async () => {
   const fetchImpl = async () => ({
     ok: false,
@@ -320,6 +344,119 @@ test("makeIntelAsk prefers the caller's submissionId over minting one", async ()
   // `mla mcp` mints one id per TOOL CALL and passes it down, so a replayed tool
   // call reuses the key and collapses. Only the caller knows what a delivery is.
   assert.equal(captured.submission_id, "tool-call-abc");
+});
+
+// ---------- egress redaction ------------------------------------------------
+
+test("makeIntelAsk redacts the question on the wire with nothing injected", async () => {
+  // Every front-end reaches this path: the standalone `meetless-mcp` bin
+  // (server.js buildDepsFromEnv) and `mla ask` both call makeIntelAsk with
+  // transport deps only. Redaction is not something either of them supplies.
+  let captured = null;
+  const fetchImpl = async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ answer: "ok", citations: [] }) };
+  };
+  const intelAsk = makeIntelAsk({ intelBaseUrl: "http://intel.test", apiKey: "K", fetchImpl });
+
+  await intelAsk({
+    question: "why does ghp_ABCDEFGHIJKLMNOPQRSTUVWX fail on src/lib/spool.ts",
+    workspaceId: "ws",
+    mode: "answer",
+  });
+
+  assert.equal(
+    captured.question,
+    "why does [REDACTED] fail on src/lib/spool.ts",
+    "the mandatory redactor runs at the retrieval bar: credential gone, path intact",
+  );
+});
+
+test("an injected redactFn CANNOT weaken the boundary", async () => {
+  // The regression this test exists for: makeIntelAsk used to accept a
+  // `redactFn` and merely DEFAULT it. `redactFn: (t) => t` is a function that
+  // returns a string, so every type guard accepted it, and the raw question
+  // went on the wire. A boundary a caller can replace is not a boundary. The
+  // parameter is gone; anything passed under that name is inert.
+  const bypassAttempts = [
+    ["identity", (t) => t],
+    ["constant raw", () => "ghp_ABCDEFGHIJKLMNOPQRSTUVWX"],
+    ["null", null],
+    ["undefined", undefined],
+    ["not a function", "off"],
+    ["returns a non-string", () => undefined],
+  ];
+  for (const [label, attempt] of bypassAttempts) {
+    let captured = null;
+    const fetchImpl = async (_url, init) => {
+      captured = JSON.parse(init.body);
+      return { ok: true, json: async () => ({ answer: "ok", citations: [] }) };
+    };
+    const intelAsk = makeIntelAsk({
+      intelBaseUrl: "http://intel.test",
+      apiKey: "K",
+      fetchImpl,
+      redactFn: attempt,
+      redact: attempt,
+      redactor: attempt,
+    });
+
+    await intelAsk({
+      question: "rotate ghp_ABCDEFGHIJKLMNOPQRSTUVWX now",
+      workspaceId: "ws",
+      mode: "answer",
+    });
+
+    assert.equal(
+      captured.question,
+      "rotate [REDACTED] now",
+      `bypass attempt "${label}" must not change the bytes on the wire`,
+    );
+    assert.ok(
+      !JSON.stringify(captured).includes("ghp_ABCDEFGHIJKLMNOPQRSTUVWX"),
+      `bypass attempt "${label}" leaked the credential into the body`,
+    );
+  }
+});
+
+test("the mandatory profile is retrieval, not full, so retrieval keys survive", async () => {
+  // The whole point of the measured two-bar design: this text IS the retrieval
+  // key. Under "full" every one of these is eaten and intel still answers 200
+  // with confidence "high", so the damage is silent. If someone swaps the
+  // profile, this fails.
+  let captured = null;
+  const fetchImpl = async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ answer: "ok", citations: [] }) };
+  };
+  const intelAsk = makeIntelAsk({ intelBaseUrl: "http://intel.test", apiKey: "K", fetchImpl });
+
+  const keys = [
+    "meetless-cli/packages/cli/src/lib/redactor.ts",
+    "feature/agent-memory-capture-live-pipeline-orchestrator",
+    "DECISION_DIFF_GENERATE_WITH_CITATIONS",
+    "runInternalRedactCaptureWithDepsAndTimeout",
+  ];
+  await intelAsk({ question: `explain ${keys.join(" and ")}`, workspaceId: "ws", mode: "answer" });
+
+  for (const key of keys) {
+    assert.ok(captured.question.includes(key), `retrieval key "${key}" must survive the wire`);
+  }
+});
+
+test("makeIntelAsk leaves a non-string question alone for the payload builder", async () => {
+  // redactForWire passes non-strings through rather than throwing on a type
+  // question; a missing question is intel's 422 to raise, not the redactor's.
+  let captured = null;
+  const fetchImpl = async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ answer: "ok", citations: [] }) };
+  };
+  const intelAsk = makeIntelAsk({ intelBaseUrl: "http://intel.test", apiKey: "K", fetchImpl });
+
+  await intelAsk({ question: undefined, workspaceId: "ws", mode: "answer" });
+
+  assert.equal(captured.question, undefined);
 });
 
 test("every ask mode forwards args.submission_id to intel", async () => {

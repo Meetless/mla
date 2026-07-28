@@ -4,6 +4,7 @@ import {
   readConfig,
   writeConfig,
 } from "../lib/config";
+import { egressFetch } from "../lib/egress/fetch";
 
 // `mla logout` (proposal §6.6, §9 "Stale-access revoke", T25).
 //
@@ -44,11 +45,13 @@ export async function revokeCliSession(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const res = await egressFetch("control", url, {
       method: "POST",
       // Content-Type only; NO Authorization header (body proof-of-possession).
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, refreshToken }),
+      // Registered passthrough: both fields are credentials-by-design and a
+      // redacted refresh token revokes nothing.
+      body: { sessionId, refreshToken },
       signal: controller.signal,
     });
     if (res.ok) return { serverCleared: true, detail: "session revoked" };

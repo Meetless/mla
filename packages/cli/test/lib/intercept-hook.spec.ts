@@ -68,8 +68,12 @@ interface RunOpts {
   // the per-session throttle state the hook reads (it makes NO network call for
   // the count, Patch 8).
   seed?: Record<string, string>;
-  // The `mlaPath` written into cli-config. Defaults to /bin/true (a no-op that
-  // exits 0 and prints nothing, which neutralises every MLA_PATH shell-out). The
+  // The `mlaPath` written into cli-config. Defaults to a stub that answers the
+  // fail-closed redaction bridge (`_internal redact-capture`/`redact-events`) as a
+  // passthrough `cat` so the redacted question equals the raw prompt, and is a
+  // silent no-op (exit 0, no output) for every other subcommand. A pure /bin/true
+  // default cannot echo stdin, so the enrich redaction gate would read empty output
+  // and fail closed (redaction_unavailable), skipping Layer 2 on every enrich. The
   // Layer C-lite recap specs override it with a stub that prints a recap block so
   // they can prove the previous-turn recap is injected.
   mlaPath?: string;
@@ -78,10 +82,10 @@ interface RunOpts {
   // the default config (controlToken, no auth object) therefore does NOT retry,
   // which is exactly the regression guard the pre-existing 401 specs assert.
   auth?: Record<string, unknown>;
-  // When set, the workdir is `git init`-ed and each path is created as an untracked
-  // (dirty) file, so collect_touched_files surfaces a busy tree. Used by the floor
-  // budget-fit spec to reproduce the worst-case Layer-1 touched_files size.
-  gitDirtyFiles?: string[];
+  // When set, each path is created in the workdir AND recorded in this session's
+  // touched-file ledger, so collect_touched_files surfaces a busy set. Used by the
+  // floor budget-fit spec to reproduce the worst-case Layer-1 touched_files size.
+  sessionTouchedFiles?: string[];
 }
 
 interface RunResult {
@@ -234,13 +238,23 @@ async function runHook(opts: RunOpts): Promise<RunResult> {
     const home = path.join(tmp, "home");
     fs.mkdirSync(home);
     const intelUrl = opts.intelDown ? "http://127.0.0.1:1" : `http://127.0.0.1:${stub.port}`;
+    // Default MLA stub: passthrough for the fail-closed redaction bridge (so the
+    // redacted question equals the raw prompt), silent no-op otherwise. Mirrors
+    // makeMlaStub's `redact-capture) exec cat`. Without this the enrich redaction
+    // gate reads empty output and fails closed on every default-stub run.
+    const defaultMlaStub = path.join(tmp, "mla-default-stub.sh");
+    fs.writeFileSync(
+      defaultMlaStub,
+      '#!/usr/bin/env bash\ncase "$2" in redact-events|redact-capture) exec cat ;; esac\nexit 0\n',
+    );
+    fs.chmodSync(defaultMlaStub, 0o755);
     fs.writeFileSync(
       path.join(home, "cli-config.json"),
       JSON.stringify({
         controlUrl: "http://127.0.0.1:1",
         intelUrl,
         controlToken: "ik-test",
-        mlaPath: opts.mlaPath ?? "/bin/true",
+        mlaPath: opts.mlaPath ?? defaultMlaStub,
         ...(opts.auth ? { auth: opts.auth } : {}),
       }),
     );
@@ -256,15 +270,24 @@ async function runHook(opts: RunOpts): Promise<RunResult> {
     // T1.2 cutover: the marker (not cli-config) is the sole workspaceId source.
     if (activate) fs.writeFileSync(path.join(workdir, ".meetless.json"), JSON.stringify({ workspaceId: "ws_test" }) + "\n");
 
-    // Optional busy working tree: git-init the workdir and drop untracked files so
-    // collect_touched_files (git ls-files --others) surfaces a large touched set.
-    if (opts.gitDirtyFiles && opts.gitDirtyFiles.length) {
+    // Optional busy session: create the files AND record them in this session's
+    // touched-file ledger, which is where the Layer-1 display now reads from.
+    // It used to be the git working tree, but that is a REPOSITORY fact: in a
+    // shared checkout it displayed a concurrent peer's WIP as this session's work
+    // (see intercept-touched-files.spec.ts). Paths are recorded physically because
+    // that is what record_touched_file writes.
+    if (opts.sessionTouchedFiles && opts.sessionTouchedFiles.length) {
       spawnSync("git", ["init", "-q"], { cwd: workdir });
-      for (const rel of opts.gitDirtyFiles) {
+      const ledgerDir = path.join(home, "queue");
+      fs.mkdirSync(ledgerDir, { recursive: true });
+      const lines: string[] = [];
+      for (const rel of opts.sessionTouchedFiles) {
         const p = path.join(workdir, rel);
         fs.mkdirSync(path.dirname(p), { recursive: true });
         fs.writeFileSync(p, "x\n");
+        lines.push(`${fs.realpathSync(path.dirname(p))}/${path.basename(p)}`);
       }
+      fs.writeFileSync(path.join(ledgerDir, "sess-intercept.touched"), lines.map((l) => `${l}\n`).join(""));
     }
 
     const prompt = opts.prompt ?? "How should I structure the auth middleware?";
@@ -575,7 +598,7 @@ describe("push interception hook (user-prompt-submit.sh) -- two-layer", () => {
       fs.mkdirSync(home);
       fs.writeFileSync(
         path.join(home, "cli-config.json"),
-        JSON.stringify({ controlUrl: "http://127.0.0.1:1", intelUrl: `http://127.0.0.1:${stub.port}`, mlaPath: "/bin/true" }),
+        JSON.stringify({ controlUrl: "http://127.0.0.1:1", intelUrl: `http://127.0.0.1:${stub.port}`, mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true" }),
       );
       const workdir = path.join(tmp, "workdir");
       fs.mkdirSync(workdir);
@@ -1349,6 +1372,11 @@ describe("push interception hook: Part 3 reactive refresh-on-401", () => {
   // A fake `mla`: exits `refreshRc` for `_internal refresh` (recording each such
   // call) and 0 for every other subcommand (flush/reap/turn-recap shell-outs must
   // stay harmless). refreshRc 0 models "rotated a fresh token".
+  //
+  // `_internal redact-capture` is the exception: it is a stdin->stdout filter,
+  // and the hook fails CLOSED on empty output (it will not send an unredacted
+  // prompt to intel), so `exit 0` would skip Layer 2 outright and there would be
+  // no enrich call left to 401. Identity is the no-op for a filter.
   function makeMlaStub(refreshRc: number): { path: string; refreshCalls: () => number } {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-refresh-stub-"));
     stubDirs.push(dir);
@@ -1357,6 +1385,7 @@ describe("push interception hook: Part 3 reactive refresh-on-401", () => {
     fs.writeFileSync(
       p,
       `#!/usr/bin/env bash\n` +
+        `case "$2" in redact-events|redact-capture) exec cat ;; esac\n` +
         `if [[ "$1 $2" == "_internal refresh" ]]; then\n` +
         `  printf '%s\\n' "$*" >> ${JSON.stringify(argsLog)}\n` +
         `  exit ${refreshRc}\n` +
@@ -1528,6 +1557,21 @@ describe("push interception hook: governed-story v2 injection_trace producer", (
     parseQueue(raw).filter((e) => e.event === event);
   const traceOf = (r: RunResult) => eventsOf(r.queueContent, "injection_trace");
 
+  // `_internal redact-capture` serves TWO callers in the hook, distinguished by
+  // the envelope on stdin, and they fail closed differently:
+  //
+  //   {blocks:[...]} -- the injected context bodies, on their way to the capture
+  //     spool. No output => the block is spooled as metadata only
+  //     (content null / contentStatus redaction_failed). Layer 2 still injects.
+  //   {query:"..."}  -- the enrichment question, on its way OUT to intel. No
+  //     output => Layer 2 is SKIPPED ENTIRELY, because the alternative is
+  //     putting a raw prompt on the wire (redaction-egress.spec.ts).
+  //
+  // So a stub that models "the body redactor is down" MUST still answer the
+  // query form, or there is no Layer 2 left to have blocks at all and the test
+  // would be asserting on the wrong fail-closed path.
+  const QUERY_PASSTHROUGH = `if has("query") then {query: .query} else empty end`;
+
   // A fake `mla` that ONLY answers `_internal redact-capture`: it reads the
   // {blocks:[...]} envelope on stdin and echoes it back with every body replaced
   // by a CONSTANT redacted token, contentStatus available, and charCount set from
@@ -1545,7 +1589,7 @@ describe("push interception hook: governed-story v2 injection_trace producer", (
       `#!/usr/bin/env bash\n` +
         `if [[ "$1 $2" == "_internal redact-capture" ]]; then\n` +
         `  input="$(cat)"\n` +
-        `  printf '%s' "$input" | jq -c 'if has("blocks") then {blocks: [ .blocks[] | {kind, content: "REDACTED_BODY", contentStatus: "available", charCount: ((.content // "") | length), citations: (.citations // []), itemCount} ]} else empty end' 2>/dev/null\n` +
+        `  printf '%s' "$input" | jq -c 'if has("blocks") then {blocks: [ .blocks[] | {kind, content: "REDACTED_BODY", contentStatus: "available", charCount: ((.content // "") | length), citations: (.citations // []), itemCount} ]} else ${QUERY_PASSTHROUGH} end' 2>/dev/null\n` +
         `  exit 0\n` +
         `fi\n` +
         `exit 0\n`,
@@ -1554,17 +1598,28 @@ describe("push interception hook: governed-story v2 injection_trace producer", (
     return { path: p };
   }
 
-  // A hermetic no-op `mla` that exists, is executable, drains stdin, and prints
-  // NOTHING. It stands in for "the redactor produced no usable output" without
-  // relying on a system path like /bin/true (absent on some macOS installs,
-  // where common.sh would silently fall back to the REAL installed mla and
-  // defeat the fail-closed premise). The metadata-only producer tests use it too
-  // so the whole block stays off the real mla (fast + deterministic).
+  // A hermetic `mla` that exists, is executable, drains stdin, and prints NOTHING
+  // for the BODY redactor -- "the redactor produced no usable output" -- without
+  // relying on a system path like /bin/true (absent on some macOS installs, where
+  // common.sh would silently fall back to the REAL installed mla and defeat the
+  // fail-closed premise). The question form passes through so the turn still
+  // reaches Layer 2 and there are evidence blocks whose redaction can fail. The
+  // metadata-only producer tests use it too so the whole block stays off the real
+  // mla (fast + deterministic).
   function makeNoopStub(): { path: string } {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-noop-stub-"));
     stubDirs.push(dir);
     const p = path.join(dir, "mla");
-    fs.writeFileSync(p, `#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\nexit 0\n`);
+    fs.writeFileSync(
+      p,
+      `#!/usr/bin/env bash\n` +
+        `if [[ "$1 $2" == "_internal redact-capture" ]]; then\n` +
+        `  cat | jq -c '${QUERY_PASSTHROUGH}' 2>/dev/null\n` +
+        `  exit 0\n` +
+        `fi\n` +
+        `cat >/dev/null 2>&1 || true\n` +
+        `exit 0\n`,
+    );
     fs.chmodSync(p, 0o755);
     return { path: p };
   }
@@ -1834,7 +1889,7 @@ describe("push interception hook: bash fallback floor delivery", () => {
     }),
   });
 
-  // 20 long monorepo-style dirty paths: a worst-case touched_files size.
+  // 20 long monorepo-style paths this session touched: a worst-case touched_files size.
   const busyTree = Array.from({ length: 20 }, (_, i) =>
     `meetless-cli/packages/cli/src/lib/scanner/module-${String(i).padStart(2, "0")}-implementation.ts`,
   );
@@ -1845,7 +1900,7 @@ describe("push interception hook: bash fallback floor delivery", () => {
   }
 
   it("delivers LAYER1 + the floor block on the fallback path (subcommand stubbed)", async () => {
-    const r = await runHook({ mlaPath: noopStub(), intelDown: true, seed: scanCacheSeed(), gitDirtyFiles: busyTree });
+    const r = await runHook({ mlaPath: noopStub(), intelDown: true, seed: scanCacheSeed(), sessionTouchedFiles: busyTree });
     const ctx = r.additionalContext ?? "";
     // The static floor and every load-bearing global MUST rule are present.
     expect(ctx).toContain('<meetless-context kind="static"');
@@ -1856,15 +1911,19 @@ describe("push interception hook: bash fallback floor delivery", () => {
     expect(ctx).toContain("rebuild, rewire, and exercise");
   });
 
-  it("bounds the variable touched_files display on a busy tree", async () => {
-    const r = await runHook({ mlaPath: noopStub(), intelDown: true, seed: scanCacheSeed(), gitDirtyFiles: busyTree });
+  it("bounds the variable touched_files display on a busy session, newest first", async () => {
+    const r = await runHook({ mlaPath: noopStub(), intelDown: true, seed: scanCacheSeed(), sessionTouchedFiles: busyTree });
     const ctx = r.additionalContext ?? "";
     const tl = touchedLine(ctx);
     // Real content kept (did not collapse to "(none)")...
-    expect(tl).toContain("meetless-cli/packages/cli/src/lib/scanner/module-00");
-    // ...but hard-capped (300-char display cut) so a busy tree cannot bloat the base.
+    expect(tl).toContain("meetless-cli/packages/cli/src/lib/scanner/module-19");
+    // ...but hard-capped (300-char display cut) so a busy session cannot bloat the base.
     expect(Buffer.byteLength(tl, "utf8")).toBeLessThan(400);
-    expect(tl).not.toContain("module-19-implementation.ts");
+    // The cut takes the OLDEST touches. Recency is the ranking signal, so the
+    // surface edited most recently must survive the cap and module-00, touched
+    // first and longest ago, must be the one that goes.
+    expect(tl).not.toContain("module-00-implementation.ts");
+    expect(tl.indexOf("module-19")).toBeLessThan(tl.indexOf("module-18"));
   });
 
   it("shows the full touched set on a quiet tree", async () => {
@@ -1872,7 +1931,7 @@ describe("push interception hook: bash fallback floor delivery", () => {
       mlaPath: noopStub(),
       intelDown: true,
       seed: scanCacheSeed(),
-      gitDirtyFiles: ["src/one.ts", "src/two.ts"],
+      sessionTouchedFiles: ["src/one.ts", "src/two.ts"],
     });
     const ctx = r.additionalContext ?? "";
     const tl = touchedLine(ctx);
@@ -1880,7 +1939,7 @@ describe("push interception hook: bash fallback floor delivery", () => {
     expect(tl).toContain("src/two.ts");
   });
 
-  it("still emits the floor (no touched files) when the tree is not a git repo", async () => {
+  it("still emits the floor (no touched files) when this session has touched nothing", async () => {
     const r = await runHook({ mlaPath: noopStub(), intelDown: true, seed: scanCacheSeed() });
     const ctx = r.additionalContext ?? "";
     expect(touchedLine(ctx)).toContain("(none)");

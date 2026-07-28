@@ -82,7 +82,7 @@ function seedCliConfig(intelUrl: string): void {
       intelUrl,
       controlToken: "ik-test",
       actorUserId: "wu_test_actor",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
 }

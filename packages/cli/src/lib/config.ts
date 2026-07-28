@@ -342,6 +342,16 @@ export function codexHooksPath(deps: HomeResolutionDeps = {}): string {
   return path.join(resolveCodexHome(deps), "hooks.json");
 }
 
+/**
+ * Absolute path to the global Codex config file, `$CODEX_HOME/config.toml`. This
+ * is the user's own file (model choice, MCP servers, timeouts, approval modes);
+ * MLA only ever APPENDS a fresh `[mcp_servers.meetless]` table to it and never
+ * parses/rewrites it. Same `$CODEX_HOME`/`~/.codex` resolution as the hooks path.
+ */
+export function codexConfigPath(deps: HomeResolutionDeps = {}): string {
+  return path.join(resolveCodexHome(deps), "config.toml");
+}
+
 // The master telemetry kill switch. The single source of truth for "no telemetry
 // of any kind leaves (or, for the local deadletter, is even recorded on) this
 // machine." It lives here in low-level config (not in observability.ts) so the

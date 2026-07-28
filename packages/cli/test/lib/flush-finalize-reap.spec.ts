@@ -57,7 +57,14 @@ function stageHooksDir(tmp: string): string {
 // silently fall back to the real `mla` in PATH and hit a live control.)
 function writeMlaStub(tmp: string, exitCode: number): string {
   const p = path.join(tmp, `mla-stub-${exitCode}`);
-  fs.writeFileSync(p, `#!/usr/bin/env bash\nexit ${exitCode}\n`, { mode: 0o755 });
+  // ...except the redaction filters, which flush.sh pipes the batch through and
+  // fails CLOSED on empty output. A blanket exit would defer the batch and never
+  // reach finalize at all. Identity is the no-op for a filter.
+  fs.writeFileSync(
+    p,
+    `#!/usr/bin/env bash\ncase "$2" in redact-events|redact-capture) exec cat ;; esac\nexit ${exitCode}\n`,
+    { mode: 0o755 },
+  );
   return p;
 }
 

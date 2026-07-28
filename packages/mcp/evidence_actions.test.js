@@ -488,3 +488,52 @@ test("a missing/absent candidates array yields count 0 and empty list", async ()
   assert.equal(out.count, 0);
   assert.deepEqual(out.candidates, []);
 });
+
+// ---------- an empty pull says WHICH empty it is ------------------------------
+//
+// A bare empty result reads to an agent as "the fact is not recorded". On prod
+// 2026-07-26 that was wrong 17 times out of 21: the workspaces had never indexed
+// anything. intel now returns `corpus_empty` on the empty path; these pin that the
+// tool relays it and names the matching remedy.
+
+test("empty pull on an EMPTY corpus names the onboarding remedy", async () => {
+  const cf = stubFetch({ candidates: [], corpus_empty: true });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.count, 0);
+  assert.equal(out.corpus_empty, true);
+  assert.equal(out.warnings.length, 1);
+  assert.match(out.warnings[0], /no indexed documents/);
+  assert.match(out.warnings[0], /\/mla onboard/);
+});
+
+test("empty pull on a REAL corpus is a retriever miss, not an onboarding gap", async () => {
+  const cf = stubFetch({ candidates: [], corpus_empty: false });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_empty, false);
+  assert.match(out.warnings[0], /has indexed documents but none matched/);
+  // Must NOT send a fully-onboarded user to onboard again.
+  assert.ok(!/\/mla onboard/.test(out.warnings[0]));
+});
+
+test("an intel without corpus_empty gets a hedged hint, never an assertion", async () => {
+  const cf = stubFetch({ candidates: [] });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_empty, undefined); // absent, not guessed
+  assert.equal(out.warnings.length, 1);
+  assert.match(out.warnings[0], /If this workspace was never ingested/);
+});
+
+test("a non-boolean corpus_empty is ignored rather than coerced", async () => {
+  const cf = stubFetch({ candidates: [], corpus_empty: null });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_empty, undefined);
+  assert.match(out.warnings[0], /If this workspace was never ingested/);
+});
+
+test("a served pull carries no warning and no corpus verdict", async () => {
+  const cf = stubFetch({ candidates: [DTO], corpus_empty: true });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.count, 1);
+  assert.equal(out.warnings, undefined);
+  assert.equal(out.corpus_empty, undefined);
+});

@@ -30,6 +30,7 @@ function wired(opts: {
     flock: { ok: true, detail: "flock present" },
     projectRules: null,
     mcp: { path: "/home/u/.claude.json", action: opts.mcp ?? "unchanged" },
+    codex: null,
   };
 }
 

@@ -976,6 +976,42 @@ export function stampMergedCorpusRollup(receipts: KbAddReceipt[], corpusName: st
   };
 }
 
+/**
+ * The per-request envelope every document batch rides on.
+ *
+ * Exported so the egress boundary test drives the REAL body instead of a hand
+ * transcription. The `fields` allowlist for `POST /internal/v1/kb/add` in
+ * lib/egress/rules.ts is a CLAIM about this object, and a claim nothing checked
+ * was already wrong once: `agentSession` and `corpusName` were absent from it,
+ * so the boundary refused `mla kb add` with `unknown_field` on every single
+ * invocation. The witness that exists to catch that named this file and had been
+ * written from the rule instead of read from it, so nothing failed.
+ *
+ * Both optional keys are present-but-undefined when absent. `JSON.stringify`
+ * drops them on the wire, but the egress classifier reads the OBJECT, which is
+ * why an undefined value still has to be classified.
+ */
+export function buildKbAddBaseBody(input: {
+  workspaceId: string;
+  actor: string;
+  provenance: string;
+  /** Empty or absent falls back to DEFAULT_PROFILE, as the flag parser allows. */
+  profile: string | undefined;
+  agentSession: string | null;
+  mode: "file" | "corpus";
+  corpusName: string | undefined;
+}): Record<string, unknown> {
+  return {
+    workspaceId: input.workspaceId,
+    actor: input.actor,
+    provenance: input.provenance, // advisory; the server derives the recorded value
+    profile: input.profile || DEFAULT_PROFILE,
+    agentSession: input.agentSession ?? undefined,
+    mode: input.mode,
+    corpusName: input.corpusName,
+  };
+}
+
 export async function runKbAdd(argv: string[]): Promise<number> {
   // Parse flags BEFORE loading config so `--workspace <id>` can override the
   // marker-resolved workspace (T1.1 folder = workspace). Passing the override
@@ -1090,15 +1126,15 @@ export async function runKbAdd(argv: string[]): Promise<number> {
   // value yields no session here, never a composed or console value.
   const agentSession = canonicalizeSessionId(flags.agentSession ?? null);
 
-  const baseBody = {
+  const baseBody = buildKbAddBaseBody({
     workspaceId,
     actor: cfg.actorUserId,
-    provenance: flags.provenance, // advisory; the server derives the recorded value
-    profile: flags.profile || DEFAULT_PROFILE,
-    agentSession: agentSession ?? undefined,
+    provenance: flags.provenance,
+    profile: flags.profile,
+    agentSession,
     mode: flags.mode,
     corpusName: marker?.corpusName,
-  };
+  });
 
   const receiptCtx = {
     mode: flags.mode,

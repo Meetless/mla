@@ -455,7 +455,7 @@ export function buildWorkProductDigest(
     const seen = new Set<string>();
     const files_metadata: DigestFileMeta[] = [];
     for (const h of hunksIn) {
-      const key = `${h.tool} ${h.file}`;
+      const key = `${h.tool}\u0000${h.file}`;
       if (seen.has(key)) continue;
       seen.add(key);
       files_metadata.push({ file: h.file, tool: h.tool });

@@ -258,6 +258,76 @@ describe("mcp-fetchers — intelAsk adapter", () => {
     expect(Object.prototype.hasOwnProperty.call(calls[0][1], "as_of")).toBe(false);
   });
 
+  // Egress lock. This closure is the `mla ask` / MCP path to intel /v1/ask, the
+  // SAME route the hook's Layer 2 enrichment posts to. That path has redacted
+  // since day one; this one shipped the question verbatim, and intel persists ask
+  // questions to Langfuse, so a pasted credential landed in observability storage
+  // in the clear. These two tests are the wire assertion: they read the bytes the
+  // transport actually receives, not the intent of the call site.
+  it("redacts the credential out of the question before it reaches intel", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      return {};
+    };
+    const intelAsk = makeIntelAskFromCli(userTokenConfig(), intelPostFn);
+
+    await intelAsk({
+      question:
+        "why does OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUv fail in apps/control?",
+      workspaceId: "ws_1",
+      threadText: "context: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+    });
+
+    const q = bodies[0].question as string;
+    expect(q).not.toContain("sk-proj-AbCdEfGhIjKlMnOpQrStUv");
+    expect(q).toContain("[REDACTED]");
+    const t = bodies[0].thread_text as string;
+    expect(t).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+    expect(t).toContain("[REDACTED]");
+  });
+
+  // The other half, and the reason the profile is "retrieval" and not "full":
+  // this text IS the retrieval key. Under the strict bar these identifiers are
+  // eaten and the ask still returns 200 with confidence "high", so the failure is
+  // invisible. Measured at 7 of 8 questions destroyed in
+  // notes/20260726-mla-redaction-fidelity-and-egress-boundary-proposal.md.
+  it("leaves the retrieval keys intact (deep paths, branches, job names, SHAs)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      return {};
+    };
+    const intelAsk = makeIntelAskFromCli(userTokenConfig(), intelPostFn);
+
+    const keys = [
+      "meetless-cli/packages/cli/src/lib/redactor.ts",
+      "feature/agent-memory-capture-live-pipeline-orchestrator",
+      "DECISION_DIFF_GENERATE_WITH_CITATIONS",
+      "runInternalRedactCaptureWithDepsAndTimeout",
+      "a887f06d3c1e4b2a9f80d5c6e7b8a9f0d1c2e3b4",
+    ];
+    await intelAsk({ question: `explain ${keys.join(" and ")}`, workspaceId: "ws_1" });
+
+    for (const key of keys) {
+      expect(bodies[0].question as string).toContain(key);
+    }
+  });
+
+  it("keeps thread_text null when absent (byte-identical body for the common case)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      return {};
+    };
+    const intelAsk = makeIntelAskFromCli(userTokenConfig(), intelPostFn);
+
+    await intelAsk({ question: "clean question", workspaceId: "ws_1" });
+
+    expect(bodies[0].thread_text).toBeNull();
+    expect(bodies[0].question).toBe("clean question");
+  });
+
   // An ask is a metered spend, and Control admits a spend only against a delivery
   // key: the key is what makes a re-delivered request collapse onto the ONE money
   // authorization it already opened instead of buying the run a second time. A

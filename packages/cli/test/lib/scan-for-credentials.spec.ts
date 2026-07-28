@@ -38,10 +38,25 @@ describe("scanForCredentials (pre-upload credential denylist)", () => {
     ]);
   });
 
+  it("fires on a bare JWT with no Authorization header to carry it", () => {
+    // The `bearer` rule only sees a token that follows "Bearer "/"Basic ". A JWT
+    // pasted into a curl body, a log line, or a config file has no such prefix,
+    // and entropy is not in this scanner, so before the `jwt` rule this file
+    // uploaded with a live session token in it.
+    expect(
+      scanForCredentials(
+        "session=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQfakesig",
+      ),
+    ).toEqual(["jwt"]);
+  });
+
   it("fires on Authorization bearer/basic, cookies, and PEM private keys", () => {
+    // Two rules fire on one span here, and that is correct: the header shape is
+    // `bearer`, the token inside it is independently a `jwt`. The rule ids are a
+    // set of reasons, not a partition of the text.
     expect(
       scanForCredentials("Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.p.s"),
-    ).toEqual(["bearer"]);
+    ).toEqual(["bearer", "jwt"]);
     expect(scanForCredentials("Set-Cookie: session=abc123; HttpOnly")).toEqual([
       "cookie",
     ]);
@@ -92,7 +107,7 @@ describe("scanForCredentials (pre-upload credential denylist)", () => {
     const text =
       "Authorization: Bearer eyJabc.def.ghi and token=ghp_ABCDEFGHIJKLMNOPQRSTUVWX and requirepass FAKE";
     const hits = scanForCredentials(text);
-    expect(hits).toEqual(["bearer", "provider_token", "redis_directive"]);
+    expect(hits).toEqual(["bearer", "jwt", "provider_token", "redis_directive"]);
     expect(hits).toEqual([...hits].sort());
     expect(hits.join(" ")).not.toContain("ghp_");
     expect(hits.join(" ")).not.toContain("eyJabc");
@@ -106,14 +121,41 @@ describe("scanForCredentials (pre-upload credential denylist)", () => {
   });
 
   it("every advertised rule id is reachable and entropy is not among them", () => {
+    // CREDENTIAL_RULE_IDS is DERIVED from the pattern tables, so it can no longer
+    // omit a reachable id. This assertion is the other half: a NEW pattern must
+    // be acknowledged here deliberately rather than appearing by itself.
     expect([...CREDENTIAL_RULE_IDS].sort()).toEqual([
       "bearer",
       "cookie",
       "env_assignment",
+      "jwt",
       "pem_key",
       "provider_token",
       "redis_directive",
     ]);
     expect(CREDENTIAL_RULE_IDS).not.toContain("high_entropy_token");
+  });
+
+  it("every advertised rule id is actually reachable from scanForCredentials", () => {
+    // Reachability, proven rather than asserted: one fixture per rule id, and
+    // the union of what the scanner returns must be the whole advertised set. A
+    // rule that no input can trigger is a lie in the block-reason vocabulary.
+    const fixtures: Record<string, string> = {
+      env_assignment: "export OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOp",
+      bearer: "Authorization: Bearer abc.def.ghi",
+      provider_token: "token=ghp_ABCDEFGHIJKLMNOPQRSTUVWX",
+      jwt: "t=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+      cookie: "Set-Cookie: session=abc123; HttpOnly",
+      pem_key:
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234\n-----END RSA PRIVATE KEY-----",
+      redis_directive: "requirepass FAKE_VALUE_xyz",
+    };
+    const reached = new Set<string>();
+    for (const id of CREDENTIAL_RULE_IDS) {
+      expect(fixtures[id]).toBeDefined();
+      expect(scanForCredentials(fixtures[id])).toContain(id);
+      for (const hit of scanForCredentials(fixtures[id])) reached.add(hit);
+    }
+    expect([...reached].sort()).toEqual([...CREDENTIAL_RULE_IDS].sort());
   });
 });

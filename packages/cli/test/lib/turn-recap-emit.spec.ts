@@ -97,6 +97,78 @@ describe("postTurnRecapToIntel", () => {
     expect(body.recap).toEqual(recap);
   });
 
+  // The egress rule for this route is `passthrough`, and a passthrough allowlist
+  // only names TOP-LEVEL keys, so `recap` rides as one object: whatever is inside
+  // it ships. The emitter therefore projects field by field instead of sending
+  // `recap` whole, and this is the pin that makes adding a field a DECISION
+  // rather than a side effect.
+  //
+  // The failure it is built for: someone adds a field to TurnRecap carrying turn
+  // content (a prompt excerpt, a file body, an error string) and it reaches
+  // intel's trace metadata because nothing asked. With this pin the new field
+  // fails here first, and the fix is either "add it to the projection knowingly"
+  // or "leave it local".
+  //
+  // Asserted against the emitted BODY, not against a copy of the source list, so
+  // the pin cannot agree with a projection it never saw.
+  it("pins the recap projection: exactly these keys reach intel", async () => {
+    const { fetchImpl, calls } = stubFetch({ ok: true });
+    await postTurnRecapToIntel(cfg(), recapFixture(), { fetchImpl });
+
+    const body = JSON.parse(calls[0].init.body as string);
+    expect(Object.keys(body.recap).sort()).toEqual([
+      "abstain_class",
+      "cited_source_ids",
+      "coverage_gap_type",
+      "enrich_latency_ms",
+      "evidence_layer_down",
+      "evidence_offered",
+      "evidence_tools_pulled",
+      "injected_evidence",
+      "injected_floor",
+      "not_run_reason",
+      "offered_source_ids",
+      "pull_count",
+      "ran",
+      "referenced_source_ids",
+      "retrieved_count",
+      "selected_count",
+      "session_id",
+      "trace_id",
+      "turn_index",
+      "verdict",
+      "zero_results",
+    ]);
+    // And the top-level body keys, for the same reason: the passthrough row
+    // allowlists these seven and nothing else.
+    expect(Object.keys(body).sort()).toEqual([
+      "footer",
+      "notRunReason",
+      "recap",
+      "sessionId",
+      "traceId",
+      "turnIndex",
+      "verdict",
+    ]);
+  });
+
+  // A new TurnRecap field does NOT silently ride along. Simulated by handing the
+  // emitter a recap carrying an extra field, exactly what a future edit to the
+  // interface produces.
+  it("omits a field the projection does not name", async () => {
+    const { fetchImpl, calls } = stubFetch({ ok: true });
+    const withExtra = {
+      ...recapFixture(),
+      raw_prompt_excerpt: "OPENAI_API_KEY=sk-proj-should-never-ship",
+    } as unknown as TurnRecap;
+
+    await postTurnRecapToIntel(cfg(), withExtra, { fetchImpl });
+
+    const wire = calls[0].init.body as string;
+    expect(wire).not.toContain("raw_prompt_excerpt");
+    expect(wire).not.toContain("sk-proj-should-never-ship");
+  });
+
   it("defaults to the local intel base url when cfg.intelUrl is unset", async () => {
     const { fetchImpl, calls } = stubFetch({ ok: true });
     await postTurnRecapToIntel(cfg({ intelUrl: undefined }), recapFixture(), {

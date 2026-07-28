@@ -688,13 +688,17 @@ describe("runInternalEvidenceCorrelate", () => {
       expect(body.captureContractVersion).toBe(evidence.CURRENT_CAPTURE_CONTRACT_VERSION);
       expect(body.capturedTurnStart).toBe(5);
       expect(body.capturedTurnEnd).toBe(8);
-      const digest = JSON.parse(String(body.workProductDigest)) as Record<string, unknown>;
+      // Read through the real `WorkProductDigest` type, with no cast. Before the
+      // cutover this was `JSON.parse(...) as Record<string, unknown>`, so every
+      // field access here was unchecked and a renamed digest key would have failed
+      // at runtime rather than at compile time.
+      const digest = body.workProductDigest;
+      if (!digest) throw new Error("a sealed body must carry a digest");
       expect(digest.window_start_turn).toBe(5);
       expect(digest.window_end_turn).toBe(8);
       expect(digest.capture_contract_version).toBe(1);
       expect(digest.sealed_at).toBe(RUN_ISO);
-      const turns = digest.turns as Array<{ changed_hunks: unknown[] }>;
-      expect(turns.some((t) => t.changed_hunks.length > 0)).toBe(true);
+      expect(digest.turns.some((t) => t.changed_hunks.length > 0)).toBe(true);
     });
 
     it("an ignored inject with staged output seals (referenced=false is still capture_expected)", async () => {
@@ -712,7 +716,12 @@ describe("runInternalEvidenceCorrelate", () => {
       expect(outcomes()[0].outcome).toBe("ignored");
       expect(s.bodies).toHaveLength(1);
       expect(s.bodies[0].status).toBe("sealed");
-      expect(typeof s.bodies[0].workProductDigest).toBe("string");
+      // A real object, not a packed JSON string: the egress boundary redacts a body by
+      // walking it to its string leaves, and a packed digest was one opaque leaf whose
+      // escaping hid credentials from the rules (egress-work-product-seal.spec.ts).
+      const digest = s.bodies[0].workProductDigest;
+      expect(typeof digest).toBe("object");
+      expect(Array.isArray(digest)).toBe(false);
     });
 
     it("a decided-but-empty window seals as `failed` with NO digest body", async () => {
@@ -833,24 +842,71 @@ describe("runInternalEvidenceCorrelate", () => {
       expect(s.order).toEqual(["flush", "post"]);
     });
 
-    it("a seal POST that throws never disturbs the sweep (best-effort, exit 0)", async () => {
+    // The seal is capture-only egress, so ruling §2 splits its failures in two. Both
+    // still drop the capture and still let the sweep finish; only one of them says so.
+    // Runs the sweep with a throwing postCapture and captures whatever reached stderr.
+    const sealFailingWith = async (thrown: unknown) => {
       await seedInject(5);
       stageAssistant(6, "output");
       recorder.resetRecorderForTesting();
       const s = seams();
       const throwingPost = jest.fn(async () => {
-        throw new Error("control 500");
+        throw thrown;
       });
-      const code = await correlate.runInternalEvidenceCorrelate([], {
-        readLog: logsWithMaxTurn(8),
-        readCfg: () => CFG,
-        flush: s.flush,
-        postCapture: throwingPost,
-        nowMs: RUN,
+      const lines: string[] = [];
+      const spy = jest.spyOn(console, "error").mockImplementation((l?: unknown) => {
+        lines.push(String(l));
       });
+      try {
+        const code = await correlate.runInternalEvidenceCorrelate([], {
+          readLog: logsWithMaxTurn(8),
+          readCfg: () => CFG,
+          flush: s.flush,
+          postCapture: throwingPost,
+          nowMs: RUN,
+        });
+        return { code, lines, throwingPost };
+      } finally {
+        spy.mockRestore();
+      }
+    };
+
+    it("a seal POST that throws never disturbs the sweep (best-effort, exit 0, silent)", async () => {
+      const { code, lines, throwingPost } = await sealFailingWith(new Error("control 500"));
       expect(code).toBe(0);
       expect(throwingPost).toHaveBeenCalledTimes(1);
       expect(outcomes()[0].outcome).toBe("ignored"); // the outcome still landed
+      // An outage is transient and the next sweep just works, so it stays quiet: a
+      // warning on every flaky connection is a warning nobody reads.
+      expect(lines).toEqual([]);
+    });
+
+    it("a seal refused by egress policy reports body-free, and the sweep still exits 0", async () => {
+      // Not an outage. It means the seal route or one of its fields is unregistered,
+      // so EVERY later seal is dead too, identically and permanently. Swallowed, the
+      // only symptom is that work-product capture quietly stops existing.
+      const { EgressPolicyError } = require("../../src/lib/egress/policy") as
+        typeof import("../../src/lib/egress/policy");
+      const { code, lines } = await sealFailingWith(
+        new EgressPolicyError(
+          "unknown_field",
+          "control",
+          "POST",
+          "/internal/v1/evidence/work-product-capture",
+          "unclassified top-level field(s): workProductDigest",
+        ),
+      );
+      expect(code).toBe(0);
+      expect(outcomes()[0].outcome).toBe("ignored"); // the sweep completed regardless
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("work-product seal");
+      expect(lines[0]).toContain("egress unknown_field");
+      expect(lines[0]).toContain("src/lib/egress/rules.ts");
+      // The seal body is the single largest payload this CLI sends. The diagnostic
+      // carries the routing triple and nothing that was in it.
+      expect(lines[0]).not.toContain("const x = 2");
+      expect(lines[0]).not.toContain("/repo/a.ts");
+      expect(lines[0]).not.toContain("output");
     });
   });
 });

@@ -62,7 +62,7 @@ function runHook(hookFile: string, stdin: string): RunResult {
       controlUrl: "http://127.0.0.1:1",
       controlToken: "x",
       workspaceId: "ws_test",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
 

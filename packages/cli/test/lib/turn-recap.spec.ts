@@ -1,4 +1,5 @@
 import {
+  INTEL_NO_OFFER_REASONS,
   computeTurnRecap,
   parseAskTrace,
   renderFooter,
@@ -345,7 +346,11 @@ describe("computeTurnRecap: verdict", () => {
     expect(r.coverage_gap_type).toBe("zero_candidates");
   });
 
-  it("NO_OFFER (router low confidence): read as should_have_matched (router never retrieved)", () => {
+  it("NO_OFFER (router low confidence): not_routed, because retrieval never ran", () => {
+    // intel emits router_low_confidence from intent_router.py's final "Nothing
+    // matched. Do NOT guess (P0): abstain" branch, at confidence 0.0 and BEFORE any
+    // retrieval call. Calling that should_have_matched contradicts that class's own
+    // definition ("candidates existed"): retrieved_count is structurally 0 here.
     const r = computeTurnRecap(
       "s1",
       8,
@@ -354,7 +359,81 @@ describe("computeTurnRecap: verdict", () => {
       }),
     );
     expect(r.verdict).toBe("NO_OFFER");
-    expect(r.abstain_class).toBe("should_have_matched");
+    expect(r.abstain_class).toBe("not_routed");
+    expect(r.retrieved_count).toBe(0);
+  });
+
+  it("ranking debt and router debt do not collapse into one number", () => {
+    // The regression that started this (2026-07-27 pulse): both reasons mapped to
+    // should_have_matched, and router_low_confidence is what intel's deliberately
+    // narrow router emits for every ordinary coding prompt. Over 62 production turns
+    // it labelled 58 as recall debt, all with retrieved_count 0, burying the real
+    // all_failed_relevance misses. The two must stay separable.
+    const cls = (reason: string, retrieved: number) =>
+      computeTurnRecap(
+        "s1",
+        8,
+        deps({
+          traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: retrieved, selected_count: 0, primary_no_offer_reason: reason } })],
+        }),
+      ).abstain_class;
+
+    // We retrieved and dropped everything: ranking debt, owned by the score floor.
+    expect(cls("all_failed_relevance", 5)).toBe("should_have_matched");
+    // We never retrieved: router debt, owned by intent_router.py.
+    expect(cls("router_low_confidence", 0)).toBe("not_routed");
+    expect(cls("all_failed_relevance", 5)).not.toBe(cls("router_low_confidence", 0));
+    // And neither one is allowed to read as a clean abstain.
+    expect(cls("zero_candidates", 0)).toBe("correct_abstain");
+  });
+
+  it("NO_OFFER (router routed it to no_offer on purpose): correct_abstain, never null", () => {
+    // primary_surface_no_offer is the intent_type != "unknown" arm of
+    // enrich_router_plan.py:144: the router RECOGNIZED the prompt (in prod,
+    // "generic_coding" at confidence 0.7) and policy routed it to no_offer, an arm
+    // that won a pre-registered trial. It used to fall through to null on a
+    // NO_OFFER turn, i.e. the most deliberate abstain we make read as "we have no
+    // idea why we said nothing". It was live in the local spool while unmapped.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "primary_surface_no_offer" } })],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("correct_abstain");
+    // Specifically NOT the null that means "instrumentation absent".
+    expect(r.abstain_class).not.toBeNull();
+  });
+
+  it("every reason intel can emit classifies; null is reserved for instrumentation absent", () => {
+    // The classifier drifted from intel's vocabulary once already: it handled six
+    // of nine and its comment claimed six was the whole set, so a live reason came
+    // back null. Mirroring the vocabulary makes the NEXT divergence a red test
+    // rather than a silent null on a production turn.
+    for (const reason of INTEL_NO_OFFER_REASONS) {
+      const r = computeTurnRecap(
+        "s1",
+        8,
+        deps({
+          traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: reason } })],
+        }),
+      );
+      expect(r.verdict).toBe("NO_OFFER");
+      // The assertion message names the offender so a future addition to intel's
+      // Literal points straight at the switch that has to grow a case.
+      expect([reason, r.abstain_class]).not.toEqual([reason, null]);
+    }
+    // The reserved meaning holds: a string intel never emits still reads as absent.
+    const legacy = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "some_future_reason" } })],
+      }),
+    );
+    expect(legacy.abstain_class).toBeNull();
   });
 
   it("NO_OFFER (provider failure): a degraded surface -> provider_failure, not a recall gap", () => {

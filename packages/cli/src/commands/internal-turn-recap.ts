@@ -14,6 +14,7 @@
 // disturb the hook that spawned it.
 
 import { CliConfig, readConfig } from "../lib/config";
+import { describeEgressRefusal } from "../lib/egress/policy";
 import { postTurnRecapToIntel } from "../lib/turn-recap-emit";
 import {
   TurnRecap,
@@ -152,8 +153,12 @@ export async function runInternalTurnRecap(argv: string[], deps: TurnRecapCmdDep
       if (cfg) {
         try {
           await postTurnRecap(cfg, recap);
-        } catch {
+        } catch (err) {
           // Langfuse/intel outage must degrade to "no score this turn", nothing more.
+          // A policy refusal is not an outage and never self-heals, so it gets one
+          // body-free line (ruling §2). Still exit 0: the hook is unaffected.
+          const refusal = describeEgressRefusal(err, "turn recap");
+          if (refusal) console.error(refusal);
         }
       }
     }

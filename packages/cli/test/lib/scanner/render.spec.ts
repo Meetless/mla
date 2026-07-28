@@ -345,6 +345,27 @@ describe("renderReconciliationBlock trust partition (ADR §3.5)", () => {
     expect(governed).toContain("[CC:case-abc]");
   });
 
+  // T10 ignition, An's Fork C ruling (2026-07-27). A decision a human published
+  // directly carries no case: the publication IS the ruling. The finding still
+  // renders in full, and the citation is OMITTED rather than minted dangling.
+  // A fabricated [CC:] would be worse than none: it invites an agent to go open
+  // a case that never existed, which is exactly the trust this block trades on.
+  it("renders a case-less finding in full and mints no dangling citation", () => {
+    for (const caseless of [{ sourceCaseId: null }, { sourceCaseId: undefined }]) {
+      const xml = renderReconciliationBlock([finding(caseless)]);
+
+      // No citation, of any shape, anywhere in the block.
+      expect(xml).not.toContain("[CC:");
+      expect(xml).not.toContain("null");
+      expect(xml).not.toContain("undefined");
+
+      // And the finding is otherwise whole: all three bands still render.
+      expect(band(xml, "accepted-decision")).toContain("Ship SSO in Q2");
+      expect(band(xml, "artifact-evidence")).toContain("Defer the SSO rollout");
+      expect(band(xml, "detector-assessment")).toContain("still asserts the superseded plan");
+    }
+  });
+
   // Test 20: no payload can close the envelope (or any band) early.
   it("escapes a payload that tries to close the envelope or forge a band", () => {
     const escape =

@@ -58,6 +58,36 @@ const pluginRoot = process.env.MLA_PLUGIN_ROOT
   : path.join(marketplaceRoot, "plugin");
 const hooksTemplateDir = path.join(cliRoot, "src", "hooks-template");
 
+// The Codex connector ships its OWN plugin manifest, hand-authored JSON whose
+// name/description/interface are curated, but whose `version` is the SAME canonical
+// MLA release version as the Claude plugin (INV-PLUGIN-VERSION-DELIVERY). It was
+// maintained by hand and drifted (0.2.25 while the CLI shipped 0.2.27). Fold ONLY its
+// version field into this generator so a release bump reaches it too; every other byte
+// stays as authored. `here` is meetless-cli/scripts, so this resolves to
+// meetless-cli/codex/mla/.codex-plugin/plugin.json.
+const codexManifestPath = path.join(here, "..", "codex", "mla", ".codex-plugin", "plugin.json");
+const CODEX_MANIFEST_REL = "codex/mla/.codex-plugin/plugin.json";
+// Only a REAL repo sync touches the codex manifest. When either DEST root is overridden
+// (the sandbox unit tests set both to a temp dir), we are exercising the plugin-tree
+// generator in isolation and must never write the committed repo file.
+const syncCodex = !process.env.MLA_PLUGIN_ROOT && !process.env.MLA_MARKETPLACE_ROOT;
+
+// The codex manifest with its version set to PLUGIN_VERSION, all other formatting
+// preserved byte-for-byte (the curated compact arrays/objects must not be reflowed by a
+// JSON round-trip). Throws if the manifest has no version key: its shape changed and this
+// generator must be updated deliberately rather than silently no-op.
+function desiredCodexManifest() {
+  const raw = fs.readFileSync(codexManifestPath, "utf8");
+  const re = /("version"\s*:\s*)"[^"]*"/;
+  if (!re.test(raw)) {
+    throw new Error(
+      `sync-plugin: ${CODEX_MANIFEST_REL} has no "version" key to sync; ` +
+        "its shape changed, update the generator deliberately.",
+    );
+  }
+  return raw.replace(re, `$1"${PLUGIN_VERSION}"`);
+}
+
 // Every hook-template file ships in the plugin (13 files). Listed by an EXPLICIT
 // allowlist, NOT a readdir: the 9 registered scripts come from MANAGED_HOOK_SCRIPTS
 // (the single source of truth the hook manifest is built from), and the 4 support
@@ -172,6 +202,15 @@ function drift(desired) {
   } else if (fs.readFileSync(catalogAbs, "utf8") !== catalog) {
     problems.push("content drift: .claude-plugin/marketplace.json");
   }
+  // Codex connector manifest (version-only, format-preserving). Real repo sync only;
+  // skipped when a DEST root is overridden so the hermetic tests never depend on it.
+  if (syncCodex) {
+    if (!fs.existsSync(codexManifestPath)) {
+      problems.push(`missing: ${CODEX_MANIFEST_REL}`);
+    } else if (fs.readFileSync(codexManifestPath, "utf8") !== desiredCodexManifest()) {
+      problems.push(`content drift: ${CODEX_MANIFEST_REL}`);
+    }
+  }
   return problems;
 }
 
@@ -201,6 +240,14 @@ function writeAll(desired) {
   const catalogAbs = path.join(marketplaceRoot, ".claude-plugin", "marketplace.json");
   fs.mkdirSync(path.dirname(catalogAbs), { recursive: true });
   fs.writeFileSync(catalogAbs, renderMarketplaceCatalog());
+  // Codex connector manifest: sync ONLY its version, preserving curated content. Real
+  // repo sync only; a missing file surfaces as drift in --check, not a write here.
+  if (syncCodex && fs.existsSync(codexManifestPath)) {
+    const desiredCodex = desiredCodexManifest();
+    if (fs.readFileSync(codexManifestPath, "utf8") !== desiredCodex) {
+      fs.writeFileSync(codexManifestPath, desiredCodex);
+    }
+  }
 }
 
 function main() {

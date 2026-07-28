@@ -13,10 +13,11 @@
 //
 // The gate is a pure function of (findings, byte-reader). It never throws: a
 // per-finding failure is contained and classified, so one bad path can never sink
-// the batch or the assembler around it. In Phase 2A there is no detector to emit
-// findings (that is Phase 2B, blocked), so every 2A cache carries none and this
-// gate is a clean no-op; it exists, is wired, and is testable now so the primitive
-// is proven before the detector arrives.
+// the batch or the assembler around it. Phase 2B shipped the detector, so this
+// gate now filters REAL findings: `mla scan` pulls the workspace's live findings
+// into the cache and every assemble runs them through here (kept on digest_match,
+// dropped on digest_drift or an unreadable/refused file). An empty cache still
+// yields a clean no-op.
 import {
   CONTENT_NORMALIZATION_V1,
   normalizedContentHash,

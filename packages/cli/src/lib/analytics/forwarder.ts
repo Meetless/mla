@@ -26,6 +26,7 @@
 // the forward inherits the run's trace_id for free.
 
 import { CliConfig } from "../config";
+import { describeEgressRefusal } from "../egress/policy";
 import { post } from "../http";
 import { remoteAnalyticsEnabled } from "./consent";
 import { AnalyticsEvent, isRemotelyEmittable } from "./envelope";
@@ -105,6 +106,14 @@ export async function forwardEvents(
     } catch (err) {
       result.failed += group.length;
       if (onError) onError(err);
+      // `onError` is a DEBUG hook with no production caller (cli.ts finalizes without
+      // one), so until now every failure here was invisible outside a test. That is the
+      // right posture for an outage and the wrong one for a policy refusal, which never
+      // recovers: analytics would simply stop forwarding, forever, with no symptom.
+      // Ruling §2 wants one body-free line, and this is the only channel that exists.
+      // Not gated on `onError`: the whole point is that production has none.
+      const refusal = describeEgressRefusal(err, "analytics events");
+      if (refusal) console.error(refusal);
     }
   }
   return result;

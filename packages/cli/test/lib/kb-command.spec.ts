@@ -79,7 +79,7 @@ function writeCfg(intelUrl: string): void {
       intelUrl,
       controlToken: "ik-test",
       workspaceId: "ws_test",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
 }

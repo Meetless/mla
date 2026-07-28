@@ -95,7 +95,7 @@ describe("user-prompt-submit.sh: per-session turn_index", () => {
           intelUrl: `http://127.0.0.1:${stub.port}`,
           controlToken: "ik-test",
           workspaceId: "ws_test",
-          mlaPath: "/bin/true",
+          mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
         }),
       );
       const workdir = path.join(tmp, "workdir");

@@ -109,6 +109,46 @@ function maskRetrievalError(err) {
 }
 
 /**
+ * Say WHICH empty a zero-candidate pull is, or null when there is nothing to say.
+ *
+ * A bare empty result is ambiguous and the ambiguity is expensive: an agent reads
+ * "no candidates" as "this workspace has no such decision" when the truth is often
+ * "this workspace has never indexed anything, and every query will return this
+ * forever". Prod on 2026-07-26: one operator held 22 auto-provisioned workspaces
+ * with zero documents between them, and 17 of that week's 21 zero-retrievals were
+ * his agent asking an empty corpus. Nothing in the product ever told him.
+ *
+ * intel now returns `corpus_empty` on the empty path (it already computed the same
+ * boolean for PostHog). Three states, three different things to tell the agent:
+ *   true      -> onboarding gap. No rewording will ever help. Name the remedy.
+ *   false     -> a real corpus, a retriever miss. Rewording MIGHT help; absence is
+ *                still not proof.
+ *   undefined -> an intel that predates the field. Say "if", never assert.
+ * Only ever called with zero candidates, so a served pull carries no warning.
+ */
+function explainEmptyPull(corpusEmpty) {
+  if (corpusEmpty === true) {
+    return (
+      "This workspace has no indexed documents, so retrieval returns nothing for EVERY " +
+      "query, not just this one. That is an onboarding gap, not a bad query: run the " +
+      "/mla onboard skill to index this repository (or `mla kb add <path>` for a single " +
+      "document). Do NOT report the absence of evidence as an absence of the fact."
+    );
+  }
+  if (corpusEmpty === false) {
+    return (
+      "The workspace has indexed documents but none matched this query. Try different " +
+      "wording or a broader phrasing before concluding the fact is not recorded."
+    );
+  }
+  return (
+    "No evidence matched. If this workspace was never ingested, retrieval will stay " +
+    "empty for every query: run `mla kb summary` to check, and the /mla onboard skill " +
+    "if it is empty."
+  );
+}
+
+/**
  * meetless__retrieve_knowledge handler. Pulls evidence candidates for a query
  * from the user's own corpus and returns them as the closed EvidenceCandidateDTO
  * facade. The model passes NO workspace_id (env-pinned); only `query` (required)
@@ -178,11 +218,23 @@ export async function runRetrieveKnowledge(args, deps) {
     ? response.candidates
     : [];
 
-  return {
+  const result = {
     tool: "meetless__retrieve_knowledge",
     workspace: workspaceId,
     query,
     count: candidates.length,
     candidates,
   };
+
+  // An empty pull is a finding, not a non-answer. Carry intel's verdict verbatim
+  // (a boolean about the caller's OWN workspace, no substrate) plus the one line
+  // that tells the agent what to do about it.
+  if (candidates.length === 0) {
+    const corpusEmpty =
+      typeof response.corpus_empty === "boolean" ? response.corpus_empty : undefined;
+    if (corpusEmpty !== undefined) result.corpus_empty = corpusEmpty;
+    result.warnings = [explainEmptyPull(corpusEmpty)];
+  }
+
+  return result;
 }

@@ -997,10 +997,13 @@ intercept_main() {
   OUTPUT_ACC=""
   BLOCKS_JSON="[]"
 
-  # --- I1: touched-file set from the git working tree (best-effort, may be []) ---
+  # --- I1: touched-file set from THIS session's own edits (may be []) ---
   # Surfaced in Layer 1 (display) AND sent to intel so the retrieval seeds from
-  # the surfaces the agent is actually modifying. Omitted from the enrich body
-  # when empty (compat 6.2: absent == today's prompt-only behavior).
+  # the surfaces the agent is actually modifying. Read from the per-session
+  # ledger, NOT the git working tree: in a shared checkout the working tree is a
+  # repository fact and injecting it claimed a concurrent peer's WIP as ours
+  # (see collect_touched_files). Omitted from the enrich body when empty
+  # (compat 6.2: absent == today's prompt-only behavior).
   local TOUCHED_FILES_JSON
   TOUCHED_FILES_JSON="$(collect_touched_files)"
   [[ -z "$TOUCHED_FILES_JSON" ]] && TOUCHED_FILES_JSON="[]"
@@ -1068,10 +1071,13 @@ intercept_main() {
   local DELIVERY_STATUS="INJECTED"
   local ASSEMBLE_BLOCK_MSG=""
   if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
-    # Full dirty set, NOT the 50-capped telemetry array: matching must see every touched path.
+    # Full dirty set, NOT the 50-capped telemetry array: matching must see every dirty path.
+    # This one deliberately stays the whole WORKING TREE rather than this session's own edits:
+    # a rule that governs a dirty file must be delivered no matter which session dirtied it, so
+    # over-inclusion here is fail-safe (more governance) where it was fail-wrong on the wire.
     # The env override is scoped to this subshell so it never leaks to TOUCHED_FILES_JSON above.
     local _asm_ws _asm_root _asm_input _asm_meter _asm_reconcile
-    _asm_ws="$(MEETLESS_TOUCHED_FILES_MAX=1000000 collect_touched_files 2>/dev/null || printf '[]')"
+    _asm_ws="$(MEETLESS_TOUCHED_FILES_MAX=1000000 collect_dirty_working_tree 2>/dev/null || printf '[]')"
     [[ -z "$_asm_ws" ]] && _asm_ws="[]"
     # Repo root for repo-relative path resolution, coordinate-consistent with the working set
     # (both derived from $PWD's git tree); fall back to the marker dir when not in a git tree.
@@ -1199,17 +1205,55 @@ intercept_main() {
       local ENRICH_ERR="$tmpdir/enrich.err"
       local ENRICH_CODE="$tmpdir/enrich.code"
 
+      # SEC (code review 2026-07-26): the wire `question` was the RAW prompt.
+      # Middle-truncation shortened it but sent head and tail unredacted, so a
+      # pasted API key in either fragment reached intel in the clear. Redact
+      # FIRST, truncate SECOND: redacting after the cut would let a secret that
+      # straddles the boundary survive in a fragment the redactor never sees as
+      # a whole token. Reuses the ONE parity-locked redactor via the same
+      # `redact-capture` bridge the injected-context blocks already use.
+      #
+      # Fail-closed: if redaction is unavailable (no mla, timeout, crash,
+      # non-JSON), we skip Layer 2 entirely rather than send the raw prompt.
+      # Layer 1's static floor is local and still injects, so the agent is
+      # never blocked; only the best-effort enrichment is lost.
+      #
+      # profile:"retrieval" (NOT the default "full"): this question is the
+      # retrieval key, so the generic entropy heuristic runs at a higher bar.
+      # At the default bar it redacts file paths, stack frames, branch names and
+      # git SHAs, which does not protect anything and does destroy the query.
+      # Every literal secret pattern still applies. See lib/redactor.ts and the
+      # measured corpus in test/lib/redaction-fidelity.spec.ts.
+      local ENRICH_Q="" ENRICH_Q_OK=0
+      local _eq_timeout _eq_red
+      _eq_timeout="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+      if [[ -n "${MLA_PATH:-}" && -x "${MLA_PATH:-}" ]]; then
+        _eq_red="$(jq -c -n --arg q "$PROMPT" '{query: $q, profile: "retrieval"}' 2>/dev/null \
+          | ${_eq_timeout:+"$_eq_timeout" 5} "$MLA_PATH" _internal redact-capture 2>/dev/null || true)"
+        if [[ -n "$_eq_red" ]] && printf '%s' "$_eq_red" | jq -e 'has("query") and (.query != null)' >/dev/null 2>&1; then
+          # Assignment inside `if` so `set -e` cannot kill the hook on a jq fault;
+          # ENRICH_Q_OK flips only when the redacted text actually materialized.
+          if ENRICH_Q="$(printf '%s' "$_eq_red" | jq -r '.query' 2>/dev/null)"; then
+            ENRICH_Q_OK=1
+          fi
+        fi
+      fi
+      if [[ "${ENRICH_Q_OK:-}" != "1" ]]; then
+        log "intercept: prompt redaction unavailable; SKIPPING Layer 2 (raw prompt NOT sent to intel)"
+        ENRICH_FAIL_REASON="redaction_unavailable"
+      fi
+
       # Oversized prompts (pasted logs, diffs, whole specs) used to go on the
       # wire verbatim as `question` and routinely blew the Layer-2 budget in
       # intel's lexical OR-fallback. Retrieval needs the head (intent) and the
       # tail (latest ask); the middle is droppable. Cap ONLY the wire question;
       # capture already spooled the full prompt above, so no fidelity is lost.
-      local ENRICH_Q="$PROMPT"
-      local PLEN="${#PROMPT}"
+      # Measured on the REDACTED text so the cut points match what is sent.
+      local PLEN="${#ENRICH_Q}"
       if [ "$PLEN" -gt 2400 ]; then
-        ENRICH_Q="${PROMPT:0:1500}
+        ENRICH_Q="${ENRICH_Q:0:1500}
 [mla: truncated $((PLEN - 2000)) middle chars for enrichment; full prompt is in capture]
-${PROMPT:$((PLEN - 500))}"
+${ENRICH_Q:$((PLEN - 500))}"
       fi
 
       # Request body built with jq; never string-concatenated (§3.10). NO
@@ -1228,6 +1272,14 @@ ${PROMPT:$((PLEN - 500))}"
         # injection payload). curl's own rc is preserved as the function's exit
         # status so wait/parse_enrich still see 28=timeout, !=0=connection failure.
         local code rc
+        # Fail-closed guard: no redacted question means no request. Returning
+        # non-zero without touching $ENRICH_OUT drops us into parse_enrich's
+        # existing intel_down branch -> ENRICH_STATUS=error -> Layer 1 only,
+        # which is exactly the degradation a real intel outage produces.
+        if [[ "${ENRICH_Q_OK:-}" != "1" ]]; then
+          printf '%s' "000" >"$ENRICH_CODE" 2>/dev/null || true
+          return 1
+        fi
         # Channel A: stamp X-Agent-Session-ID (raw canonical UUID) so intel
         # composes the workspace-namespaced Langfuse session for this enrich the
         # same single way the direct `mla ask` path does. Validate BEFORE -H: an
@@ -1252,7 +1304,11 @@ ${PROMPT:$((PLEN - 500))}"
       parse_enrich() {  # $1 = curl rc
         local rc="$1"
         ENRICH_HTTP_STATUS="$(cat "$ENRICH_CODE" 2>/dev/null || true)"
-        if [[ "$rc" -eq 28 ]]; then ENRICH_FAIL_REASON="timeout"
+        # A redaction-unavailable short-circuit already set the honest reason and
+        # never touched the network; do NOT relabel it intel_down (that would
+        # blame intel for our own guard and make evidence_layer_down lie).
+        if [[ "${ENRICH_Q_OK:-}" != "1" ]]; then :
+        elif [[ "$rc" -eq 28 ]]; then ENRICH_FAIL_REASON="timeout"
         elif [[ "$rc" -ne 0 ]]; then ENRICH_FAIL_REASON="intel_down"; fi
         if [[ "$rc" -eq 0 ]] && jq -e '.enrichment' "$ENRICH_OUT" >/dev/null 2>&1; then
           VALID_ENRICH="1"

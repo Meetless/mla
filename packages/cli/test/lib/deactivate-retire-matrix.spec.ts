@@ -33,7 +33,7 @@ function stageHome(tmp: string): string {
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(
     path.join(home, "cli-config.json"),
-    JSON.stringify({ controlUrl: "http://127.0.0.1:1", controlToken: "t", mlaPath: "/bin/true" }),
+    JSON.stringify({ controlUrl: "http://127.0.0.1:1", controlToken: "t", mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true" }),
   );
   return home;
 }
@@ -48,7 +48,7 @@ function writeMarker(dir: string, workspaceId: string): string {
 const fakeCfg: WorkspaceCliConfig = {
   controlUrl: "http://127.0.0.1:1",
   controlToken: "t",
-  mlaPath: "/bin/true",
+  mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
   workspaceId: WS,
   auth: { mode: "shared-key", accessToken: "t" },
 };

@@ -20,6 +20,7 @@ import {
   MCP_SERVER_KEY,
   mcpCommandExecutable,
   isPkgSnapshotPath,
+  resolveMlaPath,
 } from "../lib/wire";
 import {
   openCe0Store,
@@ -60,7 +61,7 @@ import {
   type ReconcilePlan,
   type ReconcileIO,
 } from "../connectors/claude-code/plugin-migrate";
-import { codexHooksInstalled } from "../connectors/codex/wire";
+import { codexHooksInstalled, isOurMlaCommand } from "../connectors/codex/wire";
 import {
   readRuleBundleCache,
   type BundleCacheRead,
@@ -343,7 +344,14 @@ export function ruleBundleDoctorChecks(read: BundleCacheRead): Check[] {
 }
 
 export type CodexMcpProbe =
+  // Canonical: an enabled meetless entry that launches `mla mcp` (bare name or
+  // the absolute mla path the auto-wire registers).
   | { kind: "configured"; detail: string }
+  // Ours, but the user disabled it in Codex. A user choice, surfaced as info.
+  | { kind: "disabled"; detail: string }
+  // A meetless entry MLA does not own (foreign command/args). MLA never
+  // overwrites it, so doctor flags it as a wiring conflict (RC4).
+  | { kind: "conflict"; detail: string }
   | { kind: "absent"; detail: string }
   | { kind: "unavailable"; detail: string };
 
@@ -356,6 +364,17 @@ export function codexMcpDoctorCheck(probe: CodexMcpProbe): Check {
       detail: probe.detail,
     };
   }
+  // A foreign `meetless` entry is a genuine wiring conflict: governed retrieval
+  // is not the server MLA manages, and MLA deliberately did not replace a
+  // user-owned/externally-managed entry. Non-ok so the operator sees and resolves it.
+  if (probe.kind === "conflict") {
+    return {
+      id: "codex.mcp.registered",
+      ok: false,
+      label: "Codex Meetless MCP server: wiring conflict",
+      detail: probe.detail,
+    };
+  }
   return {
     id: "codex.mcp.registered",
     ok: true,
@@ -363,7 +382,9 @@ export function codexMcpDoctorCheck(probe: CodexMcpProbe): Check {
     label:
       probe.kind === "absent"
         ? "Codex Meetless MCP server not installed"
-        : "Codex MCP status unavailable",
+        : probe.kind === "disabled"
+          ? "Codex Meetless MCP server registered but disabled"
+          : "Codex MCP status unavailable",
     detail: probe.detail,
   };
 }
@@ -415,27 +436,51 @@ function probeCodexMcp(): CodexMcpProbe {
     });
     const parsed = JSON.parse(raw);
     const transport = parsed?.transport;
+    const command = transport?.command;
     const args = Array.isArray(transport?.args) ? transport.args : [];
-    if (
-      parsed?.enabled === true &&
+    // RC3: identity is the SAME resolved executable the auto-wire registers, not
+    // the literal string "mla". isOurMlaCommand accepts the bare plugin name, the
+    // absolute mla path, and a symlink/realpath match, so a doctor run after an
+    // install that wrote the absolute path still reads green.
+    const mlaPath = resolveMlaPath();
+    const canonical =
       transport?.type === "stdio" &&
-      transport?.command === "mla" &&
-      args[0] === "mcp"
-    ) {
-      return { kind: "configured", detail: "meetless -> `mla mcp` (enabled)" };
+      args.length === 1 &&
+      args[0] === "mcp" &&
+      isOurMlaCommand(command, mlaPath);
+    if (canonical && parsed?.enabled === true) {
+      return {
+        kind: "configured",
+        detail: `meetless -> \`${typeof command === "string" ? command : "mla"} mcp\` (enabled)`,
+      };
     }
+    if (canonical && parsed?.enabled === false) {
+      return {
+        kind: "disabled",
+        detail: "the meetless MCP server is registered but disabled; re-enable it in Codex to use governed memory there",
+      };
+    }
+    // RC4: a present entry that is not ours. Report its exact command+args and
+    // say MLA left it untouched; never present this as a plain "absent".
+    const shownCmd = typeof command === "string" ? command : "(none)";
+    const shownArgs = args.length > 0 ? " " + args.join(" ") : "";
     return {
-      kind: "absent",
-      detail: "a meetless entry exists but is disabled or does not launch `mla mcp`; install `mla@meetless`",
+      kind: "conflict",
+      detail:
+        `a meetless MCP entry MLA does not own is registered (runs: ${shownCmd}${shownArgs}); ` +
+        `MLA left it unchanged. Remove or rename it, then run \`mla codex install\` to register the Meetless server.`,
     };
   } catch (e) {
     const err = e as NodeJS.ErrnoException;
     if (err.code === "ENOENT") {
       return { kind: "unavailable", detail: "Codex CLI is not on PATH" };
     }
+    // Non-ENOENT: `codex mcp get` exits non-zero when no meetless entry exists
+    // (and also if the config fails to load). Treat as not-installed; the
+    // connector-complete check turns a half-install into a hard failure.
     return {
       kind: "absent",
-      detail: "install the `mla@meetless` Codex plugin to enable governed retrieval",
+      detail: "no meetless MCP server is registered with Codex; run `mla codex install` to enable governed retrieval",
     };
   }
 }

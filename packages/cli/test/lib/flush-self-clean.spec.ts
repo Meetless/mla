@@ -48,7 +48,7 @@ function makeMeetlessHome(tmp: string, workspaceId = "ws_test"): string {
       controlUrl: "http://127.0.0.1:1",
       controlToken: "test-token",
       workspaceId,
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
   return home;

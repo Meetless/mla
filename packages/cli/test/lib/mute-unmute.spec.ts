@@ -24,7 +24,7 @@ function stageHome(tmp: string): string {
     JSON.stringify({
       controlUrl: "http://127.0.0.1:1",
       controlToken: "test-token",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
   return home;

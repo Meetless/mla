@@ -53,7 +53,7 @@ function makeMeetlessHome(tmp: string): string {
       workspaceId: "ws_test",
       actorUserId: "user_a",
       // /bin/true: finalize-session is a no-op so Pass 3 never networks.
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
   return home;

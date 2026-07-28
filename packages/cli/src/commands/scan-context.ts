@@ -393,6 +393,9 @@ export async function runScanContext(argv: string[], deps: ScanContextDeps = {})
       `warning: ${uploaded.failed} of ${uploaded.attempted} instruction-file snapshot uploads ` +
         `failed; reconciliation may be scanning stale content for those files.`,
     );
+    // The count above cannot distinguish a flaky network (self-healing) from an egress policy
+    // refusal (permanent until someone edits rules.ts), so name the refusal when there was one.
+    if (uploaded.refusal) err(uploaded.refusal);
   }
   return 0;
 }

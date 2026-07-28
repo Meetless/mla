@@ -65,7 +65,7 @@ beforeAll(async () => {
       controlUrl: `http://127.0.0.1:${port}`,
       controlToken: "ik-test",
       actorUserId: "wu_test_actor",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
 });

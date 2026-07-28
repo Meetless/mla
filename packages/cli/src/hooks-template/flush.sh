@@ -369,7 +369,36 @@ else
     EVENTS_OK=0
     log "Pass 2: jq event filter crashed; deferring events + finalize"
   else
-    EVENT_COUNT="$(jq 'length' < "$EVENTS_FILE" 2>/dev/null || echo 0)"
+    # MANDATORY redaction boundary. Everything the hooks spool -- the raw user
+    # prompt, the assistant's narration and final message, the full bash command
+    # plus its stdout/stderr tails, the agent-decision Q&A -- reaches the network
+    # HERE and nowhere else. Redacting at this single chokepoint (rather than at
+    # each of the ~8 spool sites) costs one node spawn per already-detached flush
+    # and, because the policy is default-redact with a structural-key allowlist,
+    # covers event types that do not exist yet.
+    #
+    # Fail-closed: a missing/non-executable mla, a timeout, a crash, or any
+    # non-JSON stdout sets EVENTS_OK=0, which re-spools the batch below and
+    # defers finalize. We NEVER fall back to the unredacted array -- a secret
+    # that leaves this machine cannot be recalled, whereas a deferred batch is
+    # redelivered on the next flush (eventKey dedupes server-side).
+    REDACTED_FILE="$(mktemp "${TMPDIR:-/tmp}/mla-events-red.XXXXXX")"
+    REDACT_TIMEOUT="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+    if [[ -z "${MLA_PATH:-}" || ! -x "${MLA_PATH:-}" ]]; then
+      EVENTS_OK=0
+      log "Pass 2: mla CLI not executable at MLA_PATH; CANNOT redact, deferring events + finalize (run mla init to repair hooks)"
+    elif ! ${REDACT_TIMEOUT:+"$REDACT_TIMEOUT" 20} "$MLA_PATH" _internal redact-events \
+           < "$EVENTS_FILE" > "$REDACTED_FILE" 2>/dev/null; then
+      EVENTS_OK=0
+      log "Pass 2: redact-events FAILED (exit non-zero); deferring events + finalize -- raw bodies NOT sent"
+    elif ! jq -e 'type == "array"' < "$REDACTED_FILE" >/dev/null 2>&1; then
+      EVENTS_OK=0
+      log "Pass 2: redact-events produced non-array output; deferring events + finalize -- raw bodies NOT sent"
+    else
+      mv -f "$REDACTED_FILE" "$EVENTS_FILE"
+      EVENT_COUNT="$(jq 'length' < "$EVENTS_FILE" 2>/dev/null || echo 0)"
+    fi
+    rm -f "$REDACTED_FILE"
   fi
 fi
 
@@ -523,7 +552,7 @@ rm -f "$TMP"
 #
 # We deliberately reap NOTHING else here. finalize fires at the end of EVERY turn
 # (Claude Code has no session-end hook), so every per-session sidecar
-# (.workspaceId, .repoPath, .gitBaseline, .turn, .lock, .hb*, .narration-cursor*)
+# (.workspaceId, .repoPath, .gitBaseline, .touched, .turn, .lock, .hb*, .narration-cursor*)
 # is session-lifetime state a later turn still needs. Deleting any of them on a
 # "successful finalize" stranded every subsequent turn (prod session 11436b5c).
 # Teardown of the sidecars is the 24h age-gated idle reaper's job alone; it is

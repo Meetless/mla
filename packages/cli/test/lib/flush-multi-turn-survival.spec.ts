@@ -42,7 +42,14 @@ function stageHooksDir(tmp: string): string {
 // finalize-OK branch (the branch that used to reap .workspaceId).
 function writeMlaStub(tmp: string): string {
   const p = path.join(tmp, "mla-stub");
-  fs.writeFileSync(p, `#!/usr/bin/env bash\nexit 0\n`, { mode: 0o755 });
+  // The redaction filters are the exception: flush.sh pipes the batch through
+  // `_internal redact-events` and fails CLOSED on empty output, so a blanket
+  // exit 0 defers every batch. Identity is the no-op for a filter.
+  fs.writeFileSync(
+    p,
+    `#!/usr/bin/env bash\ncase "$2" in redact-events|redact-capture) exec cat ;; esac\nexit 0\n`,
+    { mode: 0o755 },
+  );
   return p;
 }
 

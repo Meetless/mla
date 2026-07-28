@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.28 (2026-07-27)
+
+0.2.28 is about what leaves your machine. Every payload `mla` sends now passes through a single
+egress boundary that refuses to ship a body it cannot classify, so redaction is the default path
+instead of something each call site had to remember. The boundary now covers the four MCP routes
+it was previously refusing outright, reads its field list off the actual caller rather than
+guessing from the route name, and carries a third redaction profile for the events ledger so your
+file paths survive a scrub that secrets do not. A refusal that used to be swallowed now says so,
+once, instead of failing quietly forever. Alongside that, install wires Codex automatically for
+parity with Claude Code, and the MCP tools got more honest: an empty `retrieve_knowledge` tells
+you why it was empty and names the remedy, a reachable intel stops being reported as unreachable,
+and the pending relationship queue is ordered by what needs attention rather than by arrival.
+
+- one egress boundary that no request body can leave unclassified
+- the `/v1/ask` payload builder redacts by default, closing the last raw egress path
+- every network capture is redacted at the boundary, not just two of them
+- the four MCP egress routes the boundary was refusing are registered
+- egress field lists are read off the caller, not inferred from the route name
+- a third redactor profile keeps file paths in the events ledger while still scrubbing secrets
+- a swallowed egress refusal is permanent, so it now reports itself once
+- a JWT is redacted whole, and the wire question keeps its retrieval key
+- an injected redaction function can no longer redact less, and names survive
+- the redaction corpus fixture carries synthetic identifiers, and its generator now enforces that
+- a hook event attributes touched files to the session that changed them, not the whole dirty tree
+- `mla kb add` is no longer blocked by the egress boundary, and sends the real body
+- `mla adoption` reports a governed-catch floor rather than leaving follow-through unmeasured
+- `mla install` auto-wires Codex for parity with Claude Code, reported source-neutrally
+- an empty `retrieve_knowledge` explains why and names the remedy
+- a reachable intel is no longer reported as unreachable
+- the pending relationship queue is attention-ordered rather than FIFO
+- the abstain gauge stops counting the router's own design as recall debt
+- `publish-gcs` is write-once, so a republish can never overwrite a shipped artifact
+- the codex connector manifest version is kept in lockstep by `plugin:sync`
+- the reported workspace root is honest for public eyes
+
 ## 0.2.27 (2026-07-24)
 
 0.2.27 makes `mla scan` a reconciliation producer and makes the CLI honest about why an answer

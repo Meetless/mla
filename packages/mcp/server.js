@@ -678,6 +678,12 @@ export function buildDepsFromEnv(env = process.env) {
     // intelFetch reuses the same control token (Rule 5: one bearer for
     // /internal/v1 across services).
     intelFetch: makeIntelFetch({ baseUrl: intelBaseUrl, apiKey: controlToken }),
+    // No redactor is passed, and there is no parameter to pass one to.
+    // makeIntelAsk redacts the question with ask-core's own parity-locked ESM
+    // redactor (packages/ask-core/redactor.js) at the `retrieval` bar, so the
+    // standalone `meetless-mcp` bin is covered without this file having to
+    // remember, and no front-end can weaken it. `mla ask` reaches the same
+    // boundary the same way.
     intelAsk: makeIntelAsk({ intelBaseUrl, apiKey: controlToken }),
     defaultWorkspaceId: workspaceId,
     notesRoot,

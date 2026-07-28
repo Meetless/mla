@@ -307,6 +307,8 @@ if [[ "$TOOL" == "apply_patch" ]]; then
       --arg story "$PATCH_STORY" \
       '{ts: $ts, event: $event, eventKey: $key, sessionId: $sessionId, payload: {tool: $tool, filePath: $fp, storyCategory: $story}}')"
     spool_append "$SESSION_ID" "$LINE"
+    # I1 attribution ledger: this session just wrote this path, as a fact.
+    record_touched_file "$SESSION_ID" "$PATCH_PATH"
   done <<< "$PATCH_PATHS"
   exit 0
 fi
@@ -340,6 +342,16 @@ if [[ "$TOOL" == "Edit" || "$TOOL" == "Write" || "$TOOL" == "MultiEdit" || "$TOO
       --arg story "$FILE_STORY" \
       '{ts: $ts, event: $event, eventKey: $key, sessionId: $sessionId, payload: {tool: $tool, filePath: $fp, storyCategory: $story}}')"
     spool_append "$SESSION_ID" "$LINE"
+
+    # ---- I1 attribution ledger -----------------------------------------------
+    # The next UserPromptSubmit reads this back as `touched_files`. It sits here,
+    # immediately after the governed spool and BEFORE the best-effort work-product
+    # capture below, for the same reason that block is ordered this way: anything
+    # placed after a block that can early-exit under `set -euo pipefail` may never
+    # run. A path, already spooled one line above, so this crosses no new privacy
+    # boundary; it only records WHICH session owns the write, which the drained
+    # spool cannot answer at prompt time.
+    record_touched_file "$SESSION_ID" "$FILE_TRACE_PATH"
 
     # ---- Evidence material-incorporation P1: stage the changed hunk(s) --------
     # notes/20260716-evidence-material-incorporation-correlator.md (§5, §8, §10.6, §11).

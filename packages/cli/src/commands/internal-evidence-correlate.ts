@@ -22,6 +22,7 @@
 // error -> 2), so closing windows can never disturb the session it spawned from.
 
 import { CliConfig, readConfig } from "../lib/config";
+import { describeEgressRefusal } from "../lib/egress/policy";
 import {
   buildCoverageGapPayload,
   coerceRetrievalConfidence,
@@ -436,8 +437,13 @@ export async function runInternalEvidenceCorrelate(
               sealedAtIso: nowIso,
             });
             await postCap(cfg, body);
-          } catch {
-            // Best-effort: a failed seal never disturbs the sweep.
+          } catch (err) {
+            // Best-effort: a failed seal never disturbs the sweep. But a policy
+            // refusal means the seal route or one of its fields is unclassified,
+            // so EVERY seal from here on is dead, silently. One body-free line
+            // (ruling §2); the sweep still completes and still exits 0.
+            const refusal = describeEgressRefusal(err, "work-product seal");
+            if (refusal) console.error(refusal);
           }
         }
       }

@@ -99,6 +99,7 @@ import { runInternalEnforcementBaseline, runInternalPosttoolSweep } from "./comm
 import { runInternalForwardEnforcement } from "./commands/internal-forward-enforcement";
 import { runInternalEnforcementCorrelate } from "./commands/internal-enforcement-correlate";
 import { runInternalRedactCapture } from "./commands/internal-redact-capture";
+import { runInternalRedactEvents } from "./commands/internal-redact-events";
 import { runInternalTurnRecap } from "./commands/internal-turn-recap";
 import { runInternalRefresh } from "./commands/internal-refresh";
 import { runInternalSessionNudge } from "./commands/internal-session-nudge";
@@ -1014,6 +1015,7 @@ export const COMMANDS: CommandSpec[] = [
       if (sub === "forward-enforcement") return runInternalForwardEnforcement(rest);
       if (sub === "enforcement-correlate") return runInternalEnforcementCorrelate(rest);
       if (sub === "redact-capture") return runInternalRedactCapture(rest);
+      if (sub === "redact-events") return runInternalRedactEvents(rest);
       if (sub === "turn-recap") return runInternalTurnRecap(rest);
       if (sub === "refresh") return runInternalRefresh(rest);
       if (sub === "session-nudge") return runInternalSessionNudge(rest);

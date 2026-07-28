@@ -23,6 +23,7 @@ import { spawn } from "child_process";
 import * as crypto from "crypto";
 import * as http from "http";
 import * as os from "os";
+import { egressFetch } from "./egress/fetch";
 import { mlaUserAgent } from "./observability";
 
 // ---------------------------------------------------------------------------
@@ -323,13 +324,14 @@ export async function exchangeGrant(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const res = await egressFetch("control", url, {
       method: "POST",
       // Content-Type only; explicitly NO Authorization header.
       headers: { "Content-Type": "application/json" },
       // userAgent records the CLI version on the new session (Session.userAgent);
       // the one-time code + PKCE verifier remain the sole proof-of-possession.
-      body: JSON.stringify({ code, codeVerifier, userAgent: mlaUserAgent() }),
+      // Registered passthrough: redacting a PKCE verifier fails the exchange.
+      body: { code, codeVerifier, userAgent: mlaUserAgent() },
       signal: controller.signal,
     });
     const text = await res.text();

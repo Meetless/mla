@@ -20,6 +20,12 @@ import {
   routeNameFromPath,
 } from "./observability";
 import type { SpanHandle } from "@meetless/trace-core";
+// Every outbound request in this file goes through egressFetch. It is the only
+// module allowed to name `fetch`, and it applies the egress registry to any
+// body BEFORE serializing it, so a body this transport never classified cannot
+// reach the wire. See src/lib/egress/policy.ts for why the decision moved off
+// the call sites.
+import { egressFetch } from "./egress/fetch";
 
 export interface HttpError extends Error {
   // Optional: fetch-level failures (ECONNREFUSED, AbortError) reject as raw
@@ -144,10 +150,13 @@ async function doFetchOnce(
   try {
     let res: Response;
     try {
-      res = await fetch(url, {
+      // The PARSED body goes to the boundary, never a pre-stringified one: the
+      // boundary serializes what it approved, so there is no way to compute the
+      // wire bytes ahead of it.
+      res = await egressFetch("control", url, {
         method,
         headers: buildRequestHeaders(cfg.controlToken, hasBody, cfg.actorUserId),
-        body: hasBody ? JSON.stringify(body) : undefined,
+        body: hasBody ? body : undefined,
         signal: controller.signal,
       });
     } catch (err) {
@@ -412,12 +421,15 @@ async function callRefresh(
   try {
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await egressFetch("control", url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // userAgent carries the CLI version so control records it on the rotated
         // session (Session.userAgent); the refresh token stays the sole credential.
-        body: JSON.stringify({ refreshToken, userAgent: mlaUserAgent() }),
+        // Registered passthrough: redacting a refresh token would send garbage
+        // and lock the operator out, so the registry says so out loud rather
+        // than leaving the exemption implicit in a call site.
+        body: { refreshToken, userAgent: mlaUserAgent() },
         signal: controller.signal,
       });
     } catch {
@@ -631,7 +643,7 @@ export async function intelGet<T = unknown>(
   try {
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await egressFetch("intel", url, {
         method: "GET",
         headers: buildIntelHeaders(cfg.controlToken, false),
         signal: controller.signal,
@@ -673,10 +685,10 @@ export async function intelPost<T = unknown>(
   try {
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await egressFetch("intel", url, {
         method: "POST",
         headers: buildIntelHeaders(cfg.controlToken, true),
-        body: JSON.stringify(body),
+        body,
         signal: controller.signal,
       });
     } catch (err) {
@@ -719,10 +731,10 @@ export async function intelPatch<T = unknown>(
   try {
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await egressFetch("intel", url, {
         method: "PATCH",
         headers: buildIntelHeaders(cfg.controlToken, true),
-        body: JSON.stringify(body),
+        body,
         signal: controller.signal,
       });
     } catch (err) {

@@ -22,6 +22,13 @@ declare module "@meetless/ask-core/ask_modes.js" {
   }
   export type IntelAsk = (args: IntelAskArgs) => Promise<Record<string, unknown>>;
 
+  /**
+   * NOTE: there is deliberately no `redactFn` dependency. Egress redaction of
+   * `question` happens inside the payload builder with this package's own
+   * parity-locked ESM redactor at the `retrieval` bar, and cannot be replaced,
+   * weakened or forgotten by a front-end. A caller that wants stricter
+   * redaction applies it to its own text before calling.
+   */
   export function makeIntelAsk(deps: {
     intelBaseUrl: string;
     apiKey: string;

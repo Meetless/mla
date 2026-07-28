@@ -9,7 +9,8 @@
 //
 // Contract (fail-closed telemetry, fail-open agent -- the agent's prompt is
 // delivered by the hook independently of this call):
-//   stdin  : { blocks?: [{kind, content, citations?, charCount?, itemCount?}], query?: string }
+//   stdin  : { blocks?: [{kind, content, citations?, charCount?, itemCount?}],
+//              query?: string, profile?: "full" | "retrieval" }
 //   stdout : { blocks: [{kind, content, contentStatus, citations, charCount, itemCount}], query }
 //   exit 0 : redaction succeeded; the hook spools the redacted output verbatim.
 //   exit 1 : ANY failure (unreadable/malformed stdin, serialization fault). The
@@ -24,7 +25,7 @@
 // are producer metadata and pass through untouched (they are governance ids /
 // counts, not secrets).
 
-import { redact } from "../lib/redactor";
+import { redact, type RedactProfile } from "../lib/redactor";
 
 // contentStatus values this command can produce. "purged" (retention) and
 // "redaction_failed" (this command failed; set by the hook) are produced
@@ -46,6 +47,7 @@ export interface RedactCaptureBlockIn {
 export interface RedactCaptureInput {
   blocks?: unknown;
   query?: unknown;
+  profile?: unknown;
 }
 
 export interface RedactCaptureBlockOut {
@@ -118,8 +120,20 @@ export function redactCapturePayload(input: RedactCaptureInput): RedactCaptureOu
     };
   });
 
+  // `query` serves two callers with opposite failure costs, so the caller
+  // declares which bar it needs and the DEFAULT is the strong one:
+  //
+  //   post-tool-use.sh  -- MCP query text on its way to the SPOOL. At rest, in a
+  //     row an operator reads later. Over-redaction is cheap. Profile "full".
+  //   user-prompt-submit.sh -- the enrichment question on its way OUT to intel.
+  //     The text IS the retrieval key; "[REDACTED]" in place of a file path is
+  //     not a redaction, it is a destroyed query. Profile "retrieval".
+  //
+  // An unrecognized or absent profile falls back to "full", so a typo in the
+  // hook weakens nothing.
+  const profile: RedactProfile = input.profile === "retrieval" ? "retrieval" : "full";
   const rawQuery = typeof input.query === "string" ? input.query : null;
-  const query = rawQuery === null ? null : (redact(rawQuery) ?? rawQuery);
+  const query = rawQuery === null ? null : (redact(rawQuery, profile) ?? rawQuery);
 
   return { blocks, query };
 }

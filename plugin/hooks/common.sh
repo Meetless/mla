@@ -337,25 +337,25 @@ resolve_session_title() {
   printf '%s' "$title"
 }
 
-# I1 (interception): best-effort snapshot of the files the agent is about to
-# touch, sourced from the git working-tree delta at prompt-submit time. This is
-# literally "the surfaces the agent is actually modifying" (spec §I1: enrich must
-# seed retrieval from the touched-file SET, not from the prompt's phrasing), and
-# it picks up Bash-driven edits too, which keeps us inside the v0 Bash-only
-# capture boundary (Edit/Write tool I/O is out of scope until the rejected
-# --unsafe-capture-non-bash ships in v0.1).
+# The DIRTY WORKING TREE: every path git reports as changed vs HEAD (staged +
+# unstaged) plus untracked-but-not-ignored files, as of right now, in $dir.
 #
-# Emits a compact JSON array of paths on stdout (e.g. ["a.ts","b.ts"]), deduped
-# and bounded to MEETLESS_TOUCHED_FILES_MAX (default 50). ALWAYS returns 0 and
-# prints "[]" on any failure (no git binary, not a repo, empty repo with no HEAD,
-# detached worktree). An empty result is the compat-6.2 signal: callers OMIT the
-# field entirely, so retrieval falls back to today's prompt-only behavior.
+# The name states exactly what it measures and nothing more. This is a
+# REPOSITORY fact, not a session fact: in a checkout shared by several
+# concurrent agent sessions (our own dogfood tree runs 10+), most of what this
+# returns was written by somebody else. Do NOT use it to answer "what did THIS
+# session touch"; that is what collect_touched_files below is for.
 #
-# Deliberately does NOT emit a structured proposed_action. At UserPromptSubmit
-# there is no concrete pending action to describe; that field is reserved for a
-# future PreToolUse interception surface. touched_files are ranking hints only
-# (spec I-SEC-1) and never widen ACL (I-SEC-3); intel treats them as such.
-collect_touched_files() {
+# Legitimate consumers are the ones that genuinely want the repository's current
+# state: the rule assembler matches governance rules against the whole working
+# set on purpose, because a rule that governs a dirty file should be delivered no
+# matter who dirtied it.
+#
+# Emits a compact JSON array of repo-relative paths on stdout (e.g.
+# ["a.ts","b.ts"]), deduped and bounded to MEETLESS_TOUCHED_FILES_MAX (default
+# 50). ALWAYS returns 0 and prints "[]" on any failure (no git binary, not a
+# repo, empty repo with no HEAD, detached worktree).
+collect_dirty_working_tree() {
   local dir="${1:-$PWD}"
   local max="${MEETLESS_TOUCHED_FILES_MAX:-50}"
   command -v git >/dev/null 2>&1 || { printf '[]'; return 0; }
@@ -371,6 +371,145 @@ collect_touched_files() {
       git -C "$dir" diff --name-only HEAD 2>/dev/null
       git -C "$dir" ls-files --others --exclude-standard 2>/dev/null
     } | awk 'NF' | sort -u | head -n "$max"
+  )"
+  [[ -z "$files" ]] && { printf '[]'; return 0; }
+  printf '%s' "$files" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]'
+  return 0
+}
+
+# Append one path to THIS session's touched-file ledger. Called by post-tool-use
+# on every file-modifying tool call, which is the only place in the hook layer
+# that knows, as a fact rather than an inference, that this session just wrote
+# this file.
+#
+# Append-only, newline-delimited, one `>>` with no lock: a single short line
+# written with one write(2) under PIPE_BUF is atomic on every filesystem we
+# support, and the reader dedupes anyway, so a concurrent post-tool-use in the
+# SAME session can at worst produce a duplicate line. Never fails the caller.
+record_touched_file() {
+  local sid="$1" path="$2"
+  [[ -n "$sid" && -n "$path" ]] || return 0
+  case "$path" in *$'\n'*) return 0 ;; esac
+  # Record the PHYSICAL path. The agent host hands us the LOGICAL path the
+  # operator works in, while `git rev-parse --show-toplevel` (the scope root the
+  # reader strips) always answers physically. A project reached through a symlink
+  # (`~/work` pointing at `/Volumes/dev/work`, or anything under macOS /tmp, which
+  # is itself a link to /private/tmp) would therefore match no root at read time,
+  # every path would be dropped, and touched_files would go silently empty: the
+  # exact failure mode this ledger exists to remove. Resolving here costs one
+  # subshell per file-modifying tool call instead of one per path per prompt.
+  # Best effort by design: a path whose directory is already gone is kept
+  # verbatim rather than discarded.
+  local _rtf_dir _rtf_base _rtf_phys
+  if [[ "$path" == /* ]]; then
+    _rtf_dir="${path%/*}"
+    [[ -z "$_rtf_dir" ]] && _rtf_dir="/"
+    _rtf_base="${path##*/}"
+    _rtf_phys="$(cd "$_rtf_dir" 2>/dev/null && pwd -P || true)"
+    [[ -n "$_rtf_phys" ]] && path="${_rtf_phys%/}/$_rtf_base"
+  fi
+  mkdir -p "$QUEUE_DIR" 2>/dev/null || return 0
+  printf '%s\n' "$path" >> "$QUEUE_DIR/$sid.touched" 2>/dev/null || true
+  return 0
+}
+
+# I1 (interception): the files THIS session actually modified, read back from the
+# ledger record_touched_file appends to (spec §I1: enrich must seed retrieval
+# from the touched-file SET, not from the prompt's phrasing).
+#
+# 2026-07-27 dogfood finding (notes/20260514-dogfood-friction.md): this used to
+# be the git working-tree delta, which is a REPOSITORY fact. In a shared checkout
+# it injected a concurrent peer's uncommitted work as "the surfaces the agent is
+# actually modifying" (verified live: four paths, none of them ours). The failure
+# was silent and plausible: wrong paths that look exactly like right ones. Worse,
+# it invited the agent to `git add` files it had never touched. Attribution must
+# be exact, so the substrate moved to the only exact signal available at
+# UserPromptSubmit.
+#
+# Coverage is partial by construction and that is the correct trade. A path lands
+# here only when it came through Edit/Write/MultiEdit/NotebookEdit/apply_patch,
+# so a Bash-driven edit (`sed -i`, a `>` redirect) is NOT captured; PostToolUse
+# sees the command, never the files it wrote. Partial and exact beats complete
+# and wrong: a missing path costs one ranking hint, a wrong path poisons the
+# seed AND misattributes another human's work.
+#
+# Emits a compact JSON array of repo-relative paths on stdout, most-recently-
+# touched FIRST (recency is the ranking signal, so the bound must not truncate
+# it away), deduped and bounded to MEETLESS_TOUCHED_FILES_MAX (default 50).
+# Paths outside $dir are dropped: the wire contract is repo-relative, and a path
+# in some other repo is not a surface of this workspace. ALWAYS returns 0 and
+# prints "[]" on any failure or when the session has modified nothing yet. An
+# empty result is the compat-6.2 signal: callers OMIT the field entirely, so
+# retrieval falls back to today's prompt-only behavior.
+#
+# Deliberately does NOT emit a structured proposed_action. At UserPromptSubmit
+# there is no concrete pending action to describe; that field is reserved for a
+# future PreToolUse interception surface. touched_files are ranking hints only
+# (spec I-SEC-1) and never widen ACL (I-SEC-3); intel treats them as such.
+collect_touched_files() {
+  local sid="${1:-${SESSION_ID:-}}"
+  local dir="${2:-$PWD}"
+  local max="${MEETLESS_TOUCHED_FILES_MAX:-50}"
+  command -v jq >/dev/null 2>&1 || { printf '[]'; return 0; }
+  [[ -n "$sid" ]] || { printf '[]'; return 0; }
+  local ledger="$QUEUE_DIR/$sid.touched"
+  [[ -s "$ledger" ]] || { printf '[]'; return 0; }
+  # Resolve the scope root once. Prefer the git top level so the emitted paths
+  # match what collect_dirty_working_tree would emit for the same file; fall back
+  # to $dir when this is not a git tree (a marker-only activation still governs).
+  #
+  # TWO roots, not one, and the second is not paranoia. `git rev-parse` always
+  # answers with the PHYSICAL path (symlinks resolved) while the agent host hands
+  # post-tool-use the LOGICAL path the operator actually works in. Any project
+  # reached through a symlink (`~/work` -> `/Volumes/dev/work`, or any macOS
+  # path under /tmp, where /tmp itself is a link to /private/tmp) would then match
+  # neither root, every path would be dropped, and touched_files would go silently
+  # empty. Silent-and-empty is precisely the failure mode this whole function
+  # exists to remove, so we accept a match against either spelling of the root.
+  local root root_alt phys_dir suffix
+  root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  root_alt=""
+  if [[ -n "$root" ]]; then
+    # Derive the LOGICAL spelling of the git top level from the caller's $dir:
+    # take the part of the physical cwd below the physical top level and strip
+    # that same tail off $dir. Exact, and it costs one subshell.
+    phys_dir="$(cd "$dir" 2>/dev/null && pwd -P || true)"
+    if [[ -n "$phys_dir" && "$phys_dir" == "$root"* ]]; then
+      suffix="${phys_dir#"$root"}"
+      root_alt="${dir%"$suffix"}"
+    fi
+  else
+    root="$dir"
+    root_alt="$(cd "$dir" 2>/dev/null && pwd -P || true)"
+  fi
+  root="${root%/}"
+  root_alt="${root_alt%/}"
+  [[ "$root_alt" == "$root" ]] && root_alt=""
+  local files
+  files="$(
+    awk -v root="$root/" -v root_alt="$root_alt" '
+      # Reverse then dedupe, so the survivor of a repeated path is its MOST
+      # RECENT touch and the head-cap below keeps the freshest surfaces.
+      { a[NR] = $0 }
+      END {
+        if (root_alt != "") root_alt = root_alt "/"
+        for (i = NR; i > 0; i--) {
+          p = a[i]
+          if (p == "") continue
+          if (substr(p, 1, 1) == "/") {
+            if (index(p, root) == 1) {
+              p = substr(p, length(root) + 1)
+            } else if (root_alt != "" && index(p, root_alt) == 1) {
+              p = substr(p, length(root_alt) + 1)
+            } else {
+              continue
+            }
+          }
+          if (p == "" || seen[p]++) continue
+          print p
+        }
+      }
+    ' "$ledger" 2>/dev/null | head -n "$max"
   )"
   [[ -z "$files" ]] && { printf '[]'; return 0; }
   printf '%s' "$files" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]'
@@ -965,7 +1104,7 @@ record_active_memory() {
 
 # Detached, age-gated stale-session GC. Runs `mla flush --reap-only` (reap
 # WITHOUT draining) so a Stop hook can sweep dead-session litter
-# (`.lock`/`.turn`/`.repoPath`/`.gitBaseline`/`.workspaceId` + 0-byte spools idle > 24h) without
+# (`.lock`/`.turn`/`.repoPath`/`.gitBaseline`/`.touched`/`.workspaceId` + 0-byte spools idle > 24h) without
 # re-draining every active session -- the O(sessions) fan-out that left 99
 # stranded locks. The reap is age-gated, so on a healthy box this is a cheap
 # read-only dir scan that removes nothing. Fully detached + best-effort so it can

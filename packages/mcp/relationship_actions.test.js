@@ -253,6 +253,38 @@ test("runRelationships projects the assertion shape: assertionId leads, proposit
   assert.equal(it.sourceArtifactId, undefined);
 });
 
+test("runRelationships preserves the route's ReviewPriority order (never re-sorts to FIFO)", async () => {
+  // The route ranks by ReviewPriority, NOT by age:
+  //   [lane asc (DETERMINISTIC first), score desc, createdAt desc, assertionId desc]
+  // This projection must be a pure map. The failure this guards is specific and
+  // was live: the tool description used to claim "oldest first", so the natural
+  // "fix" for anyone who believed it is to sort the page by createdAt ascending
+  // here. That would silently reorder a queue whose whole point is attention
+  // rank, burying a CONTRADICTS behind a footnote that happens to be older.
+  //
+  // The fixture is a real page from the dogfood workspace (2026-07-27), chosen
+  // because age and rank DISAGREE on it: `depends_on_newest` is the newest row
+  // of the three yet ranks last-but-one, because impact weight 2 loses to
+  // weight 3 regardless of age. A FIFO re-sort would put it first, and an
+  // age-descending re-sort would also put it first, so this single fixture
+  // catches BOTH re-sort directions.
+  const page = [
+    { assertionId: "op_newer", relationType: "OPERATIONALIZES", createdAt: "2026-06-27T21:22:59.149Z" },
+    { assertionId: "op_older", relationType: "OPERATIONALIZES", createdAt: "2026-06-22T20:58:48.463Z" },
+    { assertionId: "depends_on_newest", relationType: "DEPENDS_ON", createdAt: "2026-06-27T21:31:24.017Z" },
+    { assertionId: "supports_oldest", relationType: "SUPPORTS_GENERIC", createdAt: "2026-06-20T00:00:00.000Z" },
+  ];
+  const out = await runRelationships(
+    {},
+    { intelFetch: stubFetch({ items: page, count: page.length }), defaultWorkspaceId: WS },
+  );
+  assert.deepEqual(
+    out.items.map((i) => i.assertionId),
+    ["op_newer", "op_older", "depends_on_newest", "supports_oldest"],
+    "the page must come back in the order the route served it",
+  );
+});
+
 test("runRelationships surfaces the full pending backlog count for a badge", async () => {
   // The route returns `count` independent of the page `limit`, so a reviewer
   // paging at limit=1 still sees how much is queued behind it.

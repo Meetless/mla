@@ -20,6 +20,9 @@ import type { ReconcileResult } from "../lib/hook-reconcile";
 import {
   ensureCodexHooks,
   removeCodexHooks,
+  ensureCodexMcpServer,
+  type CodexMcpResult,
+  type CodexExecFn,
 } from "../connectors/codex/wire";
 
 // The C2 installer text, verbatim from proposal §6.2. Registration ONLY: it does
@@ -44,9 +47,57 @@ export interface CodexCommandDeps {
     changed: boolean;
     filePath: string;
   };
+  /** Register the Meetless MCP server in $CODEX_HOME/config.toml (defaults to ensureCodexMcpServer). */
+  ensureMcp?: (opts: {
+    homeDeps?: HomeResolutionDeps;
+    configPathOverride?: string;
+    exec?: CodexExecFn;
+  }) => CodexMcpResult;
   /** Override the hooks.json path (tests point this at a temp $CODEX_HOME). */
   hooksPathOverride?: string;
+  /** Override the config.toml path (tests point this at a temp $CODEX_HOME). */
+  mcpConfigPathOverride?: string;
+  /** Injected argv runner for the `codex` CLI (tests fake its output). */
+  codexExec?: CodexExecFn;
   homeDeps?: HomeResolutionDeps;
+}
+
+/**
+ * Report the outcome of Codex MCP registration on the operator's console.
+ * Reporting is SOURCE-NEUTRAL: `codex mcp get`/`list` cannot prove where a
+ * present registration was declared (user config, trusted project config, or a
+ * plugin), so this only names config.toml when MLA actually wrote it (`added`).
+ * Every other outcome describes availability, not provenance. Returns nothing;
+ * the exit status is owned by the caller (`runCodexInstall`), which fails when
+ * the MCP half is incomplete.
+ */
+function reportCodexMcp(
+  mcp: CodexMcpResult,
+  log: (m: string) => void,
+  errlog: (m: string) => void,
+): void {
+  switch (mcp.action) {
+    case "added":
+      log(`Registered the Meetless MCP server in ${mcp.configPath}.`);
+      return;
+    case "unchanged":
+      log("Meetless MCP server already available to Codex; no configuration change was made.");
+      return;
+    case "preserved-disabled":
+      log("Meetless MCP server is available but disabled; preserving the existing setting.");
+      return;
+    case "conflict": {
+      const shown =
+        mcp.existingCommand !== undefined
+          ? ` (existing entry runs: ${[mcp.existingCommand, ...(mcp.existingArgs ?? [])].join(" ")})`
+          : "";
+      errlog(`A different Meetless MCP registration already exists; MLA did not replace it.${shown}`);
+      return;
+    }
+    case "skipped":
+      errlog(`Meetless MCP server NOT registered: ${mcp.detail}`);
+      return;
+  }
 }
 
 /**
@@ -64,6 +115,7 @@ export async function runCodexInstall(
   const errlog = deps.errlog ?? ((m: string) => console.error(m));
   const ensureScripts = deps.ensureScripts ?? (() => ensureHookScripts());
   const ensureHooks = deps.ensureHooks ?? ensureCodexHooks;
+  const ensureMcp = deps.ensureMcp ?? ensureCodexMcpServer;
 
   for (const a of argv) {
     errlog(`Unknown flag for \`mla codex install\`: ${a}. Usage: mla codex install`);
@@ -92,15 +144,40 @@ export async function runCodexInstall(
     return 1;
   }
 
-  // 3. Report what happened, then print the trust notice VERBATIM.
+  // 3. Report the hooks outcome.
   if (result.changed) {
     log(`Registered Meetless Codex hooks in ${result.filePath}.`);
   } else {
     log(`Meetless Codex hooks already registered in ${result.filePath}.`);
   }
+
+  // 4. Register the Meetless MCP server in $CODEX_HOME/config.toml. This is the
+  //    OTHER half of Codex parity (governed-memory retrieval mid-session). The
+  //    MCP writer does its OWN codex-presence detection, so the explicit repair
+  //    command still writes hooks and emits a precise MCP error even when `codex`
+  //    is momentarily off PATH.
+  const mcp = ensureMcp({
+    homeDeps: deps.homeDeps,
+    configPathOverride: deps.mcpConfigPathOverride,
+    exec: deps.codexExec,
+  });
+  reportCodexMcp(mcp, log, errlog);
+
+  // 5. Print the hook-trust instruction VERBATIM.
   log("");
   log(CODEX_INSTALL_TRUST_NOTICE);
-  return 0;
+
+  // 6. Explicit-command exit semantics (§RC2): unlike the automatic `runWire`
+  //    path (which stays fail-soft so Claude wiring is never blocked by Codex),
+  //    an operator who TYPED `mla codex install` is asking to complete the Codex
+  //    connector. Succeed (0) only when BOTH halves landed: hooks reconciled
+  //    above (a throw already returned 1) AND the MCP server is present-and-usable
+  //    (`added`, or canonical enabled `unchanged`). Everything else, a conflict,
+  //    a disabled entry, a skip (codex absent / config would not load / write
+  //    failed), is an incomplete connector -> exit nonzero. The successful half is
+  //    NOT rolled back; the full partial result was already printed above.
+  const mcpComplete = mcp.action === "added" || mcp.action === "unchanged";
+  return mcpComplete ? 0 : 1;
 }
 
 /**

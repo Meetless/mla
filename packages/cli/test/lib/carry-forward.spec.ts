@@ -162,7 +162,13 @@ function makeHome(intelUrl: string): string {
   // (empty stdout -> the intended bash-native Layer1/Layer2/carry fallback path)
   // is instant, side-effect-free, and portable across macOS + Linux CI.
   const mlaStub = path.join(tmp, "mla-noop");
-  fs.writeFileSync(mlaStub, "#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\nexit 0\n");
+  // The redaction filters are the exception: both egress paths fail CLOSED on
+  // empty output, so draining them to /dev/null would defer every batch and skip
+  // every enrichment. Identity is the no-op for a filter (jest.global-setup.js).
+  fs.writeFileSync(
+    mlaStub,
+    '#!/usr/bin/env bash\ncase "$2" in redact-events|redact-capture) exec cat ;; esac\ncat >/dev/null 2>&1 || true\nexit 0\n',
+  );
   fs.chmodSync(mlaStub, 0o755);
   const home = path.join(tmp, "home");
   fs.mkdirSync(home);

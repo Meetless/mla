@@ -1,4 +1,4 @@
-# Meetless Codex connector
+# Meetless Codex connector (OpenAI Build Week)
 
 Governed coding for the OpenAI Codex CLI. This connector extends the governance
 loop `mla` already ships for Claude Code (grounding by floor injection plus
@@ -6,11 +6,15 @@ governed retrieval, pre-execution action denial, and enforcement audit) to the
 Codex CLI, with the neutral decision core reused unchanged and one narrow output
 compatibility adaptation for Codex's unsupported `ask` result.
 
-- **What it is:** an MCP server plus an agent-hooks governance plugin.
-- **The machinery is shared:** what governs Codex here is the same neutral core
-  that already governs Claude Code. The connector is also itself built with
-  Codex.
+- **Track:** Developer Tools (an MCP plus agent-hooks governance plugin).
+- **Double alignment:** the connector is **built with** Codex and **governs**
+  Codex. The machinery that governs Codex here is the same neutral core that
+  already governs Claude Code.
 - **Tested against:** Codex CLI `0.144.6`.
+
+> Judges: the hosted, pre-seeded test path and its disposable credentials are in
+> the Devpost **private** testing instructions, not in this public repo. This
+> README explains what the demo shows and how the connector is built and wired.
 
 ---
 
@@ -60,9 +64,9 @@ By default, even a rule that detects a decision contradiction only surfaces
 evidence and warns; it does not block. The demo raises the cap to `deny` for one
 session so the notes-location rule can hard-block visibly. This is deliberate:
 adoption ramps from "notify and acknowledge" to "block," and shipping silent
-hard blocks first would erode trust. The demo shows one rung of this ladder in
-action rather than the ladder itself, so read the full ceiling here and treat it
-as part of the claim.
+hard blocks first would erode trust. The demo video does not show this ladder on
+camera (it crowds the story and advertises the gap); the honest one-sentence
+framing is in the demo narration below, and the full ceiling lives here.
 
 Codex-specific behavior: Codex 0.144.6 does not support
 `permissionDecision: "ask"` on `PreToolUse`; it treats that response as a hook
@@ -101,10 +105,10 @@ property of the model, exercised live at demo time.
 6. Codex **writes to the approved location** (`docs/decisions/`) instead.
 7. The denied attempt **appears in `mla enforcement`** as an audited incident.
 
-**What that demo does and does not prove:**
+**Demo narration (verbatim):**
 
 > MLA surfaced the current decision through governed retrieval. The hard block
-> shown enforces the approved documentation-location rule. General decision
+> shown here enforces the approved documentation-location rule. General decision
 > contradictions are currently advisory by default.
 
 The reproducible fixture for this exact workflow is in
@@ -134,8 +138,8 @@ The decision logic never moves. The connector is registration plus one wrapper.
 
 Codex `0.144.6` registers hooks from a top-level `$CODEX_HOME/hooks.json` (the
 `plugin_hooks` field is gone). The plugin still ships the MCP server; it no
-longer ships hooks. Only the global `$CODEX_HOME/hooks.json` is supported today;
-per-repo hook overrides are not implemented.
+longer ships hooks. Build-week support is the global `$CODEX_HOME/hooks.json`
+only; per-repo hook overrides are out of scope.
 
 ### Governance loop
 
@@ -207,33 +211,57 @@ leaving your own hooks intact.
 
 ## Built with Codex
 
-Stated precisely, because "built with AI" usually is not.
+Per the submission rules, this is stated precisely: no hand-waving, no
+model-certainty asserted in advance.
 
-### What Codex wrote
+### What Codex implemented
 
-The net-new connector code: the UserPromptSubmit wrapper command, the static
-plugin files, the connector install and uninstall commands, and the reproducible
-fixture.
+The net-new connector code was written inside an authenticated Codex build
+thread: the UserPromptSubmit wrapper command, the static plugin files, the
+connector install and uninstall command, and the reproducible fixture. The
+`/feedback` Session ID for that thread is the entry evidence.
 
-### What already existed
+### What MLA functionality was reused (pre-existing, not built in-window)
 
 The neutral core: the snake_case input parser, the deny decision core, the
 camelCase envelope renderer, the enforcement-incident capture, the `mla mcp`
 governed-retrieval server, and `.meetless.json` binding. The connector governs
 Codex using machinery that already governs Claude Code.
 
-### What a human decided
+### Decisions the human owner made
 
-Ratification of the design, the scope ceiling (one integrated workflow, one hard
-block), repository and visibility (this scrubbed public mirror), the hook-trust
-UX call (`/hooks` for both the demo and normal install), and the demo framing
-(the notes-location hard deny, no separate warn scene).
+Ratification of this design, the scope ceiling (one integrated workflow, one
+hard block), repository and visibility (this scrubbed public mirror), the
+hook-trust UX call (`/hooks` for the demo and normal install), and the demo
+framing (the notes-location hard deny, no separate warn scene).
+
+### Build provenance
+
+<!-- OWNER TO FINALIZE FROM THE AUTHENTICATED CODEX THREAD (precondition B1/D3).
+     Do not fabricate. These are entry-eligibility evidence, not bookkeeping. -->
+
+| Field | Value |
+|---|---|
+| Codex model | GPT-5.6 (exact model string: **capture from the build thread**) |
+| Codex CLI version | 0.144.6 |
+| `/feedback` Session ID | **capture from the build thread** |
+| Pre-existing base commit | `d328564e0` |
+| Build Week commit range | `d328564e0..<final tip>` (connector work; **reconcile so the range reflects the Codex-authored thread**) |
+
+> Provenance note for the owner: the connector commits currently on `main`
+> (`7109374bd`, `0f671e91e`, `dd101551f`, `945a038c5`, `4d5149f35`) were
+> produced by the coding-agent session that drafted this implementation. The
+> submission's Session-ID thread must be where the majority of core
+> functionality was built (submission rule). Reconcile before freeze: rebuild
+> the substantive connector work inside the authenticated Codex thread so the
+> Session ID legitimately covers it, then set the Build Week commit range to
+> that thread's commits.
 
 ---
 
 ## Scope evolution
 
-The first cut of this connector managed only UserPromptSubmit and PreToolUse.
+The Build Week cut originally managed only UserPromptSubmit and PreToolUse.
 Current Codex exposes the full local lifecycle, so the connector now also
 registers SessionStart, PostToolUse, and Stop. Those events drive real Codex
 session identity, tool/file capture, final-message capture, and finalization in

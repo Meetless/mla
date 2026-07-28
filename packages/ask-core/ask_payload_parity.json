@@ -1,0 +1,29 @@
+{
+  "why": [
+    "One route, two transports. ask-core's makeIntelAsk posts with a plain fetch and a",
+    "static key (`mla ask`); the CLI's makeIntelAskFromCli posts through http.ts so the",
+    "MCP server carries a user-token bearer and its reactive refresh. The TRANSPORT has",
+    "to differ. The BODY must not, and this file is the one artifact both of them are",
+    "measured against, so a field added to one and forgotten in the other is a red test",
+    "in two suites instead of a silent divergence on the wire.",
+    "",
+    "Read by:",
+    "  packages/ask-core/ask_modes.test.js       (node --test)",
+    "  packages/cli/test/lib/egress-ownership.spec.ts (jest)",
+    "",
+    "`wire` is compared as a STRING, not a deep-equal, so key ORDER is pinned too: the",
+    "serialized body is what actually leaves the process.",
+    "",
+    "The question carries a credential and a deep path on purpose. Both builders redact",
+    "at the `retrieval` bar, so the fixture proves the secret is gone AND that the path",
+    "which makes the question retrievable survived. A builder that redacted at `full`",
+    "would pass a shape check and fail here."
+  ],
+  "input": {
+    "question": "why did apps/console/app/settings/SettingsNav.tsx change, and is OPENAI_API_KEY=sk-proj-Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3Nn4Oo5Pp6Qq7Rr8 still needed?",
+    "workspaceId": "ws_parity",
+    "mode": "answer",
+    "submissionId": "sub_parity_fixed"
+  },
+  "wire": "{\"workspace_id\":\"ws_parity\",\"question\":\"why did apps/console/app/settings/SettingsNav.tsx change, and is OPENAI_API_KEY=[REDACTED] still needed?\",\"surface\":\"mcp\",\"stream\":false,\"language\":\"en\",\"thread_text\":null,\"mode\":\"answer\",\"filters\":{},\"max_results\":8,\"min_results\":3,\"submission_id\":\"sub_parity_fixed\"}"
+}

@@ -51,7 +51,11 @@ interface AskArgs {
 // consumers.
 type AskModeHandler = (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
 interface AskCore {
-  makeIntelAsk: (deps: { intelBaseUrl: string; apiKey: string; fetchImpl?: typeof fetch }) => unknown;
+  makeIntelAsk: (deps: {
+    intelBaseUrl: string;
+    apiKey: string;
+    fetchImpl?: typeof fetch;
+  }) => unknown;
   makeAskModes: (deps: {
     intelAsk: unknown;
     defaultWorkspaceId: string;
@@ -257,7 +261,18 @@ export async function runAsk(
     return 1;
   }
 
-  const intelAsk = core.makeIntelAsk({ intelBaseUrl: intelUrl, apiKey });
+  // No redactor is injected, and none CAN be: ask-core redacts the question
+  // inside its own payload builder with its own parity-locked copy of the same
+  // pattern set, at the same `retrieval` bar. `mla ask` is the surface where a
+  // human is most likely to paste a credential into the question itself, and
+  // intel keeps the question in its Langfuse traces, so an unredacted ask is a
+  // durable leak into a second system. Redaction happens INSIDE the payload
+  // builder, so INDEX.md canonical matching upstream still runs against the
+  // operator's raw text.
+  const intelAsk = core.makeIntelAsk({
+    intelBaseUrl: intelUrl,
+    apiKey,
+  });
   const matchCanonical = core.makeMatchCanonical({ notesRoot: notesRoot() });
   const modes = core.makeAskModes({
     intelAsk,

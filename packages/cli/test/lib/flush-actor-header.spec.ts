@@ -49,7 +49,7 @@ function makeMeetlessHome(tmp: string, actorUserId = ACTOR): string {
       controlUrl: "http://127.0.0.1:1",
       controlToken: "test-token",
       actorUserId,
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
   return home;

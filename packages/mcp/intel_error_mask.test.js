@@ -165,6 +165,68 @@ test("5xx -> unavailable and transient", () => {
   }
 });
 
+// ---------- the three `unavailable` shapes are told apart --------------------
+//
+// One category, one retry contract, three different facts about the world. The
+// mask used to render all three as "intel unreachable", which is FALSE for the
+// two where intel answered us: it sends an operator to check DNS, ingress and
+// the deploy for a fault that is plainly inside a reachable service, and it
+// hides the one shape (429) where retrying without backoff makes it worse.
+
+test("429 says intel is UP and rate limiting, never 'unreachable'", () => {
+  const c = classifyIntelError(httpErr(429, "rate limited"));
+  assert.match(c.message, /rate limiting/i);
+  assert.match(c.message, /429/);
+  assert.doesNotMatch(c.message, /unreachable/i);
+  assert.match(c.guidance, /rate limit/i);
+  assert.match(c.guidance, /back off/i);
+});
+
+test("5xx says intel is REACHABLE and faulted, never 'unreachable'", () => {
+  for (const s of [500, 502, 503, 599]) {
+    const c = classifyIntelError(httpErr(s, "boom"));
+    assert.match(c.message, /server error/i);
+    assert.match(c.message, new RegExp(String(s)));
+    assert.doesNotMatch(c.message, /unreachable/i);
+    assert.match(c.guidance, /reachable/i);
+  }
+});
+
+test("only a transport failure claims 'unreachable'", () => {
+  const e = new TypeError("fetch failed");
+  const c = classifyIntelError(e);
+  assert.match(c.message, /unreachable/i);
+  assert.match(c.message, /connection failed/i);
+});
+
+test("the three shapes never share a message or a guidance line", () => {
+  const shapes = [
+    classifyIntelError(httpErr(429)),
+    classifyIntelError(httpErr(503)),
+    classifyIntelError(new TypeError("fetch failed")),
+  ];
+  assert.equal(new Set(shapes.map((c) => c.message)).size, 3);
+  assert.equal(new Set(shapes.map((c) => c.guidance)).size, 3);
+  // ...while still agreeing on the contract every consumer keys on.
+  for (const c of shapes) {
+    assert.equal(c.category, "unavailable");
+    assert.equal(c.transient, true);
+    assert.equal(c.billing, false);
+    assert.match(c.guidance, /grep is an acceptable stopgap/);
+  }
+});
+
+test("a masked 5xx still leaks no substrate", () => {
+  // The status is already a field of the result, so naming it in the message is
+  // not a new disclosure. The BODY still must never escape.
+  const e = httpErr(503, '{"detail":"upstream weaviate at 10.1.2.3:8080 refused"}');
+  const c = classifyIntelError(e);
+  assert.ok(!c.message.includes("weaviate"));
+  assert.ok(!c.message.includes("10.1.2.3"));
+  assert.ok(!c.message.includes("8080"));
+  assert.equal(c.status, 503);
+});
+
 test("other 4xx -> error; not transient; generic message", () => {
   for (const s of [400, 404, 409, 422]) {
     const c = classifyIntelError(httpErr(s, "pydantic ValidationError workspace_id"));

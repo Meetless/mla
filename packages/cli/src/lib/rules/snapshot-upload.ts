@@ -25,6 +25,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { loadWorkspaceConfig, type WorkspaceCliConfig } from "../config";
+import { describeEgressRefusal } from "../egress/policy";
 import {
   upsertRepoInstructionSnapshot,
   type RepoInstructionSnapshotClientHttp,
@@ -73,7 +74,22 @@ export interface SnapshotUploadArgs {
  * now holds the revision); `skipped` is unreadable / too-large at re-read.
  */
 export type SnapshotUploadOutcome =
-  | { delivered: true; attempted: number; uploaded: number; skipped: number; failed: number }
+  | {
+      delivered: true;
+      attempted: number;
+      uploaded: number;
+      skipped: number;
+      failed: number;
+      /**
+       * Set iff at least one file was refused by the egress policy rather than lost to a
+       * transport failure (ruling §2). A count alone cannot tell those apart, and they need
+       * opposite reactions: a flaky network retries itself on the next scan, an unregistered
+       * route or unclassified field NEVER uploads again until someone edits rules.ts. Body-free
+       * by construction (see describeEgressRefusal). First refusal only: they are all the same
+       * defect, and N copies of one line is noise.
+       */
+      refusal?: string;
+    }
   | { delivered: false; error: string };
 
 export interface SnapshotUploadDeps {
@@ -106,6 +122,7 @@ export async function uploadSnapshotsForScan(
   let uploaded = 0;
   let skipped = 0;
   let failed = 0;
+  let refusal: string | undefined;
   for (const relativePath of args.paths) {
     const raw = readFile(join(args.scanRoot, relativePath));
     if (raw === null) {
@@ -130,11 +147,15 @@ export async function uploadSnapshotsForScan(
         deps.http,
       );
       uploaded++;
-    } catch {
+    } catch (err) {
       // Best effort: a single file's transport / auth / validation failure must not abort the rest
       // of the pass or the scan. Counted, warned by the caller, retried on the next scan.
       failed++;
+      // ...except a policy refusal, which is not retried by anything: it will refuse every file in
+      // this pass and every file in every later pass. Carry the reason out so the caller's warning
+      // can say so instead of implying a transient blip.
+      refusal ??= describeEgressRefusal(err, "instruction-file snapshot") ?? undefined;
     }
   }
-  return { delivered: true, attempted: args.paths.length, uploaded, skipped, failed };
+  return { delivered: true, attempted: args.paths.length, uploaded, skipped, failed, refusal };
 }

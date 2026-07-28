@@ -84,7 +84,7 @@ function stageHome(tmp: string, controlUrl: string): string {
       controlUrl,
       controlToken: "test-token",
       actorUserId: "wu_test_actor",
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
   return home;

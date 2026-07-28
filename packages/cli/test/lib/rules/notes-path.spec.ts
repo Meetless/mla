@@ -279,7 +279,7 @@ describe("classifyTargetPath - malformed input", () => {
   });
 
   it("returns INDETERMINATE for a path containing a NUL byte", async () => {
-    expect(await classifyTargetPath("notes/x .md", scope())).toBe("INDETERMINATE");
+    expect(await classifyTargetPath("notes/x\u0000.md", scope())).toBe("INDETERMINATE");
   });
 });
 

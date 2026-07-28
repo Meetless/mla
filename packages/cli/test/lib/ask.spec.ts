@@ -40,7 +40,7 @@ function writeCfg(workspaceId = "ws_test"): void {
       intelUrl: "http://127.0.0.1:8100",
       controlToken: "ik-test",
       workspaceId,
-      mlaPath: "/bin/true",
+      mlaPath: process.env.MLA_TEST_MLA_SHIM ?? "/bin/true",
     }),
   );
 }
@@ -210,6 +210,23 @@ describe("mla ask: workspace resolution + echo", () => {
     await run(["q"], rec);
     expect(rec.intelDeps?.intelBaseUrl).toBe("http://127.0.0.1:8100");
     expect(rec.intelDeps?.apiKey).toBe("ik-test");
+  });
+
+  it("injects NO redaction seam: ask-core owns the /v1/ask egress boundary", async () => {
+    // Regression, and the reason this assertion is on the dep KEYS rather than
+    // on behavior. `mla ask` used to pass a `redactFn` into makeIntelAsk. An
+    // injectable security boundary is not a boundary: `redactFn: (t) => t` is a
+    // function that returns a string, so it passed every type guard and shipped
+    // the question raw. There is no longer a parameter to override, and this
+    // fails the moment someone adds one back.
+    //
+    // The bytes-on-the-wire proof lives where the real code runs:
+    // packages/ask-core/ask_modes.test.js, "an injected redactFn CANNOT weaken
+    // the boundary" and "the mandatory profile is retrieval, not full".
+    const rec: Recorder = {};
+    await run(["q"], rec);
+    const deps = rec.intelDeps as Record<string, unknown>;
+    expect(Object.keys(deps).sort()).toEqual(["apiKey", "intelBaseUrl"]);
   });
 });
 

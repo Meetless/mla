@@ -29,6 +29,8 @@
 
 import { randomUUID } from "node:crypto";
 
+import { redact } from "./redactor.js";
+
 // ---------- Intel client -----------------------------------------------------
 
 /**
@@ -36,7 +38,49 @@ import { randomUUID } from "node:crypto";
  * async ({question, workspaceId, mode, filters, maxResults, minResults}) =>
  * parsed JSON; throws on non-2xx with a body snippet. fetchImpl is injectable
  * so tests stub the intel surface without a live server.
+ *
+ * Egress redaction is MANDATORY and NOT INJECTABLE. It runs HERE, in the
+ * payload builder, and not at the caller, for three reasons:
+ *
+ *   1. Everything upstream (INDEX.md canonical matching, mode routing) keeps
+ *      working on the operator's RAW text. Only the bytes that leave the
+ *      machine are redacted, so redaction cannot degrade local matching.
+ *   2. A front-end that adds a new mode, or a new field, cannot route around
+ *      it: every body this transport sends is built right here. (The CLI's
+ *      CommonJS transport has its own builder, `makeIntelAskFromCli`, with its
+ *      own redaction and its own tests. The two are parity-locked byte for
+ *      byte against ask_payload_parity.json, and the CLI one additionally
+ *      passes the egress registry. Two builders, one behavior.)
+ *   3. There is no `redactFn` parameter to override. An earlier version took
+ *      one and merely DEFAULTED it, which still let a caller pass
+ *      `redactFn: (t) => t`: a function, returning a string, that redacts
+ *      nothing. A security boundary a caller can replace is not a boundary,
+ *      so the seam is gone. A caller that wants MORE redaction than the
+ *      parity-locked floor redacts its own text before calling; it can never
+ *      get LESS.
+ *
+ * The profile is `retrieval`, not `full`: this text IS the retrieval key, and
+ * the strict bar destroys it (measured in
+ * notes/20260726-mla-redaction-fidelity-and-egress-boundary-proposal.md).
  */
+const REDACT_PROFILE = "retrieval";
+
+function redactForWire(text) {
+  // Nothing to redact in a non-string; let the payload builder decide what a
+  // missing question means, rather than failing here on a type question.
+  if (typeof text !== "string") return text;
+  const out = redact(text, REDACT_PROFILE);
+  // Fail CLOSED. A redactor that returns undefined / null / an object has
+  // redacted nothing, and silently shipping `text` instead would be exactly
+  // the hole this call exists to close. Better a failed ask than a leaked key.
+  if (typeof out !== "string") {
+    throw new Error(
+      "intelAsk: redactor returned a non-string; refusing to send unredacted text",
+    );
+  }
+  return out;
+}
+
 export function makeIntelAsk({ intelBaseUrl, apiKey, fetchImpl = fetch }) {
   return async function intelAsk({
     question,
@@ -50,7 +94,7 @@ export function makeIntelAsk({ intelBaseUrl, apiKey, fetchImpl = fetch }) {
   }) {
     const payload = {
       workspace_id: workspaceId,
-      question,
+      question: redactForWire(question),
       surface: "mcp",
       stream: false,
       language: "en",

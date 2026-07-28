@@ -17,6 +17,7 @@ function baseResult(mcpAction: McpServerAction): WireResult {
     flock: { ok: true, detail: "flock present" },
     projectRules: null,
     mcp: { path: "/home/u/.claude.json", action: mcpAction },
+    codex: null,
   };
 }
 

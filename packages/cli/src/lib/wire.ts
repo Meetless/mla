@@ -24,6 +24,15 @@ import {
   PRE_TOOL_USE_MATCHER,
   type ManagedHookScript,
 } from "../connectors/claude-code/hook-contract";
+// Codex is the second connector reached by the SAME install orchestration. The
+// import is a call-time cycle (codex/wire.ts imports resolveMlaPath +
+// backupAndPruneSettings back from here); both directions are used only inside
+// functions, never at module load, so CJS resolves it safely.
+import {
+  autoWireCodex,
+  findCodexExecutable,
+  type CodexWireOutcome,
+} from "../connectors/codex/wire";
 
 // Re-exported so no existing importer of these symbols from wire.ts breaks: the
 // hook wiring data contract now lives in hook-contract.ts (a dependency-free leaf
@@ -89,6 +98,11 @@ export interface WireResult {
   projectRules: { path: string; action: ProjectRulesAction } | null;
   // null when skillOnly or --no-mcp skipped MCP registration.
   mcp: McpRegisterResult | null;
+  // null when skillOnly skipped, MLA_NO_WIRE opted out, or no usable `codex` is
+  // on PATH (auto-wiring a second connector is best-effort, never applicable on a
+  // machine without Codex). Non-null carries the Codex hooks + MCP outcome, whose
+  // individual failures are reported but never fail the install.
+  codex: CodexWireOutcome | null;
 }
 
 export type ProjectRulesAction = "created" | "updated" | "unchanged";
@@ -1236,6 +1250,7 @@ export function runWire(opts: WireOpts): WireResult {
       flock: null,
       projectRules: null,
       mcp: null,
+      codex: null,
     };
   }
   const copied = copyHooks(!!opts.noPostToolUse);
@@ -1248,6 +1263,18 @@ export function runWire(opts: WireOpts): WireResult {
     ? null
     : writeProjectRules(opts.projectRoot ?? resolveProjectRoot());
   const mcp = opts.noMcp ? null : ensureClaudeMcpServer();
+  // Reach Codex too, so a single install wires BOTH coding agents (install
+  // parity). The executable-presence check lives HERE, in the automatic
+  // orchestration caller, not inside the Codex writer: on a machine with no
+  // Codex there is nothing to configure, so we attempt nothing. `MLA_NO_WIRE`
+  // (the same env var install.sh honors for Claude) opts out of auto-wiring
+  // coding agents; `--no-mcp` still wires the Codex hooks but suppresses the MCP
+  // registration, exactly as it does for Claude. The explicit `mla codex
+  // install` remains the path that runs even when `codex` is momentarily absent.
+  const codex =
+    !process.env.MLA_NO_WIRE && findCodexExecutable()
+      ? autoWireCodex({ registerMcp: !opts.noMcp })
+      : null;
   return {
     copied,
     hooksAdded: settings.added,
@@ -1258,6 +1285,7 @@ export function runWire(opts: WireOpts): WireResult {
     flock,
     projectRules,
     mcp,
+    codex,
   };
 }
 
@@ -1319,6 +1347,58 @@ export function printWireResult(r: WireResult, opts: { skillOnly?: boolean } = {
           "  The meetless tools + scout agents load automatically the next time you open Claude Code.",
         );
       }
+    }
+  }
+  // Codex, when a usable executable was found. Absent -> r.codex is null and we
+  // print nothing (Codex simply is not on this machine). Present -> report the
+  // hooks + MCP outcome; a failure of either is surfaced but never fatal.
+  if (r.codex) {
+    const { hooks, mcp } = r.codex;
+    if (hooks.error) {
+      console.log(`Codex hooks NOT registered: ${hooks.error}`);
+    } else if (hooks.result) {
+      console.log(
+        hooks.result.changed
+          ? `Registered Meetless Codex hooks in ${hooks.result.filePath}.`
+          : `Meetless Codex hooks already registered in ${hooks.result.filePath}.`,
+      );
+    }
+    switch (mcp.action) {
+      case "added":
+        console.log(`Meetless MCP server registered with Codex in ${mcp.configPath}.`);
+        break;
+      case "unchanged":
+        // Source-neutral: `codex mcp get`/`list` cannot prove WHERE a present
+        // entry was declared (user config, trusted project config, or a plugin),
+        // so report availability, not provenance. Only `added` names config.toml.
+        console.log("Meetless MCP server already available to Codex; no configuration change was made.");
+        break;
+      case "preserved-disabled":
+        console.log("Meetless MCP server is available but disabled with Codex; preserving the existing setting.");
+        break;
+      case "conflict": {
+        const shown =
+          mcp.existingCommand !== undefined
+            ? ` (existing entry runs: ${[mcp.existingCommand, ...(mcp.existingArgs ?? [])].join(" ")})`
+            : "";
+        console.log(`A different Meetless MCP registration already exists with Codex; MLA did not replace it.${shown}`);
+        break;
+      }
+      case "skipped":
+        // Silent for the benign --no-mcp opt-out; surface a real skip reason
+        // (config would not load) so the operator can fix it.
+        if (mcp.detail !== "--no-mcp") {
+          console.log(`Meetless MCP server NOT registered with Codex: ${mcp.detail}`);
+        }
+        break;
+    }
+    // Trust is a per-machine Codex state MLA cannot persist on the user's behalf.
+    // Remind once when hooks were freshly registered (the install path); a plain
+    // idempotent rewire stays quiet.
+    if (!hooks.error && hooks.result?.changed) {
+      console.log(
+        "  After restarting Codex, open /hooks once to review and trust the Meetless hooks.",
+      );
     }
   }
 }

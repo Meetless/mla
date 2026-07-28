@@ -49,6 +49,50 @@ describe("Codex connector doctor checks", () => {
     ]);
   });
 
+  it("fails doctor on a foreign meetless MCP entry (RC4 wiring conflict)", () => {
+    const out = doctorJson([
+      codexMcpDoctorCheck({
+        kind: "conflict",
+        detail: "a meetless MCP entry MLA does not own is registered (runs: /usr/bin/false pretend)",
+      }),
+    ]);
+    expect(out.status).toBe("red");
+    expect(out.checks[0]).toEqual(
+      expect.objectContaining({ id: "codex.mcp.registered", status: "fail" }),
+    );
+    expect(out.checks[0]?.message).toContain("wiring conflict");
+    expect(out.checks[0]?.message).toContain("/usr/bin/false pretend");
+  });
+
+  it("keeps a user-disabled meetless MCP entry informational, not a failure (RC4)", () => {
+    const out = doctorJson([
+      codexMcpDoctorCheck({
+        kind: "disabled",
+        detail: "the meetless MCP server is registered but disabled",
+      }),
+    ]);
+    expect(out.status).toBe("green");
+    expect(out.checks[0]).toEqual(
+      expect.objectContaining({ id: "codex.mcp.registered", status: "info" }),
+    );
+    expect(out.checks[0]?.message).toContain("registered but disabled");
+  });
+
+  it("treats a disabled MCP entry as NOT installed for the half-install gate (RC4)", () => {
+    // Disabled means governed retrieval is unavailable, so hooks-present +
+    // MCP-disabled is a half install and must fail, exactly like a conflict.
+    const out = doctorJson([
+      codexConnectorCompleteCheck(true, {
+        kind: "disabled",
+        detail: "registered but disabled",
+      }),
+    ]);
+    expect(out.status).toBe("red");
+    expect(out.checks[0]).toEqual(
+      expect.objectContaining({ id: "codex.connector.complete", status: "fail" }),
+    );
+  });
+
   it("keeps Codex optional when neither connector half is installed", () => {
     const out = doctorJson([
       codexConnectorCompleteCheck(false, { kind: "absent", detail: "missing" }),

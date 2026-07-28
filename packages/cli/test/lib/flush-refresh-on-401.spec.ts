@@ -53,6 +53,9 @@ function writeMlaStub(tmp: string, refreshRc: number): { mlaPath: string; refres
   fs.writeFileSync(
     mlaPath,
     `#!/usr/bin/env bash
+# The redaction filters run BEFORE the PATCH this spec is about, and flush.sh
+# fails CLOSED on empty output -- so identity, not exit 0, is their no-op.
+case "$2" in redact-events|redact-capture) exec cat ;; esac
 if [[ "$1 $2" == "_internal refresh" ]]; then
   printf '%s\\n' "$*" >> ${JSON.stringify(refreshLog)}
   if [[ "${refreshRc}" -eq 0 ]]; then

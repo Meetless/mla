@@ -283,7 +283,10 @@ describe("P2.T6: argv redaction on root span attribute", () => {
 
     const out = redactArgvForSpan(input);
 
-    expect(out[0]).toBe(REDACTED);
+    // The variable NAME survives (it is what makes the span readable); only the
+    // value goes. The header name survives for the same reason.
+    expect(out[0]).toBe(`OPENAI_API_KEY=${REDACTED}`);
+    expect(out[0]).not.toContain("sk-proj-");
     expect(out[1]).toBe(`curl -H "Authorization: ${REDACTED}" api`);
   });
 });

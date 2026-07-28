@@ -134,9 +134,10 @@ export interface ArtifactDigest {
  * mismatch is `NEEDS_REEVALUATION` and the finding is dropped from this prompt
  * (never asserted stale, never auto-resolved: item #6).
  *
- * Optional + forward-only: NO Phase 2A live path writes this field. The detector
- * that produces findings is Phase 2B (blocked), so it is absent in every 2A cache
- * and the rehash pass is a clean no-op. Readers guard with `?? []`.
+ * Optional: Phase 2B shipped the detector, so `mla scan` now pulls the workspace's
+ * live findings and writes this field into the cache; the rehash pass filters them
+ * on every assemble. A workspace with no live findings still carries none, so the
+ * rehash pass stays a clean no-op there. Readers guard with `?? []`.
  */
 export interface ReconciliationFinding {
   // Repo-relative path of the cited instruction file whose bytes are rehashed.
