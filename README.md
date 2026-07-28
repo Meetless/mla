@@ -13,6 +13,14 @@ rework.**
   <a href="https://youtu.be/xSeo5Ayj9aY">Full walkthrough on YouTube</a>
 </em></p>
 
+<p align="center">
+  <a href="https://meetless.ai">meetless.ai</a>
+  &nbsp;·&nbsp;
+  <a href="https://research.meetless.ai">Published benchmarks</a>
+  &nbsp;·&nbsp;
+  <a href="https://discord.gg/bfYNHqwHMJ">Discord</a>
+</p>
+
 `mla` (short for **Meetless Agent**) is the command-line client for Meetless. The
 load-bearing word is *proactive*: this is not a memory server your agent has to
 remember to query. It installs as a session hook, so governed context arrives on
@@ -48,6 +56,14 @@ coding agents and runs a tight loop:
 
 The result: less context re-explaining, fewer reversals, and agents that stay on
 the architecture you actually chose.
+
+That last line is a claim, so we measure it in public. The
+[benchmark suite](https://research.meetless.ai) runs governed memory against the
+tools you already reach for, `CLAUDE.md` and retrieval, and publishes the result
+either way: one of ours
+[disproved the thesis we built it to prove](https://research.meetless.ai/adherence-at-scale/).
+Three more were retracted outright, each with its reason written up in the
+[findings ledger](https://research.meetless.ai/findings/).
 
 ### What your agent actually receives
 
@@ -363,8 +379,10 @@ are in [`codex/README.md`](codex/README.md). The reproducible fixture is in
 
 Building with coding agents and want them to stop drifting? Come talk to us.
 
-- **Discord:** https://discord.gg/bfYNHqwHMJ
-- **Feedback & ideas:** https://github.com/meetless/feedback
+- **Discord:** [discord.gg/bfYNHqwHMJ](https://discord.gg/bfYNHqwHMJ)
+- **Feedback & ideas:** [github.com/meetless/feedback](https://github.com/meetless/feedback)
+- **Product site:** [meetless.ai](https://meetless.ai)
+- **Benchmarks and methods:** [research.meetless.ai](https://research.meetless.ai)
 
 ## Where this is going
 
@@ -374,3 +392,6 @@ agents) work the same codebase, everyone builds on the same approved truth inste
 of re-litigating it in the next session, the next PR, or the next meeting. Project
 memory at that scale is just coordination, which is where the name comes from:
 less rework, fewer reversals, fewer meetings.
+
+What that looks like for a team is written up at
+[meetless.ai/teams](https://meetless.ai/teams).
