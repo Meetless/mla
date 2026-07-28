@@ -168,7 +168,10 @@ describe("events profile, test 2: every literal credential still goes", () => {
 
 describe("events profile, test 3: the global full profile did not move", () => {
   // The test that proves relaxing "events" did not relax the at-rest default.
-  const PATH_SHAPED = "apps/control/src/coordination-case/coordination-case-projection";
+  // Synthetic, like the corpus: the assertions read this token's SHAPE (lowercase,
+  // a separator, >=32 chars, 2 classes, entropy over the bar), never its text, so
+  // naming a real private source file bought nothing and shipped the tree layout.
+  const PATH_SHAPED = "svc/example/src/quorum-ledger/quorum-ledger-projection";
 
   it("still redacts the path-shaped token that events now exempts", () => {
     expect(redact(PATH_SHAPED, "full")).toBe(REDACTED);
@@ -196,7 +199,7 @@ describe("events profile, test 4: the block-on-detect file scanner is unchanged"
   // blocked upload; a false negative costs a live credential. It hardcodes the
   // "full" bar and must never acquire a profile parameter.
   it("still blocks a file whose only finding is a path-shaped high-entropy token", () => {
-    const token = "apps/control/src/coordination-case/coordination-case-projection";
+    const token = "svc/example/src/quorum-ledger/quorum-ledger-projection";
     expect(scanForSecrets(token)).toContain("high_entropy_token");
   });
 

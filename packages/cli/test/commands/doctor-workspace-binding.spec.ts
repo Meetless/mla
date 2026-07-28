@@ -28,11 +28,11 @@ describe("workspaceBindingCheck: the folder-binding assertion", () => {
   });
 
   it("FAILS (not green) when control resolves a different workspace id than the marker", () => {
-    const c = workspaceBindingCheck(MARKER, { workspace: { id: "cmr9nonon00r37o4rspjl9n88", slug: "phantom" } });
+    const c = workspaceBindingCheck(MARKER, { workspace: { id: "cmexamplephantomws0000000", slug: "phantom" } });
     expect(c.ok).toBe(false);
     expect(c.label).toBe("resolved workspace does not match the folder binding");
     expect(c.detail).toContain(MARKER); // what the marker binds
-    expect(c.detail).toContain("cmr9nonon00r37o4rspjl9n88"); // what the token actually resolves
+    expect(c.detail).toContain("cmexamplephantomws0000000"); // what the token actually resolves
   });
 
   it("FAILS when the backend cannot see the workspace at all (whoami returned no workspace)", () => {

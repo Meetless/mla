@@ -16,6 +16,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   classifyIntelError,
@@ -29,6 +32,47 @@ function httpErr(status, body) {
   e.status = status;
   if (body !== undefined) e.body = body;
   return e;
+}
+
+/** The 402 shape intel actually puts on the wire (app/api/billing_errors.py). */
+function denyErr(reason) {
+  return httpErr(402, { detail: { code: "BILLING_DENIED", category: "payment_required", reason } });
+}
+
+// control is the ONLY producer of these reason codes; this file is one of four
+// consumers of them. Read the producer's enum rather than restating it, so a
+// rename or a new member on control's side lands here as a red test instead of as
+// a terminal 402 the agent is handed the wrong remedy for.
+const CONTROL_CONSTANTS_TS = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../../apps/control/src/billing/billing-envelope.constants.ts",
+);
+
+// "Does this copy ADVISE buying credit?" is the question the ruling asks, and it is
+// NOT the same question as "does this copy contain the word top-up". Banning the
+// vocabulary outright would fail the strongest possible copy ("topping up will not
+// lift it") while passing copy that stays silent and lets a 402 labelled
+// `payment_required` imply the remedy on its own. So: split into sentences, look
+// only at the ones that raise a money remedy, and require every one of them to
+// negate it. An affirmative mention in any sentence is advice.
+const MONEY_REMEDY = /top ?-?up|topping up|add (credit|funds)|fund the balance|upgrade|checkout|purchase|subscribe|buy /i;
+const NEGATED = /\b(not|never|no|cannot|can't|won't|nothing|irrelevant|wrong)\b/i;
+
+function advisesBuyingCredit(text) {
+  return text
+    .split(/(?<=[.;:])\s+/)
+    .filter((sentence) => MONEY_REMEDY.test(sentence))
+    .some((sentence) => !NEGATED.test(sentence));
+}
+
+function controlDenyReasons() {
+  const text = readFileSync(CONTROL_CONSTANTS_TS, "utf8");
+  const start = text.indexOf("export const AdmissionDenyReason = {");
+  assert.ok(start >= 0, `AdmissionDenyReason not found in ${CONTROL_CONSTANTS_TS}`);
+  const end = text.indexOf("} as const;", start);
+  assert.ok(end > start, "AdmissionDenyReason block is unterminated");
+  const block = text.slice(start, end);
+  return [...block.matchAll(/^\s+[A-Z0-9_]+:\s*"([A-Z0-9_]+)",/gm)].map((m) => m[1]);
 }
 
 // ---------- category mapping -------------------------------------------------
@@ -111,6 +155,139 @@ test("isTransientBillingDenial: only FULLY_RESERVED / NOT_PROVISIONED; everythin
   assert.equal(isTransientBillingDenial(httpErr(402)), false); // no body, no reason -> terminal
   assert.equal(isTransientBillingDenial(httpErr(503)), false); // transient, but not billing
   assert.equal(isTransientBillingDenial(httpErr(429)), false);
+});
+
+// ---------- ACCOUNT_SUSPENDED is terminal, and is NOT a money state -----------
+//
+// Owner ruling 2026-07-27, Proof 3: "account_suspended must not be treated as
+// 'buy more credit,' and callers must not retry it automatically." Both halves are
+// tested here because they fail independently: the retry contract already held by
+// construction (the transient set is an allowlist of two), while the COPY handed
+// to the agent said "escalate to bind a payer or top up the balance" for every
+// terminal 402, which is exactly the prohibited treatment.
+
+test("ACCOUNT_SUSPENDED is TERMINAL: never retried, never called transient", () => {
+  const c = classifyIntelError(denyErr("ACCOUNT_SUSPENDED"));
+  assert.equal(c.category, "payment_required");
+  assert.equal(c.status, 402);
+  assert.equal(c.transient, false);
+  assert.equal(c.billing, true);
+  assert.equal(c.reason, "ACCOUNT_SUSPENDED");
+  assert.equal(isTransientBillingDenial(denyErr("ACCOUNT_SUSPENDED")), false);
+  assert.equal(isTransientIntelError(denyErr("ACCOUNT_SUSPENDED")), false);
+  assert.match(c.message, /do not retry/i);
+  assert.ok(!/retry shortly/i.test(c.message));
+  assert.ok(!/retry/i.test(c.guidance.replace(/do NOT retry/gi, "")));
+});
+
+test("ACCOUNT_SUSPENDED never advises buying credit", () => {
+  const c = classifyIntelError(denyErr("ACCOUNT_SUSPENDED"));
+  assert.equal(advisesBuyingCredit(`${c.message}\n${c.guidance}`), false, `${c.message}\n${c.guidance}`);
+  // Silence is not enough: copy that merely omits the remedy leaves the reader to
+  // supply it themselves, and "402, payment_required" supplies it for them. The
+  // prohibition has to be stated.
+  assert.match(c.guidance, /not a money problem/i);
+  assert.match(c.guidance, /will not lift it/i);
+  assert.match(c.message, /not a spent balance/i);
+});
+
+test("ACCOUNT_SUSPENDED is not described as a billing denial or an outage", () => {
+  const c = classifyIntelError(denyErr("ACCOUNT_SUSPENDED"));
+  assert.ok(!/billing denied/i.test(c.message), c.message);
+  assert.match(c.message, /suspended/i);
+  assert.match(c.message, /not an outage/i);
+  assert.match(c.guidance, /NOT an outage and NOT self-clearing/i);
+  // Governed memory is gated, not absent: grep is still not a substitute.
+  assert.match(c.guidance, /do NOT fall back to grep/i);
+  // Suspension stops cost-bearing execution only; it is not a sign-out.
+  assert.match(c.guidance, /sign-in, reading, and export are unaffected/i);
+  assert.match(c.guidance, /support/i);
+});
+
+test("NO_HEADROOM does not advise a top-up either (same defect class)", () => {
+  // control reaches NO_HEADROOM only AFTER proving the balance positive: it is the
+  // workspace runaway brake at zero, and only an operator can raise it. control's
+  // own constants call sending the customer to a checkout page here "the dark
+  // pattern this flag exists to avoid"; the mask must not undo that downstream.
+  const c = classifyIntelError(denyErr("NO_HEADROOM"));
+  assert.equal(c.transient, false);
+  assert.equal(advisesBuyingCredit(`${c.message}\n${c.guidance}`), false, c.guidance);
+  assert.match(c.guidance, /raise the workspace cap/i);
+});
+
+test("EXHAUSTED DOES advise a top-up (the one reason where money is the answer)", () => {
+  // Pinned from the other direction so a blanket "never mention a top-up" edit
+  // cannot pass: EXHAUSTED is the only reason for which control sets
+  // topUpRequired, and it is the only one this module may say it for.
+  const c = classifyIntelError(denyErr("EXHAUSTED"));
+  assert.equal(c.transient, false);
+  assert.equal(advisesBuyingCredit(c.guidance), true, c.guidance);
+  assert.match(c.guidance, /top up the balance/i);
+});
+
+test("NO_PAYER advises binding a payer, not funding one", () => {
+  const c = classifyIntelError(denyErr("NO_PAYER"));
+  assert.match(c.guidance, /bind a payer/i);
+  assert.equal(advisesBuyingCredit(c.guidance), false, c.guidance);
+});
+
+test("the four terminal remedies never share a guidance line", () => {
+  const reasons = ["NO_PAYER", "EXHAUSTED", "NO_HEADROOM", "ACCOUNT_SUSPENDED"];
+  const seen = new Map();
+  for (const r of reasons) {
+    const g = classifyIntelError(denyErr(r)).guidance;
+    assert.ok(!seen.has(g), `${r} shares its guidance with ${seen.get(g)}; the remedies differ`);
+    seen.set(g, r);
+  }
+  // ...and none of them is the generic fallback, which names no remedy at all.
+  const generic = classifyIntelError(denyErr("PRICING_UNSUPPORTED")).guidance;
+  assert.ok(!seen.has(generic), "a keyed reason fell through to the generic terminal copy");
+});
+
+test("an unknown terminal reason names NO remedy it cannot vouch for", () => {
+  // A reason this build has never heard of (control ships one, we lag a deploy).
+  // It must stay terminal and must not guess: guessing is the whole defect.
+  const c = classifyIntelError(denyErr("SOME_FUTURE_REFUSAL"));
+  assert.equal(c.transient, false);
+  assert.equal(c.reason, "SOME_FUTURE_REFUSAL");
+  assert.equal(advisesBuyingCredit(c.guidance), false, c.guidance);
+  assert.ok(!/bind a payer/i.test(c.guidance), c.guidance);
+  assert.match(c.guidance, /escalate with the reason code/i);
+});
+
+// ---------- exhaustive over control's producer enum ---------------------------
+
+test("every AdmissionDenyReason control can emit is classified, and only the allowlisted two retry", () => {
+  const reasons = controlDenyReasons();
+  assert.ok(reasons.length >= 8, `parsed too few reasons (${reasons.length}); the regex or the enum shape moved`);
+
+  // The governed transient allowlist, restated here as the assertion's subject.
+  const transient = new Set(["FULLY_RESERVED", "NOT_PROVISIONED"]);
+  for (const reason of reasons) {
+    const err = denyErr(reason);
+    const c = classifyIntelError(err);
+    assert.equal(c.category, "payment_required", `${reason} must map to payment_required`);
+    assert.equal(c.reason, reason, `${reason} must survive the SEC-3.2 enum guard`);
+    assert.equal(c.transient, transient.has(reason), `${reason} retry contract`);
+    assert.equal(isTransientBillingDenial(err), transient.has(reason), `${reason} retry predicate`);
+    assert.ok(typeof c.guidance === "string" && c.guidance.length > 0, `${reason} has no guidance`);
+    if (!transient.has(reason)) {
+      assert.match(c.message, /do not retry/i, `${reason} must tell the caller not to retry`);
+      // EXHAUSTED is the ONLY reason in the whole enum where the money is actually
+      // gone, so it is the only one allowed to send anyone to buy credit.
+      assert.equal(
+        advisesBuyingCredit(`${c.message}\n${c.guidance}`),
+        reason === "EXHAUSTED",
+        `${reason} buy-credit advice`,
+      );
+    }
+  }
+
+  // The four we key a specific remedy on must still EXIST upstream. A rename on
+  // control's side would otherwise silently demote that reason to the generic copy.
+  for (const keyed of ["NO_PAYER", "EXHAUSTED", "NO_HEADROOM", "ACCOUNT_SUSPENDED"]) {
+    assert.ok(reasons.includes(keyed), `control no longer emits ${keyed}; update TERMINAL_BILLING_GUIDANCE_KEY`);
+  }
 });
 
 test("402 prefers the specific reason over the coarse code", () => {

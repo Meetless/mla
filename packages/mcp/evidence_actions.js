@@ -80,10 +80,14 @@ async function fetchOnce(intelFetch, init) {
  * stack. The shared classifier (intel_error_mask.js) turns the raw error into a
  * masked message plus a category the caller can act on:
  *   - auth (401/403): a leak-free "re-auth needed" hint, .status preserved.
- *   - payment_required (402), terminal (NO_PAYER / EXHAUSTED / ...): "billing
- *     denied; not an outage, do not retry" so the agent escalates to bind a payer
- *     or top up instead of treating the evidence as absent. The old generic line
- *     was lying about this case.
+ *   - payment_required (402), terminal (NO_PAYER / EXHAUSTED / NO_HEADROOM /
+ *     ACCOUNT_SUSPENDED / structural): "not an outage, do not retry", plus the
+ *     ONE remedy that actually fits the reason, so the agent escalates instead of
+ *     treating the evidence as absent. The remedies are not interchangeable: only
+ *     EXHAUSTED is fixed by money, NO_PAYER needs a payer bound, NO_HEADROOM needs
+ *     an operator to raise the workspace cap, and ACCOUNT_SUSPENDED is not a money
+ *     state at all. Naming the wrong one is the same class of lie as the old
+ *     generic "retrieval unavailable" line this mask replaced.
  *   - payment_required (402), transient (FULLY_RESERVED / NOT_PROVISIONED): a
  *     funded workspace whose balance is briefly held by its own in-flight jobs.
  *     "billing hold; retry shortly", with .transient set so the loop retries it

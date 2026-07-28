@@ -16,7 +16,7 @@ import * as path from "node:path";
 // fail here.
 
 const MARKER = "cmexampledogfoodws0000000";
-const OTHER = "cmr9nonon00r37o4rspjl9n88";
+const OTHER = "cmexamplephantomws0000000";
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "mla-doctor-e2e-home-"));
 process.env.MEETLESS_HOME = HOME;

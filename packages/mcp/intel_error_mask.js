@@ -64,6 +64,36 @@ const SAFE_ENUM = /^[A-Z0-9_]{1,40}$/;
 // like intel's frozenset does.
 const TRANSIENT_BILLING_REASONS = new Set(["FULLY_RESERVED", "NOT_PROVISIONED"]);
 
+// The terminal 402s do NOT share a remedy, and naming the wrong one is not a
+// cosmetic error: it sends the agent (and whoever it escalates to) to do a thing
+// that cannot possibly lift the denial, and then to conclude the system is broken
+// when it does not. This module used to answer every terminal 402 with one
+// sentence, "escalate to bind a payer or top up the balance". That sentence is
+// true for exactly two of the reasons control can return and false for the rest:
+//
+//   NO_PAYER          bind a payer. Money changes nothing until one exists.
+//   EXHAUSTED         top up. The ONLY reason where the money is genuinely gone,
+//                     and the only one for which control sets topUpRequired.
+//   NO_HEADROOM       the WORKSPACE RUNAWAY BRAKE is at zero. control reaches
+//                     this only AFTER proving the balance positive, so a top-up
+//                     buys nothing; only an operator can raise the cap.
+//   ACCOUNT_SUSPENDED an operator suspended cost-bearing execution for the
+//                     principal that owns this payer (abuse defense Change Set B,
+//                     owner ruling 2026-07-27). Explicitly NOT a money state:
+//                     control checks it BEFORE reading any balance, so a fully
+//                     funded account is denied all the same. Telling an agent to
+//                     top up here is the one thing the ruling forbids by name.
+//
+// Structural refusals (PRICING_UNSUPPORTED, the delivery-key family,
+// ACTOR_NOT_IN_WORKSPACE) and any reason invented later fall through to the
+// generic terminal copy, which asserts no remedy it cannot vouch for.
+const TERMINAL_BILLING_GUIDANCE_KEY = {
+  NO_PAYER: "payment_required_no_payer",
+  EXHAUSTED: "payment_required_exhausted",
+  NO_HEADROOM: "payment_required_no_headroom",
+  ACCOUNT_SUSPENDED: "payment_required_suspended",
+};
+
 /**
  * Best-effort extraction of the billing reason enum from a 402 error body,
  * without ever surfacing the raw body. Accepts the body as a JSON string (the
@@ -196,11 +226,37 @@ const GUIDANCE = {
   auth:
     "Governed memory needs re-authentication (run 'mla login', or set " +
     "MEETLESS_CONTROL_TOKEN). Do not treat missing evidence as absent.",
+  // Generic terminal fallback: a structural refusal, or a reason this build does
+  // not know. It deliberately names NO remedy, because guessing one wrong is the
+  // defect the per-reason keys below exist to fix.
   payment_required:
-    "This is a terminal billing/payer denial, NOT an outage and NOT self-" +
-    "clearing. Governed memory stays unreachable until a payer is bound or the " +
-    "balance is funded. Do NOT fall back to grep as if the evidence were absent; " +
-    "escalate to bind a payer or top up the balance.",
+    "This is a terminal billing denial, NOT an outage and NOT self-clearing. " +
+    "Governed memory stays gated until an operator resolves it. Do NOT fall back " +
+    "to grep as if the evidence were absent, and do NOT retry; escalate with the " +
+    "reason code above.",
+  payment_required_no_payer:
+    "Terminal: this workspace has NO PAYER bound, so no metered work can run. " +
+    "NOT an outage and NOT self-clearing. Funding a balance cannot help until a " +
+    "payer exists. Do NOT fall back to grep as if the evidence were absent, and " +
+    "do NOT retry; escalate to bind a payer to this workspace.",
+  payment_required_exhausted:
+    "Terminal: the balance is spent. NOT an outage and NOT self-clearing. Do NOT " +
+    "fall back to grep as if the evidence were absent, and do NOT retry; escalate " +
+    "to top up the balance.",
+  payment_required_no_headroom:
+    "Terminal: the workspace SPEND CAP is at zero. This is NOT a money problem, " +
+    "the balance is already positive, so topping up buys nothing and a checkout " +
+    "page is the wrong destination. NOT an outage and NOT self-clearing. Do NOT " +
+    "fall back to grep as if the evidence were absent, and do NOT retry; escalate " +
+    "to an operator to raise the workspace cap.",
+  payment_required_suspended:
+    "Terminal: an operator has SUSPENDED cost-bearing execution for this " +
+    "account. This is NOT a money problem and must not be treated as one: the " +
+    "balance is irrelevant, topping up will not lift it, and no checkout page or " +
+    "upgrade will either. It is NOT an outage and NOT self-clearing. Do NOT fall " +
+    "back to grep as if the evidence were absent, and do NOT retry; sign-in, " +
+    "reading, and export are unaffected. Contact support to have the suspension " +
+    "reviewed and lifted.",
   payment_required_transient:
     "A TRANSIENT billing hold, NOT a missing payer and NOT an outage: the " +
     "workspace's own in-flight jobs are holding its balance, which clears at " +
@@ -259,8 +315,20 @@ export function classifyIntelError(err, opts = {}) {
       transientBilling = true;
       message = `${noun} temporarily unavailable: billing hold${suffix}; the workspace is funded but its balance is momentarily reserved by its own in-flight jobs and clears at settlement in seconds. Retry shortly.`;
     } else {
-      // NO_PAYER / EXHAUSTED / NO_HEADROOM / structural: terminal for this call.
-      message = `${noun} unavailable: billing denied${suffix}. This is not an outage and the evidence is not absent, only gated; it will not clear on its own, so do not retry.`;
+      // NO_PAYER / EXHAUSTED / NO_HEADROOM / ACCOUNT_SUSPENDED / structural:
+      // terminal for this call. The retry contract is unchanged and stays keyed on
+      // the allowlist alone, so any reason nobody mirrored lands here rather than
+      // in a retry loop. What is NOT shared is the remedy, hence the per-reason
+      // guidance key.
+      guidanceKey = TERMINAL_BILLING_GUIDANCE_KEY[reason] || "payment_required";
+      message =
+        reason === "ACCOUNT_SUSPENDED"
+          ? // "billing denied" would describe a balance nobody looked at: control
+            // checks the suspension after resolving the payer and BEFORE reading
+            // any balance, and a reader who hears "billing" reaches for a top-up
+            // that cannot lift it.
+            `${noun} unavailable: cost-bearing execution is suspended for this account${suffix}. This is not an outage, not a spent balance, and the evidence is not absent, only gated; topping up will not lift it and it will not clear on its own, so do not retry.`
+          : `${noun} unavailable: billing denied${suffix}. This is not an outage and the evidence is not absent, only gated; it will not clear on its own, so do not retry.`;
     }
   } else if (category === "unavailable") {
     // Same category, same retry contract, three different facts. Say which one

@@ -13,11 +13,16 @@
 // It loads the LIVE redactor (transpiled from src/lib/redactor.ts at run time),
 // not a hand-copied snapshot, so the number it prints is the number that ships.
 //
-// PRIVACY. The fixture it writes contains only tokens that are BOTH path-shaped
-// (slash, lowercase, no uppercase) AND survived the literal credential patterns.
-// In practice that is source paths, node_modules paths and URL path fragments.
-// Read the diff before committing a regenerated fixture anyway: this reads real
-// session transcripts, and "path-shaped" is a signature, not a guarantee.
+// PRIVACY. This reads REAL session transcripts, so the fixture it writes is
+// never allowed to contain their text. Every token is passed through a
+// class-preserving substitution (see scrubInternal below) that keeps the shape
+// the tests assert and destroys the content. "Read the diff before committing"
+// used to be the control here; it is not one, and this file's history is the
+// proof. Nothing selected out of a transcript reaches the fixture verbatim.
+//
+//   node scripts/measure-redaction-corpus.js --rewrite-fixture
+//
+// re-draws the substitution over the committed fixture without re-harvesting.
 
 const fs = require("fs");
 const path = require("path");
@@ -123,80 +128,165 @@ function readCorpus(dir, limit) {
   return { files, corpus };
 }
 
-// PRIVACY GATE (added 0.2.28). The header above used to say "read the diff
-// before committing a regenerated fixture". That is not a control: nobody reads
-// 1575 generated lines, and it showed. The fixture reached the public-mirror
-// export staging carrying 11 real workspace/case/decision/profile cuids, this
-// laptop's project layout and 107 internal note paths, and the mirror's scrub
-// gates matched exactly ONE of the 11; the other 10 were invisible to every
-// gate and would have shipped.
+// PRIVACY GATE. Two generations of this gate, and the second one is the point.
 //
-// So the aliasing is mechanical now, and anything this function does not know
-// how to alias is a HARD STOP rather than a silent write. Note slugs are left
-// alone deliberately: `src/lib/*.ts` comments already cite notes/*.md paths in
-// the published mirror, so they are a pre-existing disclosure to settle on its
-// own terms, not something to quietly change under a release.
-function scrubInternal(entries) {
-  const CUID = /\bc[a-z0-9]{24}\b/g;
-  const isSynthetic = (c) => /^(cm|cu|c00)example/.test(c);
+// v1 (the header above) was "read the diff before committing a regenerated
+// fixture". That is not a control: nobody reads 1575 generated lines, and it
+// showed. The fixture reached the public-mirror export staging carrying 11 real
+// workspace/case/decision/profile cuids, this laptop's project layout and 107
+// internal note paths, and the mirror's scrub gates matched exactly ONE of the
+// 11; the other 10 were invisible to every gate and would have shipped.
+//
+// v2 (0.2.28) made the aliasing mechanical: cuids got numbered placeholders,
+// `projects/meetless/` became `projects/example/`, and anything it could not
+// alias was a hard stop. It was still an ENUMERATION of what to hide, so it hid
+// exactly what its author had thought of. What it shipped anyway, because
+// nobody had thought of them: 303 monorepo source paths, 135 notes/ slugs (left
+// alone ON PURPOSE, see the v2 comment), 82 `internal/v1/*` route shapes, 42
+// intel module paths, 24 private agent-skill names, and the Sentry org slug.
+// A denylist cannot see a category nobody named.
+//
+// v3 (this) inverts it. The corpus asserts exactly three things, and every one
+// of them is a statement about SHAPE:
+//
+//   1. every token survives the `events` profile   (needs: has "/", has
+//      lowercase, has no uppercase)
+//   2. the weighted occurrences total is unchanged (needs: the count, not the
+//      key)
+//   3. every token dies under the `full` profile   (needs: length >= 32,
+//      >= 2 character classes, Shannon entropy >= 3.5)
+//
+// Nothing reads a token's TEXT. So no token needs to keep its text. Every
+// alphanumeric character is replaced with a deterministic pseudorandom
+// character OF THE SAME CLASS, and separators (`/ _ - + =`) stay exactly where
+// they are. Length, slash count, class composition and path shape are preserved
+// by construction; entropy is preserved-or-raised, which is the safe direction
+// for bar 3. Then each result is checked against the LIVE redactor, so a token
+// that lands on the wrong side of either bar (a substitution can accidentally
+// spell `sk-`, `hf_`, `xox...`, which the literal patterns would then eat under
+// every profile) is re-drawn rather than written.
+//
+// The security property is the one that matters here: this cannot leak a
+// category nobody anticipated, because nothing survives verbatim. It is
+// de-identification of a shape corpus, not encryption; the mapping is a
+// keyed-by-content hash so regenerating produces a stable diff.
+const LOWER = "abcdefghijklmnopqrstuvwxyz";
+const UPPER = LOWER.toUpperCase();
+const DIGIT = "0123456789";
+const SALT = "mla-redaction-path-corpus/v3";
 
-  const real = [...new Set(entries.flatMap(([t]) => t.match(CUID) || []))].filter((c) => !isSynthetic(c)).sort();
-  const alias = new Map(real.map((c, i) => [c, `cmexample${String(i).padStart(2, "0")}a1b2c3d4e5f6g7`]));
-  for (const [from, to] of alias) {
-    if (from.length !== to.length) throw new Error(`alias length drift: ${from} -> ${to}`);
+function keystream(seed, n) {
+  const out = [];
+  let block = require("crypto").createHash("sha256").update(seed).digest();
+  while (out.length < n) {
+    out.push(...block);
+    block = require("crypto").createHash("sha256").update(block).digest();
   }
+  return out;
+}
 
-  const scrub = (t) => {
-    let s = t.replace(/projects\/meetless\//g, "projects/example/").replace(/projects\/example\/meetless\//g, "projects/example/example/");
-    for (const [from, to] of alias) s = s.split(from).join(to);
-    return s;
-  };
+/** Same length, same class per position, same separators. Different text. */
+function synthesize(token, attempt) {
+  const ks = keystream(`${SALT} ${attempt} ${token}`, token.length);
+  let out = "";
+  for (let i = 0; i < token.length; i += 1) {
+    const c = token[i];
+    if (c >= "a" && c <= "z") out += LOWER[ks[i] % 26];
+    else if (c >= "A" && c <= "Z") out += UPPER[ks[i] % 26];
+    else if (c >= "0" && c <= "9") out += DIGIT[ks[i] % 10];
+    else out += c;
+  }
+  return out;
+}
 
+function scrubInternal(entries) {
   const out = [];
   const seen = new Set();
+
   for (const [t, n] of entries) {
-    const s = scrub(t);
-    if (seen.has(s)) throw new Error(`alias collision: ${t} and an earlier token both became ${s}`);
+    let s = null;
+    for (let attempt = 0; attempt < 64 && s === null; attempt += 1) {
+      const c = synthesize(t, attempt);
+      // The corpus only means anything if every token still sits on the same
+      // side of both bars it was selected for. A substitution that moves a
+      // token is a bug in the substitution, not a fact about the redactor.
+      if (seen.has(c)) continue;
+      if (redact(c, "events") !== c) continue;
+      if (redact(c, "full") === c) continue;
+      s = c;
+    }
+    if (s === null) throw new Error(`could not synthesize a shape-equivalent token for a ${t.length}-char input after 64 draws`);
     seen.add(s);
-    // The corpus only means anything if every token still sits on the same side
-    // of both bars it was selected for. An alias that moves a token is a bug in
-    // the alias, not a fact about the redactor.
-    if (redact(s, "events") !== s) throw new Error(`alias broke the events verdict: ${t} -> ${s}`);
-    if (redact(s, "full") === s) throw new Error(`alias broke the full verdict: ${t} -> ${s}`);
     out.push([s, n]);
   }
 
-  // The operator is derived at run time, never spelled. The first draft of this
-  // guard hardcoded this laptop's username and the dogfood domain, which
-  // published two internal identifiers inside the very check that exists to
-  // catch them, in the release whose headline is that the fixture stopped
-  // carrying them. Deriving it also means the check works for whoever
-  // regenerates the fixture next, instead of only for the person who wrote it.
+  // Belt and braces. After a total substitution this should be vacuous, and
+  // that is the point: it is an assertion that v3 did what it claims, not a
+  // filter that anything is expected to trip. If it ever fires, the
+  // substitution stopped being total and the enumeration problem is back.
   //
-  // Dogfood hostnames are deliberately not checked here. The mirror export's
-  // gate 3 greps the whole staging tree for them and is the authority on
-  // publication; what THAT gate cannot see is opaque identifiers, which is
-  // exactly what the cuid and operator checks below cover.
+  // The operator is derived at run time, never spelled. An earlier draft
+  // hardcoded this laptop's username and the dogfood domain, which published
+  // two internal identifiers inside the very check that exists to catch them.
   const operator = [os.userInfo().username, path.basename(os.homedir())].filter((s) => s && s.length > 2);
   const residual = out
     .map(([t]) => t)
     .filter(
       (t) =>
-        /\/Users\/|projects\/meetless\//.test(t) ||
+        /\/users\/|meetless|notes\/\d{8}|internal\/v\d|apps\/(control|connector|worker|console|relay)\/|intel\/app\/|claude\/skills\//i.test(t) ||
         operator.some((u) => t.includes(u)) ||
-        (t.match(CUID) || []).some((c) => !isSynthetic(c)),
+        /\bc[a-z0-9]{24}\b/.test(t),
     );
   if (residual.length) {
-    throw new Error(`refusing to write: ${residual.length} token(s) still carry an internal identifier this script cannot alias:\n  ${residual.slice(0, 20).join("\n  ")}`);
+    throw new Error(`refusing to write: ${residual.length} token(s) still carry an internal identifier after substitution:\n  ${residual.slice(0, 20).join("\n  ")}`);
   }
   return out;
 }
 
+const FIXTURE_COMMENT =
+  "Generated by scripts/measure-redaction-corpus.js. Every token is a path-shaped span the 'full' entropy bar destroys and the 'events' profile preserves. The TEXT is synthetic: each token is a class-preserving substitution of a real captured span (same length, same separators, same character classes, entropy preserved-or-raised), because these tests assert shape and nothing reads the text. Do not 'restore' readability here; the readable version leaked internal paths for two releases.";
+
+function writeFixture({ transcripts, entries, totalOccurrences }) {
+  const sorted = scrubInternal(entries).sort((a, b) => a[0].localeCompare(b[0]));
+  fs.writeFileSync(
+    FIXTURE,
+    `${JSON.stringify(
+      {
+        _comment: FIXTURE_COMMENT,
+        transcripts,
+        distinctTokens: sorted.length,
+        totalOccurrences,
+        tokens: Object.fromEntries(sorted),
+      },
+      null,
+      1,
+    )}\n`,
+  );
+  console.error(`wrote ${FIXTURE}: ${sorted.length} distinct, ${totalOccurrences} occurrences`);
+}
+
+// Re-run the substitution over the COMMITTED fixture. The corpus is a harvest
+// from 40 real transcripts that no longer reproduce byte-for-byte, so
+// "regenerate it" is not available as a remedy once a privacy bug is found in
+// a fixture that already shipped. This is: same counts, same shapes, new text.
+function rewriteFixture() {
+  const cur = JSON.parse(fs.readFileSync(FIXTURE, "utf8"));
+  const entries = Object.entries(cur.tokens);
+  const occurrences = entries.reduce((sum, [, n]) => sum + n, 0);
+  if (occurrences !== cur.totalOccurrences) {
+    throw new Error(`fixture is already inconsistent: weights sum to ${occurrences}, header says ${cur.totalOccurrences}`);
+  }
+  writeFixture({ transcripts: cur.transcripts, entries, totalOccurrences: cur.totalOccurrences });
+}
+
 function main() {
+  if (process.argv.includes("--rewrite-fixture")) return rewriteFixture();
+
   const dir = process.argv[2];
   const limit = Number(process.argv[3] || 40);
   if (!dir) {
     console.error("usage: measure-redaction-corpus.js <transcriptDir> [transcriptLimit]");
+    console.error("       measure-redaction-corpus.js --rewrite-fixture");
     process.exit(2);
   }
 
@@ -246,23 +336,11 @@ function main() {
   console.log(JSON.stringify({ transcripts: files.length, report, totals }, null, 2));
 
   if (process.argv.includes("--write-fixture")) {
-    const sorted = scrubInternal([...tokens.entries()].sort((a, b) => a[0].localeCompare(b[0])));
-    fs.writeFileSync(
-      FIXTURE,
-      `${JSON.stringify(
-        {
-          _comment:
-            "Generated by scripts/measure-redaction-corpus.js --write-fixture. Every token here is a path-shaped span the 'full' entropy bar destroys and the 'events' profile preserves. Regenerate only with a deliberate re-measurement; read the diff first.",
-          transcripts: files.length,
-          distinctTokens: sorted.length,
-          totalOccurrences: totals.pathShapedEatenFull,
-          tokens: Object.fromEntries(sorted),
-        },
-        null,
-        1,
-      )}\n`,
-    );
-    console.error(`wrote ${FIXTURE}: ${sorted.length} distinct, ${totals.pathShapedEatenFull} occurrences`);
+    writeFixture({
+      transcripts: files.length,
+      entries: [...tokens.entries()],
+      totalOccurrences: totals.pathShapedEatenFull,
+    });
   }
 }
 
