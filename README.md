@@ -14,9 +14,9 @@ rework.**
 </em></p>
 
 <p align="center">
-  <a href="https://meetless.ai">meetless.ai</a>
+  <a href="https://meetless.ai?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=mla&amp;utm_content=header">meetless.ai</a>
   &nbsp;·&nbsp;
-  <a href="https://research.meetless.ai">Published benchmarks</a>
+  <a href="https://research.meetless.ai?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=mla&amp;utm_content=header_research">Published benchmarks</a>
   &nbsp;·&nbsp;
   <a href="https://discord.gg/bfYNHqwHMJ">Discord</a>
 </p>
@@ -58,12 +58,12 @@ The result: less context re-explaining, fewer reversals, and agents that stay on
 the architecture you actually chose.
 
 That last line is a claim, so we measure it in public. The
-[benchmark suite](https://research.meetless.ai) runs governed memory against the
+[benchmark suite](https://research.meetless.ai?utm_source=github&utm_medium=readme&utm_campaign=mla&utm_content=proof_suite) runs governed memory against the
 tools you already reach for, `CLAUDE.md` and retrieval, and publishes the result
 either way: one of ours
-[disproved the thesis we built it to prove](https://research.meetless.ai/adherence-at-scale/).
+[disproved the thesis we built it to prove](https://research.meetless.ai/adherence-at-scale/?utm_source=github&utm_medium=readme&utm_campaign=mla&utm_content=proof_disproved).
 Three more were retracted outright, each with its reason written up in the
-[findings ledger](https://research.meetless.ai/findings/).
+[findings ledger](https://research.meetless.ai/findings/?utm_source=github&utm_medium=readme&utm_campaign=mla&utm_content=proof_findings).
 
 ### What your agent actually receives
 
@@ -381,8 +381,8 @@ Building with coding agents and want them to stop drifting? Come talk to us.
 
 - **Discord:** [discord.gg/bfYNHqwHMJ](https://discord.gg/bfYNHqwHMJ)
 - **Feedback & ideas:** [github.com/meetless/feedback](https://github.com/meetless/feedback)
-- **Product site:** [meetless.ai](https://meetless.ai)
-- **Benchmarks and methods:** [research.meetless.ai](https://research.meetless.ai)
+- **Product site:** [meetless.ai](https://meetless.ai?utm_source=github&utm_medium=readme&utm_campaign=mla&utm_content=footer_site)
+- **Benchmarks and methods:** [research.meetless.ai](https://research.meetless.ai?utm_source=github&utm_medium=readme&utm_campaign=mla&utm_content=footer_research)
 
 ## Where this is going
 
@@ -394,4 +394,4 @@ memory at that scale is just coordination, which is where the name comes from:
 less rework, fewer reversals, fewer meetings.
 
 What that looks like for a team is written up at
-[meetless.ai/teams](https://meetless.ai/teams).
+[meetless.ai/teams](https://meetless.ai/teams?utm_source=github&utm_medium=readme&utm_campaign=mla&utm_content=teams).
