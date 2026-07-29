@@ -172,7 +172,7 @@ test("small limit passes through; huge limit clamps to client cap (SEC-2.4)", as
 });
 
 test("invalid limit throws and never calls intel", async () => {
-  for (const bad of [0, -1, "abc", 1.5 === 1.5 ? NaN : 0]) {
+  for (const bad of [0, -1, "abc", NaN]) {
     const cf = stubFetch({ candidates: [] });
     await assert.rejects(
       () => runRetrieveKnowledge({ query: "q", limit: bad }, { intelFetch: cf, defaultWorkspaceId: WS }),

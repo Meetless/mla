@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.30 (2026-07-29)
+
+0.2.30 carries no user-facing change. Every command, flag, and output behaves exactly as it did in
+0.2.29; the version exists so the published surfaces sit on the same tree as the backend that
+shipped alongside it. What did change is hygiene the public mirror inherits. The CLI workspace had
+been sitting outside the repo's lint gate entirely, so its source was the one part of the codebase
+nothing was checking, and it is now inside that gate. Two test fixtures were also carrying things
+that had no business leaving this machine: a real internal workspace-user id threaded through the
+ask parity fixtures, and a private filesystem path named in a hook spec. Both are genericized. If
+you are already on 0.2.29, there is nothing here you need.
+
+- the CLI workspace is inside the repo's lint gate instead of outside its field of view
+- a real user id no longer rides along inside the ask parity fixtures
+- a test fixture no longer names a private notes path the public mirror cannot carry
+
 ## 0.2.29 (2026-07-29)
 
 0.2.29 is mostly the redactor learning the difference between a credential and a sentence about
