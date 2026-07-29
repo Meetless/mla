@@ -450,7 +450,11 @@ describe("/v1/ask bodies are parity-locked across both builders", () => {
   //     name /v1/ask is pinned below, in BOTH packages.
   const FIXTURE = JSON.parse(
     read(path.join(ASK_CORE, "ask_payload_parity.json")),
-  ) as { input: Record<string, unknown>; wire: string };
+  ) as {
+    builder: { userId: string };
+    input: Record<string, unknown>;
+    wire: string;
+  };
 
   it("posts the parity fixture byte for byte from the CLI transport", async () => {
     let sent: string | null = null;
@@ -464,6 +468,10 @@ describe("/v1/ask bodies are parity-locked across both builders", () => {
       controlToken: "k",
       intelUrl: "http://intel.test",
       mlaPath: "/tmp/mla",
+      // The metering actor is bound to the TRANSPORT, not passed per call, so
+      // for this builder it lives on the config rather than in FIXTURE.input.
+      // ask-core's half of the lock binds the same id through its deps.
+      actorUserId: FIXTURE.builder.userId,
       auth: { mode: "shared-key" },
     } as unknown as CliConfig;
     await makeIntelAskFromCli(cfg, intelPostFn)(

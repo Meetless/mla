@@ -84,7 +84,17 @@ function runHook(hookFile: string, activate: boolean, deactivate = false): RunRe
       // This spec is about the CAPTURE gate only. Push interception
       // (user-prompt-submit.sh) would otherwise fire curls at intel; suppress
       // enrich so the test stays hermetic and fast regardless of what's listening.
-      env: { ...process.env, MEETLESS_HOME: home, MEETLESS_SUPPRESS_ENRICH: "1" },
+      //
+      // MEETLESS_DEBUG=0 is load-bearing, not cosmetic. stop.sh ends with six
+      // DETACHED spawns so Stop returns in under a second, and every spawn_* in
+      // common.sh branches on `${MEETLESS_DEBUG:-1}`. The default branch appends
+      // into $MEETLESS_HOME/logs, and the subshell performs that redirect (thus
+      // CREATES the file) before exec, so a log file can appear under `home/`
+      // AFTER spawnSync has already returned. "0" is the quiet branch that
+      // redirects to /dev/null, which removes the writer instead of racing it.
+      // Nothing this spec asserts on lives in logs/ (the gate spools to queue/),
+      // so silencing them changes no observed behaviour.
+      env: { ...process.env, MEETLESS_HOME: home, MEETLESS_SUPPRESS_ENRICH: "1", MEETLESS_DEBUG: "0" },
     });
 
     const queueDir = path.join(home, "queue");
@@ -94,7 +104,17 @@ function runHook(hookFile: string, activate: boolean, deactivate = false): RunRe
       jsonlFiles: files.filter((f) => f.endsWith(".jsonl")),
     };
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    // Teardown must never be able to fail an assertion. `force` only swallows
+    // ENOENT; a writer that creates a file between readdir and rmdir throws
+    // ENOTEMPTY, and because that throw happens in `finally` it DISCARDS the
+    // already-computed return value, so the expects never run and the stack
+    // blames the runHook() call site. A red spec that never actually tested the
+    // gate is worse than a leaked temp dir, so retry, then give up quietly.
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    } catch {
+      /* best effort: os.tmpdir() litter is not what this spec asserts on */
+    }
   }
 }
 

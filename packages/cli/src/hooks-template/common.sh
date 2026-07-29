@@ -446,6 +446,110 @@ record_touched_file() {
 # there is no concrete pending action to describe; that field is reserved for a
 # future PreToolUse interception surface. touched_files are ranking hints only
 # (spec I-SEC-1) and never widen ACL (I-SEC-3); intel treats them as such.
+
+# ---- Non-retrievable prompt taxonomy ------------------------------------
+# Not every string arriving on UserPromptSubmit is an operator QUESTION. Two
+# distinct classes reach this hook that the retrieval layer can never help with,
+# and both were being routed anyway: measured over the 3973 enrich rows in
+# ~/.meetless/logs/ask-traces.jsonl, 294 IDE events and 66 slash commands paid
+# for a full intel /v1/ask round trip and then landed in the router's `unknown`
+# bucket, inflating the abstain denominator with turns that were never
+# answerable. Echoes the class, or NOTHING when this is a real prompt:
+#
+#   harness_event  The coding-agent harness authored the WHOLE turn; no human
+#                  typed anything. `<task-notification>` (background-task
+#                  wake-up) is the established case. Nothing at all should run:
+#                  no floor, no enrich, no trace.
+#
+#                  A leading harness block is NOT by itself a harness event, and
+#                  assuming it was cost 299 real operator turns. The
+#                  `<task-notification>` precedent was generalized to `<ide_*>`
+#                  and `<hint>` on the strength of the shape alone; re-measured
+#                  over the 3991 rows in ~/.meetless/logs/ask-traces.jsonl it
+#                  holds for exactly one of the three:
+#
+#                    <task-notification>  148 rows, 148 block-only, 0 with text
+#                    <ide_*>              294 rows,   0 block-only, 294 with text
+#                    <hint>                 5 rows,   0 block-only,   5 with text
+#
+#                  The IDE extension PREPENDS its telemetry to the message the
+#                  operator typed; it does not replace it. So every one of those
+#                  299 turns was a human asking a real question ("remove .claude
+#                  dir out of git of the Meetless repo") behind a block, and the
+#                  gate gave each of them no floor, no enrich, and no trace row
+#                  at all. Invisible twice over: the turn cannot be counted as an
+#                  abstain either, so the miss does not even show up as a miss.
+#                  Still arriving on 2026-07-28, i.e. it was live when found.
+#
+#                  Hence: strip the leading blocks, then classify what SURVIVES.
+#                  A block-only prompt still lands on harness_event (all the
+#                  pre-existing cases are block-only and still pass), and a block
+#                  followed by human text is the human's turn, keyed on the
+#                  human's words rather than on editor telemetry.
+#   slash_command  A human DID author this turn and the agent WILL do real work
+#                  in it (`/implement <doc>` is a full implementation run), but
+#                  the prompt TEXT is a command invocation, not a question, so it
+#                  is a useless retrieval key. Layer 1's floor MUST still inject
+#                  (the turn writes code and the governing rules apply); only the
+#                  Layer 2 pull is skipped. This is why the two classes are not
+#                  collapsed into one boolean.
+#
+# The slash pattern deliberately requires the leading token to carry no SECOND
+# slash, so a pasted absolute path ("/Users/an/notes/x.md ...") stays a real
+# prompt. Verified against the corpus: 0 false positives over 3973 rows.
+# A mid-text "/implement" is likewise a real prompt; only a LEADING token counts.
+# Peel leading harness blocks off a prompt and echo what the human actually
+# typed. Echoes the input unchanged when there is no leading block.
+#
+# Non-greedy by construction (`${s#*"$close"}` cuts at the FIRST close tag) so a
+# `</ide_selection>` mentioned inside a later pasted document cannot swallow the
+# operator's text. The loop bound is a runaway guard, not a semantic limit; no
+# corpus row carries more than two stacked blocks.
+#
+# An UNTERMINATED block is left in place deliberately. If the close tag never
+# arrives we cannot say where harness telemetry stops and a human would start,
+# and inventing a boundary there would send editor telemetry to intel as a
+# retrieval key. Leaving it makes classify_non_prompt below still call it a
+# harness_event, which is the safe reading and matches today's behavior.
+strip_harness_blocks() {
+  local s="${1-}" tag close guard=0
+  while [[ $guard -lt 8 ]]; do
+    guard=$((guard + 1))
+    s="${s#"${s%%[![:space:]]*}"}"
+    case "$s" in
+      '<task-notification>'*) tag="task-notification" ;;
+      '<ide_'*) tag="${s#<}"; tag="${tag%%[ >]*}" ;;
+      '<hint>'*|'<hint '*) tag="hint" ;;
+      *) break ;;
+    esac
+    close="</$tag>"
+    case "$s" in
+      *"$close"*) s="${s#*"$close"}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "${s#"${s%%[![:space:]]*}"}"
+}
+
+classify_non_prompt() {
+  local p="${1-}"
+  # Classify what SURVIVES the harness blocks, not what leads the string. See the
+  # 299-turn measurement above for why the leading token is the wrong key.
+  local s
+  s="$(strip_harness_blocks "$p")"
+  case "$s" in
+    # Nothing survived: the harness authored the whole turn.
+    '') [[ -n "$p" ]] && { printf 'harness_event'; return 0; }; return 0 ;;
+    # Stripping made no progress, so the block never closed. Same reading.
+    '<task-notification>'*|'<ide_'*|'<hint>'*|'<hint '*) printf 'harness_event'; return 0 ;;
+  esac
+  if [[ "$s" =~ ^/[A-Za-z][A-Za-z0-9_:-]*([[:space:]]|$) ]]; then
+    printf 'slash_command'
+    return 0
+  fi
+  return 0
+}
+
 collect_touched_files() {
   local sid="${1:-${SESSION_ID:-}}"
   local dir="${2:-$PWD}"
@@ -513,6 +617,144 @@ collect_touched_files() {
   )"
   [[ -z "$files" ]] && { printf '[]'; return 0; }
   printf '%s' "$files" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]'
+  return 0
+}
+
+# ---- I4 session-local feed: the per-session recent-turn ledger ------------
+#
+# WHY THIS EXISTS. intel has shipped a `session_local` evidence provider since
+# P0.3 (enrich_session_local.py) and it is the ONLY non-KB surface with a live
+# provider (enrich_router_plan.py `_BUILT_NON_KB_SURFACES`). It reads the feed
+# from the enrich REQUEST BODY only, never by cross-querying control-db (the
+# two-DSN discipline). Its first act is:
+#
+#     has_feed = bool(recent_turns) or bool((changes_summary or "").strip())
+#     if not has_feed: return SessionLocalResult(items=[], provider_available=False)
+#
+# and this hook never sent either field. So a built provider was structurally
+# starved: every `session_report` turn resolved to NO_OFFER with reason
+# `surface_provider_missing`, which reads in the trace like "intel has no
+# provider for this" when the truth was "the client sent no feed". Measured
+# 2026-07-28 over the local trace log: 46 of 138 diagnosable turns (33%) died
+# here, and NONE of them could ever have succeeded.
+#
+# THE LEDGER. One line per turn, appended at UserPromptSubmit, in the same
+# QUEUE_DIR/<session>.<kind> shape as the `.touched` ledger above. Deliberately
+# NOT read from ask-traces.jsonl: that file is local analytics and is contracted
+# never to be networked, so sourcing a wire payload from it would cross a stated
+# boundary (and cost a 38MB scan on the hot path).
+#
+# WHAT WE HONESTLY KNOW at UserPromptSubmit is only the CURRENT turn's prompt and
+# touched set. `assistant_summary` / `commands_run` / `outcome` belong to a turn
+# that has not run yet, so they are recorded empty here and back-filled
+# best-effort from the still-undrained capture spool by collect_recent_turns.
+# `outcome` stays "unknown" rather than guessing: we do not track apply/revert,
+# and a fabricated outcome would be laundered into the model as evidence.
+#
+# TRUST. The text written here is the REDACTED prompt (the caller passes
+# ENRICH_Q, never $PROMPT), so the ledger never holds a secret the wire would
+# not already carry. intel re-redacts on its side and frames every item as
+# low-trust `derived_from_agent_session` evidence.
+SESSION_TURNS_MAX_DEFAULT=3
+# Per-turn goal cap. Long pasted specs are truncated to keep the feed a summary
+# rather than a second copy of the prompt (intel caps at 3 items, not 3 KB).
+SESSION_TURN_GOAL_CHARS=400
+
+# Append ONE turn record to the ledger. Best-effort: any failure is silent and
+# non-fatal (the feed degrades to "fewer turns", never to a broken hook).
+# $1 = session id, $2 = turn index, $3 = turn id, $4 = REDACTED goal text.
+record_session_turn() {
+  local sid="${1:-}" turn="${2:-0}" turn_id="${3:-}" goal="${4:-}"
+  command -v jq >/dev/null 2>&1 || return 0
+  [[ -n "$sid" ]] || return 0
+  # A turn with no goal text is not evidence; skip rather than write a husk that
+  # _render_turn would drop anyway.
+  [[ -n "$goal" ]] || return 0
+  # --argjson below is strict: a non-numeric sequence would abort the jq call and
+  # silently drop the turn. Coerce instead, so a caller passing a weird index
+  # costs us the ordinal, not the record.
+  [[ "$turn" =~ ^[0-9]+$ ]] || turn=0
+  [[ -n "$turn_id" ]] || turn_id="${sid}:${turn}"
+  goal="${goal:0:$SESSION_TURN_GOAL_CHARS}"
+  local ledger="$QUEUE_DIR/$sid.turns"
+  local line
+  line="$(jq -c -n --arg id "$turn_id" --argjson seq "${turn:-0}" --arg goal "$goal" \
+    '{turn_id: $id, sequence: $seq, user_goal: $goal}' 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 0
+  printf '%s\n' "$line" >>"$ledger" 2>/dev/null || true
+  # Bound the file so a long-lived session cannot grow it without limit. Keep a
+  # generous tail (far more than we ever send) so the trim is rare.
+  local keep=200 count
+  # BSD `wc -l` pads its count with leading spaces, so an un-stripped value fails
+  # the numeric guard below and the bound silently becomes dead code on macOS
+  # (caught by intercept-recent-turns.spec.ts, which is why the guard is tested).
+  count="$(wc -l <"$ledger" 2>/dev/null | tr -cd '0-9' || printf 0)"
+  if [[ "$count" =~ ^[0-9]+$ ]] && (( count > keep * 2 )); then
+    local tmp="$ledger.tmp.$$"
+    if tail -n "$keep" "$ledger" >"$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$ledger" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+      rm -f "$tmp" 2>/dev/null || true
+    fi
+  fi
+  return 0
+}
+
+# Emit the `recent_turns` array for the enrich body: the last N COMPLETED turns,
+# freshest first, in intel's RecentTurnSummary shape. Prints `[]` when there is
+# no usable feed, which the caller treats as "omit the field" (compat 6.2:
+# absent == today's prompt-only behavior).
+#
+# The current turn is NOT in the ledger yet (record_session_turn runs after the
+# enrich body is built), so a turn is never its own evidence.
+collect_recent_turns() {
+  local sid="${1:-${SESSION_ID:-}}"
+  local max="${2:-${MEETLESS_RECENT_TURNS_MAX:-$SESSION_TURNS_MAX_DEFAULT}}"
+  command -v jq >/dev/null 2>&1 || { printf '[]'; return 0; }
+  [[ -n "$sid" ]] || { printf '[]'; return 0; }
+  [[ "$max" =~ ^[0-9]+$ ]] || max="$SESSION_TURNS_MAX_DEFAULT"
+  (( max > 0 )) || { printf '[]'; return 0; }
+  local ledger="$QUEUE_DIR/$sid.turns"
+  [[ -s "$ledger" ]] || { printf '[]'; return 0; }
+
+  # Best-effort back-fill from the capture spool: it holds this session's
+  # assistant narration and bash commands keyed by the SAME session id. The
+  # spool is drained periodically, so treat a miss as normal, not an error.
+  local spool="$QUEUE_DIR/$sid.jsonl"
+  local narration="[]" commands="[]"
+  if [[ -s "$spool" ]]; then
+    narration="$(tail -n 400 "$spool" 2>/dev/null \
+      | jq -s -c '[ .[] | select(.event == "assistant_message")
+                    | (.payload.narration // "") | select(length > 0) ]' 2>/dev/null || printf '[]')"
+    commands="$(tail -n 400 "$spool" 2>/dev/null \
+      | jq -s -c '[ .[] | select(.event == "tool_used_bash")
+                    | (.payload.command // "") | select(length > 0) ]' 2>/dev/null || printf '[]')"
+  fi
+  case "$narration" in '['*']') ;; *) narration="[]" ;; esac
+  case "$commands" in '['*']') ;; *) commands="[]" ;; esac
+
+  # The spool is not turn-indexed for these two events, so attribute the freshest
+  # narration/commands to the freshest turn ONLY. Attaching them to every turn
+  # would assert a join we cannot prove and would repeat the same text three times.
+  local out
+  out="$(tail -n "$max" "$ledger" 2>/dev/null \
+    | jq -s -c --argjson narr "$narration" --argjson cmds "$commands" \
+        --argjson tf "${TOUCHED_FILES_JSON:-[]}" '
+      # freshest first, so the max-items trim downstream keeps the latest turns
+      ( . | map(select(type == "object" and (.user_goal // "") != "")) | reverse ) as $rows
+      | [ $rows | to_entries[]
+          | .key as $i | .value as $r
+          | {
+              turn_id: ($r.turn_id // "unknown"),
+              sequence: ($r.sequence // 0),
+              user_goal: ($r.user_goal // ""),
+              assistant_summary: (if $i == 0 then ($narr | last // "") else "" end),
+              touched_files: (if $i == 0 then $tf else [] end),
+              commands_run: (if $i == 0 then ($cmds | .[-5:]) else [] end),
+              outcome: "unknown",
+              low_trust: true
+            } ]' 2>/dev/null || printf '[]')"
+  case "$out" in '['*']') printf '%s' "$out" ;; *) printf '[]' ;; esac
   return 0
 }
 

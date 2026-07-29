@@ -74,6 +74,18 @@ if meetless_session_disabled "$SESSION_ID"; then
 fi
 
 PROMPT="$(echo "$INPUT" | jq -r '.prompt // ""')"
+# What the human actually typed, with any leading harness block peeled off (see
+# strip_harness_blocks in common.sh, and the 299-turn measurement above it).
+#
+# TWO spellings on purpose, and the split is deliberate. PROMPT stays RAW
+# everywhere the turn is RECORDED (the capture spool, the markdown log, the
+# prompt hash): that is an audit record of what the harness actually delivered,
+# and rewriting it would desync turn derivation downstream, which reads the
+# spooled text. PROMPT_HUMAN is used everywhere the prompt is a RETRIEVAL KEY,
+# because `<ide_opened_file>The user opened /Users/an/x.md ...` is not what the
+# operator asked, and it is 294 corpus rows of noise at the head of the string
+# where the router's windowed cues do their matching.
+PROMPT_HUMAN="$(strip_harness_blocks "$PROMPT")"
 TS="$(date -u +%FT%TZ)"
 EVENT_KEY="$(gen_event_key)"
 
@@ -336,30 +348,62 @@ Pull the cited decisions and confirm the accountable owner has signed off before
 # so it MUST be called as a plain statement, never in a $(...) subshell, or the
 # assignments and the per-session inject-state write are lost. Kill switch:
 # MEETLESS_GOVERNANCE_HINT=0.
+#
+# SILENCE IS RECORDED, NOT IMPLIED. Every path that declines to nudge writes a
+# `silent_reason` instead of leaving GOVERNANCE_JSON at its "null" default. This
+# is not cosmetic: over 3977 real dogfood trace rows the governance block is
+# present on 932 and null on the other 3045, and a null was indistinguishable
+# between "the operator muted it", "no cache was ever written", "the cache is
+# corrupt", and "the cache decayed past its TTL". Four different diagnoses, one
+# null.
+#
+# The live condition on the dogfood machine is the fourth one, and it is datable
+# to the minute. The count cache holds {"count":0,"ts":1783301418}, written
+# 2026-07-06T01:30:18Z, and MEETLESS_GOVERNANCE_CACHE_TTL_S defaults to 86400, so
+# it expired at 2026-07-07T01:30:18Z. The last trace row carrying ANY governance
+# block is 2026-07-07T01:24:22Z: six minutes inside that boundary. The nudge did
+# not break. It DECAYED, on schedule, and then went quiet for three weeks while
+# the only readout said `null`, the same `null` a muted session writes. An
+# instrument that cannot tell you why it is quiet is not an instrument.
+#
+# A live turn keeps silent_reason:null, so `silent_reason == null` means the
+# block ran and decided, and a missing block still means the hook never got here.
+_gov_silent() {
+  GOVERNANCE_JSON="$(jq -cn --arg r "$1" \
+    '{pending_count:null, injected:false, form:null, silent_reason:$r}')"
+}
+
 maybe_governance_block() {
-  [[ "${MEETLESS_GOVERNANCE_HINT:-1}" == "0" ]] && return 0
+  [[ "${MEETLESS_GOVERNANCE_HINT:-1}" == "0" ]] && { _gov_silent disabled; return 0; }
 
   local count_file count cache_ts now cache_ttl
   count_file="$(governance_count_file "$WORKSPACE_ID")"
-  [[ -f "$count_file" ]] || return 0  # no cache -> never a false governance signal
+  # no cache -> never a false governance signal
+  [[ -f "$count_file" ]] || { _gov_silent no_cache; return 0; }
 
   count="$(jq -r '.count // empty' "$count_file" 2>/dev/null || true)"
   cache_ts="$(jq -r '.ts // 0' "$count_file" 2>/dev/null || printf 0)"
-  [[ "$count" =~ ^[0-9]+$ ]] || return 0           # malformed cache -> no signal
-  [[ "$cache_ts" =~ ^[0-9]+$ ]] || cache_ts=0
+  # malformed cache -> no signal
+  [[ "$count" =~ ^[0-9]+$ ]] || { _gov_silent malformed_cache; return 0; }
+  # An unparseable `ts` is a CORRUPT file, not an old one. Coercing it to 0 (as
+  # this did) makes it trip the staleness guard below and report itself as
+  # `stale_cache`, which points the reader at the wrong fix: waiting for the next
+  # `mla kb pending` will never repair a malformed file.
+  [[ "$cache_ts" =~ ^[0-9]+$ ]] || { _gov_silent malformed_cache; return 0; }
 
   now="$(date +%s)"
   # Stale-cache guard: a count older than the cache TTL might be wrong (the queue
   # moved since `mla kb pending` last ran), so treat it as NO signal rather than
-  # nudge on possibly-wrong data. governance stays null (distinct from count==0,
-  # which is a KNOWN-empty queue and records {pending_count:0,...}).
+  # nudge on possibly-wrong data. Distinct from count==0, which is a KNOWN-empty
+  # queue and records {pending_count:0,...}.
   cache_ttl="${MEETLESS_GOVERNANCE_CACHE_TTL_S:-86400}"
   [[ "$cache_ttl" =~ ^[0-9]+$ ]] || cache_ttl=86400
-  if (( now - cache_ts > cache_ttl )); then return 0; fi
+  if (( now - cache_ts > cache_ttl )); then _gov_silent stale_cache; return 0; fi
 
-  # Fresh, valid count from here on -> governance is non-null.
+  # Fresh, valid count from here on -> governance carries a real pending_count.
   if (( count <= 0 )); then
-    GOVERNANCE_JSON="$(jq -cn --argjson c "$count" '{pending_count:$c, injected:false, form:null}')"
+    GOVERNANCE_JSON="$(jq -cn --argjson c "$count" \
+      '{pending_count:$c, injected:false, form:null, silent_reason:null}')"
     return 0
   fi
 
@@ -394,7 +438,10 @@ maybe_governance_block() {
   fi
 
   if (( fire == 0 )); then
-    GOVERNANCE_JSON="$(jq -cn --argjson c "$count" '{pending_count:$c, injected:false, form:null}')"
+    # Throttled, not silent: the count is real and known, so silent_reason stays
+    # null. `injected:false` with a non-null pending_count IS the throttle record.
+    GOVERNANCE_JSON="$(jq -cn --argjson c "$count" \
+      '{pending_count:$c, injected:false, form:null, silent_reason:null}')"
     return 0
   fi
 
@@ -422,7 +469,8 @@ user_confirm_actions: accept, apply_correction
 default = propose (accept and apply_correction are governed changes under the user's authority; propose them and let the user confirm)
 List your session's candidates with: mla kb review (add --json for structured output); full workspace queue: mla kb review --all.
 </meetless-context>"
-  GOVERNANCE_JSON="$(jq -cn --argjson c "$count" --arg f "$form" '{pending_count:$c, injected:true, form:$f}')"
+  GOVERNANCE_JSON="$(jq -cn --argjson c "$count" --arg f "$form" \
+    '{pending_count:$c, injected:true, form:$f, silent_reason:null}')"
 
   # Persist the inject-state ONLY when we inject. last_prose_ts advances only on a
   # prose form so the prose TTL measures time-since-last-PROSE, not last-inject.
@@ -899,26 +947,37 @@ intercept_main() {
   [[ "$SUPPRESS_ENRICH" == "1" ]] && return 0
   [[ -z "$PROMPT" ]] && return 0
 
-  # Harness-synthetic prompts: Claude Code feeds `<task-notification>` wake-ups
-  # (background task finished, monitor events) through UserPromptSubmit exactly
-  # like a human prompt. No human wrote them, so enriching one wastes an intel
-  # /v1/ask call and injects evidence into a turn nobody reads. Treat a prompt
-  # whose first non-whitespace token is the tag exactly like SUPPRESS_ENRICH:
-  # capture already spooled above (the wake-up IS part of session history); no
-  # floor, no enrich, no trace. Under governed-story §4.2 the single turn-counter
-  # advance has ALREADY happened once at UPS entry (before this returns), so a
-  # synthetic prompt gets its OWN turnIndex; it does NOT borrow or collide with the
-  # next real turn's index. That is exactly what the turnId join relies on (spec
-  # §5.3 / acceptance #3): the next human turn's injected panel can never be
-  # misattributed to a synthetic wake-up. The captured prompt_submitted row is
-  # filtered OUT of HUMAN turn derivation downstream by isSyntheticAgentPrompt
-  # (worker turn-assembler + control firstPrompt + the getEventsBySession read
-  # defense), so it still never manufactures a fake human turn even though it
-  # occupies an index slot. A mid-text mention is a real prompt.
-  local PROMPT_LSTRIP="${PROMPT#"${PROMPT%%[![:space:]]*}"}"
-  case "$PROMPT_LSTRIP" in
-    '<task-notification>'*) return 0 ;;
-  esac
+  # Harness-authored events: Claude Code feeds `<task-notification>` wake-ups
+  # through UserPromptSubmit exactly like a human prompt. No human wrote them, so
+  # enriching one wastes an intel /v1/ask call and injects evidence into a turn
+  # nobody reads. Treat them exactly like SUPPRESS_ENRICH: capture already spooled
+  # above (the event IS part of session history); no floor, no enrich, no trace.
+  #
+  # This gate used to fire on any prompt whose LEADING token was a harness tag,
+  # which swept in 294 `<ide_*>` and 5 `<hint>` turns that a human really did
+  # type into (the IDE extension prepends telemetry, it does not replace the
+  # message). classify_non_prompt now strips the blocks and classifies the
+  # remainder, so only a genuinely block-ONLY turn returns here; see the measured
+  # taxonomy above it in common.sh before widening this back.
+  # The taxonomy itself lives in classify_non_prompt (common.sh) so the two tiers
+  # share one definition; only `harness_event` returns here, because the other
+  # class (slash_command) is a REAL human turn that still needs the floor.
+  #
+  # Under governed-story §4.2 the single turn-counter advance has ALREADY happened
+  # once at UPS entry (before this returns), so a harness event gets its OWN
+  # turnIndex; it does NOT borrow or collide with the next real turn's index. That
+  # is exactly what the turnId join relies on (spec §5.3 / acceptance #3): the next
+  # human turn's injected panel can never be misattributed to a wake-up.
+  #
+  # Turn derivation downstream is a SEPARATE question with a separate predicate.
+  # isSyntheticAgentPrompt (packages/utils/src/agent-prompt.ts) decides whether a
+  # spooled prompt_submitted may OPEN a human turn; it is deliberately narrower
+  # than this gate, because "not worth retrieving on" and "not a human turn" are
+  # not the same set (a slash command is the counterexample in both directions).
+  # Widening one does not imply widening the other.
+  if [[ "$(classify_non_prompt "$PROMPT")" == "harness_event" ]]; then
+    return 0
+  fi
 
   # --- identity + trace setup ---
   TRACE_ID="$(gen_event_key | tr -d '-' | tr 'A-F' 'a-f')"
@@ -982,9 +1041,16 @@ intercept_main() {
   # injected (and in which form); GOV_BLOCK is the rendered <meetless-context>
   # block appended to the prompt. maybe_governance_block sets both as a plain
   # statement (NOT in a $(...) subshell) so its global assignments and the
-  # per-session inject-state write survive into the live shell. Defaults cover
-  # every early-return path (pull_only, missing token, SUPPRESS_ENRICH) so those
-  # record "no governance nudge" with the field present rather than unset.
+  # per-session inject-state write survive into the live shell.
+  #
+  # This default is now a MEANINGFUL third value, not just a placeholder. Since
+  # maybe_governance_block records a `silent_reason` on every path it declines,
+  # `governance: null` in a trace means exactly one thing: the turn short-circuited
+  # before the nudge was ever considered (pull_only, missing token,
+  # SUPPRESS_ENRICH). A non-null block with silent_reason set means it ran and
+  # chose not to nudge, and it says why. Do not "simplify" the early returns back
+  # to a bare `return 0`: that collapses the two cases into the same null and
+  # re-blinds the only readout we have of whether this surface works.
   GOVERNANCE_JSON="null"
   GOV_BLOCK=""
   STEER_BLOCK=""
@@ -1100,7 +1166,7 @@ intercept_main() {
     _asm_reconcile="$(mktemp 2>/dev/null || printf '')"
     _asm_input="$(jq -cn \
       --arg base "$LAYER1" \
-      --arg prompt "$PROMPT" \
+      --arg prompt "$PROMPT_HUMAN" \
       --argjson workingSet "$_asm_ws" \
       --arg workspaceId "${WORKSPACE_ID:-}" \
       --arg repoRoot "$_asm_root" \
@@ -1184,7 +1250,25 @@ intercept_main() {
   # floor stands alone, exactly as a missing token did before.
   INTEL_TOKEN="$(jq -r '.auth.accessToken // .controlToken // empty' "$CFG" 2>/dev/null || true)"
 
-  if [[ -z "$INTEL_TOKEN" ]]; then
+  # Tier 2 of the non-prompt taxonomy (classify_non_prompt, common.sh). A slash
+  # command is a REAL human turn that does REAL work, so it has already been given
+  # the Layer 1 floor above and MUST keep it. What it is not is a retrieval key:
+  # "/audit-doc @notes/x.md" describes which skill to run, not a question anyone
+  # can answer from the governed corpus, and the router has no choice but to dump
+  # it in `unknown`. Skipping only the Layer 2 pull saves the round trip and keeps
+  # 66 unanswerable turns out of the abstain denominator, while the floor (the part
+  # that actually governs the work the command is about to do) still injects.
+  #
+  # Recorded as a first-class arbitration reason rather than a silent return so the
+  # skip stays countable in the trace; a suppression nobody can measure is how the
+  # last set of dead instruments got that way.
+  if [[ "$(classify_non_prompt "$PROMPT")" == "slash_command" ]]; then
+    log "intercept: slash command; Layer 1 only (command text is not a retrieval key)"
+    ENRICHMENT_JSON="$(synth_enrichment skipped)"
+    ENRICH_STATUS="skipped"
+    ARB_DECISION="layer1_only"; ARB_REASON="non_retrievable_prompt"; FAIL_OPEN_REASON=""
+    LAYER2_INJECTED="false"
+  elif [[ -z "$INTEL_TOKEN" ]]; then
     log "intercept: no auth token in config; Layer 1 only (Layer 2 needs intel auth)"
     ENRICHMENT_JSON="$(synth_enrichment skipped)"
     ENRICH_STATUS="skipped"
@@ -1228,7 +1312,7 @@ intercept_main() {
       local _eq_timeout _eq_red
       _eq_timeout="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
       if [[ -n "${MLA_PATH:-}" && -x "${MLA_PATH:-}" ]]; then
-        _eq_red="$(jq -c -n --arg q "$PROMPT" '{query: $q, profile: "retrieval"}' 2>/dev/null \
+        _eq_red="$(jq -c -n --arg q "$PROMPT_HUMAN" '{query: $q, profile: "retrieval"}' 2>/dev/null \
           | ${_eq_timeout:+"$_eq_timeout" 5} "$MLA_PATH" _internal redact-capture 2>/dev/null || true)"
         if [[ -n "$_eq_red" ]] && printf '%s' "$_eq_red" | jq -e 'has("query") and (.query != null)' >/dev/null 2>&1; then
           # Assignment inside `if` so `set -e` cannot kill the hook on a jq fault;
@@ -1256,6 +1340,16 @@ intercept_main() {
 ${ENRICH_Q:$((PLEN - 500))}"
       fi
 
+      # I4: the request-carried recent-trajectory feed. Read from the per-session
+      # `.turns` ledger BEFORE this turn is appended to it, so a turn is never its
+      # own evidence. Omitted from the body when empty (compat 6.2: absent ==
+      # prompt-only behavior). Without this field intel's `session_local` provider
+      # returns provider_available=False on every turn and the router's
+      # session_report route can only ever produce surface_provider_missing.
+      local RECENT_TURNS_JSON
+      RECENT_TURNS_JSON="$(collect_recent_turns "$SESSION_ID")"
+      [[ -z "$RECENT_TURNS_JSON" ]] && RECENT_TURNS_JSON="[]"
+
       # Request body built with jq; never string-concatenated (§3.10). NO
       # workspace_hint field on the wire: the hint is Layer-1 display text only;
       # scope is the env-pinned workspace_id (SEC-2.2 / §12.5).
@@ -1263,8 +1357,15 @@ ${ENRICH_Q:$((PLEN - 500))}"
       ENRICH_BODY="$(jq -n --arg q "$ENRICH_Q" --arg w "$WORKSPACE_ID" --arg t "$TRACE_ID" \
         --arg strat "$STRATEGY" --arg surf "$SURFACE" \
         --argjson tf "$TOUCHED_FILES_JSON" \
+        --argjson rt "$RECENT_TURNS_JSON" \
         '{workspace_id:$w, question:$q, surface:$surf, mode:"enrich", strategy:$strat, trace_id:$t, stream:false}
-         + (if ($tf | length) > 0 then {touched_files:$tf} else {} end)')"
+         + (if ($tf | length) > 0 then {touched_files:$tf} else {} end)
+         + (if ($rt | length) > 0 then {recent_turns:$rt} else {} end)')"
+
+      # Append THIS turn to the ledger so the NEXT turn can see it. Runs after the
+      # body is built (never self-evidence) and carries the REDACTED question, so
+      # the ledger never holds text the wire would not already carry. Best-effort.
+      record_session_turn "$SESSION_ID" "${TURN_INDEX:-0}" "${TURN_ID:-}" "$ENRICH_Q"
 
       do_enrich() {  # backgrounded curl -> $ENRICH_OUT (body), $ENRICH_CODE (http status)
         # -o writes the body to the file; -w emits ONLY the HTTP status to stdout,

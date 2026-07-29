@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.29 (2026-07-29)
+
+0.2.29 is mostly the redactor learning the difference between a credential and a sentence about
+one. The scrub that keeps secrets off the wire had started refusing runbooks, design notes, and
+anything that merely said "Bearer token" or "passphrase" out loud, which made the safe path the
+annoying one. It now reads a value the way a person does: on the same line as its name, set by a
+header rather than described in prose, and a reference to a secret is not the secret. Every
+refusal that matters is intact and pinned by a test, including the two residuals that were
+previously only a comment. The other half of the release is `mla scan` finally reporting absence:
+it tells control what the checkout no longer contains, so a file you deleted stops being cited as
+evidence. That half needs the backend shipped alongside it, and it is. Two spend paths also got
+their attribution back, an ask that posted no actor and a suspended account that read like a
+customer who forgot to pay, and three error paths stopped blaming intel for refusals we issued
+ourselves.
+
+- a reference to a credential is not the credential, so a runbook stops being scrubbed
+- a value lives on the same line as its name
+- a header sets a value; a sentence describing one does not
+- a bare word is not a value unless a human chose it
+- an elision and a name are references, not values
+- `scope_key` is a domain identifier, not a credential
+- a passphrase is a password, and the word list now knows it
+- a phrase is a credential shape, so a token-shaped placeholder stays refused
+- a credential-word suffix cannot buy an exemption for what sits in front of it
+- the two measured prose residuals carry an executable ruling instead of a comment
+- the `redis_directive` residual is pinned as a ruling, not a gap
+- `mla scan` states what the checkout contains, so control can sweep what it no longer sees
+- the scan reports absence, so evidence you deleted stops being cited
+- the plugin artifact is the shipped hook, so it moves with its source
+- CI gates the plugin, because the plugin is what ships the hooks
+- retrieval is no longer paid for on prompts nobody asked
+- the one non-KB provider we actually shipped is no longer starved
+- the retrieval profile stops eating the subject of the question
+- an ask that posts no actor is anonymous spend, so it now carries one
+- a suspended account reads as suspended, not as a customer who forgot to pay
+- a recovered evidence outage stops shouting that intel is down
+- a refusal we issued ourselves is not the server going down
+- the governance nudge says why it is quiet, and it has been quiet since July 7
+- the export gate scans what we publish and gates the harvest, not the mention
+- the public corpus fixture is synthetic rather than a harvest of the private tree
+- the activation gate spec no longer races its own detached spawns
+
 ## 0.2.28 (2026-07-27)
 
 0.2.28 is about what leaves your machine. Every payload `mla` sends now passes through a single

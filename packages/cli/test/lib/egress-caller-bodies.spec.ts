@@ -70,6 +70,10 @@ const WITNESSES: Record<string, Witness> = {
     path: "/v1/ask",
     body: {
       workspace_id: "ws_1",
+      // The metering actor. Null under shared-key, a workspace_users id under a
+      // user token; either way the KEY is always sent, so the witness must
+      // declare it or the boundary fails closed on it.
+      user_id: "c00exampleuser00000000001",
       question: "why did we deprecate the decision diff",
       surface: "mcp",
       stream: false,
@@ -245,6 +249,15 @@ const WITNESSES: Record<string, Witness> = {
       contentNormalizationVersion: 1,
       observedCommitSha: "8c80ec96f",
       observedAt: "2026-07-26T00:00:00.000Z",
+      workspaceId: "ws_1",
+    },
+  },
+  [`control POST ${/^\/internal\/v1\/repo-instruction-snapshots\/sweep$/.source}`]: {
+    caller: "lib/rules/repo-instruction-snapshot-client.ts sweepRepoInstructionSnapshots",
+    path: "/internal/v1/repo-instruction-snapshots/sweep",
+    body: {
+      repositoryId: "repo_1",
+      observedPaths: ["CLAUDE.md", ".claude/rules/floor.md"],
       workspaceId: "ws_1",
     },
   },

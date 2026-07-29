@@ -28,6 +28,9 @@ const okUpload = async (): Promise<SnapshotUploadOutcome> => ({
   uploaded: 0,
   skipped: 0,
   failed: 0,
+  // `null`, not `0`. A stub that holds the push out of the way ran no sweep, and the two values
+  // mean opposite things: 0 asserts a sweep ran and found the corpus already matching.
+  swept: null,
 });
 
 /** One §3.5 reconciliation finding in cache shape, shared by the rescan and the runScanContext specs. */
@@ -401,7 +404,7 @@ describe("runScanContext", () => {
       refreshBundle: async () => ({ delivered: true }),
       uploadSnapshots: async (a) => {
         captured = a;
-        return { delivered: true, attempted: a.paths.length, uploaded: a.paths.length, skipped: 0, failed: 0 };
+        return { delivered: true, attempted: a.paths.length, uploaded: a.paths.length, skipped: 0, failed: 0, swept: 0 };
       },
       home,
       out: o, err: e,
@@ -417,6 +420,66 @@ describe("runScanContext", () => {
     expect(captured!.paths).toContain("CLAUDE.md");
     expect(captured!.observedCommitSha).toBeTruthy();
     expect(captured!.observedAt).toBeTruthy();
+  });
+
+  // The REMOVAL half of the same producer. `paths` is what we managed to digest; `observedPaths` is
+  // what is on disk, and control retires every stored revision outside it. Wiring the sweep to
+  // `paths` would look identical in the happy case and quietly tombstone every file too large or
+  // unreadable to digest, on every single scan.
+  it("hands the sweep the FULL on-disk enumeration, not just the digested subset", async () => {
+    const { o, e } = sink();
+    let captured: SnapshotUploadArgs | undefined;
+    // >256KB: scanned and enumerated, but past MAX_FILE_BYTES so it carries no digest.
+    mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+    writeFileSync(join(repo, ".claude", "rules", "huge.md"), "x".repeat(300 * 1024));
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "huge"]);
+
+    const code = await runScanContext([], {
+      refreshBundle: async () => ({ delivered: true }),
+      uploadSnapshots: async (a) => {
+        captured = a;
+        return { delivered: true, attempted: a.paths.length, uploaded: a.paths.length, skipped: 0, failed: 0, swept: 0 };
+      },
+      home,
+      out: o, err: e,
+    });
+
+    expect(code).toBe(0);
+    expect(captured!.observedPaths).toEqual(
+      expect.arrayContaining(["CLAUDE.md", ".claude/rules/huge.md"]),
+    );
+    expect(captured!.paths).not.toContain(".claude/rules/huge.md");
+  });
+
+  // The one input that must never be guessed. `observedPaths: []` tells control to retire the
+  // WHOLE corpus for this checkout, so a scan that could not enumerate anything (non-git root, git
+  // missing) has to say nothing at all rather than say "zero".
+  it("claims NOTHING about the checkout's contents when it could not enumerate it", async () => {
+    const { o, e } = sink();
+    let captured: SnapshotUploadArgs | undefined;
+    const nongit = mkdtempSync(join(tmpdir(), "mla-rsc-nongit-"));
+    writeFileSync(join(nongit, "CLAUDE.md"), "- NEVER commit secrets.\n");
+    process.chdir(nongit);
+
+    try {
+      const code = await runScanContext(["--workspace", "ws-nongit"], {
+        refreshBundle: async () => ({ delivered: true }),
+        uploadSnapshots: async (a) => {
+          captured = a;
+          return { delivered: true, attempted: 0, uploaded: 0, skipped: 0, failed: 0, swept: null };
+        },
+        home,
+        out: o, err: e,
+      });
+
+      expect(code).toBe(0);
+      expect(captured).toBeDefined();
+      expect(captured!.observedPaths).toBeUndefined();
+    } finally {
+      process.chdir(repo);
+      rmSync(nongit, { recursive: true, force: true });
+    }
   });
 
   // Warn about a failed PUSH only when the PULL succeeded. A push that failed for the same reason
@@ -458,7 +521,7 @@ describe("runScanContext", () => {
 
     const code = await runScanContext([], {
       refreshBundle: async () => ({ delivered: true }),
-      uploadSnapshots: async () => ({ delivered: true, attempted: 2, uploaded: 1, skipped: 0, failed: 1 }),
+      uploadSnapshots: async () => ({ delivered: true, attempted: 2, uploaded: 1, skipped: 0, failed: 1, swept: 0 }),
       home,
       out: o, err: e,
     });

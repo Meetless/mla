@@ -222,6 +222,13 @@ export function makeIntelAskFromCli(
   return (params) => {
     const payload: Record<string, unknown> = {
       workspace_id: params.workspaceId,
+      // Who ran this ask. intel copies it onto the llm_usage_events row, so an
+      // ask that posts nothing here is anonymous spend. Read off `cfg` (the
+      // transport binding) rather than `params`, because `mla mcp` builds this
+      // closure from the config and the ask-core mode router that invokes it
+      // never sees an operator. Null under shared-key, where there is no human.
+      // Key order matches ask_modes.js: the parity fixture pins the string.
+      user_id: cfg.actorUserId ?? null,
       // Redacted at the egress, not at the call site. This is the SAME route the
       // hook's Layer 2 enrichment posts to (user-prompt-submit.sh), and that path
       // has redacted since day one; this one shipped the question verbatim, so a

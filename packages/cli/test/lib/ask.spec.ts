@@ -223,10 +223,18 @@ describe("mla ask: workspace resolution + echo", () => {
     // The bytes-on-the-wire proof lives where the real code runs:
     // packages/ask-core/ask_modes.test.js, "an injected redactFn CANNOT weaken
     // the boundary" and "the mandatory profile is retrieval, not full".
+    //
+    // `userId` joined the list when MCP/CLI asks started carrying their metering
+    // actor. It is DATA, not a seam: a workspace_users id that intel stamps onto
+    // llm_usage_events, with no behavior to override. The second assertion is
+    // what actually holds the line now, and it is stronger than the key list:
+    // no dependency here may be callable, so a redactFn cannot come back under
+    // any name.
     const rec: Recorder = {};
     await run(["q"], rec);
     const deps = rec.intelDeps as Record<string, unknown>;
-    expect(Object.keys(deps).sort()).toEqual(["apiKey", "intelBaseUrl"]);
+    expect(Object.keys(deps).sort()).toEqual(["apiKey", "intelBaseUrl", "userId"]);
+    expect(Object.entries(deps).filter(([, v]) => typeof v === "function")).toEqual([]);
   });
 });
 

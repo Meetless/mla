@@ -81,7 +81,7 @@ function redactForWire(text) {
   return out;
 }
 
-export function makeIntelAsk({ intelBaseUrl, apiKey, fetchImpl = fetch }) {
+export function makeIntelAsk({ intelBaseUrl, apiKey, userId = null, fetchImpl = fetch }) {
   return async function intelAsk({
     question,
     workspaceId,
@@ -94,6 +94,17 @@ export function makeIntelAsk({ intelBaseUrl, apiKey, fetchImpl = fetch }) {
   }) {
     const payload = {
       workspace_id: workspaceId,
+      // Who ran this ask. intel copies it onto the llm_usage_events row for the
+      // call, so an ask that posts nothing here lands with a NULL userId and
+      // per-user cost is unanswerable on the one surface where a human is
+      // actually spending. Bound at closure construction (see the deps arg)
+      // because the callers that KNOW the actor build the closure, while the
+      // mode handlers that invoke it never see an operator.
+      //
+      // Always present, never omitted: intel's AskRequest.user_id is
+      // `str | None`, and a conditionally-absent key would let the two builders
+      // diverge on key ORDER, which ask_payload_parity.json pins as a string.
+      user_id: userId ?? null,
       question: redactForWire(question),
       surface: "mcp",
       stream: false,

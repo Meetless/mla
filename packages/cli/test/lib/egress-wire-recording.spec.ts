@@ -213,6 +213,7 @@ describe("the generated route samples are honest", () => {
       "redact control POST ^\\/internal\\/v1\\/session-conflicts\\/[^/]+\\/agent-dismiss$",
       "redact control POST ^\\/internal\\/v1\\/analytics\\/enforcement\\/incidents\\/[^/]+\\/adjudicate$",
       "block_on_detect control POST ^\\/internal\\/v1\\/repo-instruction-snapshots$",
+      "block_on_detect control POST ^\\/internal\\/v1\\/repo-instruction-snapshots\\/sweep$",
       "block_on_detect intel POST ^\\/internal\\/v1\\/kb\\/add$",
       "passthrough control POST ^\\/internal\\/v1\\/workspaces$",
       "passthrough control POST ^\\/internal\\/v1\\/workspaces\\/(deactivate|reactivate)$",
@@ -279,6 +280,11 @@ const PRESERVED_BY_ROW: ReadonlyArray<readonly [string, readonly string[]]> = [
       "stream",
       "submission_id",
       "surface",
+      // The metering actor: a workspace_users id intel stamps onto
+      // llm_usage_events.userId. An id, so it belongs on this list by the rule
+      // above; and preserved rather than redacted because a mangled id joins to
+      // nothing while still LOOKING attributed, which is worse than absent.
+      "user_id",
       "workspace_id",
     ],
   ],

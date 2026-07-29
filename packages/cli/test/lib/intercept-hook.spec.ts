@@ -992,7 +992,15 @@ describe("A-0c governance nudge (user-prompt-submit.sh surface 2)", () => {
     expect(iGov).toBeGreaterThan(iStatic);
     expect(iGov).toBeGreaterThan(iEvidence);
     // trace records the firing + form; state is persisted for the next turn.
-    expect(r.trace.governance).toEqual({ pending_count: 3, injected: true, form: "prose" });
+    // silent_reason is null on every path that RAN and decided (see
+    // governance-silent-reason.spec.ts): a reason is only ever set when the block
+    // declined before it had a real count to act on.
+    expect(r.trace.governance).toEqual({
+      pending_count: 3,
+      injected: true,
+      form: "prose",
+      silent_reason: null,
+    });
     expect(r.govState).not.toBeNull();
     expect(r.govState.last_count).toBe(3);
     expect(r.govState.last_prose_ts).toBeGreaterThan(0);
@@ -1002,15 +1010,31 @@ describe("A-0c governance nudge (user-prompt-submit.sh surface 2)", () => {
     const r = await runHook({ seed: { [COUNT_CACHE]: countCache(0) }, intelDown: true });
     expectLayer1(r.additionalContext);
     expect(r.additionalContext).not.toContain('kind="governance"');
-    expect(r.trace.governance).toEqual({ pending_count: 0, injected: false, form: null });
+    // A KNOWN-empty queue is an answer, not a silence: pending_count is real and
+    // silent_reason stays null.
+    expect(r.trace.governance).toEqual({
+      pending_count: 0,
+      injected: false,
+      form: null,
+      silent_reason: null,
+    });
     expect(r.govState).toBeNull();
   });
 
-  it("does not nudge when there is no count cache (never a false governance signal)", async () => {
+  it("does not nudge when there is no count cache, and says SO rather than going quiet", async () => {
     const r = await runHook({ intelDown: true });
     expectLayer1(r.additionalContext);
     expect(r.additionalContext).not.toContain('kind="governance"');
-    expect(r.trace.governance).toBeNull();
+    // This used to assert `toBeNull()`, which is what made the surface unreadable:
+    // an absent cache, a corrupt cache, a decayed cache and a muted nudge all wrote
+    // the same null. "No cache" is the live dogfood condition (nothing has run
+    // `mla kb pending`), so it is the one that most needed a name.
+    expect(r.trace.governance).toEqual({
+      pending_count: null,
+      injected: false,
+      form: null,
+      silent_reason: "no_cache",
+    });
   });
 
   it("emits the COMPACT machine block (no prose) when prose was already shown and the count changed", async () => {
@@ -1021,7 +1045,12 @@ describe("A-0c governance nudge (user-prompt-submit.sh surface 2)", () => {
     expect(r.additionalContext).toContain('kind="governance"');
     expect(r.additionalContext).toContain("governance_pending_count: 5");
     expect(r.additionalContext).not.toMatch(PROSE_MARKER);
-    expect(r.trace.governance).toEqual({ pending_count: 5, injected: true, form: "compact" });
+    expect(r.trace.governance).toEqual({
+      pending_count: 5,
+      injected: true,
+      form: "compact",
+      silent_reason: null,
+    });
     // state advances to the new count.
     expect(r.govState.last_count).toBe(5);
   });
@@ -1032,7 +1061,14 @@ describe("A-0c governance nudge (user-prompt-submit.sh surface 2)", () => {
       intelDown: true,
     });
     expect(r.additionalContext).not.toContain('kind="governance"');
-    expect(r.trace.governance).toEqual({ pending_count: 4, injected: false, form: null });
+    // Throttled, not silent: the count is known, so this is a decision with a real
+    // pending_count and silent_reason null. Distinguishing the two is the point.
+    expect(r.trace.governance).toEqual({
+      pending_count: 4,
+      injected: false,
+      form: null,
+      silent_reason: null,
+    });
   });
 
   it("fires on an unchanged, recently-injected count when the prompt is governance-related", async () => {
@@ -1064,7 +1100,12 @@ describe("A-0c governance nudge (user-prompt-submit.sh surface 2)", () => {
       intelDown: true,
     });
     expect(r.additionalContext).not.toContain('kind="governance"');
-    expect(r.trace.governance).toBeNull();
+    expect(r.trace.governance).toEqual({
+      pending_count: null,
+      injected: false,
+      form: null,
+      silent_reason: "stale_cache",
+    });
   });
 
   it("kill switch MEETLESS_GOVERNANCE_HINT=0 suppresses the nudge even with a non-empty cache", async () => {
@@ -1074,7 +1115,16 @@ describe("A-0c governance nudge (user-prompt-submit.sh surface 2)", () => {
       intelDown: true,
     });
     expect(r.additionalContext).not.toContain('kind="governance"');
-    expect(r.trace.governance).toBeNull();
+    // Muted is an operator CHOICE, and it now says so. Before silent_reason this
+    // wrote the same null as "the cache is corrupt", so the one condition that
+    // needs no fix and the one that needs a fix were indistinguishable in the
+    // trace. See governance-silent-reason.spec.ts for the full path matrix.
+    expect(r.trace.governance).toEqual({
+      pending_count: null,
+      injected: false,
+      form: null,
+      silent_reason: "disabled",
+    });
   });
 });
 
@@ -1150,17 +1200,116 @@ describe("user-prompt-submit.sh: muted-session NOT_RUN liveness line", () => {
   });
 });
 
-// Synthetic harness prompts: Claude Code feeds `<task-notification>` wake-ups
-// (background task finished, scheduled wake, etc.) through UserPromptSubmit
-// exactly like a human prompt. Dogfood incident 2026-06-10: turns 15-19 of a
-// real session each fired a FULL Layer-2 enrichment (an intel /v1/ask call +
-// 7-8 injected evidence items) for prompts no human wrote. A synthetic prompt
-// is NOT a real agent turn, so it must behave like MEETLESS_SUPPRESS_ENRICH:
-// capture still spools (the notification IS part of the session's history),
-// but NO interception runs: no floor, no enrich call, no trace line (a trace
-// would advance the turn counter and desync `mla turn N`, same reasoning as
-// the muted-session scoping note above).
-describe("user-prompt-submit.sh: synthetic <task-notification> prompts never intercept", () => {
+// ---------------------------------------------------------------------------
+// The non-retrievable prompt taxonomy (classify_non_prompt, common.sh).
+//
+// Not every string arriving on UserPromptSubmit is an operator QUESTION. Two
+// classes reach this hook that retrieval can never serve, and they need DIFFERENT
+// treatment, which is why one boolean was not enough:
+//
+//   harness_event  Nobody typed it. `<task-notification>` wake-ups,
+//                  `<ide_opened_file>` / `<ide_selection>` editor telemetry,
+//                  `<hint>` blocks. No human turn happens, so nothing runs:
+//                  no floor, no enrich, no trace.
+//   slash_command  A human DID author it and the agent WILL do real work in the
+//                  turn, but the prompt TEXT is a command invocation, not a
+//                  question. Layer 1's floor MUST still inject (the turn writes
+//                  code and the governing rules apply); only the Layer 2 pull is
+//                  skipped, recorded as arbitration.reason=non_retrievable_prompt.
+//
+// Dogfood incident 2026-06-10 established the first tier: turns 15-19 of a real
+// session each fired a FULL Layer-2 enrichment (an intel /v1/ask call + 7-8
+// injected evidence items) for prompts no human wrote. The second tier comes from
+// measuring ~/.meetless/logs/ask-traces.jsonl: over 3973 enrich rows, 294
+// `<ide_*>` events and 66 slash commands paid for a round trip and then landed in
+// the router's `unknown` bucket, inflating the abstain denominator with turns
+// nobody could have answered.
+//
+// A trace would also advance the turn counter and desync `mla turn N` for tier 1,
+// the same reasoning as the muted-session scoping note above.
+describe("classify_non_prompt (common.sh): the taxonomy both tiers share", () => {
+  const classify = (prompt: string): string => {
+    const r = spawnSync(
+      "bash",
+      ["-c", `source "${COMMON}" >/dev/null 2>&1; classify_non_prompt "$1"`, "_", prompt],
+      { encoding: "utf8", env: { ...process.env, MEETLESS_DEBUG: "0" } },
+    );
+    return (r.stdout || "").trim();
+  };
+
+  it.each([
+    ["<task-notification>done</task-notification>"],
+    ["<ide_opened_file>/Users/an/x.ts</ide_opened_file>"],
+    ["<ide_selection>const a = 1;</ide_selection>"],
+    ["<hint>the user is looking at foo.ts</hint>"],
+    ["<hint attr='x'>body</hint>"],
+    ["\n   <ide_opened_file>x</ide_opened_file>"],
+  ])("classifies %s as harness_event", (prompt) => {
+    expect(classify(prompt)).toBe("harness_event");
+  });
+
+  it.each([["/implement notes/x.md"], ["/social engage"], ["/code-review"], ["  /loop"], ["/mla:doctor now"]])(
+    "classifies %s as slash_command",
+    (prompt) => {
+      expect(classify(prompt)).toBe("slash_command");
+    },
+  );
+
+  // A leading block is not a harness event; the IDE extension PREPENDS its
+  // telemetry to what the operator typed. Re-measured over the 3991-row trail:
+  // <task-notification> is 148/148 block-only, <ide_*> is 0/294 and <hint> is
+  // 0/5. All the prompts below are verbatim corpus rows that the old
+  // leading-token gate threw away whole.
+  it.each([
+    [
+      "<ide_opened_file>The user opened the file /Users/an/projects/x/src/main.ts in the IDE. " +
+        "This may or may not be related to the current task.</ide_opened_file>\n" +
+        "remove .claude dir out of git of the Meetless repo",
+    ],
+    ["<ide_selection>The user selected lines 40 to 51 from src/main.ts</ide_selection>\nwe are running with thinking ON right?"],
+    ["<hint>The user is currently viewing packages/utils/src/agent-prompt.ts</hint>\nHelp me review @notes/20260514-dogfood-friction.md for current issue and fix them for me."],
+    // Stacked blocks: peel both, keep the question.
+    ["<ide_opened_file>a.ts</ide_opened_file><ide_selection>lines 1-2</ide_selection>\nAny pending items?"],
+    // A close tag appearing again inside pasted content must not swallow the ask:
+    // the cut is at the FIRST close tag, so the human text survives intact.
+    ["<ide_opened_file>x.ts</ide_opened_file>\nwhy does the doc say </ide_opened_file> here? fix it"],
+  ])("treats a block followed by human text as a real prompt: %s", (prompt) => {
+    expect(classify(prompt)).toBe("");
+  });
+
+  // The taxonomy still has to survive the strip. A slash command behind editor
+  // telemetry is a slash command, not a harness event and not a retrieval key.
+  it("classifies a slash command behind an IDE block as slash_command", () => {
+    expect(classify("<ide_opened_file>x.ts</ide_opened_file>\n/implement notes/x.md")).toBe("slash_command");
+  });
+
+  // An unterminated block leaves no honest boundary between telemetry and a
+  // human's words, so it stays suppressed rather than being sent as a key.
+  it.each([["<ide_selection>lines 40 to 51 and then the file just ends"], ["<hint>no close tag here"]])(
+    "keeps an unterminated block a harness_event: %s",
+    (prompt) => {
+      expect(classify(prompt)).toBe("harness_event");
+    },
+  );
+
+  // The negatives are the whole reason the slash pattern is strict. A pasted
+  // absolute path leads with a slash too, and it is a REAL prompt carrying real
+  // retrieval signal. Measured over the 3973-row corpus: 0 false positives.
+  it.each([
+    ["/Users/an/notes/x.md is stale, fix it"],
+    ["/etc/hosts needs the tunnel entry"],
+    ["run /implement on the doc when you get a chance"],
+    ["what does the /v1/ask contract require?"],
+    ["how should I structure the auth middleware?"],
+    ["/"],
+    ["/ leading slash alone is not a command"],
+    [""],
+  ])("leaves %s unclassified (a real prompt)", (prompt) => {
+    expect(classify(prompt)).toBe("");
+  });
+});
+
+describe("user-prompt-submit.sh: harness-authored prompts never intercept", () => {
   beforeAll(() => {
     const jq = spawnSync("jq", ["--version"], { encoding: "utf8" });
     if (jq.status !== 0) throw new Error("jq must be installed to run intercept-hook specs");
@@ -1178,6 +1327,43 @@ describe("user-prompt-submit.sh: synthetic <task-notification> prompts never int
     expect(r.classifyHits).toBe(0);
     expect(r.trace).toBeNull();
     expect(r.queueFiles).toEqual(["sess-intercept.jsonl"]);
+  });
+
+  // THE LIVE LEAK. `<task-notification>` stopped appearing in the trail on
+  // 2026-06-10 (the gate works); `<ide_opened_file>` was still arriving and still
+  // paying for a full enrich on 2026-07-28, because the old gate matched one
+  // literal prefix instead of the class.
+  it("suppresses interception for an <ide_opened_file> editor event", async () => {
+    const r = await runHook({
+      prompt:
+        "<ide_opened_file>The user opened the file /Users/an/projects/x/src/main.ts in the IDE. This may or may not be related to the current task.</ide_opened_file>",
+      stub: { enrich: { body: enrichOk("## must never be reached") } },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe("");
+    expect(r.enrichHits).toBe(0);
+    expect(r.trace).toBeNull();
+    expect(r.queueFiles).toEqual(["sess-intercept.jsonl"]);
+  });
+
+  it("suppresses interception for an <ide_selection> editor event", async () => {
+    const r = await runHook({
+      prompt: "<ide_selection>The user selected lines 40 to 51 from src/main.ts</ide_selection>",
+      stub: { enrich: { body: enrichOk("## must never be reached") } },
+    });
+    expect(r.stdout.trim()).toBe("");
+    expect(r.enrichHits).toBe(0);
+    expect(r.trace).toBeNull();
+  });
+
+  it("suppresses interception for a <hint> block", async () => {
+    const r = await runHook({
+      prompt: "<hint>The user is currently viewing packages/utils/src/agent-prompt.ts</hint>",
+      stub: { enrich: { body: enrichOk("## must never be reached") } },
+    });
+    expect(r.stdout.trim()).toBe("");
+    expect(r.enrichHits).toBe(0);
+    expect(r.trace).toBeNull();
   });
 
   it("tolerates leading whitespace before the synthetic tag", async () => {
@@ -1198,6 +1384,131 @@ describe("user-prompt-submit.sh: synthetic <task-notification> prompts never int
     expect(r.additionalContext).toContain('kind="static"');
     expect(r.enrichHits).toBe(1);
     expect(r.trace.hook.injected).toBe(true);
+  });
+
+  it("a real prompt ABOUT ide events still intercepts normally", async () => {
+    const r = await runHook({
+      prompt: "should <ide_opened_file> events be suppressed before routing?",
+      stub: { enrich: { body: enrichOk("## x") } },
+    });
+    expect(r.additionalContext).toContain('kind="static"');
+    expect(r.enrichHits).toBe(1);
+  });
+
+  // THE REGRESSION THIS SUITE MISSED. Every case above is block-ONLY, and so was
+  // every case when the gate shipped, which is why a green suite coexisted with
+  // 294 dropped operator turns: the corpus has 0 block-only `<ide_*>` rows. The
+  // shape that actually arrives is telemetry PLUS the message the human typed,
+  // and it has to intercept like any other prompt.
+  it("an IDE block followed by human text intercepts normally (floor + enrich + trace)", async () => {
+    const r = await runHook({
+      prompt:
+        "<ide_opened_file>The user opened the file /Users/an/projects/x/src/main.ts in the IDE. " +
+        "This may or may not be related to the current task.</ide_opened_file>\n" +
+        "remove .claude dir out of git of the Meetless repo",
+      stub: { enrich: { body: enrichOk("## x") } },
+    });
+    expect(r.status).toBe(0);
+    expect(r.additionalContext).toContain('kind="static"');
+    expect(r.enrichHits).toBe(1);
+    expect(r.trace).not.toBeNull();
+    expect(r.trace.hook.injected).toBe(true);
+  });
+
+  // The retrieval KEY is the human's words, not the editor telemetry. Asserted
+  // separately from "it intercepts" because the two failed independently: the
+  // gate could be fixed and still send `<ide_opened_file>The user opened ...` as
+  // the query, which spends the round trip and hands the router 150 chars of
+  // noise ahead of the cues it windows over.
+  it("keys retrieval on the human's words, not on the editor telemetry", async () => {
+    const r = await runHook({
+      prompt:
+        "<ide_opened_file>The user opened the file /Users/an/projects/x/src/main.ts in the IDE.</ide_opened_file>\n" +
+        "we are running with thinking ON right?",
+      stub: { enrich: { body: enrichOk("## x") } },
+    });
+    const sent = r.enrichBody as Record<string, string>;
+    const q = sent.question ?? sent.query ?? "";
+    expect(q).toContain("thinking ON");
+    expect(q).not.toContain("ide_opened_file");
+    expect(q).not.toContain("The user opened the file");
+  });
+
+  // The capture spool is an audit record of what the harness DELIVERED, so it
+  // keeps the block. Turn derivation downstream reads this text; rewriting it to
+  // match the retrieval key would be a silent semantic change to session history.
+  it("still spools the RAW prompt, block included", async () => {
+    const prompt =
+      "<ide_opened_file>The user opened the file /Users/an/x.ts in the IDE.</ide_opened_file>\nAny pending items?";
+    const r = await runHook({ prompt, stub: { enrich: { body: enrichOk("## x") } } });
+    const spooled = (r.queueContent ?? "")
+      .split("\n")
+      .filter(Boolean)
+      .map((l: string) => JSON.parse(l))
+      .find((e: { event?: string }) => e.event === "prompt_submitted");
+    expect(spooled).toBeDefined();
+    // Both halves: the block is NOT stripped from the record, and the human text
+    // is still there. Stringified because the record shape is not this test's
+    // subject; what it delivered is.
+    const raw = JSON.stringify(spooled);
+    expect(raw).toContain("ide_opened_file");
+    expect(raw).toContain("Any pending items?");
+  });
+});
+
+// Tier 2. The asymmetry with tier 1 is the entire point: a slash command IS a
+// human turn that does real work, so stripping the governing floor off it would
+// be strictly worse than the waste we are removing.
+describe("user-prompt-submit.sh: slash commands keep the floor, skip the pull", () => {
+  beforeAll(() => {
+    const jq = spawnSync("jq", ["--version"], { encoding: "utf8" });
+    if (jq.status !== 0) throw new Error("jq must be installed to run intercept-hook specs");
+  });
+
+  it("injects Layer 1 but makes NO enrich call for a slash command", async () => {
+    const r = await runHook({
+      prompt: "/implement notes/20260728-mla-helpfulness-plan.md",
+      stub: { enrich: { body: enrichOk("## must never be reached") } },
+    });
+
+    expect(r.status).toBe(0);
+    expectLayer1(r.additionalContext);
+    expect(r.enrichHits).toBe(0);
+    expect(r.additionalContext).not.toContain("must never be reached");
+  });
+
+  // Countability. A suppression nobody can measure is how the dead instruments
+  // got that way; the skip has to show up in the trail as its own reason.
+  it("records the skip as arbitration layer1_only/non_retrievable_prompt", async () => {
+    const r = await runHook({
+      prompt: "/code-review",
+      stub: { enrich: { body: enrichOk("## x") } },
+    });
+    expect(r.trace).not.toBeNull();
+    expect(r.trace.arbitration.decision).toBe("layer1_only");
+    expect(r.trace.arbitration.reason).toBe("non_retrievable_prompt");
+    expect(r.trace.enrichment.status).toBe("skipped");
+    expect(r.trace.hook.injected).toBe(true); // the FLOOR was delivered
+    // Unlike a harness event, this IS a human turn: it gets a trace line and its
+    // own turn index, so `mla turn N` still resolves the turn the operator took.
+    expect(r.trace.turn_index).toBe(1);
+  });
+
+  it("a pasted absolute path is a REAL prompt and still enriches", async () => {
+    const r = await runHook({
+      prompt: "/Users/alice/projects/acme/notes/20260728-x.md contradicts the floor; which wins?",
+      stub: { enrich: { body: enrichOk("## real evidence") } },
+    });
+    expect(r.enrichHits).toBe(1);
+    expect(r.trace.arbitration.reason).not.toBe("non_retrievable_prompt");
+  });
+
+  it("a mid-text slash token is a REAL prompt and still enriches", async () => {
+    const r = await runHook({
+      prompt: "when you run /implement, does the floor still inject?",
+      stub: { enrich: { body: enrichOk("## real evidence") } },
+    });
+    expect(r.enrichHits).toBe(1);
   });
 });
 

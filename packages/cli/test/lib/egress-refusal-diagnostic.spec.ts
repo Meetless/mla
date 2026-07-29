@@ -110,6 +110,7 @@ describe("the turn recap (src/commands/internal-turn-recap.ts)", () => {
             zero_results: false,
             coverage_gap_type: null,
             evidence_layer_down: false,
+            evidence_layer_recovered: false,
             retrieved_count: null,
             selected_count: null,
             abstain_class: null,

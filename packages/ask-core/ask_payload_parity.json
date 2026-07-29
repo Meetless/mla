@@ -17,13 +17,23 @@
     "The question carries a credential and a deep path on purpose. Both builders redact",
     "at the `retrieval` bar, so the fixture proves the secret is gone AND that the path",
     "which makes the question retrievable survived. A builder that redacted at `full`",
-    "would pass a shape check and fail here."
+    "would pass a shape check and fail here.",
+    "",
+    "`builder` is the part of the body that is NOT a property of the call. The metering",
+    "actor is bound when the closure is constructed (ask-core takes it as `userId` in its",
+    "deps; the CLI reads it off `cfg.actorUserId`), because the mode handlers that invoke",
+    "the closure never see an operator. Both suites must bind this id before comparing",
+    "against `wire`, which is exactly the point: it pins the id's PLACE in the body, so a",
+    "builder that started sending it per-call, or stopped sending it at all, goes red."
   ],
+  "builder": {
+    "userId": "c00exampleuser00000000001"
+  },
   "input": {
     "question": "why did apps/console/app/settings/SettingsNav.tsx change, and is OPENAI_API_KEY=sk-proj-Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3Nn4Oo5Pp6Qq7Rr8 still needed?",
     "workspaceId": "ws_parity",
     "mode": "answer",
     "submissionId": "sub_parity_fixed"
   },
-  "wire": "{\"workspace_id\":\"ws_parity\",\"question\":\"why did apps/console/app/settings/SettingsNav.tsx change, and is OPENAI_API_KEY=[REDACTED] still needed?\",\"surface\":\"mcp\",\"stream\":false,\"language\":\"en\",\"thread_text\":null,\"mode\":\"answer\",\"filters\":{},\"max_results\":8,\"min_results\":3,\"submission_id\":\"sub_parity_fixed\"}"
+  "wire": "{\"workspace_id\":\"ws_parity\",\"user_id\":\"c00exampleuser00000000001\",\"question\":\"why did apps/console/app/settings/SettingsNav.tsx change, and is OPENAI_API_KEY=[REDACTED] still needed?\",\"surface\":\"mcp\",\"stream\":false,\"language\":\"en\",\"thread_text\":null,\"mode\":\"answer\",\"filters\":{},\"max_results\":8,\"min_results\":3,\"submission_id\":\"sub_parity_fixed\"}"
 }

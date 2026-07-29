@@ -94,6 +94,88 @@ describe("scanWorkspace", () => {
     expect(byPath.has(".claude/rules/a.md")).toBe(true);
   });
 
+  // The enumeration that feeds the snapshot SWEEP (snapshot-upload.ts observedPaths). It is
+  // deliberately a SUPERSET of artifactDigests: the sweep retires every stored revision whose
+  // path is not in the observed set, so a file the scan saw but could not digest must still be
+  // named or the next scan quietly deletes a rule the operator can still see in their editor.
+  describe("instructionFilePaths (the authoritative on-disk enumeration)", () => {
+    it("names a file it could not digest, so the sweep never retires what is still on disk", () => {
+      // >256KB: past MAX_FILE_BYTES, so safeRead returns null and no digest is computed. On disk
+      // all the same, and still counted in inventory.instructionFiles.
+      mkdirSync(join(repo, ".claude", "rules"), { recursive: true });
+      writeFileSync(join(repo, ".claude", "rules", "huge.md"), "x".repeat(300 * 1024));
+      git(repo, ["add", "."]);
+      git(repo, ["commit", "-m", "huge"]);
+
+      const result = scanWorkspace(repo, { workspaceId: "ws1", now: () => "x" });
+
+      expect(result.instructionFilePaths).toContain(".claude/rules/huge.md");
+      // The uploaded set does NOT carry it, which is exactly why the two lists must differ.
+      expect((result.artifactDigests ?? []).map((d) => d.relativePath)).not.toContain(
+        ".claude/rules/huge.md",
+      );
+      // The enumeration is the same population the inventory counter reports.
+      expect(result.instructionFilePaths).toHaveLength(result.inventory.instructionFiles);
+    });
+
+    it("reports a genuinely empty checkout as [], so a deleted last CLAUDE.md converges", () => {
+      const bare = mkdtempSync(join(tmpdir(), "mla-scan-empty-"));
+      try {
+        git(bare, ["init"]);
+        git(bare, ["config", "user.email", "t@test"]);
+        git(bare, ["config", "user.name", "t"]);
+        // Tracked, but not an instruction file: the repo has prose and zero rules.
+        writeFileSync(join(bare, "README.md"), "hello\n");
+        git(bare, ["add", "."]);
+        git(bare, ["commit", "-m", "init"]);
+
+        const result = scanWorkspace(bare, { workspaceId: "ws1", now: () => "x" });
+
+        // [] is a CLAIM ("I looked, there are none"), and the sweep acts on it by retiring the
+        // whole corpus. That is the single-CLAUDE.md-just-deleted case, the common one.
+        expect(result.instructionFilePaths).toEqual([]);
+      } finally {
+        rmSync(bare, { recursive: true, force: true });
+      }
+    });
+
+    it("omits the enumeration OUTSIDE a git repo rather than claiming zero", () => {
+      // A non-git scan root is supported (the workspace marker can sit above the checkouts), and
+      // git ls-files simply fails there. Reporting [] would be a lie that reads as "I looked and
+      // found nothing", and the sweep would tombstone every revision in the workspace.
+      const nongit = mkdtempSync(join(tmpdir(), "mla-scan-nongit-"));
+      try {
+        writeFileSync(join(nongit, "CLAUDE.md"), "- NEVER commit secrets.\n");
+
+        const result = scanWorkspace(nongit, { workspaceId: "ws1", now: () => "x" });
+
+        expect(result.instructionFilePaths).toBeUndefined();
+      } finally {
+        rmSync(nongit, { recursive: true, force: true });
+      }
+    });
+
+    it("excludes the mla-managed rule file from BOTH the enumeration and the digests", () => {
+      // The managed file is never uploaded, so it is never in the corpus, so it must never be in
+      // the observed set either. Pinned together: dropping it from one side only would make the
+      // sweep retire a path the upload never published, or publish one the sweep then retires.
+      mkdirSync(join(repo, ".meetless"), { recursive: true });
+      writeFileSync(
+        join(repo, MANAGED_RULES_PATH),
+        renderManagedRules([makeManagedRule({ statement: "MUST ship tests.", strength: "MUST_FOLLOW" })]),
+      );
+      git(repo, ["add", "-f", MANAGED_RULES_PATH]);
+      git(repo, ["commit", "-m", "managed"]);
+
+      const result = scanWorkspace(repo, { workspaceId: "ws1", now: () => "x" });
+
+      expect(result.instructionFilePaths).not.toContain(MANAGED_RULES_PATH);
+      expect((result.artifactDigests ?? []).map((d) => d.relativePath)).not.toContain(
+        MANAGED_RULES_PATH,
+      );
+    });
+  });
+
   // The same boilerplate rule repeated across per-service CLAUDE.md files must
   // collapse to a single directive: the grounding pack (and the reported rule
   // count) should reflect distinct rules, not per-file occurrences.

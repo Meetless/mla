@@ -684,7 +684,10 @@ export function buildDepsFromEnv(env = process.env) {
     // standalone `meetless-mcp` bin is covered without this file having to
     // remember, and no front-end can weaken it. `mla ask` reaches the same
     // boundary the same way.
-    intelAsk: makeIntelAsk({ intelBaseUrl, apiKey: controlToken }),
+    // `userId` is the metering actor, not auth: intel stamps it onto the
+    // llm_usage_events row for the call, so an ask that omits it is anonymous
+    // spend. Same id the relationship actions already default to.
+    intelAsk: makeIntelAsk({ intelBaseUrl, apiKey: controlToken, userId: operatorUserId }),
     defaultWorkspaceId: workspaceId,
     notesRoot,
     operatorUserId,

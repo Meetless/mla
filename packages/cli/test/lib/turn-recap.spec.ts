@@ -312,6 +312,116 @@ describe("computeTurnRecap: verdict", () => {
     expect(r.evidence_layer_down).toBe(false);
   });
 
+  // --- a recovered outage is history, not a live alarm ------------------------
+  //
+  // THE LIVE DEFECT (measured 2026-07-28): the C-lite block injected at the top of
+  // turn k carries turn k-1's recap. When k-1 timed out and k reached intel in
+  // 1.1 seconds, the agent still read "⚠ evidence layer DOWN (could not reach
+  // intel)" in the present tense, in the same hook invocation that had just gotten
+  // a healthy answer. 70 turns in the local spool did exactly this.
+  //
+  // The hook writes THIS turn's ask-traces line (write_trace) BEFORE it appends the
+  // recap block, so the answer is already on disk: turn k's own trace says whether
+  // intel is up. The recap reads it rather than taking a new flag from the hook, so
+  // `mla turn N` gets the same correction for free.
+
+  it("an outage the NEXT turn recovered from is not rendered as a live alarm", () => {
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [
+          ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_timeout", fail_open: "timeout" }),
+          // turn 9: intel answered, with evidence. The outage is over.
+          ask({ turn: 9, injected: true, layer2: true, offered: ["NT:a.md"], latency: 1129 }),
+        ],
+      }),
+    );
+    // The finding stays true as history: turn 8 WAS an outage, not a merits abstain.
+    expect(r.evidence_layer_down).toBe(true);
+    expect(r.coverage_gap_type).toBe("enrich_timeout");
+    // ... but nothing the agent reads may assert a present-tense outage.
+    expect(r.evidence_layer_recovered).toBe(true);
+    expect(renderFooter(r)).not.toMatch(/⚠/);
+    expect(renderFooter(r)).not.toMatch(/DOWN/);
+    expect(renderFooter(r)).toMatch(/recovered/);
+  });
+
+  it("recovery counts when intel ANSWERED, even if the answer was a no-offer", () => {
+    // A governed no-offer still proves intel is reachable: the enrich trace only
+    // rides back on a real response. Requiring evidence to have been injected
+    // would leave the alarm up through every healthy abstain, which is most turns.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [
+          ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_intel_down", fail_open: "intel_down" }),
+          ask({ turn: 9, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "router_low_confidence" } }),
+        ],
+      }),
+    );
+    expect(r.evidence_layer_recovered).toBe(true);
+  });
+
+  it("an outage on the NEWEST turn keeps its alarm (nothing yet proves recovery)", () => {
+    // Fail loud. With no later turn on disk we have no evidence intel came back,
+    // and silencing the warning on no evidence would be the mirror of the bug.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({ traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_timeout", fail_open: "timeout" })] }),
+    );
+    expect(r.evidence_layer_recovered).toBe(false);
+    expect(renderFooter(r)).toMatch(/⚠ evidence layer DOWN/);
+  });
+
+  it("a still-broken next turn keeps the alarm up", () => {
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [
+          ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_timeout", fail_open: "timeout" }),
+          ask({ turn: 9, injected: true, layer2: false, offered: [], arb_reason: "enrichment_intel_down", fail_open: "intel_down" }),
+        ],
+      }),
+    );
+    expect(r.evidence_layer_recovered).toBe(false);
+    expect(renderFooter(r)).toMatch(/⚠ evidence layer DOWN/);
+  });
+
+  it("a next turn that never reached enrich does not count as recovery", () => {
+    // A muted / suppressed / pull_only turn proves nothing about intel's health.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [
+          ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_timeout", fail_open: "timeout" }),
+          ask({ turn: 9, injected: false, layer2: false, offered: [], not_run_reason: "muted" }),
+        ],
+      }),
+    );
+    expect(r.evidence_layer_recovered).toBe(false);
+  });
+
+  it("recovery is never claimed on a turn that was not an outage", () => {
+    // The flag is a qualifier ON evidence_layer_down, so it can never stand alone.
+    const merits = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [
+          ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "no_relevant_context" }),
+          ask({ turn: 9, injected: true, layer2: true, offered: ["NT:a.md"] }),
+        ],
+      }),
+    );
+    expect(merits.evidence_layer_down).toBe(false);
+    expect(merits.evidence_layer_recovered).toBe(false);
+  });
+
   it("NO_OFFER (should have matched): candidates found but all dropped -> should_have_matched + counts", () => {
     // retrieved > 0 && selected == 0 is the recall/ranking-debt signature: the
     // score floor or cap dropped every candidate. This is the miss An wants split
@@ -563,6 +673,7 @@ const used: TurnRecap = {
   zero_results: false,
   coverage_gap_type: null,
   evidence_layer_down: false,
+  evidence_layer_recovered: false,
   retrieved_count: null,
   selected_count: null,
   abstain_class: null,
@@ -609,6 +720,16 @@ describe("renderFooter", () => {
     expect(renderFooter(r)).toBe("🔎 mla · turn 8 · floor only · ⚠ evidence layer DOWN (could not reach intel) · NO_OFFER");
   });
 
+  it("NO_OFFER (evidence layer recovered) states it in the PAST tense and drops the warning sign", () => {
+    // The recap is always about a FINISHED turn. Once a later turn reached intel,
+    // the only honest rendering is history. Keeping "⚠ ... DOWN" here is what made
+    // an agent announce an outage while its own enrich was answering in 1.1s.
+    const r: TurnRecap = { ...used, turn_index: 8, verdict: "NO_OFFER", evidence_offered: false, zero_results: true, coverage_gap_type: "enrich_unreachable", evidence_layer_down: true, evidence_layer_recovered: true, offered_source_ids: [], injected_evidence: false, pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
+    expect(renderFooter(r)).toBe(
+      "🔎 mla · turn 8 · floor only · evidence layer was down then (could not reach intel), recovered since · NO_OFFER",
+    );
+  });
+
   it("IGNORED renders pulled/cited counts", () => {
     const r: TurnRecap = { ...used, turn_index: 9, verdict: "IGNORED", enrich_latency_ms: 380, offered_source_ids: ["NT:a.md", "NT:b.md", "NT:c.md", "NT:d.md", "NT:e.md"], pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
     expect(renderFooter(r)).toBe("🔎 mla · turn 9 · evidence injected (5 src, 380ms) · pulled 0 · cited 0 · IGNORED");
@@ -632,6 +753,15 @@ describe("renderBlockContext", () => {
     expect(out).toContain(renderFooter(used));
     expect(out).toMatch(/You may surface this assist recap/);
     expect(out.trimEnd().endsWith("</meetless-context>")).toBe(true);
+  });
+
+  it("says the recap is about a FINISHED turn, not the turn being answered now", () => {
+    // The block is injected at the TOP of turn 8 and describes turn 7. The turn
+    // number was always in the wrapper, but nothing in the prose said "this is
+    // history", so a stale condition read as the current state of the world.
+    const out = renderBlockContext(used);
+    expect(out).toMatch(/turn 7\b.*(already finished|has finished)/);
+    expect(out).toMatch(/not the turn you are answering now/);
   });
 });
 

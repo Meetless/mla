@@ -27,6 +27,7 @@ import { join } from "node:path";
 import { loadWorkspaceConfig, type WorkspaceCliConfig } from "../config";
 import { describeEgressRefusal } from "../egress/policy";
 import {
+  sweepRepoInstructionSnapshots,
   upsertRepoInstructionSnapshot,
   type RepoInstructionSnapshotClientHttp,
 } from "./repo-instruction-snapshot-client";
@@ -60,6 +61,18 @@ export interface SnapshotUploadArgs {
   scanRoot: string;
   /** The scan's instruction-file relative paths (ScanResult.artifactDigests[].relativePath). */
   paths: string[];
+  /**
+   * The FULL enumeration of instruction files this scan saw on disk, used to retire everything
+   * else. Deliberately a superset of `paths`: an oversized or unreadable file is still ON DISK, and
+   * sweeping by the uploaded set would tombstone it every scan and re-detect nothing, quietly
+   * dropping a rule the operator can still see in their editor.
+   *
+   * `undefined` means "I have no authoritative list" (the scan could not enumerate the checkout, or
+   * the caller predates this field) and NO sweep runs. `[]` means "I looked, and there are genuinely
+   * zero instruction files" and DOES sweep: a repo whose only CLAUDE.md was just deleted is the
+   * common case, and refusing to converge there would leave the bug permanently unfixed.
+   */
+  observedPaths?: string[];
   /** The commit the scan observed (ScanResult.commitSha). */
   observedCommitSha: string;
   /** When the scan ran (ScanResult.generatedAt), ISO-8601. */
@@ -89,6 +102,14 @@ export type SnapshotUploadOutcome =
        * defect, and N copies of one line is noise.
        */
       refusal?: string;
+      /**
+       * Live revisions control retired because this scan no longer sees their path, or `null` when
+       * no sweep ran. Null covers both "the scan could not enumerate the checkout" (no authority to
+       * retire anything) and "the sweep call failed"; 0 means it ran and the corpus already matched.
+       * The distinction matters because 0 and null read identically in a counter but mean opposite
+       * things about whether removal is working.
+       */
+      swept: number | null;
     }
   | { delivered: false; error: string };
 
@@ -157,5 +178,35 @@ export async function uploadSnapshotsForScan(
       refusal ??= describeEgressRefusal(err, "instruction-file snapshot") ?? undefined;
     }
   }
-  return { delivered: true, attempted: args.paths.length, uploaded, skipped, failed, refusal };
+  // The removal half, AFTER the uploads. Order is load-bearing: sweeping first would retire a path
+  // this very scan is about to re-upload, and a crash in between would leave the corpus short of a
+  // file that is on disk. It runs even when some uploads failed, because a failed upload is a blip
+  // against a path that IS in the observed set, and the sweep only ever retires paths outside it;
+  // making removal hostage to an unrelated flake would be the wrong trade.
+  let swept: number | null = null;
+  if (args.observedPaths !== undefined) {
+    try {
+      const res = await sweepRepoInstructionSnapshots(
+        cfg,
+        { repositoryId: args.repositoryId, observedPaths: args.observedPaths },
+        deps.http,
+      );
+      swept = res.tombstonedCount;
+    } catch (err) {
+      // Same best-effort posture as a per-file upload: the next scan sweeps again with the same
+      // authoritative set, so a blip costs nothing. A POLICY refusal does not self-heal though, so
+      // it takes the refusal channel (?? because a per-file refusal already named the same defect).
+      refusal ??= describeEgressRefusal(err, "instruction-file sweep") ?? undefined;
+    }
+  }
+
+  return {
+    delivered: true,
+    attempted: args.paths.length,
+    uploaded,
+    skipped,
+    failed,
+    refusal,
+    swept,
+  };
 }

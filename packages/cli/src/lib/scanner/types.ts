@@ -228,6 +228,20 @@ export interface ScanResult {
   // NOT consumed by any Phase 2A live path (the detector that uploads/reads these is
   // Phase 2B). Readers guard with `?? []`.
   artifactDigests?: ArtifactDigest[];
+  // Every instruction-file path this scan OBSERVED on disk, whether or not it could be digested.
+  // Deliberately a SUPERSET of `artifactDigests`: a file past the size ceiling or unreadable at
+  // read time carries no digest but is still there, and this list is what the snapshot sweep
+  // treats as authoritative (control retires every stored revision whose path is NOT in it).
+  //
+  // Three states, all load-bearing:
+  //   [...]     the checkout contains exactly these; retire the complement.
+  //   []        "I looked and there are genuinely none": retire everything. The repo whose only
+  //             CLAUDE.md was just deleted is the common case, and it MUST converge.
+  //   undefined "I have no authoritative list": sweep nothing. Covers a non-git scan root (the
+  //             marker can sit above the checkouts, and `git ls-files` simply fails there) and a
+  //             pre-sweep on-disk cache. Never conflate this with []; the two ask for opposite
+  //             actions, and guessing [] here would tombstone the whole corpus.
+  instructionFilePaths?: string[];
   // Prompt-time reconciliation findings the assembler rehashes and gates on (ADR §3.3 item 9,
   // see ReconciliationFinding). Absent in every pre-Phase-3 cache; readers guard with `?? []`.
   // Written by the scan-time pull from control, which is the only authority on which findings

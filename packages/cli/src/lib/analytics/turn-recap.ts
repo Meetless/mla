@@ -111,6 +111,13 @@ export interface TurnRecap {
   // is UP; the session just needs re-auth). See notes/20260514-dogfood-friction.md.
   evidence_layer_down: boolean;
 
+  // A qualifier ON evidence_layer_down, never a standalone claim: the outage this
+  // turn hit is OVER, because the NEXT turn reached intel. The recap the hook
+  // injects describes the PREVIOUS turn, so without this the agent read
+  // "⚠ evidence layer DOWN" in the present tense inside the very hook invocation
+  // that had just gotten a healthy answer (70 such turns in the local spool).
+  evidence_layer_recovered: boolean;
+
   // Enrichment instrumentation (Item 4). These come from the governed-KB enrich
   // trace intel returns; null on turns predating the trace or that never ran
   // enrich. retrieved_count is the candidate count BEFORE the score-floor/cap;
@@ -318,6 +325,19 @@ function deriveEvidenceLayerDown(verdict: Verdict, coverageGap: string | null): 
   return verdict === "NO_OFFER" && coverageGap != null && EVIDENCE_DOWN_GAPS.has(coverageGap);
 }
 
+// Did intel demonstrably ANSWER on this turn? Two proofs, either sufficient:
+// evidence came back injected, or an enrich trace rode home with the response.
+// A governed no-offer still proves reachability (intel replied "nothing to
+// offer"), which is why the second proof is not redundant. Deliberately NOT
+// "the next turn did not fail the same way": a turn that failed for another
+// reason (stop_guard, muted, unauthorized) proves nothing about the backend,
+// and treating it as healthy is what manufactured 160 phantom recoveries in
+// the first measurement of this defect.
+function intelAnswered(t: AskTrace): boolean {
+  if (t.injected_evidence) return true;
+  return t.retrieved_count != null || t.selected_count != null || t.primary_no_offer_reason != null;
+}
+
 // --- the join ----------------------------------------------------------------
 
 export function computeTurnRecap(sessionId: string, turnIndex: number, deps: TurnRecapDeps = {}): TurnRecap {
@@ -329,10 +349,17 @@ export function computeTurnRecap(sessionId: string, turnIndex: number, deps: Tur
 
   // The single ask-traces line for this turn. One line per turn is the invariant
   // (write_trace is the sole emitter); take the last match so a re-emit wins.
+  // The NEXT turn's line answers "is the backend still down?" for free: the hook
+  // calls write_trace for turn k BEFORE it appends turn k-1's recap block, so by
+  // the time this renders, turn k is already on disk. `mla turn N` gets the same
+  // correction with no extra plumbing.
   let trace: AskTrace | null = null;
+  let nextTrace: AskTrace | null = null;
   for (const raw of askLines) {
     const t = parseAskTrace(raw);
-    if (t && t.session_id === sessionId && t.turn_index === turnIndex) trace = t;
+    if (!t || t.session_id !== sessionId) continue;
+    if (t.turn_index === turnIndex) trace = t;
+    else if (t.turn_index === turnIndex + 1) nextTrace = t;
   }
 
   const ran = trace !== null;
@@ -375,6 +402,9 @@ export function computeTurnRecap(sessionId: string, turnIndex: number, deps: Tur
   // turn that offered evidence has no NO_OFFER reason to classify.
   const abstain_class = verdict === "NO_OFFER" ? deriveAbstainClass(trace?.primary_no_offer_reason ?? null) : null;
   const evidence_layer_down = deriveEvidenceLayerDown(verdict, coverage_gap_type);
+  // Fail LOUD: no next turn on disk means nothing yet proves recovery, so the
+  // alarm stands. Only a turn that actually reached intel clears it.
+  const evidence_layer_recovered = evidence_layer_down && nextTrace != null && intelAnswered(nextTrace);
 
   return {
     session_id: sessionId,
@@ -390,6 +420,7 @@ export function computeTurnRecap(sessionId: string, turnIndex: number, deps: Tur
     zero_results: !evidence_offered,
     coverage_gap_type,
     evidence_layer_down,
+    evidence_layer_recovered,
     retrieved_count: trace?.retrieved_count ?? null,
     selected_count: trace?.selected_count ?? null,
     abstain_class,
@@ -487,6 +518,12 @@ export function renderFooter(r: TurnRecap): string {
     // unmistakable, never read as "we looked, nothing matched". No governed-KB
     // trace rides an outage, so there are no counts to append here.
     if (r.evidence_layer_down) {
+      // Past tense, no warning sign, once a later turn reached intel. This recap
+      // is read one turn LATE, so a live-alarm rendering of a resolved outage is
+      // a false alarm, and a false alarm teaches the agent to ignore the real one.
+      if (r.evidence_layer_recovered) {
+        return `${head} · floor only · evidence layer was down then (${gapPhrase(r.coverage_gap_type)}), recovered since · NO_OFFER`;
+      }
       return `${head} · floor only · ⚠ evidence layer DOWN (${gapPhrase(r.coverage_gap_type)}) · NO_OFFER`;
     }
     // Append the retrieved/selected counts + abstain class only when the
@@ -505,6 +542,10 @@ export function renderBlockContext(r: TurnRecap): string {
   return [
     `<meetless-context kind="turn-recap" for-turn="${r.turn_index}">`,
     renderFooter(r),
+    // Name the subject explicitly. This block rides the NEXT prompt, so an agent
+    // reading it as a status report on the turn it is answering right now will
+    // report a resolved outage as a current one.
+    `This recaps turn ${r.turn_index}, which has already finished; it is not the turn you are answering now.`,
     "You may surface this assist recap to the operator as a one-line footer if useful.",
     "</meetless-context>",
   ].join("\n");
@@ -534,7 +575,9 @@ export function renderBlock(r: TurnRecap): string {
   ];
   // Outage callout: make an evidence-backend-down NO_OFFER impossible to misread
   // as a merits result in the expanded view too.
-  if (r.evidence_layer_down) {
+  if (r.evidence_layer_down && r.evidence_layer_recovered) {
+    lines.push(`  evidence layer was DOWN on this turn (a backend outage, not a merits result); it recovered on turn ${r.turn_index + 1}`);
+  } else if (r.evidence_layer_down) {
     lines.push(`  ⚠ evidence layer DOWN: this NO_OFFER is a backend outage, not a merits result`);
   }
   // Enrichment instrumentation (Item 4): only shown when the governed-KB trace

@@ -89,6 +89,12 @@ export async function postTurnRecapToIntel(
       zero_results: recap.zero_results,
       coverage_gap_type: recap.coverage_gap_type,
       evidence_layer_down: recap.evidence_layer_down,
+      // Ships DELIBERATELY (the projection pin makes this a decision, not a
+      // side effect). It is a derived boolean, no turn content, and it is the
+      // only thing that keeps an `evidence_layer_down` count in Langfuse from
+      // reading resolved blips as live outages, which is the same misreading
+      // this field was added to stop in the injected recap.
+      evidence_layer_recovered: recap.evidence_layer_recovered,
       retrieved_count: recap.retrieved_count,
       selected_count: recap.selected_count,
       abstain_class: recap.abstain_class,

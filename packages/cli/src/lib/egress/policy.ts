@@ -278,8 +278,14 @@ function redactField(
  * Deliberately the high-confidence DENYLIST (scanForCredentials), not the
  * entropy scanner: this decides whether to refuse a write the operator asked
  * for, so a false positive costs them a document. Returns ids, never spans.
+ *
+ * EXPORTED so a caller holding a refused batch can ask which of ITS parts the
+ * boundary would object to, and drop only those. That question has exactly one
+ * correct answer, and it is this function: a caller that re-implements the check
+ * drifts from the boundary the moment either side changes, and then isolates the
+ * wrong documents while reporting confidence. Read-only, ids only, no spans.
  */
-function scanLeavesForCredentials(value: unknown): string[] {
+export function scanLeavesForCredentials(value: unknown): string[] {
   const found = new Set<string>();
   const walk = (v: unknown): void => {
     if (typeof v === "string") {
@@ -398,12 +404,19 @@ export function applyRule(
         // Rule IDS only. The matched text is the credential; naming it in an
         // error that gets logged would leak the thing this branch just refused
         // to send. The ids are what the human needs anyway.
+        //
+        // The remedy rides WITH the refusal. Without it the operator's next move
+        // is to re-run, which refuses identically forever: this body is never
+        // rewritten, so nothing changes until the SOURCE does. Say what to change.
         throw new EgressPolicyError(
           "blocked",
           service,
           rule.method,
           pathname,
-          `${rule.why}; credential pattern(s) detected: ${hits.join(", ")}`,
+          `${rule.why}; credential pattern(s) detected: ${hits.join(", ")}. ` +
+            "Nothing was sent, and re-running refuses identically until the source changes: " +
+            "quote the shape, not the value (replace the secret with a placeholder such as " +
+            "<TOKEN>), then retry. If it is a live credential, rotate it.",
         );
       }
     }

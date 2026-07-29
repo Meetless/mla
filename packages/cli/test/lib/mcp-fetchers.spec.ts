@@ -241,6 +241,8 @@ describe("mcp-fetchers — intelAsk adapter", () => {
     expect(calls[0][0]).toBe("/v1/ask");
     expect(calls[0][1]).toEqual({
       workspace_id: "ws_1",
+      // The metering actor, off cfg. userTokenConfig() is a logged-in operator.
+      user_id: "u1",
       question: "what is X?",
       surface: "mcp",
       stream: false,
@@ -256,6 +258,47 @@ describe("mcp-fetchers — intelAsk adapter", () => {
     });
     // as_of is omitted entirely when not supplied (byte-identical to today).
     expect(Object.prototype.hasOwnProperty.call(calls[0][1], "as_of")).toBe(false);
+  });
+
+  // Metering attribution. intel stamps AskRequest.user_id onto the
+  // llm_usage_events row for the call, so an ask that posts no actor lands with
+  // a NULL userId and per-user cost becomes unanswerable. Console sends the
+  // field on this same route and is 100% attributed; this transport did not, so
+  // every `mla mcp` ask in prod was anonymous. Not the INV-METER-ATTRIBUTED
+  // case: that covers background jobs with no acting user, and an MCP ask is a
+  // human pressing enter.
+  //
+  // The actor comes off `cfg`, not off the call: `mla mcp` builds this closure
+  // from the CLI config (commands/mcp.ts), while the thing that INVOKES it is
+  // ask-core's mode router, which never sees an operator.
+  it("stamps cfg.actorUserId as user_id so an MCP ask is attributable", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      return {};
+    };
+    const cfg = userTokenConfig();
+    await makeIntelAskFromCli(cfg, intelPostFn)({ question: "q", workspaceId: "ws_1" });
+
+    expect(bodies[0].user_id).toBe(cfg.actorUserId);
+  });
+
+  it("sends user_id: null in shared-key mode, where there is no human actor", async () => {
+    // Present-and-null, never absent: intel's user_id is `str | None`, and a
+    // conditionally-omitted key would let the two builders diverge on key ORDER,
+    // which the parity fixture compares as a string.
+    const bodies: Array<Record<string, unknown>> = [];
+    const intelPostFn = async (_c: CliConfig, _p: string, b: unknown) => {
+      bodies.push(b as Record<string, unknown>);
+      return {};
+    };
+    await makeIntelAskFromCli(sharedKeyConfig(), intelPostFn)({
+      question: "q",
+      workspaceId: "ws_1",
+    });
+
+    expect(Object.prototype.hasOwnProperty.call(bodies[0], "user_id")).toBe(true);
+    expect(bodies[0].user_id).toBeNull();
   });
 
   // Egress lock. This closure is the `mla ask` / MCP path to intel /v1/ask, the

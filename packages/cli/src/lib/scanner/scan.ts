@@ -47,23 +47,34 @@ export interface ScanOptions {
 const MAX_FILE_BYTES = 256 * 1024; // skip large files for the free pass
 
 export function scanWorkspace(cwd: string, opts: ScanOptions): ScanResult {
+  // `null` means the enumeration itself failed (non-git scan root, no git). That is NOT the same
+  // as an empty checkout, and the difference is load-bearing downstream: instructionFilePaths
+  // carries it out as undefined so the snapshot sweep declines to retire anything, where an
+  // empty array would claim we looked and found nothing and wipe the corpus.
   const tracked = gitLsFiles(cwd);
   const directives: Directive[] = [];
   const staleSignals: StaleSignal[] = [];
   const artifactDigests: ArtifactDigest[] = [];
+  const instructionFilePaths: string[] = [];
   let instructionFiles = 0;
   let decisionDocs = 0;
   let legacyNotes = 0;
 
-  for (const rel of tracked) {
+  for (const rel of tracked ?? []) {
     // The mla-managed rule file is NOT an injection source: the injected rule set comes from
     // the principal-bound backend rule bundle, folded in below. Skip it here so it is not also
     // processed as a generic T2 prose doc, which would double-count it and run stale detection.
     if (rel === MANAGED_RULES_PATH) continue;
     const tier = classifyTier(rel);
     if (!tier) continue;
-    if (isInstructionFile(rel)) instructionFiles++;
-    else if (tier === "T2") decisionDocs++;
+    // Recorded HERE, alongside the counter and BEFORE the safeRead below, so the enumeration
+    // covers every instruction file on disk rather than only the ones that survive to a digest.
+    // A file too large or unreadable still exists, and naming it is what stops the sweep from
+    // retiring it on every scan.
+    if (isInstructionFile(rel)) {
+      instructionFiles++;
+      instructionFilePaths.push(rel);
+    } else if (tier === "T2") decisionDocs++;
     else if (tier === "T4") legacyNotes++;
     if (tier === "T3") continue; // grounding-only; no directives/signals in P0A
 
@@ -179,6 +190,10 @@ export function scanWorkspace(cwd: string, opts: ScanOptions): ScanResult {
     staleContextXml: renderStaleContextXml(dedupedSignals),
     advisoryDirectives,
     artifactDigests,
+    // undefined, NOT [], when the enumeration failed: see the field's contract in types.ts. The
+    // consumer (the snapshot sweep) reads [] as "retire everything else", so an unenumerable
+    // checkout has to decline to answer rather than answer zero.
+    instructionFilePaths: tracked === null ? undefined : instructionFilePaths,
   };
 }
 
@@ -255,14 +270,17 @@ export function buildStructuredRules(dirs: Directive[]): {
 // writer's runGit already uses); the degradation is the API, the noise was never part of it.
 const GIT_STDIO = ["ignore", "pipe", "ignore"] as const;
 
-function gitLsFiles(cwd: string): string[] {
+// Returns null (not []) when the probe itself failed, so callers can tell "this is not a git
+// checkout" apart from "this checkout tracks nothing". Both scan the same (zero files), but only
+// the second is an authoritative statement about what is on disk.
+function gitLsFiles(cwd: string): string[] | null {
   try {
     return execFileSync("git", ["ls-files"], { cwd, encoding: "utf8", stdio: [...GIT_STDIO] })
       .split("\n")
       .map((s) => s.trim())
       .filter(Boolean);
   } catch {
-    return [];
+    return null;
   }
 }
 

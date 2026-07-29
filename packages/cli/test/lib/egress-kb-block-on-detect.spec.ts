@@ -106,6 +106,21 @@ describe("KB block-on-detect at the transport boundary", () => {
     expect(err.message).not.toContain("ghp_");
   });
 
+  it("states the remedy, because the obvious next move (re-run) can never work", async () => {
+    // A refusal without a remedy sends the operator straight back to `mla kb add`,
+    // where they are refused identically. This mode never rewrites the body, so
+    // nothing changes until the SOURCE does, and the message is the only place
+    // that fact is ever stated. Every caller inherits it: the refusal travels as
+    // the error message, and `kb add` stamps that string onto the document receipt.
+    const err = (await post(kbAddBody(`deploy with ${PAT}\n`))) as EgressPolicyError;
+
+    expect(err.message).toMatch(/quote the shape, not the value/i);
+    expect(err.message).toMatch(/re-?running refuses identically/i);
+    // The remedy must not become the leak: a worked example that pasted the match
+    // back in would defeat the assertion above it.
+    expect(err.message).not.toContain(PAT);
+  });
+
   it("sends a clean document BYTE-EXACT (this is why it is not `redact`)", async () => {
     // The other half of the contract, and the reason the mode exists. A KB write
     // that survived the scan must arrive unmodified: version numbers, paths and

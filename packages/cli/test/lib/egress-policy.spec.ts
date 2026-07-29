@@ -323,7 +323,7 @@ describe("the real registry", () => {
 
   it("keeps block_on_detect to routes whose body cannot be rewritten", () => {
     // The mode exists for bodies that redaction would CORRUPT rather than
-    // protect, and there are exactly two reasons a body qualifies:
+    // protect, and there are exactly three reasons a body qualifies:
     //
     //   1. it is stored verbatim and read back as fact (the KB documents:
     //      a redacted document is a wrong document, permanently);
@@ -336,6 +336,13 @@ describe("the real registry", () => {
     //      rewriting there fails LATER and SILENTLY, as a governing rule dropped
     //      at bundle-verify. publish-rules publishes rule text under that same
     //      hash.
+    //   3. the body is an authoritative SET whose complement the far side acts
+    //      on. The snapshot sweep sends the instruction-file paths this scan
+    //      observed and control retires every live revision outside them, so a
+    //      redacted path is not a weaker claim, it is the opposite claim:
+    //      ["CLAUDE.md"] rewritten to ["[REDACTED].md"] says "I have a file
+    //      nobody has heard of" and tombstones the whole real corpus. Nothing is
+    //      lost by redacting these bytes; the MEANING inverts.
     //
     // The pin is a list, not a rule, because "cannot be rewritten" is a
     // judgement. A future row reaching for this mode to dodge classifying its
@@ -348,6 +355,7 @@ describe("the real registry", () => {
       "bulk rule import (G2 one-time importer)",
       "mint governing rule v1",
       "publish the LIVE governing-rule set for one runtime scope",
+      "repo file PATHS: the instruction files this scan observed on disk",
       "repo file content: CLAUDE.md / AGENTS.md snapshot",
     ]);
   });
@@ -521,15 +529,20 @@ describe("the real registry", () => {
     const used = EGRESS_RULES.filter(
       (r) => r.mode === "redact" && (r as any).structuralKeys?.length,
     ).map((r) => `${r.note} :: ${((r as any).structuralKeys as string[]).join(",")}`);
-    expect(used).toEqual([
-      "active review detection: produced-doc bodies sent to intel :: canonicalPath",
-    ]);
+    // EMPTY as of 2026-07-28. The one user (active-review/detect :: canonicalPath)
+    // existed because the `retrieval` profile ate date-prefixed note paths; OR-1
+    // fixed that at the redactor, so the field is now walked like any other and
+    // the whole-value passthrough is unused. The mechanism is kept because it is
+    // the reviewed way to solve that class, not because anything needs it today.
+    expect(used).toEqual([]);
   });
 
   it("keeps a detect candidate's join key while redacting the file it carries", () => {
-    // The row exists because these two demands land on the same array. A
-    // date-prefixed note path is the measured worst case: it is a single long
-    // high-entropy token, so a blind walk eats it.
+    // Both demands land on the same array, and a date-prefixed note path is the
+    // measured worst case. This used to hold via structuralKeys; since OR-1 it
+    // holds because the retrieval profile measures a path by its parts, which is
+    // why the assertion is unchanged while the mechanism under it is gone. That
+    // is the point of asserting behaviour instead of wiring.
     const NOTE = "notes/20260726-mla-redaction-fidelity-and-egress-boundary-proposal.md";
     const LEAKED = "sk-proj-Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3Nn4Oo5Pp6Qq7Rr8";
 
@@ -555,9 +568,20 @@ describe("the real registry", () => {
     expect(sent.candidates[0].kind).toBe("produced_doc");
   });
 
-  it("does not let a structural key launder a value that merely sits beside it", () => {
-    // Guarding the obvious abuse: naming a key does not widen to its siblings,
-    // and it does not apply to a rule that did not ask for it.
+  it("scans the join key itself, so a credential cannot ride out inside a path", () => {
+    // This is the leak that removing structuralKeys closed, asserted directly.
+    // A structural key preserves its value WHOLE, so while canonicalPath was
+    // named there it was the one field in this body that NO redaction touched:
+    // both of these shipped raw to intel, byte for byte.
+    //
+    // The test deliberately uses credentials embedded in path-shaped strings.
+    // Anything else would pass under either implementation and prove nothing:
+    // the old bypass and the new walk agree on every ordinary path, and that
+    // agreement is exactly what made the leak invisible for as long as it was.
+    const TOKEN = "ghp_ABCDEFGHIJKLMNOPQRSTUVWX";
+    const JWT =
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
     const sent = applyEgressPolicy(
       EGRESS_RULES,
       "intel",
@@ -568,17 +592,27 @@ describe("the real registry", () => {
         ownerUserId: "user_a",
         dryRun: true,
         candidates: [
+          { canonicalPath: `notes/token-${TOKEN}.md`, kind: "produced_doc", body: "fine" },
           {
-            canonicalPath: "notes/a.md",
+            canonicalPath: `notes/jwt-${JWT}.md`,
             kind: "produced_doc",
-            // Same shape, different key: gets walked like any other content.
-            otherPath: "notes/20260726-mla-redaction-fidelity-and-egress-boundary-proposal.md",
+            // A sibling of the same shape, to keep the original claim too: no
+            // key name here is exempt from the walk.
+            otherPath: `notes/token-${TOKEN}.md`,
             body: "fine",
           },
         ],
       },
     ) as any;
-    expect(sent.candidates[0].otherPath).toBe("[REDACTED].md");
+
+    const wire = JSON.stringify(sent);
+    expect(wire).not.toContain(TOKEN);
+    expect(wire).not.toContain(JWT);
+    // Redacted in place, not eaten whole: the surviving path is still the join
+    // key, which is the whole reason this row is `retrieval`.
+    expect(sent.candidates[0].canonicalPath).toBe("notes/token-[REDACTED].md");
+    expect(sent.candidates[1].canonicalPath).toBe("notes/jwt-[REDACTED].md");
+    expect(sent.candidates[1].otherPath).toBe("notes/token-[REDACTED].md");
   });
 
   // The /v1/ask row is the one place where the boundary re-runs a redaction the
@@ -625,6 +659,29 @@ describe("the real registry", () => {
         filters: { canonical: true, paths: ["notes/20260726-mla-redaction.md"] },
       }) as any;
       expect(sent.filters.paths).toEqual(["notes/20260726-mla-redaction.md"]);
+    });
+
+    it("preserves user_id, the metering actor the row is attributed to", () => {
+      // A workspace_users id, not a secret, and intel writes it straight onto
+      // llm_usage_events.userId. Redacting it would be worse than dropping it:
+      // the row would carry a mangled id that joins to nothing and looks
+      // attributed. This test is coupled to the builders on purpose: the
+      // boundary fails CLOSED on unclassified fields (the test right below), so
+      // adding user_id to a builder without adding it here does not leak, it
+      // throws, and `mla ask` stops working outright.
+      const sent = askThrough({
+        ...JSON.parse(parity.wire),
+        user_id: "c00exampleuser00000000001",
+      }) as Record<string, unknown>;
+      expect(sent.user_id).toBe("c00exampleuser00000000001");
+    });
+
+    it("carries user_id: null through untouched when there is no actor", () => {
+      const sent = askThrough({
+        ...JSON.parse(parity.wire),
+        user_id: null,
+      }) as Record<string, unknown>;
+      expect(sent.user_id).toBeNull();
     });
 
     it("fails closed on a field ask-core adds and nobody classifies here", () => {

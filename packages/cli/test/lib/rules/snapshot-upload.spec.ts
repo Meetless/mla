@@ -60,7 +60,16 @@ describe("uploadSnapshotsForScan", () => {
       { loadConfig: () => cfg(), http, readFile: (abs) => files[abs] ?? null },
     );
 
-    expect(outcome).toEqual({ delivered: true, attempted: 2, uploaded: 2, skipped: 0, failed: 0 });
+    // `swept: null` because these args carry no `observedPaths`: this caller made no claim about
+    // what the checkout contains, so the removal half correctly declines to retire anything.
+    expect(outcome).toEqual({
+      delivered: true,
+      attempted: 2,
+      uploaded: 2,
+      skipped: 0,
+      failed: 0,
+      swept: null,
+    });
     expect(bodies).toHaveLength(2);
     // repositoryId is the per-checkout id, NEVER the workspaceId (the cross-checkout stomp guard).
     expect(bodies[0].repositoryId).toBe(REPO);
@@ -101,7 +110,14 @@ describe("uploadSnapshotsForScan", () => {
       },
     );
 
-    expect(outcome).toEqual({ delivered: true, attempted: 2, uploaded: 1, skipped: 1, failed: 0 });
+    expect(outcome).toEqual({
+      delivered: true,
+      attempted: 2,
+      uploaded: 1,
+      skipped: 1,
+      failed: 0,
+      swept: null,
+    });
     expect(bodies).toHaveLength(1);
   });
 
@@ -122,7 +138,14 @@ describe("uploadSnapshotsForScan", () => {
       { loadConfig: () => cfg(), http, readFile: () => "x\n" },
     );
 
-    expect(outcome).toEqual({ delivered: true, attempted: 2, uploaded: 1, skipped: 0, failed: 1 });
+    expect(outcome).toEqual({
+      delivered: true,
+      attempted: 2,
+      uploaded: 1,
+      skipped: 0,
+      failed: 1,
+      swept: null,
+    });
     // The second file still uploaded despite the first throwing.
     expect(bodies).toHaveLength(1);
     expect(bodies[0].relativePath).toBe("B.md");
@@ -171,7 +194,14 @@ describe("uploadSnapshotsForScan", () => {
       readFile: () => "x\n",
     });
 
-    expect(outcome).toEqual({ delivered: true, attempted: 0, uploaded: 0, skipped: 0, failed: 0 });
+    expect(outcome).toEqual({
+      delivered: true,
+      attempted: 0,
+      uploaded: 0,
+      skipped: 0,
+      failed: 0,
+      swept: null,
+    });
     expect(bodies).toHaveLength(0);
   });
 });

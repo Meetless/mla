@@ -94,6 +94,12 @@ export const EGRESS_RULES: readonly EgressRule[] = [
     profile: "retrieval",
     fields: {
       workspace_id: "preserve",
+      // The metering actor: a workspace_users id that intel writes straight onto
+      // llm_usage_events.userId. Preserved, not redacted, for the same reason
+      // the other identity fields in this file are: redacting it is WORSE than
+      // dropping it, because the row would then carry a mangled id that joins to
+      // nothing while still looking attributed.
+      user_id: "preserve",
       question: "redact",
       thread_text: "redact",
       surface: "preserve",
@@ -406,6 +412,23 @@ export const EGRESS_RULES: readonly EgressRule[] = [
       "observedAt",
       "workspaceId",
     ],
+  },
+  {
+    service: "control",
+    method: "POST",
+    match: /^\/internal\/v1\/repo-instruction-snapshots\/sweep$/,
+    note: "repo file PATHS: the instruction files this scan observed on disk",
+    // block_on_detect for a different reason than its sibling above. There are no
+    // bytes here, only paths, so nothing is lost by redacting. What breaks is the
+    // MEANING: this body is the authoritative observed set, and control retires
+    // every live revision OUTSIDE it. Rewrite ["CLAUDE.md"] into
+    // ["[REDACTED].md"] and the sweep no longer says "I still have CLAUDE.md", it
+    // says "I have a file nobody has ever heard of", and control dutifully
+    // tombstones every real path in the checkout. A redactor that fires here does
+    // not degrade the request, it inverts it into data loss.
+    mode: "block_on_detect",
+    why: "observedPaths is an authoritative set that control retires the complement of; a redacted path is not a weaker claim but the opposite claim, and would tombstone the whole corpus",
+    fields: ["repositoryId", "observedPaths", "workspaceId"],
   },
 
   // ------------------------------------------------------------ KB writes ----
@@ -736,14 +759,30 @@ export const EGRESS_RULES: readonly EgressRule[] = [
       // review time: content, unambiguously.
       candidates: "redact",
     },
-    // canonicalPath is the key intel records the detection against, and a
-    // detection filed against "[REDACTED].md" is worse than no detection: it
-    // silently points at nothing. It cannot be hoisted to a top-level preserve
-    // because it is per-candidate. Measured: `retrieval` keeps ordinary source
-    // paths but eats date-prefixed note paths (one long high-entropy token),
-    // which is the notes vault this feature is aimed at, so the damage would
-    // land on an unpredictable subset rather than announce itself.
-    structuralKeys: ["canonicalPath"],
+    // NO structuralKeys. This row carried `structuralKeys: ["canonicalPath"]`
+    // until 2026-07-28, for a reason that has since been fixed one layer down:
+    // "`retrieval` keeps ordinary source paths but eats date-prefixed note
+    // paths, which is the notes vault this feature is aimed at." True at the
+    // time. A detection filed against "[REDACTED].md" points at nothing, so the
+    // row bought the join key with a name-based bypass.
+    //
+    // The price of that bypass was invisible and total: a structural key
+    // preserves its value WHOLE, so it is the one field in this body that no
+    // redaction ever touched. Measured before removal, all three shipped raw:
+    //
+    //   notes/20260726-mla-redaction-fidelity-...md   (the case it was for)
+    //   notes/token-ghp_ABCDEFGHIJKLMNOPQRSTUVWX.md   (a live provider token)
+    //   notes/jwt-eyJhbGciOiJIUzI1NiJ9.eyJ...         (a live JWT)
+    //
+    // OR-1 taught the retrieval profile that a path and a URL are STRUCTURES,
+    // not opaque tokens, so a walked canonicalPath now keeps every real path
+    // (dated note slugs and timestamped migration names included) while the
+    // literal credential patterns still fire inside it. Walking it is therefore
+    // strictly better than exempting it on both axes at once, and the bypass is
+    // gone rather than merely unnecessary: `structuralKeys` is now used by no
+    // rule at all, which is the state a passthrough should be kept in.
+    // Pinned by egress-policy.spec.ts ("keeps every structuralKeys use to the
+    // reviewed set" and the two candidate tests below it).
   },
   {
     service: "intel",

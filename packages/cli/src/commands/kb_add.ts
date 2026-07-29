@@ -12,6 +12,7 @@ import { governedPathEntryForReceipt, writeGovernedPath } from "../lib/governed-
 import { recordKbWriteBlocked } from "../lib/failure-telemetry";
 import { getRunTraceId, canonicalizeSessionId } from "../lib/observability";
 import { INGEST_BATCH_SIZE, INGEST_TIMEOUT_MS } from "../lib/intel-ingest-budget";
+import { EgressPolicyError, scanLeavesForCredentials } from "../lib/egress/policy";
 
 // `mla kb add <path> --mode file|corpus --provenance <kind> [flags]`
 // (proposal §4.1).
@@ -729,7 +730,7 @@ export function mergeSkippedReceipts(
 // ---------------------------------------------------------------------------
 // Batch-failure isolation, and the trace that bounds it.
 //
-// RETRY POLICY. Exactly two cases, and the second one is the default:
+// RETRY POLICY. Three cases, and the LAST one is the default:
 //
 //   1. A pre-handler 422 is a pydantic REQUEST-validation rejection. FastAPI validates
 //      `KbAddRequest` (intel `app/api/routes/kb_add.py:126-148`) BEFORE the route
@@ -738,8 +739,22 @@ export function mergeSkippedReceipts(
 //      therefore provably side-effect-free, and we do it so the healthy siblings still
 //      land instead of being punished for a neighbour.
 //
-//   2. Everything else — 5xx, gateway timeout, severed connection, a short/garbled
-//      response — is AMBIGUOUS by construction, so we do NOT auto-retry or bisect. The
+//   2. An `EgressPolicyError` from the `block_on_detect` boundary is a LOCAL verdict,
+//      thrown by this process BEFORE the socket. It is the strongest case of the three:
+//      not merely "nothing was committed" but "nothing was transmitted", so the server
+//      holds no state and its health is not in evidence at all. We isolate exactly like
+//      case 1, and by the same license, except the offenders are named by re-running the
+//      boundary's OWN scanner over each document instead of by reading a 422 body.
+//
+//      This case used to fall through to case 3 because `EgressPolicyError` carries no
+//      `.status`, so `httpStatusOf` returned undefined and a refusal was filed as a
+//      severed connection. Measured against the real 2094-note vault, that cost the run
+//      everything: one refused note failed its whole batch of 5, two refused batches in
+//      a row tripped the down-server abort, and the receipt advised a re-run that can
+//      never succeed. `governed: 5 / 2094`. See `test/commands/kb-add-egress-block.spec.ts`.
+//
+//   3. Everything else (5xx, gateway timeout, severed connection, a short/garbled
+//      response) is AMBIGUOUS by construction, so we do NOT auto-retry or bisect. The
 //      route is NOT atomic: it loops the documents (`kb_add.py:595`) and each one runs
 //      its own `intake_delivery` + `execute_run_set` with per-document faults caught into
 //      a receipt (`kb_add.py:607-619`). Documents 0..k can be committed AND activated
@@ -761,9 +776,13 @@ export function mergeSkippedReceipts(
 // ---------------------------------------------------------------------------
 
 // Pydantic reports EVERY validation error in one response, so a single isolation round
-// names all the offenders. The second round exists only so a server that somehow answers
-// with fresh indices cannot loop us.
-const MAX_VALIDATION_ISOLATION_ROUNDS = 2;
+// names all the offenders. The egress scanner is likewise exhaustive: it walks every leaf
+// in one pass. The second round exists only so a server that somehow answers with fresh
+// indices (or a body whose credential sits in a field no document owns) cannot loop us.
+const MAX_ISOLATION_ROUNDS = 2;
+
+/** The failure code for a document this client's own egress boundary refused to send. */
+export const EGRESS_FAILURE_CODE = "egress_blocked";
 
 function httpStatusOf(err: unknown): number | undefined {
   if (typeof err !== "object" || err === null) return undefined;
@@ -828,7 +847,8 @@ function ambiguousBatchReason(reason: string, paths: string[]): string {
  * Returns one receipt per document in `batch` order, plus whether the failure (if any)
  * was a transport/ambiguous one. A 422 is NOT a transport failure: the server answered,
  * fast and deterministically, so it says nothing about server health and must not feed
- * the "the server is down" abort.
+ * the "the server is down" abort. An egress refusal is not one either, and for a stronger
+ * reason: the server was never contacted, so it cannot be evidence about the server.
  */
 async function postBatchIsolatingRejected(
   batch: KbAddDocument[],
@@ -846,7 +866,11 @@ async function postBatchIsolatingRejected(
     pending = [];
   };
 
-  for (let round = 0; round < MAX_VALIDATION_ISOLATION_ROUNDS; round++) {
+  // Which isolation we are actually running, so the rounds-exhausted settle below cannot
+  // stamp an egress refusal with the server's rejection code.
+  let exhausted = { code: "ingest_rejected_invalid", kind: "request-validation" };
+
+  for (let round = 0; round < MAX_ISOLATION_ROUNDS; round++) {
     try {
       const res = await post({ ...baseBody, documents: pending.map((p) => p.doc) }, INGEST_TIMEOUT_MS);
       const got = res.receipts ?? [];
@@ -864,10 +888,38 @@ async function postBatchIsolatingRejected(
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       errors.push(reason);
+
+      // Case 2: our OWN egress boundary refused this body. Handled before the HTTP
+      // reasoning below, which is all keyed on a status this error does not have.
+      if (e instanceof EgressPolicyError && e.reason === "blocked") {
+        exhausted = { code: EGRESS_FAILURE_CODE, kind: "egress" };
+        // Ask the boundary's own scanner which documents it would object to. Same
+        // function, same denylist, same walk: an answer that cannot drift from the
+        // refusal that produced it.
+        const offenders = new Set(
+          pending.filter((p) => scanLeavesForCredentials(p.doc).length > 0).map((p) => p.index),
+        );
+        if (offenders.size === 0) {
+          // The credential rides in a field EVERY batch carries (workspaceId, corpusName,
+          // actor, agentSession). No subset of documents is sendable, so isolating would
+          // walk to an empty batch and blame each innocent file on the way down.
+          settle(EGRESS_FAILURE_CODE, () => reason);
+          return { receipts: out as KbAddReceipt[], errors, transportFailed: false };
+        }
+        for (const p of pending) {
+          if (offenders.has(p.index)) out[p.index] = failedDocumentReceipt(p.doc, stamp, EGRESS_FAILURE_CODE, reason);
+        }
+        pending = pending.filter((p) => !offenders.has(p.index));
+        if (pending.length === 0) {
+          return { receipts: out as KbAddReceipt[], errors, transportFailed: false };
+        }
+        continue;
+      }
+
       const rejected = validationRejectedIndices(e, pending.length);
 
       if (rejected === null) {
-        // Case 2 above (or a 422 that blames the request, not a document): no auto-retry.
+        // Case 3 above (or a 422 that blames the request, not a document): no auto-retry.
         const isRejection = httpStatusOf(e) === 422;
         settle(
           isRejection ? "ingest_rejected_invalid" : "ingest_post_failed",
@@ -877,7 +929,8 @@ async function postBatchIsolatingRejected(
       }
 
       // Case 1: a pre-handler request-validation rejection. Nothing was committed, so
-      // naming the offenders and re-POSTing the survivors is safe.
+      // naming the offenders and re-POSTing the survivors is safe. (See case 2 above for
+      // the same move applied to a refusal that never reached the server at all.)
       const offenders = new Set(rejected);
       for (const idx of rejected) {
         const p = pending[idx];
@@ -895,8 +948,8 @@ async function postBatchIsolatingRejected(
     }
   }
 
-  // Rounds exhausted: the server kept rejecting fresh documents. Stop rather than loop.
-  settle("ingest_rejected_invalid", () => `not sent: ${MAX_VALIDATION_ISOLATION_ROUNDS} request-validation isolation rounds did not yield an acceptable batch`);
+  // Rounds exhausted: isolation kept naming fresh offenders. Stop rather than loop.
+  settle(exhausted.code, () => `not sent: ${MAX_ISOLATION_ROUNDS} ${exhausted.kind} isolation rounds did not yield an acceptable batch`);
   return { receipts: out as KbAddReceipt[], errors, transportFailed: false };
 }
 
@@ -1178,13 +1231,24 @@ export async function runKbAdd(argv: string[]): Promise<number> {
   const anyFailed = receipts.some((r) => r.outcome === "failed");
   if (anyFailed) {
     // One deadletter per run, named for the dominant cause: a dead transport is an
-    // operator/infra problem, a server-side per-doc rejection is a content problem, and
-    // an unsendable file is a vault-hygiene problem the operator fixes in their editor.
+    // operator/infra problem, a server-side per-doc rejection is a content problem, an
+    // unsendable file is a vault-hygiene problem the operator fixes in their editor, and
+    // an egress refusal is a credential in the source that no retry can dislodge. That
+    // last one is checked FIRST: it also populates `errors`, and reporting it as
+    // `ingest_post_failed` would tell the telemetry that intel was unhealthy during a run
+    // in which intel was never contacted.
     const onlySkips = receipts.every((r) => r.outcome !== "failed" || r.failure?.code === EMPTY_FILE_FAILURE_CODE);
+    const anyBlocked = receipts.some((r) => r.failure?.code === EGRESS_FAILURE_CODE);
     recordKbWriteBlocked({
       traceId: getRunTraceId(),
       workspaceId,
-      reasonCode: errors.length > 0 ? "ingest_post_failed" : onlySkips ? EMPTY_FILE_FAILURE_CODE : "ingest_doc_failed",
+      reasonCode: anyBlocked
+        ? EGRESS_FAILURE_CODE
+        : errors.length > 0
+          ? "ingest_post_failed"
+          : onlySkips
+            ? EMPTY_FILE_FAILURE_CODE
+            : "ingest_doc_failed",
       status: 1,
     });
   }

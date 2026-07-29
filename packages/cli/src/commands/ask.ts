@@ -54,6 +54,7 @@ interface AskCore {
   makeIntelAsk: (deps: {
     intelBaseUrl: string;
     apiKey: string;
+    userId?: string | null;
     fetchImpl?: typeof fetch;
   }) => unknown;
   makeAskModes: (deps: {
@@ -272,6 +273,10 @@ export async function runAsk(
   const intelAsk = core.makeIntelAsk({
     intelBaseUrl: intelUrl,
     apiKey,
+    // Who ran this ask. intel stamps it onto the llm_usage_events row, so
+    // without it a `mla ask` is anonymous spend and per-user cost is
+    // unanswerable. Null under shared-key, where there is no human actor.
+    userId: cfg.actorUserId ?? null,
   });
   const matchCanonical = core.makeMatchCanonical({ notesRoot: notesRoot() });
   const modes = core.makeAskModes({

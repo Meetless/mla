@@ -251,6 +251,10 @@ test("makeIntelAsk serializes the parity fixture byte for byte", async () => {
   const intelAsk = makeIntelAsk({
     intelBaseUrl: "http://intel.test",
     apiKey: "K",
+    // Bound to the transport, not passed per call, so it comes from the
+    // fixture's `builder` block rather than from `input`. The CLI's half of the
+    // lock binds the same id through cfg.actorUserId.
+    userId: fixture.builder.userId,
     fetchImpl,
   });
   await intelAsk(fixture.input);
@@ -299,6 +303,51 @@ test("makeIntelAsk omits as_of from the body when not provided (byte-identical M
   await intelAsk({ question: "q", workspaceId: "ws", mode: "answer" });
   const body = JSON.parse(captured.init.body);
   assert.ok(!("as_of" in body), "as_of must be absent from the body when not requested");
+});
+
+// ---------- Metering attribution: who ran this ask --------------------------
+// intel stamps AskRequest.user_id onto the llm_usage_events row it writes for
+// the call (app/api/routes/ask.py, `_ask_scope`). Console sends it and is 100%
+// attributed; this transport did not, so every MCP ask landed with a NULL
+// userId. That is NOT the INV-METER-ATTRIBUTED case: background jobs have no
+// acting user by design, but an MCP ask is a human pressing enter, and losing
+// the actor there means per-user cost is unanswerable on the one surface where
+// a human is actually spending.
+//
+// The id is bound at CLOSURE construction, not per call, because the callers
+// that know the actor (server.js buildDepsFromEnv, `mla ask`) build the closure,
+// while the caller that invokes it (ask_modes' mode handlers) never sees an
+// operator. Identity is a property of the transport binding, like apiKey.
+
+test("makeIntelAsk stamps the bound operator id as user_id", async () => {
+  let captured = null;
+  const fetchImpl = async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({}) };
+  };
+  const intelAsk = makeIntelAsk({
+    intelBaseUrl: "http://intel.test",
+    apiKey: "K",
+    userId: "c00exampleuser00000000001",
+    fetchImpl,
+  });
+  await intelAsk({ question: "q", workspaceId: "ws", mode: "answer" });
+  assert.equal(captured.user_id, "c00exampleuser00000000001");
+});
+
+test("makeIntelAsk sends user_id: null when no operator is bound", async () => {
+  // Present-and-null, never absent. intel's AskRequest.user_id is `str | None`,
+  // and a body that sometimes omits the key would make the two builders diverge
+  // on key ORDER the moment one of them had an id and the other did not.
+  let captured = null;
+  const fetchImpl = async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({}) };
+  };
+  const intelAsk = makeIntelAsk({ intelBaseUrl: "http://intel.test", apiKey: "K", fetchImpl });
+  await intelAsk({ question: "q", workspaceId: "ws", mode: "answer" });
+  assert.ok("user_id" in captured, "user_id must be present even when unbound");
+  assert.equal(captured.user_id, null);
 });
 
 // ---------- Delivery key: every ask is a metered spend ----------------------

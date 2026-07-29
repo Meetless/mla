@@ -370,6 +370,13 @@ export async function runScanContext(argv: string[], deps: ScanContextDeps = {})
     repositoryId: resolveScanRootIdentity(target.scanRoot),
     scanRoot: target.scanRoot,
     paths: (result.artifactDigests ?? []).map((d) => d.relativePath),
+    // The REMOVAL half, and deliberately a different list from `paths` above. `paths` is what we
+    // could digest; this is what is on disk. Control retires every stored revision outside it, so
+    // sweeping by the digested subset would tombstone every file too large or unreadable to
+    // digest on every scan. Passed through verbatim INCLUDING undefined, which the scan sets when
+    // it could not enumerate the checkout at all and which means "sweep nothing" (see
+    // ScanResult.instructionFilePaths).
+    observedPaths: result.instructionFilePaths,
     observedCommitSha: result.commitSha,
     observedAt: result.generatedAt,
   });

@@ -32,6 +32,11 @@ declare module "@meetless/ask-core/ask_modes.js" {
   export function makeIntelAsk(deps: {
     intelBaseUrl: string;
     apiKey: string;
+    /** Workspace user id this transport acts as. Sent as the ask body's
+     * `user_id`, which intel stamps onto the llm_usage_events row so the spend
+     * is attributable. Bound here rather than per call: the mode handlers that
+     * invoke the closure never see an operator. Null when unbound. */
+    userId?: string | null;
     fetchImpl?: typeof fetch;
   }): IntelAsk;
 
