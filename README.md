@@ -1,8 +1,8 @@
-# mla: proactive project memory for Claude Code and Codex
+# mla: the active source of truth for Claude Code and Codex
 
-**`mla` hooks into your Claude Code and Codex sessions, injects approved project
-context before the agent acts, and surfaces contradictions before they become
-rework.**
+**`mla` watches your coding sessions, captures decisions as work happens, detects
+stale or conflicting instructions, and proactively steers each agent before it
+acts. You review only the changes that require human judgment.**
 
 <p align="center">
   <img src="docs/assets/mla-demo.gif" width="900"
@@ -22,20 +22,22 @@ rework.**
 </p>
 
 `mla` (short for **Meetless Agent**) is the command-line client for Meetless. The
-load-bearing word is *proactive*: this is not a memory server your agent has to
-remember to query. It installs as a session hook, so governed context arrives on
-every turn whether the agent thinks to ask or not. It keeps your coding agents
-grounded in the architecture you approved, captures the decisions they make each
-session, flags when a new session contradicts a settled one, and lets you approve
-what becomes project truth for every run that follows.
+load-bearing word is *active*: this is not a memory server your agent has to
+remember to query. It installs as a session hook, so the decisions that are
+currently in force arrive on every turn whether the agent thinks to ask or not.
 
 ## The problem
 
-Coding agents are fast, but they forget. Every session starts cold. The agent
-re-derives architecture you already settled, quietly makes decisions you never
-see, and contradicts choices from last week because nothing carried them forward.
-You spend your turns re-explaining context instead of shipping, and the agent
-drifts a little further from the design each time.
+Coding agents do not only fail because information is missing. They fail because
+obsolete decisions, current decisions, conflicting instructions, and model
+assumptions can all appear equally authoritative.
+
+A summary can confidently state something you replaced weeks ago. A memory system
+can retrieve both the old and the new decision. A larger context window can put
+both in front of the agent. None of those systems decides which one is still in
+force.
+
+> **The problem is not memory. The problem is authority.**
 
 The code has a system of record: git. The decisions behind the code do not. That
 gap is where rework comes from.
@@ -45,14 +47,19 @@ gap is where rework comes from.
 `mla` is the system of record for the decisions. It sits between you and your
 coding agents and runs a tight loop:
 
-1. **Capture.** Every session's decisions are recorded as governed memory, with
-   the evidence behind them, not buried in a transcript you will never reread.
-2. **Ground.** Before an agent acts, it retrieves the approved architecture and
-   prior decisions, so it builds on settled ground instead of guessing.
-3. **Catch contradictions.** When a new session cuts against a decision you
-   already made, `mla` surfaces the conflict instead of letting it ship silently.
-4. **Approve.** You decide what becomes project truth. Approved decisions feed
-   forward into every future run; the rest stays out of the agent's way.
+1. **Watch.** It rides along in the sessions you chose to govern, so capture is a
+   side effect of working rather than a chore you remember afterwards.
+2. **Capture.** Decisions are recorded as they happen, with the evidence behind
+   them, not buried in a transcript you will never reread.
+3. **Detect.** When a session cuts against a decision you already settled, or a
+   file in the checkout still asserts something a ruling replaced, `mla` surfaces
+   the conflict instead of letting it ship silently.
+4. **Steer.** Before an agent acts, the decisions still in force are placed in its
+   context, so it builds on settled ground instead of guessing.
+
+**You are still the architect.** Nothing an agent proposes becomes project truth
+until a human approves it. You review only the changes that require human
+judgment; the rest stays out of the agent's way.
 
 The result: less context re-explaining, fewer reversals, and agents that stay on
 the architecture you actually chose.
@@ -290,9 +297,10 @@ runtime). How it authenticates to `control` is recorded in
 | `none` | `mla logout`, or never logged in | none | terminal state; control and intel calls fail fast with "not logged in" |
 
 - **`mla login`** opens the Console authorize page in your browser, completes a
-  loopback PKCE (S256) flow, and writes a `user-token` (a short-lived access token
-  plus a 90-day refresh token). Access tokens auto-refresh on a 401, so you do not
-  re-auth until the refresh token expires. Use `--no-browser` to print the URL
+  loopback PKCE (S256) flow, and writes a `user-token` (a 24h access token plus a
+  30-day refresh token). The refresh window slides: every rotation re-issues a
+  fresh 30 days, so an actively-used CLI never has to log in again. Only about 30
+  days of total dormancy ends the session. Use `--no-browser` to print the URL
   instead of opening it.
 - **`mla whoami`** prints the identity behind the current config (user, mode, token
   runway) without ever revealing the token.
@@ -386,11 +394,12 @@ Building with coding agents and want them to stop drifting? Come talk to us.
 
 ## Where this is going
 
-Today the memory is yours: one operator, their agents, one approved architecture.
-The same governed decisions extend to a team. When several people (and their
-agents) work the same codebase, everyone builds on the same approved truth instead
-of re-litigating it in the next session, the next PR, or the next meeting. Project
-memory at that scale is just coordination, which is where the name comes from:
+`mla` is built for solo builders and software teams alike. Today the authority is
+yours: one operator, their agents, one approved architecture. The same governed
+decisions extend to a team. When several people (and their agents) work the same
+codebase, everyone acts on the decisions still in force instead of re-litigating
+them in the next session, the next PR, or the next meeting. Deciding what is still
+in force, at that scale, is just coordination, which is where the name comes from:
 less rework, fewer reversals, fewer meetings.
 
 What that looks like for a team is written up at
