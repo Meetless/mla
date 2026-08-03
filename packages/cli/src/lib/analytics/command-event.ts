@@ -12,6 +12,7 @@ import {
   CommandOutcome,
   CommandScope,
 } from "./envelope";
+import type { HandledFailure } from "./handled-failure";
 
 // The closed set of top-level commands `mla` dispatches. A first token outside
 // this set is normalized to "unknown" so a typo'd path or secret pasted as
@@ -125,7 +126,7 @@ export const KNOWN_SUBCOMMANDS: Record<string, Set<string>> = {
   // `mla decisions show <id>` is the only form. The id is a POSITIONAL and must never reach the
   // wire, so only the keyword is listed.
   decisions: new Set(["show"]),
-  enrich: new Set(["plan", "brief", "ingest", "materialize", "accept"]),
+  enrich: new Set(["plan", "brief", "ingest", "materialize", "accept", "resolve"]),
   graph: GRAPH_SUBS,
   cg: GRAPH_SUBS,
   "agent-memory": new Set([
@@ -305,28 +306,82 @@ export interface OutcomeClassification {
   retryable: boolean;
 }
 
+// A class token is a bare snake_case identifier and nothing else. Every handled
+// declaration is squeezed through this before it can reach the wire, which is what keeps
+// INV-POSTHOG-PII-1 structurally true rather than true-by-call-site-review: a path, an
+// email, a query, or an interpolated message carries slashes, dots, spaces, @, or capitals
+// and cannot pass. Same guard style as the errno check further down.
+const CLASS_TOKEN = /^[a-z][a-z0-9_]{0,47}$/;
+
+// The JS runtime's own fault types. A thrown one of these is a bug in our code,
+// not a condition a user can act on, and it is the only thing the bug-report
+// nudge should fire for besides a 5xx.
+const JS_FAULT_TYPES = new Set([
+  "TypeError",
+  "ReferenceError",
+  "RangeError",
+  "SyntaxError",
+  "EvalError",
+  "URIError",
+]);
+
+// `SqliteError` -> `sqlite_error`. A type NAME is PII-safe (it is a class, not a
+// message); this only puts it in the same snake_case shape as the http_* and
+// config_error tokens so every error_class value in the funnel reads alike. The
+// result is squeezed through CLASS_TOKEN for the same structural reason the
+// handled declarations are: a type name is safe, but nothing here should be
+// able to emit something that is not a bare token.
+function toClassToken(name: string): string {
+  const token = name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .slice(0, 48);
+  return CLASS_TOKEN.test(token) ? token : "error";
+}
+
 // Map a finished run (exit code + optional thrown error) to a closed-enum
 // outcome, a PII-safe error_class (a class/category token, NEVER a message), and
 // a retryable hint. The error's `status` (set by lib/http.buildError on HTTP
 // failures) drives the HTTP mapping; otherwise the error code/name is inspected
 // for the common network failure modes.
+//
+// `handled` is the run's handled-failure declaration (analytics/handled-failure), set by
+// the call site that decided to fail. It only ever applies to the no-throw branch below: a
+// real exception classifies from the exception itself, which is strictly more informative.
 export function classifyOutcome(
   exitCode: number,
   threw: boolean,
   thrown: unknown,
+  handled?: HandledFailure | null,
 ): OutcomeClassification {
   if (exitCode === 0) {
+    // A non-fatal declaration on a run that went on to succeed is not a failure. The
+    // exit code is the authority on whether the run failed; the declaration only ever
+    // explains WHY it did.
     return { outcome: "success", error_class: null, retryable: false };
   }
 
   if (!threw) {
     // A command returned non-zero without throwing: a handled, user-facing
-    // failure (bad input, not found, usage error -> exit 2). No exception object
-    // to classify, so no error_class.
-    return { outcome: "user_error", error_class: null, retryable: false };
+    // failure (bad input, not found, usage error -> exit 2). There is no exception
+    // object to classify, so the only possible reason is the one the call site
+    // declared. Absent that (an un-declared handled exit), this stays the historical
+    // unexplained user_error.
+    const token = handled?.error_class ?? "";
+    return {
+      outcome: handled?.outcome ?? "user_error",
+      error_class: CLASS_TOKEN.test(token) ? token : null,
+      retryable: handled?.retryable ?? false,
+    };
   }
 
-  const err = thrown as { status?: number; code?: string; name?: string } | null;
+  const err = thrown as {
+    status?: number;
+    code?: string;
+    name?: string;
+    message?: string;
+    cause?: unknown;
+  } | null;
   const status = err?.status;
   if (typeof status === "number") {
     if (status === 401) return { outcome: "auth_error", error_class: "http_401", retryable: false };
@@ -375,15 +430,34 @@ export function classifyOutcome(
   if (code === "ETIMEDOUT" || name === "AbortError" || name === "TimeoutError") {
     return { outcome: "timeout", error_class: "timeout", retryable: true };
   }
+  // node's fetch rejects with `TypeError: fetch failed` and the real socket
+  // error hung on `.cause`. That wrapper is what this branch is for, and it used
+  // to be matched on the type name ALONE, which swallowed every genuine
+  // programming TypeError with it: a real in-process crash was recorded as a
+  // retryable network_error and, being retryable-looking, never fired the
+  // bug-report nudge. Meanwhile a bare usage Error fell to the tail and DID fire
+  // it. The two commonest cases were classified as each other. `.cause` (or the
+  // literal undici message) is the discriminator; a hand-written TypeError has
+  // neither and now falls through to the crash branch below.
+  const isFetchWrapper =
+    name === "TypeError" && (err?.cause !== undefined || err?.message === "fetch failed");
   if (
     code === "ECONNREFUSED" ||
     code === "ENOTFOUND" ||
     code === "ECONNRESET" ||
     code === "EAI_AGAIN" ||
     name === "FetchError" ||
-    name === "TypeError" // node's fetch wraps network failures as TypeError
+    isFetchWrapper
   ) {
     return { outcome: "network_error", error_class: "network_error", retryable: true };
+  }
+
+  // The JS fault types. Reaching here means a real bug in our code (reading a
+  // property of undefined, calling a non-function, a bad regex), which is the
+  // one thing the nudge exists for. Emitted as a snake_case class token so it
+  // stays PII-safe and matches the http_*/config_error style.
+  if (JS_FAULT_TYPES.has(name)) {
+    return { outcome: "system_error", error_class: toClassToken(name), retryable: false };
   }
 
   // Node OS/filesystem faults carry a classic errno on `.code` (ENOENT, EACCES,
@@ -406,8 +480,25 @@ export function classifyOutcome(
     return { outcome: "system_error", error_class: code.toLowerCase(), retryable: false };
   }
 
+  // A bare `Error` with no status, no errno and no distinguishing type carries
+  // no evidence that anything is OUR fault. In this CLI it is overwhelmingly a
+  // deliberate `throw new Error("Unknown flag: ...")` / "Missing value for ..."
+  // / "Pass at most one of ..." at a call site describing something the user
+  // must fix: 133 such throw sites interpolate argv into the message. Calling
+  // that a system_error made `mla review --typo` print "MLA hit an internal
+  // error. Send us a redacted diagnostic report", which is both wrong for the
+  // user and noise in the bug queue.
+  //
+  // An internal invariant that DOES want the nudge should say so in the type,
+  // which is this codebase's existing idiom (ConfigError, NotActivatedError,
+  // RefreshBusyError). Any named type still lands in system_error on the line
+  // below; only the anonymous fallback is treated as the user's to act on.
+  if (!name || name === "Error") {
+    return { outcome: "user_error", error_class: "unclassified_error", retryable: false };
+  }
+
   // Unknown thrown error: a class name is PII-safe (it is a type, not a message).
-  return { outcome: "system_error", error_class: name || "Error", retryable: false };
+  return { outcome: "system_error", error_class: toClassToken(name), retryable: false };
 }
 
 // True when a run's classification is a genuinely unexpected fault on OUR side,

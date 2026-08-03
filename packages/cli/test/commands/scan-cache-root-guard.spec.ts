@@ -7,9 +7,12 @@
 // checkout scanned LAST, and an unguarded read in the other checkout would render / inject a
 // sibling repo's scan as its own.
 //
-// The fix stamps each scan with its scan-root identity (ScanResult.scanRootPath) and reads it back
-// through readScanCacheForRoot / a filtered review card, so a reader only ever sees ITS checkout's
-// scan. Legacy (unstamped) caches and single-repo installs must be entirely unaffected.
+// The fix has two halves. First, each scan is stamped with its scan-root identity
+// (ScanResult.scanRootPath) and read back through readScanCacheForRoot / a filtered review card,
+// so a reader never sees a sibling checkout's scan as its own. That guard alone leaves the other
+// checkouts DARK, which is what took every floor MUST off the prompt for 8h11m on 2026-08-02, so
+// the second half gives each root its own cache slot: a scan from B writes B's slot and cannot
+// darken A. Legacy (unstamped) caches and single-repo installs must be entirely unaffected.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,7 +22,12 @@ import {
   rescanAndCache,
   resolveScanRootIdentity,
 } from "../../src/commands/scan-context";
-import { readScanCache, reviewCardsPath, writeScanCache } from "../../src/lib/scanner/cache";
+import {
+  readScanCache,
+  reviewCardsPath,
+  scanCachePathForRoot,
+  writeScanCache,
+} from "../../src/lib/scanner/cache";
 import { latestReviewCardItems } from "../../src/commands/context";
 import { ScanResult } from "../../src/lib/scanner/types";
 
@@ -68,20 +76,37 @@ describe("scan-cache scan-root guard (Finding A: two checkouts, one workspace)",
     expect(readScanCache(home, WS)!.scanRootPath).toBe(realpathSync(repoA));
   });
 
-  it("isolates a checkout from a sibling that stomped the shared cache file", () => {
-    // A scans, then B scans the SAME workspace: B's scan overwrites the one shared file.
+  it("keeps each checkout on its OWN scan after a sibling scans the same workspace", () => {
+    // A scans, then B scans the SAME workspace.
     rescanAndCache({ cwd: repoA, workspaceId: WS, home, now: () => "t" });
     rescanAndCache({ cwd: repoB, workspaceId: WS, home, now: () => "t" });
 
-    // The file on disk now belongs to B (last writer wins) — this is the stomp.
+    // The workspace-global slot still belongs to whoever scanned last. That one shared slot IS
+    // the defect: with only this file, the stamp guard can tell A that the cache is not its own,
+    // but it cannot give A a cache, so A stays dark until someone rescans from A.
     expect(readScanCache(home, WS)!.scanRootPath).toBe(realpathSync(repoB));
 
-    // The guarded read isolates them: reading AS A rejects B's cache (would otherwise show B's
-    // commitSha / stale signals as A's), reading AS B accepts it.
+    // Per-root slots end that. Each root reads its own, so B's scan neither replaces A's nor
+    // darkens it, and neither checkout can be handed the other's repo-specific scan.
+    const asA = readScanCacheForRoot(home, WS, repoA)!;
+    const asB = readScanCacheForRoot(home, WS, repoB)!;
+    expect(asA.scanRootPath).toBe(realpathSync(repoA));
+    expect(asB.scanRootPath).toBe(realpathSync(repoB));
+    // Content, not just the stamp: each carries ITS repo's unique superseded ADR and commit.
+    expect(asA.staleSignals.map((s) => s.source)).toEqual(["docs/adr/0001-a.md"]);
+    expect(asB.staleSignals.map((s) => s.source)).toEqual(["docs/adr/0002-b.md"]);
+    expect(asA.commitSha).not.toBe(asB.commitSha);
+  });
+
+  it("falls back to the stamp guard when this root has no per-root slot", () => {
+    // The shape an older build leaves behind: one stamped workspace-global cache and no per-root
+    // slot at all. The guard is still the only thing standing between A and B's scan, so it has
+    // to keep rejecting a foreign stamp on that path.
+    rescanAndCache({ cwd: repoB, workspaceId: WS, home, now: () => "t" });
+    rmSync(scanCachePathForRoot(WS, realpathSync(repoB), home), { force: true });
+
     expect(readScanCacheForRoot(home, WS, repoA)).toBeNull();
-    const asB = readScanCacheForRoot(home, WS, repoB);
-    expect(asB).not.toBeNull();
-    expect(asB!.scanRootPath).toBe(realpathSync(repoB));
+    expect(readScanCacheForRoot(home, WS, repoB)!.scanRootPath).toBe(realpathSync(repoB));
   });
 
   it("does not regress the single-checkout case: a scan is readable from its own root", () => {

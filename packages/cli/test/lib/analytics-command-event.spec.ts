@@ -206,6 +206,70 @@ describe("classifyOutcome", () => {
     });
   });
 
+  // Every HANDLED failure (the `failInMode` path and the enrich-ingest exit-1) used to
+  // land in the branch above: outcome user_error, error_class NULL. That is the whole
+  // handled-failure surface of the CLI reduced to one undiagnosable bucket, so a prod
+  // workspace that burned three ingest attempts left no recoverable reason anywhere. The
+  // call site already knows its class token; classifyOutcome now accepts it.
+  describe("a declared handled failure (4th argument)", () => {
+    it("carries the call site's class token onto a non-zero exit that did not throw", () => {
+      expect(classifyOutcome(2, false, null, { error_class: "ingest_rejected" })).toEqual({
+        outcome: "user_error",
+        error_class: "ingest_rejected",
+        retryable: false,
+      });
+    });
+
+    it("lets the call site override outcome and retryable (an infra fault is not the user's error)", () => {
+      expect(
+        classifyOutcome(1, false, null, {
+          error_class: "scout_persistence_failed",
+          outcome: "system_error",
+          retryable: true,
+        }),
+      ).toEqual({
+        outcome: "system_error",
+        error_class: "scout_persistence_failed",
+        retryable: true,
+      });
+    });
+
+    it("is ignored on a successful exit (a non-fatal note must never fail the run)", () => {
+      expect(classifyOutcome(0, false, null, { error_class: "ingest_rejected" })).toEqual({
+        outcome: "success",
+        error_class: null,
+        retryable: false,
+      });
+    });
+
+    it("loses to a real thrown error, which classifies from the exception itself", () => {
+      expect(
+        classifyOutcome(1, true, { status: 503 }, { error_class: "usage_error" }),
+      ).toMatchObject({ outcome: "system_error", error_class: "http_503", retryable: true });
+    });
+
+    // INV-POSTHOG-PII-1 backstop. Today every call site passes a static snake_case
+    // literal, but the argument is a `string`: one future `fail(\`bad ref ${ref}\`, ...)`
+    // would put a path, a query, or an email on the wire. Only the token SHAPE can pass,
+    // exactly like the errno guard below, so the invariant holds structurally rather than
+    // by call-site review.
+    it("drops a class token that is not a bare snake_case shape", () => {
+      for (const leaky of [
+        "could not read /Users/an/secret.md",
+        "an@meetless.ai",
+        "HTTP 404",
+        "a".repeat(65),
+        "",
+      ]) {
+        expect(classifyOutcome(2, false, null, { error_class: leaky })).toEqual({
+          outcome: "user_error",
+          error_class: null,
+          retryable: false,
+        });
+      }
+    });
+  });
+
   it("maps HTTP status to closed-enum outcomes and class tokens", () => {
     expect(classifyOutcome(1, true, { status: 401 })).toMatchObject({
       outcome: "auth_error",
@@ -249,9 +313,73 @@ describe("classifyOutcome", () => {
       outcome: "timeout",
       retryable: true,
     });
-    expect(classifyOutcome(1, true, { name: "TypeError" })).toMatchObject({
+    // node's fetch rejects with `TypeError: fetch failed` and hangs the real
+    // socket error on `.cause`. THAT is a network error.
+    //
+    // This assertion used to be `{ name: "TypeError" }` with nothing else, which
+    // encoded the defect rather than the contract: matching the type name ALONE
+    // swallowed every genuine programming TypeError into the retryable network
+    // bucket, so a real in-process crash never fired the bug-report nudge. A
+    // fixture that omits the very field the branch exists to recognize does not
+    // test the branch. See the bare-TypeError crash case below.
+    expect(
+      classifyOutcome(
+        1,
+        true,
+        Object.assign(new TypeError("fetch failed"), {
+          cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:8080"), {
+            code: "ECONNREFUSED",
+          }),
+        }),
+      ),
+    ).toMatchObject({
+      outcome: "network_error",
+      error_class: "network_error",
+      retryable: true,
+    });
+    // Same wrapper, `.cause` stripped by a transport that did not preserve it:
+    // the literal undici message is the fallback discriminator.
+    expect(classifyOutcome(1, true, { name: "TypeError", message: "fetch failed" })).toMatchObject({
       outcome: "network_error",
     });
+  });
+
+  it("a hand-written TypeError is OUR crash, not a network error", () => {
+    // The inverse of the case above, and the one that was misfiled for as long as
+    // the branch matched on the name. A TypeError with no `.cause` and no undici
+    // message is what a real bug looks like (reading a property of undefined,
+    // calling a non-function): our fault, not retryable, and the single thing the
+    // bug-report nudge exists for.
+    const crash = new TypeError("Cannot read properties of undefined (reading 'reduce')");
+    const c = classifyOutcome(1, true, crash);
+    expect(c).toMatchObject({
+      outcome: "system_error",
+      error_class: "type_error",
+      retryable: false,
+    });
+    expect(isReportableFault(c)).toBe(true);
+    // The message is not the class (it can carry a path or a query).
+    expect(JSON.stringify(c)).not.toContain("reduce");
+  });
+
+  it("a bare Error with nothing distinguishing is the USER's to fix, and stays quiet", () => {
+    // 133 throw sites in this CLI are `throw new Error(\`Unknown flag: ${x}\`)` /
+    // "Missing value for ..." / "Pass at most one of ...": a usage message for a
+    // human, interpolating their argv. Bucketing those as system_error printed
+    // "MLA hit an internal error. Send us a redacted diagnostic report" for a
+    // typo, which is wrong for the user and noise in the bug queue.
+    //
+    // An internal invariant that DOES want the nudge says so in its type; every
+    // named type still lands in system_error (see the RangeError case below).
+    const usage = new Error("Unknown flag: --pilot. Supported flags: --plain, --no-flush");
+    const c = classifyOutcome(1, true, usage);
+    expect(c).toMatchObject({
+      outcome: "user_error",
+      error_class: "unclassified_error",
+      retryable: false,
+    });
+    expect(isReportableFault(c)).toBe(false);
+    expect(JSON.stringify(c)).not.toContain("--pilot");
   });
 
   it("maps app-level user-actionable errors by their type name (never system_error)", () => {
@@ -288,7 +416,10 @@ describe("classifyOutcome", () => {
   it("error_class for an unknown throw is the class NAME, never a message", () => {
     const res = classifyOutcome(1, true, new RangeError("an@meetless.ai exploded at /secret/path"));
     expect(res.outcome).toBe("system_error");
-    expect(res.error_class).toBe("RangeError");
+    // The type name, snake_cased so every error_class in the funnel reads alike
+    // (http_503, config_error, enoent, range_error) instead of one column mixing
+    // `RangeError` with `http_503`.
+    expect(res.error_class).toBe("range_error");
     // The message (which could carry PII) is not surfaced.
     expect(JSON.stringify(res)).not.toContain("meetless.ai");
     expect(JSON.stringify(res)).not.toContain("/secret/path");
@@ -337,7 +468,10 @@ describe("classifyOutcome", () => {
       name: "Error",
       code: "/Users/an/secret/eaccestoken@meetless.ai",
     });
-    expect(res.error_class).toBe("Error");
+    // Falls all the way through to the anonymous-Error tail. Which bucket it
+    // lands in is not this test's point; that the pasted value is NOT in the
+    // output is.
+    expect(res.error_class).toBe("unclassified_error");
     expect(JSON.stringify(res)).not.toContain("secret");
     expect(JSON.stringify(res)).not.toContain("meetless.ai");
   });
@@ -355,6 +489,11 @@ describe("isReportableFault (bug-report nudge policy)", () => {
     { label: "HTTP 502", thrown: { status: 502 }, nudge: true },
     { label: "HTTP 503", thrown: { status: 503 }, nudge: true },
     { label: "unhandled in-process crash", thrown: new RangeError("boom"), nudge: true },
+    {
+      label: "unhandled in-process crash (TypeError, the commonest one)",
+      thrown: new TypeError("Cannot read properties of undefined"),
+      nudge: true,
+    },
     // User-actionable / transient -> quiet.
     { label: "HTTP 401 (auth)", thrown: { status: 401 }, nudge: false },
     { label: "HTTP 403 (permission)", thrown: { status: 403 }, nudge: false },
@@ -371,7 +510,16 @@ describe("isReportableFault (bug-report nudge policy)", () => {
     },
     { label: "refresh busy", thrown: { name: "RefreshBusyError" }, nudge: false },
     { label: "backend unreachable (ECONNREFUSED)", thrown: { code: "ECONNREFUSED" }, nudge: false },
-    { label: "fetch failed (TypeError)", thrown: { name: "TypeError" }, nudge: false },
+    // The undici wrapper, with the socket error where undici actually puts it.
+    // Written as `{ name: "TypeError" }` this row was the defect in table form:
+    // it asserted that a TypeError NEVER nudges, which is true of the wrapper and
+    // false of every real crash. The crash row is two lines down.
+    {
+      label: "fetch failed (undici TypeError wrapper)",
+      thrown: Object.assign(new TypeError("fetch failed"), { cause: new Error("ECONNREFUSED") }),
+      nudge: false,
+    },
+    { label: "usage error (bare Error, our own throw site)", thrown: new Error("Unknown flag: --x"), nudge: false },
     { label: "aborted / timeout", thrown: { name: "AbortError" }, nudge: false },
     // Local permission denial -> the user's chmod, not a bug (permission_denied).
     { label: "local EACCES (unwritable ~/.meetless)", thrown: { code: "EACCES" }, nudge: false },

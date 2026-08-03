@@ -188,10 +188,42 @@ describe("renderAcceptReview", () => {
     expect(text).not.toContain("--all");
   });
 
+  // This screen is where onboarding died for real workspaces: it stated the outcome and
+  // then stopped, so the operator's session ended with zero rules and no way to know what
+  // to do next. It must always end with a runnable command.
+  describe("the zero-durable dead end", () => {
+    it("offers the manual rule path when the run found only governed knowledge", () => {
+      const text = renderAcceptReview(RUN_ID, [], knowledge);
+      // The distinction that matters: knowledge is answerable, only a RULE is injected.
+      expect(text).toContain("mla rules add");
+      expect(text).toMatch(/only a rule is injected/i);
+      // Not a re-run suggestion: the scouts DID find something, re-running finds it again.
+      expect(text).not.toContain("mla enrich plan");
+    });
+
+    it("tells the operator to re-run the scouts when the run found nothing at all", () => {
+      const text = renderAcceptReview(RUN_ID, [], []);
+      expect(text).toContain("mla enrich plan");
+      expect(text).toContain("mla rules add");
+    });
+
+    it("never ends on a bare statement of the outcome (the dead end itself)", () => {
+      for (const text of [renderAcceptReview(RUN_ID, [], knowledge), renderAcceptReview(RUN_ID, [], [])]) {
+        const last = text.trimEnd().split("\n").pop() ?? "";
+        expect(last).toMatch(/mla /); // the last thing on screen is a command to run
+      }
+    });
+  });
+
   it("contains no em dash or double dash (writing-style guard)", () => {
-    const text = renderAcceptReview(RUN_ID, durable, knowledge);
-    expect(text).not.toContain("—");
-    expect(text).not.toMatch(/ -- /);
+    for (const text of [
+      renderAcceptReview(RUN_ID, durable, knowledge),
+      renderAcceptReview(RUN_ID, [], knowledge),
+      renderAcceptReview(RUN_ID, [], []),
+    ]) {
+      expect(text).not.toContain("—");
+      expect(text).not.toMatch(/ -- /);
+    }
   });
 });
 

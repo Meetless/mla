@@ -4,6 +4,8 @@ import {
   SCOUT_NAMES,
   MAX_STATEMENT_LENGTH,
   MAX_CANDIDATES_TOTAL,
+  DOC_CLAIM_CLASSES,
+  claimClassPhraseExamples,
   scoutCandidateCap,
 } from "../../../src/lib/enrichment/protocol";
 
@@ -279,6 +281,49 @@ describe("buildScoutPrompt (history role)", () => {
     const out = buildScoutPrompt(run({ historyEvidence: [] }), "history");
     expect(out).toMatch(/no commit history/i);
     expect(out).toContain('"status": "complete"');
+  });
+});
+
+// The reconciliation brief is the only place a scout is told what a `doc_code_inconsistency`
+// must look like, and every rule it states is enforced by `validateInconsistency` after the
+// scout returns. A brief that invites something the validator rejects does not produce a bad
+// finding, it produces a WASTED scout run: the candidate is dropped and the tokens are spent.
+// So each assertion below pins the brief to the constant or the reject code that governs it.
+describe("buildScoutPrompt (reconciliation role): the brief states the grammar ingest enforces", () => {
+  const brief = (): string => buildScoutPrompt(run(), "reconciliation");
+
+  it("never asks the scout which rule kind to mint: the CLI stamps that in trusted code", () => {
+    // `proposedRuleKind` left the wire entirely (it is an unknown_field now), so asking for it
+    // would make every honest reply rejected on a field the scout was told to send.
+    expect(brief()).not.toMatch(/proposedRuleKind/);
+  });
+
+  it("prints, for every claim class, an approved prohibition phrase the validator matches", () => {
+    const out = brief();
+    for (const cls of DOC_CLAIM_CLASSES) {
+      const ex = claimClassPhraseExamples(cls);
+      expect(out).toContain(ex.passive);
+      expect(out).toContain(ex.imperative);
+    }
+    // And the reason the grammar exists: a sentence that merely describes reality is not a rule.
+    expect(out).toMatch(/is not a rule/i);
+  });
+
+  it("tells the scout the scope must be a path the quoted sentence itself writes out", () => {
+    const out = brief();
+    expect(out).toMatch(/writes out|written out/i);
+    // The old brief invited exactly the broadening the validator now rejects: it offered to
+    // accept any directory the changed file "sits under", which turns a rule about one file
+    // into a rule about all of its neighbours.
+    expect(out).not.toMatch(/sits under/);
+    expect(out).toMatch(/widen|infer/i);
+  });
+
+  it("says never_rename needs R, and that a copy is not a rename", () => {
+    const out = brief();
+    expect(out).not.toMatch(/R or C/);
+    expect(out).toMatch(/`never_rename` needs R/);
+    expect(out).toMatch(/copy/i);
   });
 });
 

@@ -52,6 +52,10 @@ function newestMtimeMs(dir: string): number {
 interface CacheSeed {
   schemaVersion: number;
   workspaceId: string;
+  // Absent = an unstamped legacy cache, which the root guard TRUSTS. Set it to a directory that is
+  // not the hook's cwd to reproduce the foreign-root case (several `.meetless.json` markers sharing
+  // one workspace id, last scan wins the workspace-global slot).
+  scanRootPath?: string;
   floorRulesXml: string;
   floorRules: Array<{ ruleId: string; versionId: string; text: string; strength: string }>;
   scopedRules: Array<{
@@ -73,10 +77,31 @@ interface PersistedAudit {
   omitted: Array<{ ruleId: string; reason: string }>;
 }
 
+// The per-turn DELIVERY receipt the hook stamps (user-prompt-submit.sh §emit_delivery_receipt).
+// Every field is derived from the text bash actually emitted, which is the whole point: the
+// previous `emit_floor_receipt` derived it from a jq read of the scan cache BEFORE the assembler
+// ran, so it could only ever report "the cache has a floorRulesXml field". Across the 8h11m window
+// in which every floor MUST was dropped it was byte-identical to a healthy turn's.
+interface HookReceipt {
+  at: string;
+  path: "assembler" | "fallback" | "blocked" | "none";
+  delivery: "emitted" | "missing";
+  floorRules: number;
+  scopedRules: number;
+  bytes: number;
+  cwd: string;
+  freshness: string;
+  bundleId: string;
+  degraded?: string;
+  reason?: string;
+  bundleHash?: string;
+}
+
 interface RunResult {
   status: number;
   additionalContext: string | null;
   audit: PersistedAudit | null;
+  receipt: HookReceipt | null;
   stdout: string;
 }
 
@@ -145,16 +170,33 @@ async function runHook(args: {
       additionalContext = null;
     }
   }
-  const auditFile = path.join(args.home, "workspaces", WS, "assemble-audit.json");
-  let audit: PersistedAudit | null = null;
-  if (fs.existsSync(auditFile)) {
+  const readJson = <T,>(file: string): T | null => {
+    if (!fs.existsSync(file)) return null;
     try {
-      audit = JSON.parse(fs.readFileSync(auditFile, "utf8")) as PersistedAudit;
+      return JSON.parse(fs.readFileSync(file, "utf8")) as T;
     } catch {
-      audit = null;
+      return null;
     }
-  }
-  return { status, additionalContext, audit, stdout: out };
+  };
+  const wsDir = path.join(args.home, "workspaces", WS);
+  const audit = readJson<PersistedAudit>(path.join(wsDir, "assemble-audit.json"));
+  const receipt = readJson<HookReceipt>(path.join(wsDir, "hook-receipt.json"));
+  return { status, additionalContext, audit, receipt, stdout: out };
+}
+
+/**
+ * The receipt is only worth anything if it describes THIS turn's emitted head, so every
+ * assertion below is cross-checked against the context string the same run returned. A receipt
+ * that agrees with itself proves nothing; a receipt whose counts match an independent count of
+ * the delivered text is the falsifiable version.
+ */
+function expectReceiptMatchesContext(r: RunResult): void {
+  expect(r.receipt).not.toBeNull();
+  const rec = r.receipt!;
+  const ctx = r.additionalContext ?? "";
+  expect(rec.bytes).toBe(Buffer.byteLength(ctx, "utf8"));
+  expect(rec.delivery).toBe(ctx.includes('kind="floor-rules"') ? "emitted" : "missing");
+  expect(rec.at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 }
 
 const count = (s: string, sub: string): number => s.split(sub).length - 1;
@@ -208,6 +250,55 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     roots.push(s.root);
     return s;
   }
+
+  it("Path 1 (foreign root): a cache stamped by ANOTHER checkout still delivers the workspace-global floor", async () => {
+    // The 2026-08-02 outage, end to end at the process boundary. One workspace id is bound by
+    // several `.meetless.json` markers; the last scan wins the workspace-global slot and stamps it
+    // with ITS root, so every other root's guarded read returns null and the assembler takes Row 5.
+    //
+    // Row 5 used to emit base + marker only, and the bash hook could not make up for it: the head
+    // below is a non-empty SUCCESS output, so the hook takes Path 1 and the `else` arm that appends
+    // FLOOR_RULES never runs. Every floor MUST was silently dropped for 8h11m. The floor is
+    // bundle-sourced and workspace-global, so the correct behavior is to lose ONLY the scoped rules.
+    const seed = normalCache();
+    seed.scanRootPath = path.join(os.tmpdir(), "some-other-checkout-that-does-not-exist");
+    const { root, home } = sandbox(seed);
+    const r = await runHook({
+      root,
+      home,
+      sessionId: "sess-foreign-root",
+      prompt: "please update apps/control/outbox.ts to guard the outbox invariants",
+    });
+
+    expect(r.status).toBe(0);
+    const ctx = r.additionalContext!;
+    // The floor MUST still reached the model.
+    expect(ctx).toContain(FLOOR_MUST_TEXT);
+    // The degradation is VISIBLE, and this marker is also the proof that the ASSEMBLER emitted this
+    // head (Path 1): the bash fallback has no marker to emit.
+    expect(ctx).toContain('kind="delivery-incomplete"');
+    // The scoped rule is correctly withheld: it was parsed from a checkout that is not this one.
+    expect(ctx).not.toContain(SCOPED_MUST_TEXT);
+    // Exactly one floor block: the assembler's. Nothing double-appended by the fallback.
+    expect(count(ctx, 'kind="floor-rules"')).toBe(1);
+
+    expect(r.audit).not.toBeNull();
+    expect(r.audit!.state).toBe("incomplete");
+    // No rule is claimed as delivered by identity: the floor rode as a pre-rendered block, and a
+    // block cannot say which versions are inside it. Honest under-claiming, not silence.
+    expect(r.audit!.delivered).toEqual([]);
+
+    // The delivery receipt SEES the degradation. This is the case the old cache-derived receipt
+    // could not tell apart from a healthy turn: same cache, same bundle, same floorRulesXml field,
+    // and the only difference is what actually reached the model. `scopedRules: 0` next to
+    // `floorRules: 1` is the whole finding, in one line, on the turn it happened.
+    expectReceiptMatchesContext(r);
+    expect(r.receipt!.path).toBe("assembler");
+    expect(r.receipt!.delivery).toBe("emitted");
+    expect(r.receipt!.degraded).toBe("delivery-incomplete");
+    expect(r.receipt!.floorRules).toBe(1);
+    expect(r.receipt!.scopedRules).toBe(0);
+  });
 
   it("Path 1 (normal): emits the byte-asserted floor + explicit-scoped head, nothing appended after", async () => {
     const { root, home } = sandbox(normalCache());
@@ -263,6 +354,18 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     // byte length equals the count the assembler asserted under SAFE_TOTAL. Any trailing rule block
     // would break this equality.
     expect(Buffer.byteLength(ctx, "utf8")).toBe(r.audit!.bytes);
+
+    // The healthy turn's receipt. Paired with the foreign-root case above, these two are the
+    // discrimination the whole fix exists for: 1/1 here, 1/0 there, from the same cache file.
+    expectReceiptMatchesContext(r);
+    expect(r.receipt!.path).toBe("assembler");
+    expect(r.receipt!.delivery).toBe("emitted");
+    expect(r.receipt!.floorRules).toBe(1);
+    expect(r.receipt!.scopedRules).toBe(1);
+    expect(r.receipt!.degraded).toBeUndefined();
+    expect(r.receipt!.reason).toBeUndefined();
+    // Derived from the emitted STRING, so it agrees with the assembler's independent byte assert.
+    expect(r.receipt!.bytes).toBe(r.audit!.bytes);
   });
 
   it("Path 1 (old-schema): a pre-activation cache still delivers the floor XML + a VISIBLE scoped-unavailable marker", async () => {
@@ -285,6 +388,13 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     expect(ctx).toContain(SCOPED_UNAVAILABLE_MARKER_TEXT); // degradation is VISIBLE, not silent
     expect(r.audit).not.toBeNull();
     expect(r.audit!.state).toBe("old-schema");
+
+    // The receipt names the OTHER degradation marker. Both §6 markers are distinguishable from
+    // each other and from healthy, which is what makes a detector over this file possible at all.
+    expectReceiptMatchesContext(r);
+    expect(r.receipt!.path).toBe("assembler");
+    expect(r.receipt!.degraded).toBe("scoped-unavailable");
+    expect(r.receipt!.scopedRules).toBe(0);
   });
 
   it("Path 2 (over-budget floor): the subcommand delivers a floor larger than SAFE_TOTAL whole, no fallback needed", async () => {
@@ -331,5 +441,51 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     expect(r.audit!.bytes).toBeGreaterThan(r.audit!.safeTotal);
     // No-append-after-assert: the delivered context is EXACTLY the byte-asserted head.
     expect(Buffer.byteLength(ctx, "utf8")).toBe(r.audit!.bytes);
+
+    // One giant floor rule is still ONE bullet, and the receipt's byte count is what makes the
+    // over-budget delivery legible after the fact.
+    expectReceiptMatchesContext(r);
+    expect(r.receipt!.floorRules).toBe(1);
+    expect(r.receipt!.bytes).toBeGreaterThan(SAFE_TOTAL);
+  });
+
+  it("receipt: a cache WITH floorRulesXml that delivers ZERO floor rules is reported as missing", async () => {
+    // The regression this fix exists to make visible, isolated. The cache carries a non-empty
+    // `floorRulesXml` (the exact field the retired `emit_floor_receipt` jq-read to decide
+    // `delivery: "emitted"`), but the assembler renders the floor from the STRUCTURED
+    // `floorRules`, which is empty here. So the model receives zero floor rules while the cache
+    // still advertises a floor.
+    //
+    // Old receipt: `{"delivery":"emitted", ...}` — indistinguishable from a healthy turn.
+    // New receipt: floorRules 0, delivery missing, reason floor_empty. Falsifiable.
+    const cache = normalCache();
+    cache.floorRules = [];
+    const { root, home } = sandbox(cache);
+    const r = await runHook({
+      root,
+      home,
+      sessionId: "sess-empty-floor",
+      prompt: "please update apps/control/outbox.ts to guard the outbox invariants",
+    });
+
+    expect(r.status).toBe(0);
+    const ctx = r.additionalContext!;
+    // Proof the premise holds: no floor reached the model, but the scoped rule did, so this is a
+    // real delivering turn rather than a hook that did nothing.
+    expect(ctx).not.toContain(FLOOR_MUST_TEXT);
+    expect(ctx).not.toContain('kind="floor-rules"');
+    expect(ctx).toContain(SCOPED_MUST_TEXT);
+    // And the cache the OLD receipt would have read still advertises a floor.
+    const seeded = JSON.parse(
+      fs.readFileSync(path.join(home, "workspaces", WS, "scan-cache.json"), "utf8"),
+    );
+    expect(seeded.floorRulesXml).toContain(FLOOR_XML_SENTINEL);
+
+    expectReceiptMatchesContext(r);
+    expect(r.receipt!.path).toBe("assembler");
+    expect(r.receipt!.delivery).toBe("missing");
+    expect(r.receipt!.reason).toBe("floor_empty");
+    expect(r.receipt!.floorRules).toBe(0);
+    expect(r.receipt!.scopedRules).toBe(1);
   });
 });

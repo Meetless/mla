@@ -17,6 +17,7 @@ import {
   classifyScope,
   normalizeCommand,
 } from "./command-event";
+import type { HandledFailure } from "./handled-failure";
 import { computeSequence } from "./sequence";
 import { machineId } from "./store";
 import {
@@ -45,6 +46,11 @@ export interface CaptureCommandParams {
   // their difference; both are injectable so tests are deterministic.
   startedAtMs: number;
   nowMs: number;
+  // The run's handled-failure declaration (analytics/handled-failure), read by cli.ts at
+  // finalize. Without it a handled non-zero exit reaches classifyOutcome as an unexplained
+  // exit code and records error_class null. Read at the call site (not here) so this
+  // function and buildCommandPayload stay pure and injectable.
+  handledFailure?: HandledFailure | null;
   // null when the run has no control config (e.g. `mla init` on a fresh box):
   // record locally, skip the remote forward.
   cfg: CliConfig | null;
@@ -65,6 +71,7 @@ export function buildCommandPayload(params: {
   startedAtMs: number;
   nowMs: number;
   sessionId: string | null;
+  handledFailure?: HandledFailure | null;
   env?: NodeJS.ProcessEnv;
 }): CommandPayload {
   const { command, subcommand, flags_shape } = normalizeCommand(params.argv);
@@ -72,6 +79,7 @@ export function buildCommandPayload(params: {
     params.exitCode,
     params.threw,
     params.thrown,
+    params.handledFailure,
   );
   const seq = computeSequence(params.sessionId, params.startedAtMs, params.env);
   const duration_ms = Math.max(0, params.nowMs - params.startedAtMs);
@@ -122,6 +130,7 @@ export async function captureCommandEvent(params: CaptureCommandParams): Promise
         startedAtMs: params.startedAtMs,
         nowMs: params.nowMs,
         sessionId: params.sessionId,
+        handledFailure: params.handledFailure,
         env,
       });
 

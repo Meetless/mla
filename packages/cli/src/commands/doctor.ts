@@ -47,6 +47,13 @@ import {
 import { NOTES_LOCATION_RULE_ID } from "../lib/rules/attest-notes-location";
 import { resolveActiveRuntimeScopeId } from "../lib/rules/runtime-scope";
 import { type RulePayloadV1 } from "../lib/rules/types";
+import {
+  readScanCache,
+  readDeliveryReceipt,
+  type PersistedDeliveryReceipt,
+} from "../lib/scanner/cache";
+import { type ScanResult } from "../lib/scanner/types";
+import { readScanCacheForRoot, resolveScanRootIdentity } from "./scan-context";
 import { defaultCe0StorePath } from "./evidence";
 import {
   detectPluginOwnership,
@@ -339,6 +346,158 @@ export function ruleBundleDoctorChecks(read: BundleCacheRead): Check[] {
     detail:
       `${"allowedRootAbsolutePath" in config ? config.allowedRootAbsolutePath : "unknown vault"}; ` +
       `${payload.enforcementCeiling} via rule ${noteVaultRule.ruleNodeId}; receipts: \`mla enforcement --json\``,
+  });
+  return checks;
+}
+
+/**
+ * What the RULE DELIVERY path actually did, as opposed to what the rule BUNDLE contains.
+ *
+ * These are two different artifacts and `mla doctor` only ever looked at the first one.
+ * `ruleBundleDoctorChecks` above validates `~/.meetless/rules/bundle-<ws>-<principal>-<proj>.json`
+ * and prints "revision N, M active rule(s)". The hook that puts rules in front of the model reads
+ * `~/.meetless/workspaces/<ws>/scan-cache.json`, keyed by the checkout it was scanned from. On
+ * 2026-08-02 three `mla activate` calls from throwaway directories re-stamped that cache with a
+ * foreign root; the hook correctly refused it and dropped every floor MUST for 8h11m, and doctor
+ * stayed green the entire time because the bundle it validates was never touched.
+ *
+ * So a green `rules.bundle` means "the rules exist". These two checks mean "the rules were
+ * DELIVERED, here, on the last turn". Pure and `now`-injected so the tests are deterministic.
+ */
+export interface RuleDeliveryProbe {
+  // The realpath of the checkout doctor is being run from (resolveScanRootIdentity(cwd)).
+  root: string;
+  // The cache the HOOK would read from this root, via readScanCacheForRoot: the per-root slot,
+  // else the workspace-global slot IF its stamp matches this root. Null means the hook gets
+  // nothing here and every turn from this directory falls back to the floor at best.
+  cacheForThisRoot: ScanResult | null;
+  // The workspace-global slot as-is, whoever stamped it. Only consulted to explain a null above:
+  // a cache stamped by ANOTHER root is the signature of the 08-02 failure and is worth naming.
+  globalCache: ScanResult | null;
+  // The last turn's delivery receipt, written by the bash hook. Null before any turn has run.
+  receipt: PersistedDeliveryReceipt | null;
+  now: Date;
+}
+
+function ageLabel(from: string | undefined, now: Date): string {
+  if (!from) return "unknown age";
+  const ms = now.getTime() - new Date(from).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return "unknown age";
+  const mins = Math.floor(ms / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  return hours < 48 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
+}
+
+export function ruleDeliveryDoctorChecks(probe: RuleDeliveryProbe): Check[] {
+  const checks: Check[] = [];
+  const { cacheForThisRoot: mine, globalCache, root, receipt } = probe;
+
+  if (mine) {
+    const floor = mine.floorRules?.length ?? 0;
+    const scoped = mine.scopedRules?.length ?? 0;
+    checks.push({
+      id: "rules.scan-cache",
+      // A cache that resolves but carries zero floor rules still delivers nothing, and that is
+      // exactly the state the old jq receipt could not distinguish from health, so it is not ok.
+      ok: floor > 0,
+      label:
+        floor > 0
+          ? "rule delivery cache resolves for this checkout"
+          : "rule delivery cache carries NO floor rules",
+      detail:
+        `${root}: ${floor} floor, ${scoped} scoped, scanned ${ageLabel(mine.generatedAt, probe.now)}` +
+        (floor > 0 ? "" : "; the hook will emit no floor block here, run `mla scan`"),
+    });
+  } else if (globalCache) {
+    // The 2026-08-02 signature, named explicitly so the operator does not have to reconstruct it.
+    const foreign = globalCache.scanRootPath ?? "an unstamped scan";
+    checks.push({
+      id: "rules.scan-cache",
+      ok: false,
+      label: "rule delivery cache belongs to a DIFFERENT checkout",
+      detail:
+        `this root ${root} has no cache; the workspace-global slot was stamped by ${foreign} ` +
+        `(${ageLabel(globalCache.generatedAt, probe.now)}). Scoped rules are unavailable here ` +
+        "until you run `mla scan` from this directory.",
+    });
+  } else {
+    checks.push({
+      id: "rules.scan-cache",
+      ok: true,
+      level: "info",
+      label: "no rule delivery cache yet",
+      detail: `nothing scanned for ${root}; run \`mla scan\``,
+    });
+  }
+
+  if (!receipt) {
+    checks.push({
+      id: "rules.last-delivery",
+      ok: true,
+      level: "info",
+      label: "no rule delivery recorded yet",
+      detail: "the hook writes hook-receipt.json on the next prompt in this workspace",
+    });
+    return checks;
+  }
+
+  // A receipt from the PREVIOUS hook build carries only {at, delivery, freshness, bundleId,
+  // bundleHash}: no path, no counts, no bytes. That `delivery` field was a constant derived from a
+  // jq read of the cache BEFORE the assembler ran, so it read "emitted" on the two turns that
+  // delivered nothing. Reading it as a delivery verdict reproduces the exact bug this check exists
+  // to kill, and formatting its absent fields prints "undefined floor, undefinedB". Refuse it by
+  // shape (this cost a live run to catch: doctor printed a green row full of `undefined`).
+  const legacy =
+    typeof receipt.path !== "string" ||
+    typeof receipt.floorRules !== "number" ||
+    typeof receipt.bytes !== "number";
+  if (legacy) {
+    checks.push({
+      id: "rules.last-delivery",
+      ok: true,
+      level: "info",
+      label: "last delivery receipt predates delivery accounting",
+      detail:
+        `written ${ageLabel(receipt.at, probe.now)} by an older hook, which recorded no counts; ` +
+        "run `mla wire` (or `mla plugin sync`) to install the current hook",
+    });
+    return checks;
+  }
+
+  const age = ageLabel(receipt.at, probe.now);
+  // `path: "none"` is the pull_only control arm deliberately injecting nothing. Grading it as a
+  // delivery failure would train the operator to ignore this row, so it reports as info.
+  if (receipt.path === "none") {
+    checks.push({
+      id: "rules.last-delivery",
+      ok: true,
+      level: "info",
+      label: "last turn injected nothing (by design)",
+      detail: `${age}; ${receipt.reason ?? "no_injection_this_turn"}`,
+    });
+    return checks;
+  }
+
+  const bits = [
+    `path ${receipt.path}`,
+    `${receipt.floorRules} floor`,
+    `${receipt.scopedRules} scoped`,
+    `${receipt.bytes}B`,
+    age,
+  ];
+  if (receipt.degraded) bits.push(`degraded: ${receipt.degraded}`);
+  if (receipt.reason) bits.push(receipt.reason);
+  checks.push({
+    id: "rules.last-delivery",
+    ok: receipt.delivery === "emitted" && !receipt.degraded,
+    label:
+      receipt.delivery === "emitted"
+        ? receipt.degraded
+          ? "last turn delivered rules, DEGRADED"
+          : "last turn delivered rules"
+        : "last turn delivered NO floor rules",
+    detail: bits.join(", "),
   });
   return checks;
 }
@@ -1001,6 +1160,18 @@ export async function runDoctor(argv: string[]): Promise<number> {
       ...ruleBundleDoctorChecks(
         readRuleBundleCache(resolveBundlePrincipal(markerWorkspaceId)),
       ),
+    );
+    // The bundle check above says the rules EXIST. This one says they were DELIVERED, from this
+    // checkout, on the last turn. Same reader the hook uses (readScanCacheForRoot), so a doctor
+    // green and a hook green are now statements about the same artifact.
+    checks.push(
+      ...ruleDeliveryDoctorChecks({
+        root: resolveScanRootIdentity(process.cwd()),
+        cacheForThisRoot: readScanCacheForRoot(undefined, markerWorkspaceId, process.cwd()),
+        globalCache: readScanCache(undefined, markerWorkspaceId),
+        receipt: readDeliveryReceipt(undefined, markerWorkspaceId),
+        now: new Date(),
+      }),
     );
   }
 

@@ -6,7 +6,7 @@ import { HOOKS_DIR } from "./config";
 import { isPackagedBinary } from "./packaged";
 import { BuildInfo, loadBuildInfo } from "./observability";
 import { DEFAULT_CONFLICT_GATE_MODE, type ConflictGateMode } from "./active-conflict-cache";
-import { SCOUT_NAMES, type ScoutName } from "./enrichment/protocol";
+import { DISPATCH_SCOUT_NAMES, type ScoutName } from "./enrichment/protocol";
 import { SCOUT_AGENT_NAME } from "./enrichment/scout-brief";
 import {
   LEGACY_SURFACE,
@@ -88,7 +88,7 @@ export interface WireResult {
   settingsPath: string;
   skillDir: string;
   // The /mla onboard orchestration skill dir + one read-only scout subagent file per
-  // role in SCOUT_NAMES. Refreshed on every wire (including --skill-only) since they
+  // DISPATCHED role. Refreshed on every wire (including --skill-only) since they
   // are skill content; never null (the umbrella always installs them).
   onboardSkillDir: string;
   scoutAgents: string[];
@@ -1211,15 +1211,21 @@ function installOnboardSkill(): string {
   return dir;
 }
 
-// Install one read-only scout subagent per SCOUT_NAMES role at ~/.claude/agents/<name>.md. Always
-// rewritten from buildScoutAgent so the `tools:` capability boundary (derived from
+// Install one read-only scout subagent per DISPATCHED role at ~/.claude/agents/<name>.md.
+// Always rewritten from buildScoutAgent so the `tools:` capability boundary (derived from
 // SCOUT_TOOL_ALLOWLIST in surface.ts) can never silently drift from the code. Returns
 // the file paths.
-function installScoutAgents(): string[] {
+//
+// The roster is DISPATCH_SCOUT_NAMES, not SCOUT_NAMES: installing an agent definition for a
+// retired role would leave a dispatchable scout on disk that no skill body mentions, which is
+// the one way a retirement could still cost tokens (a stale session, or a human, dispatching
+// it by name). Uninstall keeps using the FULL roster: it has to remove the file an older
+// version wrote. See SCOUT_AGENT_FILES in unwire.ts.
+export function installScoutAgents(roster: readonly ScoutName[] = DISPATCH_SCOUT_NAMES): string[] {
   const dir = path.join(userHomeDir(), ".claude", "agents");
   fs.mkdirSync(dir, { recursive: true });
   const written: string[] = [];
-  for (const role of SCOUT_NAMES) {
+  for (const role of roster) {
     const file = path.join(dir, `${SCOUT_AGENT_NAME[role]}.md`);
     fs.writeFileSync(file, buildScoutAgent(role), "utf8");
     written.push(file);

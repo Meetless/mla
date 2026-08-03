@@ -6,7 +6,8 @@
 //   3. Deep-link suppressed on flush failure with no intel echo.
 //   4. Deep-link printed when only intel echoed the trace id.
 //   5. Deep-link suppressed when tracing.enabled is false.
-//   6. argv redaction on root span attribute.
+//   6. argv REDUCTION on the root span attribute (was: redaction; see
+//      trace-argv-reduction.spec.ts for why a secret redactor was not enough).
 
 import {
   createRunTracer,
@@ -14,12 +15,11 @@ import {
   setRunTracer,
   resetRunTracerForTesting,
   maybePrintDeepLink,
-  redactArgvForSpan,
+  reduceArgvForSpan,
   loadBuildInfo,
   type WorkspaceConfigForTracing,
 } from "../../src/lib/observability";
 import { get as controlGet } from "../../src/lib/http";
-import { REDACTED } from "../../src/lib/redactor";
 import type { CliConfig } from "../../src/lib/config";
 
 function fakeCfg(): CliConfig {
@@ -245,13 +245,14 @@ describe("P2.T5: deep-link suppressed when tracing.enabled is false (tenant safe
   });
 });
 
-describe("P2.T6: argv redaction on root span attribute", () => {
-  it("strips known secret-shaped tokens out of every argv element, preserving low-entropy words", () => {
-    // Fixtures intentionally mirror the PARITY_CASES set in redactor-parity.spec.ts.
-    // If the redactor diverges from those, this test fails AT THE SAME TIME and
-    // the failure points back at the shared contract.
+describe("P2.T6: argv reduction on root span attribute", () => {
+  it("keeps the command and approved flag names, drops every value and positional", () => {
+    // The spec's must-test 6 was written as "argv redaction" and was satisfied
+    // by mapping argv through the secret redactor. That stripped the token on
+    // line 4 and nothing else, so the prose on the last line survived. The
+    // contract is now reduction: a token cannot leak because no VALUE is
+    // emitted at all, whatever its shape.
     const input = [
-      "mla",
       "init",
       "--control-token",
       "ghp_ABCDEFGHIJKLMNOPQRSTUVWX",
@@ -261,32 +262,32 @@ describe("P2.T6: argv redaction on root span attribute", () => {
       "the quick brown fox jumps over the lazy dog",
     ];
 
-    const out = redactArgvForSpan(input);
+    const out = reduceArgvForSpan(input);
 
-    // Token element is fully replaced with the redactor sentinel.
-    expect(out[3]).toBe(REDACTED);
-    // Structural shape preserved (length + positions).
-    expect(out).toHaveLength(input.length);
-    expect(out[0]).toBe("mla");
-    expect(out[1]).toBe("init");
-    expect(out[4]).toBe("--workspace-id");
-    expect(out[5]).toBe("ws_an_local");
-    // Low-entropy prose passes through untouched.
-    expect(out[7]).toBe("the quick brown fox jumps over the lazy dog");
+    expect(out.command).toBe("init");
+    expect(out.subcommand).toBeNull();
+    expect(out.flags).toEqual(["control-token", "note", "workspace-id"]);
+
+    const wire = JSON.stringify(out);
+    expect(wire).not.toContain("ghp_");
+    expect(wire).not.toContain("ws_an_local");
+    expect(wire).not.toContain("the quick brown fox");
   });
 
-  it("redacts env-style assignments and bearer headers passed as single argv strings", () => {
+  it("emits nothing at all for env-style assignments and inline bearer headers", () => {
+    // These used to be the interesting cases because the redactor had to find
+    // the secret inside a larger string. Now they are positionals, so they are
+    // dropped whole and the redactor is not in the path.
     const input = [
       "OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUv",
       'curl -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6IjEifQ.payload.sig" api',
     ];
 
-    const out = redactArgvForSpan(input);
+    const out = reduceArgvForSpan(input);
 
-    // The variable NAME survives (it is what makes the span readable); only the
-    // value goes. The header name survives for the same reason.
-    expect(out[0]).toBe(`OPENAI_API_KEY=${REDACTED}`);
-    expect(out[0]).not.toContain("sk-proj-");
-    expect(out[1]).toBe(`curl -H "Authorization: ${REDACTED}" api`);
+    expect(out).toEqual({ command: "unknown", subcommand: null, flags: [] });
+    const wire = JSON.stringify(out);
+    expect(wire).not.toContain("sk-proj-");
+    expect(wire).not.toContain("eyJhbGci");
   });
 });

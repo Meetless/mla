@@ -3,6 +3,10 @@ import * as path from "path";
 
 import { COMMANDS, dispatch } from "../../src/cli";
 import {
+  getHandledFailure,
+  resetHandledFailure,
+} from "../../src/lib/analytics/handled-failure";
+import {
   BEGIN_MARKER,
   END_MARKER,
   renderCommandIndex,
@@ -165,6 +169,32 @@ describe("dispatch: the registry is the dispatch table", () => {
       "onboard is an agent skill, not a CLI command; in your coding agent, run /mla onboard",
     );
     expect(resolveCommand(COMMANDS, "onboard")).toBeUndefined();
+  });
+
+  // The two dispatch-level dead ends are the CLI's single largest failing bucket in
+  // production (44 failed `command:"unknown"` rows, more than any real command), and
+  // both exit 2 WITHOUT throwing, so classifyOutcome sees a bare exit code and records
+  // error_class null. The reason is known right here at the return; declare it.
+  describe("the dispatch dead ends name themselves to analytics", () => {
+    beforeEach(() => resetHandledFailure());
+    afterEach(() => resetHandledFailure());
+
+    it("an unrecognized command declares unknown_command", async () => {
+      expect(await dispatch(["definitely-not-a-command"])).toBe(2);
+      expect(getHandledFailure()).toEqual({ error_class: "unknown_command" });
+    });
+
+    it("`onboard` declares its own class, so the skill confusion is countable", async () => {
+      // Distinct from a typo on purpose: this one measures how often someone reaches
+      // for `mla onboard` as a CLI command, which is a docs/naming signal, not an error.
+      expect(await dispatch(["onboard"])).toBe(2);
+      expect(getHandledFailure()).toEqual({ error_class: "onboard_is_a_skill" });
+    });
+
+    it("a run that resolves to a real command declares nothing", async () => {
+      expect(await dispatch(["help"])).toBe(0);
+      expect(getHandledFailure()).toBeNull();
+    });
   });
 
   it("`mla help <command>` narrows; an unknown command falls back to the full screen", async () => {

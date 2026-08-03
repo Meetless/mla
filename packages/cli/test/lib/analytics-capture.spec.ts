@@ -109,6 +109,28 @@ describe("captureCommandEvent", () => {
     expect(p.invoker).toBe("agent");
   });
 
+  it("threads a declared handled failure onto the recorded event (error_class is no longer null)", async () => {
+    // The whole point of the ambient: the class token is declared deep inside the command
+    // (failInMode, or the ingest exit-1 site), and cli.ts hands it to finalize. Without
+    // this thread the event carries outcome=user_error / error_class=null, which is what
+    // made every handled failure in prod undiagnosable.
+    await capture.captureCommandEvent(
+      baseParams({
+        argv: ["enrich", "ingest"],
+        exitCode: 1,
+        handledFailure: {
+          error_class: "scout_persistence_failed",
+          outcome: "system_error",
+          retryable: true,
+        },
+      }),
+    );
+    const ev = store.readEvents()[0] as unknown as Record<string, unknown>;
+    expect(ev.error_class).toBe("scout_persistence_failed");
+    expect(ev.outcome).toBe("system_error");
+    expect(ev.retryable).toBe(true);
+  });
+
   it("records an mla_command event locally", async () => {
     await capture.captureCommandEvent(baseParams());
     const events = store.readEvents();

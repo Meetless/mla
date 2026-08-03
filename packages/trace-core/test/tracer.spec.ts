@@ -97,16 +97,33 @@ describe("makeTracer (P1.1 / P1.T6)", () => {
     expect(out.output).toEqual({ ok: true });
   });
 
-  it("error attribute on a span is serialized into attributes.error", () => {
+  it("error attribute on a span is serialized into attributes.error, REDUCED", () => {
+    // This assertion used to read `expect(errAttr.message).toBe("boom")`, which
+    // is how the message reached the wire for as long as it did: a passing test
+    // vouching for the leak. `message` is prose written by whichever throw site
+    // fired, and this CLI interpolates raw argv into 133 of them, so the span
+    // carried the user's flags and paths verbatim. It is dropped now; what
+    // survives is what is OURS to say. See serializeError's comment in
+    // ../src/index.ts and the guards in the CLI's trace-error-reduction.spec.ts.
     const t = makeTracer({ traceId, rootName: "mla.cmd", client });
     const s = t.startSpan({ name: "intel.ask" });
-    s.end({ status: "error", error: new Error("boom") });
+    s.end({ status: "error", error: new Error("boom --acme-pilot /Users/an/prd.md") });
     const snap = t.snapshot();
     const out = snap.spans[0];
     expect(out.status).toBe("error");
-    const errAttr = out.attributes?.["error"] as { message: string; name?: string };
-    expect(errAttr.message).toBe("boom");
+    const errAttr = out.attributes?.["error"] as {
+      name: string;
+      message?: string;
+      stack?: string;
+      frames?: string[];
+    };
     expect(errAttr.name).toBe("Error");
+    expect(errAttr.message).toBeUndefined();
+    expect(errAttr.stack).toBeUndefined();
+    // Frames stay: "which code path failed" is the actual triage question.
+    expect(errAttr.frames?.every((f) => f.startsWith("at "))).toBe(true);
+    expect(JSON.stringify(snap)).not.toContain("--acme-pilot");
+    expect(JSON.stringify(snap)).not.toContain("prd.md");
   });
 });
 

@@ -22,6 +22,7 @@ import {
   normalizeExactSourceClaim,
   RECONCILIATION_FINDING_KIND,
   SCOUT_NAMES,
+  DISPATCH_SCOUT_NAMES,
   scoutCandidateCap,
   type CandidateValidationError,
   type EnrichmentCandidate,
@@ -138,11 +139,16 @@ export interface IngestResult {
   runId?: string;
   outcomes: ScoutIngestOutcome[];
   state?: OnboardingState;
+  // Candidate ids of the doc/code inconsistencies that landed NEWLY on this call (design §9).
+  // Returned rather than emitted here so the analytics append stays at the command boundary,
+  // where the session and run context live; this module keeps doing persistence only.
+  //
+  // `noop_unchanged` findings are deliberately excluded: that outcome means the governed
+  // document was already there, so counting it would restart the "time to first finding"
+  // clock every time a repository re-onboards and would inflate the share metrics with
+  // findings the operator has already seen.
+  newFindingIds?: string[];
 }
-
-// Iteration order for merge and rendering ONLY. Derived from SCOUT_NAMES so a role can never
-// exist without a slot. Allocation does NOT read this: see allocateScoutBudgets.
-const SCOUT_SLOTS: readonly ScoutName[] = SCOUT_NAMES;
 
 /**
  * Per-ROLE HARD cap, NO reallocation and NO shared pool (verdict item 8, revised).
@@ -207,6 +213,12 @@ function mergeAcceptedCandidates(
           sourceScouts: [],
           rationale: c.rationale ?? null,
           rationaleSource: c.rationaleSource ?? null,
+          // The payload IS the finding. It rides the merge for the same reason kind and statement
+          // do: nothing downstream can re-derive it. The scout process is gone by now, the results
+          // file was a temp file, and the KB stores rendered markdown. Drop it here and the record
+          // that reaches the sidecar is a finding that landed, was counted, and can never be
+          // answered, because `isFinding` and every reader after it gate on this field.
+          ...(c.inconsistency ? { inconsistency: c.inconsistency } : {}),
         };
         merged.set(key, m);
         evidenceSeen.set(key, new Set());
@@ -423,6 +435,15 @@ function isoFromEpochSeconds(raw: string): string | undefined {
  * teaches the reader that these findings are noise. Every unprovable branch below therefore
  * rejects this ONE candidate and lets the run continue. Zero findings beats a plausible one.
  */
+// Occurrences of `needle` in `haystack`, counting OVERLAPPING ones (advance by one, not by the
+// needle's length). A repeated rule is ambiguous however its copies overlap, and the stricter
+// count can only reject more.
+function countOccurrences(haystack: string, needle: string): number {
+  let count = 0;
+  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) count += 1;
+  return count;
+}
+
 function verifyInconsistency(
   candidate: EnrichmentCandidate,
   run: OnboardingRun,
@@ -453,8 +474,8 @@ function verifyInconsistency(
 
   // 1. The claimed change against the change the CLI prepared. The scout was SHOWN this line and
   // asked to copy it, so any difference is either a transcription error or an invention; neither
-  // is a finding. Compared field for field (DivergenceShapeGuard keeps the two shapes in lockstep
-  // so a new field cannot slip past this).
+  // is a finding. Compared field for field (DivergenceFileChange is a projection of the prepared
+  // shape, so a new field lands on both sides and cannot slip past this unnoticed).
   const prepared = run.historyEvidence.find((e) => e.commit.toLowerCase() === sha);
   const change = prepared?.changedFiles.find((f) => f.path === inc.divergence.path);
   if (!change) {
@@ -489,12 +510,24 @@ function verifyInconsistency(
     );
     return;
   }
-  const anchoredRange = normalizeExactSourceClaim(snapLines.slice(docAnchor.startLine - 1, docAnchor.endLine).join("\n"));
+  const windowText = (from: number, to: number): string =>
+    normalizeExactSourceClaim(snapLines.slice(from - 1, to).join("\n"));
+  const anchoredRange = windowText(docAnchor.startLine, docAnchor.endLine);
   const quote = normalizeExactSourceClaim(inc.claimText);
-  if (quote.length === 0 || !anchoredRange.includes(quote)) {
+  const hits = quote.length === 0 ? 0 : countOccurrences(anchoredRange, quote);
+  if (hits === 0) {
     push(
       "claim_not_in_document",
       `claimText is not a verbatim quote of ${docPath}#L${docAnchor.startLine}-L${docAnchor.endLine} at headCommit`,
+    );
+    return;
+  }
+  if (hits > 1) {
+    // Two occurrences are two candidate origins with two possible blames, and picking either
+    // asserts an ancestry the CLI cannot prove. A narrower anchor makes this finding provable.
+    push(
+      "ambiguous_claim_occurrence",
+      `claimText occurs ${hits} times in ${docPath}#L${docAnchor.startLine}-L${docAnchor.endLine}; anchor the one occurrence`,
     );
     return;
   }
@@ -503,11 +536,26 @@ function verifyInconsistency(
   // why what lands in the artifact is provably the document's own words.
   inc.claimText = quote;
 
+  // The MINIMAL line span still containing that one occurrence. A scout quoting one sentence
+  // routinely anchors the paragraph around it, and blaming the paragraph attributes the rule to
+  // whoever last touched any neighbouring line: one unrelated edit anywhere in the anchor makes
+  // the range span two commits and drops a provable finding as `ambiguous_claim_origin`. The
+  // walk is safe because the occurrence is unique: the set of start lines whose window still
+  // holds it is a prefix, so the last one that holds is where the quote begins.
+  let claimStart = docAnchor.startLine;
+  while (claimStart < docAnchor.endLine && windowText(claimStart + 1, docAnchor.endLine).includes(quote)) {
+    claimStart += 1;
+  }
+  let claimEnd = claimStart;
+  while (claimEnd < docAnchor.endLine && !windowText(claimStart, claimEnd).includes(quote)) {
+    claimEnd += 1;
+  }
+
   // 3. Ancestry. The doc-anchor commit is the one that last touched the quoted range; one blame
   // call yields both it and the attribution. Failure drops this finding, never the run.
-  const blamed = probe.blameRange(headCommit, docPath, docAnchor.startLine, docAnchor.endLine);
+  const blamed = probe.blameRange(headCommit, docPath, claimStart, claimEnd);
   if (!blamed || blamed.length === 0) {
-    push("blame_unavailable", `git could not blame ${docPath}#L${docAnchor.startLine}-L${docAnchor.endLine} at headCommit`);
+    push("blame_unavailable", `git could not blame ${docPath}#L${claimStart}-L${claimEnd} at headCommit`);
     return;
   }
   const distinct = [...new Set(blamed.map((l) => l.commit))];
@@ -517,7 +565,7 @@ function verifyInconsistency(
     // anchor (quote the one sentence) makes this finding provable; guessing does not.
     push(
       "ambiguous_claim_origin",
-      `the anchored range spans ${distinct.length} commits, so no single commit can be shown to predate the change`,
+      `${docPath}#L${claimStart}-L${claimEnd} spans ${distinct.length} commits, so no single commit can be shown to predate the change`,
     );
     return;
   }
@@ -820,8 +868,17 @@ export async function ingestRun(input: {
   now: string;
   probe?: FsProbe;
   gitRunner?: GitRunner;
+  // The ONBOARDING roster this run dispatched (defaults to the compile-time
+  // DISPATCH_SCOUT_NAMES). Not a runtime switch: nothing at run time can select it, the
+  // production call sites take the default, and the parameter exists so the retirement of
+  // a scout is testable against real run records BEFORE the constant is edited. Note the
+  // asymmetry that makes retirement safe: `scoutState` is still keyed by the full PARSE
+  // roster (SCOUT_NAMES), so a pre-retirement run's slots survive a reload untouched, but
+  // only roster members are runnable, budgeted, or counted toward completion.
+  dispatchRoster?: readonly ScoutName[];
 }): Promise<IngestResult> {
   const { env, request, persist, now } = input;
+  const dispatchRoster = input.dispatchRoster ?? DISPATCH_SCOUT_NAMES;
 
   const envelope = validateIngestRequestShape(request);
   if (!envelope.ok) return { ok: false, rejectionReason: envelope.error, outcomes: [] };
@@ -858,7 +915,9 @@ export async function ingestRun(input: {
   // independent per-ROLE cap (no reallocation, no shared pool, no order sensitivity); the cap
   // does NOT depend on what any scout actually sent, so a low-producing scout never frees
   // capacity for another and an appended role can never allocate zero.
-  const runnable = new Set<ScoutName>(SCOUT_NAMES.filter((s) => scoutState[s].status !== "complete"));
+  const runnable = new Set<ScoutName>(
+    dispatchRoster.filter((s) => scoutState[s].status !== "complete"),
+  );
   const budget = allocateScoutBudgets(runnable);
 
   // Phase 1: validate + cap each scout, but persist NOTHING yet. A scout that completed in a
@@ -891,6 +950,29 @@ export async function ingestRun(input: {
     }
     const result = shape.result;
     const scout = result.scout;
+
+    // A result for a role this run never dispatched. Reachable two ways: a stale agent
+    // still installed in someone's home dir, or a hand-rolled ingest envelope. Refuse it
+    // BEFORE any state read or budget lookup: the slot may not exist in the roster at all,
+    // and accepting it would spend a retired scout's cap and re-open a closed surface.
+    if (!dispatchRoster.includes(scout)) {
+      outcomes.push({
+        scout,
+        received: result.candidates.length,
+        accepted: 0,
+        rejected: 0,
+        persisted: 0,
+        deduped: 0,
+        errors: [
+          {
+            index: -1,
+            code: "scout_not_dispatched",
+            message: `the ${scout} scout was not dispatched by this run; its result is ignored`,
+          },
+        ],
+      });
+      continue;
+    }
 
     if (scoutState[scout].status === "complete") {
       outcomes.push({
@@ -1183,6 +1265,13 @@ export async function ingestRun(input: {
         rationaleSource: m.rationaleSource ?? null,
         relPath,
         landed,
+        // The verified payload, carried verbatim from the candidate this CLI proved: the
+        // normalized quote `verifyInconsistency` overwrote onto the wire string, the attribution
+        // it derived from blame over the minimal span, the parser-stamped `proposedRuleKind`, and
+        // the divergence. `mla enrich resolve` runs LATER, in another session, with only this
+        // sidecar to read; without the payload the three-way choice has nothing to offer and
+        // `isFinding` is false, so the finding is invisible to the very surface built to close it.
+        ...(m.inconsistency ? { inconsistency: m.inconsistency } : {}),
       });
     }
   }
@@ -1200,7 +1289,11 @@ export async function ingestRun(input: {
     });
   }
 
-  const allComplete = SCOUT_SLOTS.every((s) => scoutState[s].status === "complete");
+  // Completion is judged over the DISPATCHED roster, not every slot that exists. Judging it
+  // over SCOUT_NAMES would leave every post-retirement run "partial" forever (the retired
+  // slot can never reach "complete" because nothing dispatches it), which in turn disables
+  // the plan-digest reuse gate that only trusts a "complete" state.
+  const allComplete = dispatchRoster.every((s) => scoutState[s].status === "complete");
   const state: OnboardingState = {
     workspaceId: env.workspaceId,
     runId,
@@ -1215,7 +1308,13 @@ export async function ingestRun(input: {
   };
   writeState(env.home, state);
 
-  return { ok: true, runId, outcomes, state };
+  // The findings this call newly landed, in sidecar order. Filtered on `landed === "ingested"`
+  // (not merely "is a finding") so the §9 clock starts on the run that actually surfaced it.
+  const newFindingIds = records
+    .filter((r) => r.kind === RECONCILIATION_FINDING_KIND && r.landed === "ingested")
+    .map((r) => r.candidateId);
+
+  return { ok: true, runId, outcomes, state, newFindingIds };
 }
 
 // Attribute a MALFORMED envelope to a slot so it can be retried. Membership is tested against

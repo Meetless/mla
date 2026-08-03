@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { HOOKS_DIR } from "./config";
 import { isManagedHookCommand, MANAGED_HOOK_SCRIPTS, MCP_SERVER_KEY } from "./wire";
-import { SCOUT_NAMES } from "./enrichment/protocol";
+import { DISPATCH_SCOUT_NAMES, SCOUT_NAMES } from "./enrichment/protocol";
 import { SCOUT_AGENT_NAME } from "./enrichment/scout-brief";
 
 // Inverse primitives of lib/wire.ts. Pure-ish and best-effort: a step that
@@ -198,10 +198,23 @@ export function removeMeetlessMcp(claudeJsonPath: string): RemoveMcpResult {
 // Exported so plugin-migrate's inspectLegacyWiring enumerates the SAME set it removes.
 export const MANAGED_SKILL_DIRS = ["mla", "mla-onboard"] as const;
 
-// The legacy scout agent filenames the home-dir wiring installs under ~/.claude/agents.
-// Derived from SCOUT_AGENT_NAME so it cannot drift from what installScoutAgents wrote;
-// exported for the same reason as MANAGED_SKILL_DIRS.
+// Every legacy scout agent filename ANY version of the home-dir wiring has installed under
+// ~/.claude/agents. Derived from SCOUT_AGENT_NAME so it cannot drift from what
+// installScoutAgents wrote; exported for the same reason as MANAGED_SKILL_DIRS.
+//
+// This is the REMOVAL set, so it is deliberately the full protocol roster and not the
+// dispatch roster. Retiring a scout stops the installer from writing its file; it does not
+// remove the file an earlier install already wrote. Narrowing this to the dispatch roster
+// would strand that file on disk forever, still loadable by Claude Code, which is precisely
+// the leftover a retirement is supposed to eliminate.
 export const SCOUT_AGENT_FILES: readonly string[] = SCOUT_NAMES.map(
+  (role) => `${SCOUT_AGENT_NAME[role]}.md`,
+);
+
+// The subset THIS version installs. Used to judge whether a legacy home-dir install is
+// complete: measuring completeness against the removal superset would report every correctly
+// wired home as missing a file the installer intentionally no longer writes.
+export const INSTALLED_SCOUT_AGENT_FILES: readonly string[] = DISPATCH_SCOUT_NAMES.map(
   (role) => `${SCOUT_AGENT_NAME[role]}.md`,
 );
 

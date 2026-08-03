@@ -2,7 +2,7 @@
 # posttool-sweep.sh: the enforcement BACKSTOP (PostToolUse, catch-all).
 #
 # The PreToolUse gate blocks the writes it can SEE. This catches the ones it cannot.
-# It never looks at the tool name or its arguments — it asks only whether a file
+# It never looks at the tool name or its arguments; it asks only whether a file
 # appeared under a governed forbidden root, and if one did, removes it and tells the
 # agent why. That makes it immune to shell obfuscation the pre-tool parser would miss
 # (`python -c "open('notes/x','w')"`, base64, eval).
@@ -11,7 +11,7 @@
 # a hard block in one move: Write -> DENIED, then `cat > notes/design.md` -> succeeded.
 #
 # Fail open, always. No `set -e`. If mla is missing, slow, or prints nothing, this emits
-# the empty pass-through body and exits 0 — a broken sweep must never wedge a session.
+# the empty pass-through body and exits 0: a broken sweep must never wedge a session.
 source "$(dirname "$0")/common.sh"
 meetless_activated || exit 0
 

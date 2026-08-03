@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { resolveMeetlessHome } from "../config";
 import { ScanResult, Verdicts } from "./types";
@@ -36,6 +37,31 @@ function wsDir(home: string | undefined, workspaceId: string): string {
 export function scanCachePath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "scan-cache.json");
 }
+
+// PER-ROOT scan cache slots.
+//
+// One workspace id can be bound by SEVERAL `.meetless.json` markers: this dogfood workspace is
+// bound by three (the umbrella dir, `meetless/`, `intel/`). Every one of them scans into the SAME
+// workspace-keyed `scan-cache.json` above, so the file is last-writer-wins across roots, and the
+// reader-side guard (`readScanCacheForRoot`) then correctly refuses a cache stamped with another
+// root. Correct, and the net effect was that two of three roots delivered ZERO rules at any moment
+// and `mla scan` from any one of them inverted which two were dark (2026-07-28 and again
+// 2026-08-02, 8h11m exposure the second time).
+//
+// The fix is a slot per root, keyed by a hash of the resolved (realpath'd) scan root. The
+// workspace-keyed file above is still written unchanged, because it is workspace-GLOBAL content
+// that three shell readers in the hot-path hook consume directly with jq (`.floorRulesXml`,
+// `.floorMeta.*`) and because it remains the compatibility path for a cache written by an older
+// build. Repo-specific reads prefer the per-root slot.
+export function scanCacheRootKey(scanRootPath: string): string {
+  return createHash("sha256").update(scanRootPath).digest("hex").slice(0, 12);
+}
+export function scanCacheRootsDir(workspaceId: string, home?: string): string {
+  return join(wsDir(home, workspaceId), "roots");
+}
+export function scanCachePathForRoot(workspaceId: string, scanRootPath: string, home?: string): string {
+  return join(scanCacheRootsDir(workspaceId, home), `scan-cache-${scanCacheRootKey(scanRootPath)}.json`);
+}
 export function verdictsPath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "scanner-verdicts.json");
 }
@@ -57,6 +83,13 @@ export function reviewCardsPath(workspaceId: string, home?: string): string {
 export function assembleAuditPath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "assemble-audit.json");
 }
+// The hook's per-turn delivery receipt. The ONLY artifact written by the bash side
+// (hooks-template/user-prompt-submit.sh §emit_delivery_receipt), and the only one that covers the
+// paths where the assembler never runs: the bash fallback, the fail-closed block, and the
+// inject-nothing arm. TypeScript reads it and never writes it.
+export function deliveryReceiptPath(workspaceId: string, home?: string): string {
+  return join(wsDir(home, workspaceId), "hook-receipt.json");
+}
 
 function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -70,11 +103,70 @@ function readJson<T>(path: string): T | null {
   }
 }
 
+// How many per-root slots to keep. Real installs have one to three roots; the extra headroom is
+// for the throwaway directories that create these in the first place (three `mla activate` calls
+// from `live-handoff-test-000{1,2,3}` on 2026-08-02). Beyond the cap the oldest by mtime are
+// dropped: a pruned root falls back to the workspace-global slot, whose stamp check then refuses
+// it, which is a floor-only turn rather than a wrong-rules turn. Bounded, not clever.
+const MAX_ROOT_SLOTS = 8;
+
+function pruneRootSlots(workspaceId: string, home: string | undefined, keep: string): void {
+  try {
+    const dir = scanCacheRootsDir(workspaceId, home);
+    const entries = readdirSync(dir)
+      .filter((f) => f.startsWith("scan-cache-") && f.endsWith(".json"))
+      .map((f) => {
+        const path = join(dir, f);
+        let mtime = 0;
+        try {
+          mtime = statSync(path).mtimeMs;
+        } catch {
+          /* unreadable: sorts oldest, gets pruned first */
+        }
+        return { path, mtime };
+      })
+      .filter((e) => e.path !== keep)
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const stale of entries.slice(MAX_ROOT_SLOTS - 1)) {
+      try {
+        unlinkSync(stale.path);
+      } catch {
+        /* best effort */
+      }
+    }
+  } catch {
+    // No roots dir yet, or an unreadable one: nothing to prune.
+  }
+}
+
 export function writeScanCache(home: string | undefined, workspaceId: string, result: ScanResult): void {
+  // The workspace-global slot, unchanged. Three shell readers in the hot-path hook consume it
+  // directly, and its workspace-global content (floor XML, floor meta) is correct from any root.
   writeJson(scanCachePath(workspaceId, home), result);
+  // The per-root slot. Only written when the scan stamped its root; a result without one is a
+  // pre-stamp cache and has nothing to key by.
+  if (!result.scanRootPath) return;
+  try {
+    const path = scanCachePathForRoot(workspaceId, result.scanRootPath, home);
+    writeJson(path, result);
+    pruneRootSlots(workspaceId, home, path);
+  } catch {
+    // Best effort: the workspace-global slot above is already written, so a failure here degrades
+    // to exactly the pre-fix behavior rather than losing the scan.
+  }
 }
 export function readScanCache(home: string | undefined, workspaceId: string): ScanResult | null {
   return readJson<ScanResult>(scanCachePath(workspaceId, home));
+}
+// Read the slot belonging to ONE resolved scan root. Null when this root has never been scanned
+// by a build that writes per-root slots; the caller falls back to the workspace-global slot and
+// its stamp check.
+export function readScanCacheAtRoot(
+  home: string | undefined,
+  workspaceId: string,
+  scanRootPath: string,
+): ScanResult | null {
+  return readJson<ScanResult>(scanCachePathForRoot(workspaceId, scanRootPath, home));
 }
 
 // The persisted shape of a projection receipt. `projection` is the load-bearing field
@@ -154,6 +246,50 @@ export function writeAssembleAudit(
   } catch {
     // The audit is observability, never a gate: a failure here must not break delivery.
   }
+}
+
+// The per-turn DELIVERY receipt, written by the BASH hook (user-prompt-submit.sh
+// §emit_delivery_receipt) and read here. It is the only artifact that records what the hook
+// actually put in front of the model on the last turn: which emission path won, how many floor and
+// scoped rule bullets rode along, how many bytes, and which degradation marker (if any) was
+// present. Latest-state, overwritten every turn.
+//
+// It is deliberately derived from the emitted STRING rather than from the assemble audit above:
+// the audit records what the ASSEMBLER decided, and on the bash fallback path the assembler does
+// not run at all. Between 2026-08-02T07:38Z and 15:49Z the assembler emitted a non-empty head
+// carrying ZERO floor rules on two turns while every other signal read healthy; `floorRules` is
+// the field that would have said so.
+//
+// TypeScript never writes this file. The reader tolerates a missing or malformed one (no turn has
+// run yet under this workspace, or an older hook build) by returning null.
+export interface PersistedDeliveryReceipt {
+  at: string;
+  // Which arm of the hook's emission fork ran. "assembler" = the byte-asserted head from
+  // `mla _internal assemble-context`; "fallback" = bash's LAYER1 + pre-rendered floor XML;
+  // "blocked" = the fail-closed rc==3 path that exits 2 and shows the model nothing;
+  // "none" = an inject-nothing turn (the pull_only control arm).
+  path: "assembler" | "fallback" | "blocked" | "none";
+  // Whether a floor-rules block reached the model at all. Kept as the original field name so a
+  // receipt written before and after the rewrite compares cleanly.
+  delivery: "emitted" | "missing";
+  floorRules: number;
+  scopedRules: number;
+  bytes: number;
+  cwd: string;
+  freshness: string;
+  bundleId: string;
+  // The §6 degradation marker present in the emitted head, in severity order:
+  // "delivery-incomplete" (no cache for THIS root) beats "scoped-unavailable" (matching failed).
+  degraded?: "delivery-incomplete" | "scoped-unavailable";
+  // Why the floor is missing, when it is. Absent on a delivering turn.
+  reason?: string;
+  bundleHash?: string;
+}
+export function readDeliveryReceipt(
+  home: string | undefined,
+  workspaceId: string,
+): PersistedDeliveryReceipt | null {
+  return readJson<PersistedDeliveryReceipt>(deliveryReceiptPath(workspaceId, home));
 }
 
 const EMPTY_VERDICTS: Verdicts = { schemaVersion: 1, accepted: [], dismissed: [] };

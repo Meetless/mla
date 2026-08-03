@@ -28,6 +28,25 @@ import { printWireResult, resolveMlaPath, runWire } from "../lib/wire";
 //   - Always idempotent; safe to run any number of times.
 //
 // For "the binary upgraded, refresh hooks only" use `mla rewire` instead.
+
+/**
+ * The first-run telemetry disclosure, printed once at the end of `mla init`.
+ *
+ * Exported so a test can hold it to the wire it describes. It is the only
+ * consent moment most users get: they read this line, not TELEMETRY.md, and
+ * almost never twice. That makes it the sentence most worth pinning, and it is
+ * exactly the sentence that drifted (it used to promise "never paths", which
+ * the governance-deny tile does not keep).
+ *
+ * See `privacy-copy-matches-wire.spec.ts` for what "matches the wire" means
+ * here, and `analytics-deny-evidence-boundary.spec.ts` for the behavior itself.
+ */
+export const TELEMETRY_DISCLOSURE =
+  "Telemetry: crash reporting OFF (no Sentry DSN); run traces go only to " +
+  "your configured control. Product-health analytics is ON by default " +
+  "(ids/counts/enums, never prompts/argv/content; a governance deny also " +
+  "carries your own rule's text and the repo-relative path it blocked, to " +
+  "your control only). Opt out with MEETLESS_TELEMETRY=off. See TELEMETRY.md.";
 // It takes no token and never touches credentials.
 //
 // Folder = workspace (T3.1): `mla init` is machine setup only (creds + hooks).
@@ -290,16 +309,17 @@ export async function runInit(argv: string[]): Promise<number> {
   // every invocation (a per-run notice would pollute scriptable output). Crash
   // reporting is OFF unless a Sentry DSN is configured; run traces, when a
   // backend enables them, go ONLY to the control URL above (your own server).
-  // Product-health analytics is ON by default but ids/counts/enums only (never
-  // your prompts, paths, argv, or file contents) and is sent to your configured
-  // control, not directly to Meetless. Opt out of everything with
+  // Product-health analytics is ON by default, ids/counts/enums (never your
+  // prompts, argv, or file contents), and is sent to your configured control,
+  // not directly to Meetless. It has exactly one content-bearing exception and
+  // this line names it, because this is the only consent moment the user gets:
+  // a governance deny carries YOUR rule's text and the repo-relative path it
+  // blocked, so your review queue can adjudicate the block. Both stop at your
+  // control (dropped before the onward mirror by the fail-closed key allowlist,
+  // INV-POSTHOG-PII-1). Saying "never paths" here, as this line used to, would
+  // be a promise the deny tile does not keep. Opt out of everything with
   // MEETLESS_TELEMETRY=off.
-  console.log(
-    "Telemetry: crash reporting OFF (no Sentry DSN); run traces go only to " +
-      "your configured control. Product-health analytics is ON by default " +
-      "(ids/counts/enums only, never prompts/paths/content). Opt out with " +
-      "MEETLESS_TELEMETRY=off. See TELEMETRY.md.",
-  );
+  console.log(TELEMETRY_DISCLOSURE);
   // A logged-out machine's next step is the browser login; a headless shared-key
   // install goes straight to doctor.
   console.log(`Next: ${authMode === "none" ? "mla login" : "mla doctor"}`);

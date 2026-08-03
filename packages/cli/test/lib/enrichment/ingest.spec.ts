@@ -24,6 +24,8 @@ import {
   SCOUT_NAMES,
   candidateId,
   candidateRelPath,
+  FINDING_PROPOSED_RULE_KIND,
+  type DocCodeInconsistency,
   type DocumentationTarget,
   type EnrichmentCandidate,
   type EnrichmentLimits,
@@ -38,6 +40,10 @@ const NOW = "2026-06-26T12:00:00.000Z";
 const ALLOWED_SHA = "a".repeat(40);
 const HEAD_SHA = "b".repeat(40); // the run's snapshot: every quote and blame is read AS OF this
 const CLAIM_SHA = "c".repeat(40); // the commit that wrote the rule; a proven ancestor of ALLOWED_SHA
+// Attribution is passed through verbatim, so the fixture only needs A name, never a real one.
+// Keep it synthetic: this tree is exported to a public mirror whose scrub gate refuses any
+// operator identity, and a real name here blocks that export (it blocked 0.2.31's).
+const CLAIM_AUTHOR = "Test Author";
 
 // The document the fake probe serves at HEAD_SHA. Reconciliation fixtures quote it BY LINE, so
 // a claim is "verbatim" in these tests only because it really was copied from here; a fixture
@@ -72,7 +78,7 @@ function makeProbe(over: Partial<FsProbe> = {}): FsProbe {
     readFileAtCommit:
       over.readFileAtCommit ?? ((_commit, relPath) => (relPath === RECON_DOC ? RECON_DOC_LINES.join("\n") : null)),
     blameRange:
-      over.blameRange ?? (() => [{ commit: CLAIM_SHA, authorName: "Test Author", authorTime: "1750000000" }]),
+      over.blameRange ?? (() => [{ commit: CLAIM_SHA, authorName: CLAIM_AUTHOR, authorTime: "1750000000" }]),
     isAncestor: over.isAncestor ?? (() => true),
   };
 }
@@ -131,13 +137,17 @@ const reconCandidate = (over: Partial<EnrichmentCandidate> = {}, n = 1): Enrichm
     { type: "commit", commit: "aaaaaaa" }, // unambiguous prefix of ALLOWED_SHA
   ],
   sourceScout: "reconciliation",
+  // Exactly what a scout may send. `proposedRuleKind` and `attribution` are stamped by the CLI
+  // and are unknown fields on the wire, so the fixture omits them and casts: a fixture that
+  // carried them would be testing a payload no scout is allowed to produce.
   inconsistency: {
+    // The scope is the path the QUOTE names, not the directory around it: a scope the document
+    // does not write out is a broadening the CLI cannot verify (`claim_scope_not_in_quote`).
     claimClass: "never_modify",
     claimText: reconClaim(n),
-    claimScope: "src/generated/",
-    proposedRuleKind: "constraint",
+    claimScope: `src/generated/file-${n}.ts`,
     divergence: { path: `src/generated/file-${n}.ts`, status: "M" },
-  },
+  } as DocCodeInconsistency,
   ...over,
 });
 
@@ -1331,6 +1341,47 @@ describe("renderCandidateDocument", () => {
     const md = renderCandidateDocument(asMerged(docCandidate()));
     expect(md).not.toContain("## Rationale");
   });
+
+  // CROSS-PACKAGE CONTRACT. The console renders a finding card by PARSING this artifact back
+  // out of the governed KB (apps/console/app/kb/[id]/onboarding-candidate.ts), because a
+  // finding's structured payload and its verdict live only in a per-machine sidecar and the
+  // card is not allowed to add a second store or a second way to close a finding. That parser
+  // fails closed on any deviation, so a silent change here does not corrupt the card, it makes
+  // the card VANISH. This test is the tripwire: it pins the exact byte layout the parser keys
+  // on. If it fails, fix the parser and its fixture in the same change, or bump
+  // CANDIDATE_DOC_SCHEMA_VERSION so the parser refuses the new layout on purpose.
+  it("emits the EXACT frontmatter block and body skeleton the console parser reads back", () => {
+    const c = asMerged(reconCandidate());
+    const lines = renderCandidateDocument(c).split("\n");
+
+    // Six flat `key: value` lines between two fences, in this order, with nothing else.
+    expect(lines.slice(0, 8)).toEqual([
+      "---",
+      "mlaGenerated: onboarding-candidate",
+      "schemaVersion: 1",
+      `candidateId: ${candidateId(c)}`,
+      "kind: doc_code_inconsistency",
+      "sourceScouts: [reconciliation]",
+      "reviewHint: provisional",
+      "---",
+    ]);
+    // The parser matches the id as 64 lowercase hex and shows its first 12 as the `--finding`
+    // prefix; anything else and the card's copyable command points at nothing.
+    expect(candidateId(c)).toMatch(/^[0-9a-f]{64}$/);
+
+    // Body skeleton: blank, heading, blank, statement, blank, the sentinel that bounds it.
+    expect(lines[8]).toBe("");
+    expect(lines[9]).toBe("# Candidate");
+    expect(lines[10]).toBe("");
+    expect(lines[11]).toBe(c.statement);
+    expect(lines[12]).toBe("");
+    expect(lines[13]).toBe("Surfaced by the reconciliation scout (onboarding enrichment, advisory).");
+
+    // Evidence bullets: `- ` prefixed, under a bare `## Evidence` heading.
+    const evidenceAt = lines.indexOf("## Evidence");
+    expect(evidenceAt).toBeGreaterThan(13);
+    expect(lines[evidenceAt + 1].startsWith("- ")).toBe(true);
+  });
 });
 
 describe("verifyCandidate (unit)", () => {
@@ -1391,7 +1442,7 @@ describe("verifyCandidate: doc_code_inconsistency (historical proof)", () => {
       },
       blameRange: (commit, relPath, s, e) => {
         seen.push(["blame", commit, relPath, String(s), String(e)]);
-        return [{ commit: CLAIM_SHA, authorName: "Test Author", authorTime: "1750000000" }];
+        return [{ commit: CLAIM_SHA, authorName: CLAIM_AUTHOR, authorTime: "1750000000" }];
       },
       isAncestor: (a, b) => {
         seen.push(["ancestor", a, b]);
@@ -1507,6 +1558,49 @@ describe("verifyCandidate: doc_code_inconsistency (historical proof)", () => {
     expect(cand.inconsistency!.claimText).toBe(reconClaim(1));
   });
 
+  it("blames the MINIMAL span containing the quote, not the whole anchored range", () => {
+    // A generous anchor is the normal case: a scout quotes one sentence and anchors the
+    // paragraph around it. Blaming the paragraph attributes the rule to whoever last touched
+    // any neighbouring line, and one unrelated edit anywhere in it makes the range span two
+    // commits, which drops a provable finding as `ambiguous_claim_origin`.
+    const seen: number[][] = [];
+    const probe = makeProbe({
+      blameRange: (_c, _p, s, e) => {
+        seen.push([s, e]);
+        return [{ commit: CLAIM_SHA, authorName: CLAIM_AUTHOR, authorTime: "1750000000" }];
+      },
+    });
+    const wideAnchor = reconCandidate(
+      {
+        evidence: [
+          { type: "file", path: RECON_DOC, startLine: 1, endLine: 5 },
+          { type: "commit", commit: "aaaaaaa" },
+        ],
+      },
+      3,
+    );
+    expect(codes(wideAnchor, probe)).toEqual([]);
+    expect(seen).toEqual([[3, 3]]);
+  });
+
+  it("rejects a quote that occurs more than once in the anchored range", () => {
+    // Two occurrences means two candidate origins, and picking either one asserts an ancestry
+    // the CLI cannot prove. A narrower anchor makes this finding provable; a guess does not.
+    const repeated = makeProbe({
+      readFileAtCommit: () => [reconClaim(1), reconClaim(2), reconClaim(1), reconClaim(4), reconClaim(5)].join("\n"),
+    });
+    const wideAnchor = reconCandidate(
+      {
+        evidence: [
+          { type: "file", path: RECON_DOC, startLine: 1, endLine: 5 },
+          { type: "commit", commit: "aaaaaaa" },
+        ],
+      },
+      1,
+    );
+    expect(codes(wideAnchor, repeated)).toEqual(["ambiguous_claim_occurrence"]);
+  });
+
   it("rejects when git cannot blame the anchored range", () => {
     expect(codes(reconCandidate(), makeProbe({ blameRange: () => null }))).toEqual(["blame_unavailable"]);
   });
@@ -1544,7 +1638,7 @@ describe("verifyCandidate: doc_code_inconsistency (historical proof)", () => {
     expect(codes(cand)).toEqual([]);
     expect(cand.inconsistency!.attribution).toEqual({
       commit: CLAIM_SHA,
-      authorName: "Test Author",
+      authorName: CLAIM_AUTHOR,
       authorTime: "2025-06-15T15:06:40.000Z",
     });
 
@@ -1700,6 +1794,164 @@ describe("ingestRun writes the candidates sidecar", () => {
     expect(loaded?.candidates[0].kind).toBe("constraint");
     expect(loaded?.candidates[0].statement).toBe("Use 127.0.0.1 not localhost on macOS.");
     expect(loaded?.repositoryRoot).toBe("/repo");
+  });
+});
+
+// Design §9: the metric plane needs to know WHICH findings newly landed on this call, and it has
+// to learn it from the ingest itself. The command boundary emits one analytics row per id in this
+// array, so what is in it decides whether "time to first finding" and the share metrics measure
+// onboarding or measure how often somebody re-ran a command.
+describe("ingestRun reports the findings that newly landed (design §9)", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "mla-ingest-newfindings-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const reconResults = (candidates: unknown[]) => [
+    { scout: "reconciliation", status: "complete", candidates },
+  ];
+
+  it("returns the candidate id of each finding whose document was newly ingested", async () => {
+    seedRun(home);
+    const first = reconCandidate({}, 1);
+    const second = reconCandidate({}, 2);
+    const res = await ingestRun(ingestArgs(home, "run-1", reconResults([first, second])));
+    expect(res.ok).toBe(true);
+    expect(res.newFindingIds).toHaveLength(2);
+    // Asserted against the SIDECAR's ids, not against candidateId() re-run on the fixtures. The
+    // ids must join to the records `mla enrich resolve` reads, and the CLI expands the short
+    // commit prefix a scout may send before it hashes, so a fixture-side recomputation would
+    // "pass" while producing an id that resolves to nothing.
+    const sidecar = loadCandidatesSidecar(home, "ws_1", "run-1")!;
+    const findingIds = sidecar.candidates
+      .filter((c) => c.kind === "doc_code_inconsistency")
+      .map((c) => c.candidateId);
+    expect(new Set(res.newFindingIds)).toEqual(new Set(findingIds));
+  });
+
+  it("returns NOTHING for a re-onboard the server deduped (noop_unchanged)", async () => {
+    // The single most damaging way to get this wrong. A repository that re-onboards would
+    // restart the time-to-first-finding clock and re-count toward the share metrics every time,
+    // so a feature nobody adopted would read as one being discovered over and over.
+    seedRun(home);
+    const deduping: Persister = jest.fn(async (docs) => ({
+      docs: docs.map((d) => ({ relPath: d.relPath, outcome: "noop_unchanged" as const })),
+    }));
+    const res = await ingestRun({
+      env: { home, workspaceId: "ws_1", repositoryRoot: "/repo" },
+      request: { protocolVersion: 1, runId: "run-1", results: reconResults([reconCandidate()]) },
+      persist: deduping,
+      now: NOW,
+      probe: makeProbe(),
+    });
+    // It still landed (persisted counts it), it just was not NEW.
+    expect(res.outcomes.find((o) => o.scout === "reconciliation")!.persisted).toBe(1);
+    expect(res.newFindingIds).toEqual([]);
+  });
+
+  it("returns NOTHING for a document the server failed to persist", async () => {
+    seedRun(home);
+    const failing: Persister = jest.fn(async (docs) => ({
+      docs: docs.map((d) => ({ relPath: d.relPath, outcome: "failed" as const })),
+    }));
+    const res = await ingestRun({
+      env: { home, workspaceId: "ws_1", repositoryRoot: "/repo" },
+      request: { protocolVersion: 1, runId: "run-1", results: reconResults([reconCandidate()]) },
+      persist: failing,
+      now: NOW,
+      probe: makeProbe(),
+    });
+    expect(res.newFindingIds).toEqual([]);
+  });
+
+  it("counts ONLY findings, never the conventions and decisions the other scouts land", async () => {
+    // The §9 metrics are about the drift-finding feature. A run that lands twelve conventions and
+    // zero findings must read as zero findings, not as a productive onboarding.
+    seedRun(home);
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [
+        { scout: "documentation", status: "complete", candidates: [docCandidate()] },
+        { scout: "history", status: "complete", candidates: [histCandidate()] },
+      ]),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(1);
+    expect(res.newFindingIds).toEqual([]);
+  });
+});
+
+// The sidecar is the ONLY place a finding survives its own ingest. Nothing re-derives it: the
+// scout is gone, the results file was a temp file, and the KB holds rendered markdown. So a
+// record written without its `inconsistency` is a finding that landed, counted, printed a
+// candidate id, and then became permanently unanswerable, because every reader downstream
+// (`isFinding`, the ingest summary, `mla enrich resolve`, findingToRuleCandidate) gates on the
+// presence of that field. This is exactly what a live run of the built binary did: 1 persisted,
+// "No inconsistencies...", and a review surface that reported zero.
+describe("the sidecar carries the finding the CLI verified", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "mla-ingest-sidecar-inc-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const reconResults = (candidates: unknown[]) => [
+    { scout: "reconciliation", status: "complete", candidates },
+  ];
+
+  async function ingestOne(): Promise<OnboardingCandidateRecord> {
+    seedRun(home);
+    const res = await ingestRun(ingestArgs(home, "run-1", reconResults([reconCandidate()])));
+    expect(res.ok).toBe(true);
+    const sidecar = loadCandidatesSidecar(home, "ws_1", "run-1")!;
+    const finding = sidecar.candidates.find((c) => c.kind === "doc_code_inconsistency");
+    expect(finding).toBeDefined();
+    return finding!;
+  }
+
+  it("persists the inconsistency, so the finding is still answerable in a later session", async () => {
+    const finding = await ingestOne();
+    expect(finding.inconsistency).toBeDefined();
+    expect(finding.inconsistency!.claimClass).toBe("never_modify");
+    expect(finding.inconsistency!.claimScope).toBe("src/generated/file-1.ts");
+    expect(finding.inconsistency!.divergence).toEqual({ path: "src/generated/file-1.ts", status: "M" });
+  });
+
+  it("persists the CLI-stamped proposedRuleKind, not whatever a scout wished for", async () => {
+    // The scout cannot send this field at all (unknown-field reject). If the record loses it, a
+    // `code_diverged` resolution has no durable kind to mint under.
+    const finding = await ingestOne();
+    expect(finding.inconsistency!.proposedRuleKind).toBe(FINDING_PROPOSED_RULE_KIND);
+  });
+
+  it("persists the attribution ingest derived from blame, so the card can say who last changed it", async () => {
+    const finding = await ingestOne();
+    expect(finding.inconsistency!.attribution).toBeDefined();
+    expect(finding.inconsistency!.attribution!.commit).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it("persists the VERIFIED quote, not the model's string", async () => {
+    // verifyInconsistency overwrites claimText with the normalized text it proved is in the
+    // document. A record that kept the wire string would mint a rule the CLI never verified.
+    const finding = await ingestOne();
+    expect(finding.inconsistency!.claimText).toBe(reconClaim(1));
+  });
+
+  it("leaves a non-finding candidate WITHOUT an inconsistency", async () => {
+    // The field is present iff the kind is a finding, enforced both directions. A convention
+    // carrying one would make isFinding true for something that answers no question.
+    seedRun(home);
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [{ scout: "documentation", status: "complete", candidates: [docCandidate()] }]),
+    );
+    expect(res.ok).toBe(true);
+    const sidecar = loadCandidatesSidecar(home, "ws_1", "run-1")!;
+    expect(sidecar.candidates).toHaveLength(1);
+    expect(sidecar.candidates[0].inconsistency).toBeUndefined();
   });
 });
 

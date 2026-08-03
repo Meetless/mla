@@ -20,6 +20,8 @@ import {
   MAX_CANDIDATES_TOTAL,
   SCOUT_NAMES,
   scoutCandidateCap,
+  statusProvesClaimViolation,
+  FINDING_PROPOSED_RULE_KIND,
   type EnrichmentCandidate,
   type OnboardingRun,
 } from "../../../src/lib/enrichment/protocol";
@@ -457,6 +459,129 @@ describe("validateCandidateShape", () => {
     const res = validateCandidateShape({ kind: "bad", statement: "", sourceScout: "bad", evidence: [] }, 0);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.errors.length).toBeGreaterThan(1);
+  });
+});
+
+// `claimClass` and `claimScope` are the scout's ASSERTIONS about a quote. The quote is the only
+// part of a finding the CLI can prove against the repository, so both assertions have to be
+// readable OUT of that quote or they are unfalsifiable model output riding a verified string.
+describe("validateCandidateShape: claimClass and claimScope are untrusted", () => {
+  const QUOTE = "src/generated/api.ts is generated and must never be edited by hand.";
+  const wireFinding = (inc: Record<string, unknown> = {}): unknown => ({
+    kind: "doc_code_inconsistency",
+    statement: "CLAUDE.md forbids editing this file, but a commit edited it.",
+    sourceScout: "reconciliation",
+    evidence: [
+      { type: "file", path: "CLAUDE.md", startLine: 12, endLine: 12 },
+      { type: "commit", commit: "abcdef1234567890" },
+    ],
+    inconsistency: {
+      claimClass: "never_modify",
+      claimText: QUOTE,
+      claimScope: "src/generated/api.ts",
+      divergence: { path: "src/generated/api.ts", status: "M" },
+      ...inc,
+    },
+  });
+  const codes = (raw: unknown): string[] => {
+    const res = validateCandidateShape(raw, 0);
+    return res.ok ? [] : res.errors.map((e) => e.code);
+  };
+
+  it("accepts a finding whose quote states the class and names the scope", () => {
+    expect(codes(wireFinding())).toEqual([]);
+  });
+
+  it("rejects a quote that prohibits nothing", () => {
+    // "is generated" is a description. A finding built on it reports a governance violation
+    // against a document that never governed anything.
+    expect(codes(wireFinding({ claimText: "src/generated/api.ts is generated from the OpenAPI spec." }))).toEqual([
+      "claim_class_not_stated",
+    ]);
+  });
+
+  it("rejects a prohibition that belongs to a DIFFERENT class than the one claimed", () => {
+    // The status letter proves SOME change happened; only the document can say which change it
+    // forbade. A delete prohibition read as a modify prohibition is a fabricated rule.
+    expect(
+      codes(wireFinding({ claimText: "src/generated/api.ts is generated and must never be deleted." })),
+    ).toEqual(["claim_class_not_stated"]);
+  });
+
+  it("accepts each claim class only under its own prohibition phrase", () => {
+    expect(codes(wireFinding({
+      claimClass: "never_add",
+      claimText: "src/legacy/shim.ts was removed and must never be added back.",
+      claimScope: "src/legacy/shim.ts",
+      divergence: { path: "src/legacy/shim.ts", status: "A" },
+    }))).toEqual([]);
+    expect(codes(wireFinding({
+      claimClass: "never_delete",
+      claimText: "docs/CHANGELOG.md must never be deleted.",
+      claimScope: "docs/CHANGELOG.md",
+      divergence: { path: "docs/CHANGELOG.md", status: "D" },
+    }))).toEqual([]);
+    expect(codes(wireFinding({
+      claimClass: "never_rename",
+      claimText: "src/generated/api.ts must never be moved or renamed.",
+      divergence: { path: "src/new/api.ts", status: "R100", renamedFrom: "src/generated/api.ts" },
+    }))).toEqual([]);
+  });
+
+  it("rejects a scope broadened past what the quote names", () => {
+    // The quote governs ONE file. A directory scope silently converts it into a rule about
+    // every neighbour, and every neighbour's commit then reads as a violation.
+    expect(codes(wireFinding({ claimScope: "src/generated/" }))).toEqual(["claim_scope_not_in_quote"]);
+    expect(codes(wireFinding({ claimScope: "src/" }))).toEqual(["claim_scope_not_in_quote"]);
+  });
+
+  it("rejects a scope the quote never mentions", () => {
+    expect(codes(wireFinding({ claimScope: "src/other/thing.ts" }))).toEqual([
+      "claim_scope_not_in_quote",
+      "divergence_outside_claim_scope",
+    ]);
+  });
+
+  it("accepts a directory scope the quote writes out literally", () => {
+    expect(codes(wireFinding({
+      claimText: "Everything under src/generated/ is generated and must never be edited by hand.",
+      claimScope: "src/generated/",
+    }))).toEqual([]);
+  });
+
+  it("derives proposedRuleKind in trusted code and rejects one sent over the wire", () => {
+    expect(codes(wireFinding({ proposedRuleKind: "convention" }))).toEqual(["unknown_field"]);
+    const res = validateCandidateShape(wireFinding(), 0);
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.candidate.inconsistency!.proposedRuleKind).toBe(FINDING_PROPOSED_RULE_KIND);
+  });
+
+  it("rejects a copy for a never_rename claim: a copy leaves the governed path where it was", () => {
+    // `C` adds a SECOND file and does not touch the original, so nothing the document named
+    // was renamed. Prohibiting copies is a claim class this version does not ship.
+    expect(codes(wireFinding({
+      claimClass: "never_rename",
+      claimText: "src/generated/api.ts must never be moved or renamed.",
+      divergence: { path: "src/copy/api.ts", status: "C75", renamedFrom: "src/generated/api.ts" },
+    }))).toEqual(["claim_not_proven_by_status"]);
+  });
+});
+
+describe("statusProvesClaimViolation", () => {
+  it("maps each class to the porcelain letter that proves it", () => {
+    expect(statusProvesClaimViolation("never_modify", "M")).toBe(true);
+    expect(statusProvesClaimViolation("never_add", "A")).toBe(true);
+    expect(statusProvesClaimViolation("never_delete", "D")).toBe(true);
+    expect(statusProvesClaimViolation("never_rename", "R100")).toBe(true);
+  });
+  it("does not read a copy as a rename", () => {
+    expect(statusProvesClaimViolation("never_rename", "C75")).toBe(false);
+    expect(statusProvesClaimViolation("never_rename", "C")).toBe(false);
+  });
+  it("does not read a modification as an add, a delete, or a rename", () => {
+    expect(statusProvesClaimViolation("never_add", "M")).toBe(false);
+    expect(statusProvesClaimViolation("never_delete", "M")).toBe(false);
+    expect(statusProvesClaimViolation("never_rename", "M")).toBe(false);
   });
 });
 

@@ -179,10 +179,32 @@ export interface StatsDashboard {
 // window" (INV-GLOBAL-UNKNOWN-1). It deliberately carries NO load-bearing source
 // ids and NO activity footnote: remote sees opaque ids only (spec section 9, 7.3),
 // so those two local-only sections have no global counterpart.
+export interface GlobalActivitySummary {
+  commands: number;
+  sessions: number;
+  rule_injections: number;
+  head_tokens: number;
+  hook_invocations: number;
+  hook_failures: number;
+  rules_configured: number;
+  last_active_at: string | null;
+}
+
 export interface GlobalRollup {
   window_days: number;
   workspaces: number;
   has_any_events: boolean;
+  // The THIRD state (notes/20260801-value-dashboard-empty-root-cause.md).
+  // has_any_events answers "is the CLI syncing at all"; this answers "has any
+  // instrument this dashboard reads ever fired". They came apart in production:
+  // every workspace synced heavily and not one had produced a governed event, so
+  // --global printed a full dashboard of zeros as if it had measured a failure.
+  // Optional so an older control (pre-rollout) is read as governed, i.e. the old
+  // behavior, rather than flipping every terminal into the new branch.
+  has_governed_events?: boolean;
+  // What the workspaces DID, whether or not it was governed. Rendered in place of
+  // the zero wall so the third state is informative instead of a dead end.
+  activity?: GlobalActivitySummary;
   generated_at: string;
   evidence: MetricFamily;
   injections: number;
@@ -593,6 +615,80 @@ export function renderGlobalDashboard(r: GlobalRollup): string {
   return lines.join("\n");
 }
 
+// "2026-07-12 (20 days ago)". The reader of this block is asking one question:
+// is this install dead, or just quiet? The age answers it; the milliseconds never
+// did. The reference clock is the rollup's OWN generated_at (server-stamped,
+// already on the wire), not Date.now(), so the line is deterministic, testable,
+// and identical whether it is read now or out of a log next week. A last_active
+// ahead of generated_at (clock skew, or a replayed rollup) degrades to the bare
+// date: a negative age reads as a bug in mla rather than a fact about the data.
+function lastActiveLabel(iso: string, generatedAt: string): string {
+  const day = iso.slice(0, 10);
+  const then = Date.parse(iso);
+  const now = Date.parse(generatedAt);
+  if (!Number.isFinite(then) || !Number.isFinite(now)) return day;
+  const days = Math.floor((now - then) / 86_400_000);
+  if (days < 0) return day;
+  if (days === 0) return `${day} (today)`;
+  if (days === 1) return `${day} (1 day ago)`;
+  return `${day} (${days} days ago)`;
+}
+
+// The THIRD state render: the CLI is syncing and NOT ONE governed instrument has
+// ever fired. Rendering the normal dashboard here is a lie in the other direction:
+// every rate divides by zero, so a wall of 0% reads as "mla ran and achieved
+// nothing" when the truth is "mla ran and was never given anything to govern". We
+// name that, show the work that did happen, and give the one action that changes it.
+export function renderGlobalNothingGoverned(r: GlobalRollup): string {
+  const a = r.activity;
+  const wsLabel = r.workspaces === 1 ? "1 workspace" : `${r.workspaces} workspaces`;
+  const lines: string[] = [];
+  lines.push(`mla usefulness, last ${r.window_days}d (global: ${wsLabel} you can view):`);
+  lines.push("");
+  lines.push("Nothing governed yet.");
+  lines.push(
+    `   mla is syncing, but nothing governed has been recorded in the last ${r.window_days}d:`,
+  );
+  lines.push(
+    "   no evidence offered, no contradiction surfaced, no rule enforced, no review decision.",
+  );
+  lines.push("   Every rate would divide by zero, so here is what actually happened instead.");
+  lines.push("");
+
+  if (a) {
+    lines.push(`   ${a.commands} command(s) across ${a.sessions} session(s).`);
+    if (a.rule_injections > 0) {
+      lines.push(
+        `   ${a.rule_injections} rule injection(s), ${a.head_tokens.toLocaleString("en-US")} tokens of context.`,
+      );
+    }
+    // A healthy hook is not worth a line; a failing one is a reason the governed
+    // instruments never fire, so it earns one.
+    if (a.hook_failures > 0) {
+      lines.push(
+        `   ${a.hook_failures} of ${a.hook_invocations} hook invocation(s) failed; mla could not observe those turns.`,
+      );
+    }
+    if (a.last_active_at) {
+      lines.push(`   Last active: ${lastActiveLabel(a.last_active_at, r.generated_at)}.`);
+    }
+    lines.push("");
+  }
+
+  // Zero rules is the production cause (75 of 85 workspaces had none). A workspace
+  // WITH rules is genuinely just quiet, and claiming otherwise would be the same
+  // over-claim in reverse.
+  if ((a?.rules_configured ?? 0) > 0) {
+    lines.push(`   ${a?.rules_configured} rule(s) in force and nothing has tripped them.`);
+    lines.push("   That is a quiet window, not a broken install.");
+  } else {
+    lines.push("   No rules are configured, so there is nothing for mla to catch.");
+    lines.push("   Run `mla onboard` in your repo to turn your conventions into governed rules.");
+  }
+
+  return lines.join("\n");
+}
+
 // INV-GLOBAL-UNKNOWN-1: telemetry off AND nothing-synced are both "unknown", never
 // a misleading zero. Same human-facing message for both; in --json the machine gets
 // an explicit `available:false` with the reason so it cannot read it as activity=0.
@@ -770,8 +866,13 @@ async function runGlobalStats(args: StatsArgs, deps: StatsDeps): Promise<number>
     return 0;
   }
 
+  // --json passes the rollup through untouched: it already carries
+  // has_governed_events + activity, so a machine reader sees the third state
+  // explicitly rather than inferring activity=0 from the counters.
   if (args.json) {
     console.log(JSON.stringify(rollup, null, 2));
+  } else if (rollup.has_governed_events === false) {
+    console.log(renderGlobalNothingGoverned(rollup));
   } else {
     console.log(renderGlobalDashboard(rollup));
   }

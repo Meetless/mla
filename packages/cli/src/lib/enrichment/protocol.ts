@@ -114,10 +114,24 @@ export const MINTABLE_ENRICHMENT_KINDS: readonly MintableEnrichmentKind[] = ENRI
 // surface and the governance kinds cannot drift apart.
 export type ProposedRuleKind = MintableEnrichmentKind;
 
-// The scout roles. `documentation` and `history` EXTRACT governance candidates from one
-// source each. `reconciliation` reads BOTH (the ranked doc targets via Read, the prepared
-// commits inlined) and reports only where they disagree: the one finding class neither
-// extraction scout can see, because each holds half the evidence.
+// The kind a `code_diverged` resolution mints, decided HERE and never by a scout.
+//
+// Every claim class this version ships ("must never be edited / added / deleted / renamed") is
+// the same durable type: a constraint on what may happen to a path. Letting the model pick the
+// kind bought nothing but a second untrusted field, and the wrong pick is not visibly wrong
+// (a "convention" and a "constraint" read alike and enforce differently). When a claim class
+// lands that genuinely needs another durable type, this becomes a function of the class.
+export const FINDING_PROPOSED_RULE_KIND: ProposedRuleKind = "constraint";
+
+// The scout roles this protocol UNDERSTANDS. `documentation` and `history` EXTRACT governance
+// candidates from one source each. `reconciliation` reads BOTH (the ranked doc targets via
+// Read, the prepared commits inlined) and reports only where they disagree: the one finding
+// class neither extraction scout can see, because each holds half the evidence.
+//
+// This is the PARSE roster, and it is append-only in practice: it is the set of names a stored
+// run record may carry, an ingest envelope may name, and a persisted finding may cite as its
+// source. Removing a name from here does not retire a scout, it makes every run and finding
+// that ever mentioned it unreadable. To retire one, see RETIRED_SCOUT_NAMES below.
 //
 // Order here is presentation only. It must never affect allocation (see SCOUT_CANDIDATE_CAPS)
 // and there is a test that permutes it.
@@ -129,15 +143,98 @@ export function isScoutName(value: unknown): value is ScoutName {
   return typeof value === "string" && (SCOUT_NAMES as readonly string[]).includes(value);
 }
 
+/**
+ * Roles this version still parses but no longer RUNS. Retiring a scout is one line here.
+ *
+ * The two rosters are not the same question. `SCOUT_NAMES` answers "may a stored record name
+ * this?", which has to keep saying yes forever: the run records, resume state, candidate
+ * `sourceScout` fields and findings already on disk outlive any decision to stop dispatching.
+ * `DISPATCH_SCOUT_NAMES` answers "does this version brief, dispatch, install an agent for, and
+ * expect a result from this role?", which is exactly what a retirement changes.
+ *
+ * Expressing the retirement as a subtraction rather than as a second hand-written list keeps
+ * the subset invariant by construction and, more importantly, keeps ADDING a scout safe: a new
+ * role is dispatched the moment it exists. A second literal list would mean a newly added
+ * scout is installed, briefed by nobody, and silently never run, with a green build.
+ *
+ * There is no runtime switch here and there must not be one: which scouts a build dispatches
+ * is a property of the build, not of an operator's environment. A flag would mean two
+ * behaviors in one binary and support tickets that turn on which one was live.
+ */
+export const RETIRED_SCOUT_NAMES: readonly ScoutName[] = [];
+
+/** The roles this version dispatches: every parsed role that has not been retired. */
+export const DISPATCH_SCOUT_NAMES: readonly ScoutName[] = SCOUT_NAMES.filter(
+  (role) => !RETIRED_SCOUT_NAMES.includes(role),
+);
+
+/**
+ * Narrow an untrusted value to a role this version actually dispatches.
+ *
+ * `roster` is a defaulted parameter, not configuration: nothing at run time can select it (no
+ * env var, no flag, no config key), and the one production call path takes the default. It
+ * exists so a retirement can be PROVEN against existing data before the constant is edited.
+ */
+export function isDispatchScoutName(
+  value: unknown,
+  roster: readonly ScoutName[] = DISPATCH_SCOUT_NAMES,
+): value is ScoutName {
+  return isScoutName(value) && roster.includes(value);
+}
+
+/**
+ * Gate for `enrich brief --role`: a retired scout must be unbriefable, because a brief is
+ * where the token cost starts. Throws with the roster that RUNS, never the roster that parses;
+ * offering a name the run will then refuse at ingest is worse than not offering it.
+ */
+export function assertDispatchableRole(
+  value: unknown,
+  roster: readonly ScoutName[] = DISPATCH_SCOUT_NAMES,
+): ScoutName {
+  if (!isDispatchScoutName(value, roster)) {
+    throw new Error(`--role must be one of: ${roster.join(", ")}`);
+  }
+  return value;
+}
+
 const SMALL_COUNT_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven"];
 
 /**
  * "three". User-facing copy in several commands used to spell the roster size as the
  * literal word "two"; prose is not type-checked, so a third role left three surfaces
  * confidently lying about how many scouts run. Every such sentence now derives from here.
+ *
+ * Counts the DISPATCH roster: the operator is being told how many scouts will run, not how
+ * many names the parser accepts.
  */
-export function scoutCountWord(): string {
-  return SMALL_COUNT_WORDS[SCOUT_NAMES.length] ?? String(SCOUT_NAMES.length);
+export function scoutCountWord(roster: readonly ScoutName[] = DISPATCH_SCOUT_NAMES): string {
+  return SMALL_COUNT_WORDS[roster.length] ?? String(roster.length);
+}
+
+/**
+ * Can the roster this version dispatches produce a doc/code finding at all?
+ *
+ * Derived from the per-role emit table rather than from a role name, so it stays true by
+ * construction if the finding moves to another scout. Every operator sentence that asks about
+ * findings, and above all the ZERO-result sentence ("the documents and the commits did not
+ * disagree"), is gated on this. That sentence is a claim about evidence someone read; with no
+ * scout dispatched to read it, printing it reports a comparison that never happened.
+ */
+export function rosterProducesFindings(
+  roster: readonly ScoutName[] = DISPATCH_SCOUT_NAMES,
+): boolean {
+  return findingScoutRole(roster) !== undefined;
+}
+
+/**
+ * The dispatched role that reports doc/code findings, or undefined once it is retired.
+ * Operator prose that names it reads this rather than the literal role name, so retiring the
+ * role removes every sentence about it instead of leaving one that names a scout nobody ran.
+ */
+export function findingScoutRole(
+  roster: readonly ScoutName[] = DISPATCH_SCOUT_NAMES,
+): ScoutName | undefined {
+  return roster.find((role) => scoutMayEmitKind(role, RECONCILIATION_FINDING_KIND));
 }
 
 export const SCOUT_STATUSES = ["complete", "failed", "timed_out"] as const;
@@ -211,32 +308,15 @@ export function scoutMayEmitKind(role: ScoutName, kind: EnrichmentKind): boolean
 
 // The commit-side half of a finding: the ONE changed file it claims contradicts the document.
 //
-// Structurally identical to PreparedGitFileChange on purpose, because ingest validates it by
-// exact field-for-field comparison against the plan's prepared change under the validated
-// commit SHA. It is a SEPARATE type because the provenance differs: a PreparedGitFileChange is
-// what the CLI read out of git, a DivergenceFileChange is what a model claims it read out of
-// the brief, and the entire point of the check is that those are not the same thing until they
-// are proven equal.
-export interface DivergenceFileChange {
-  path: string;
-  status: string; // git porcelain status letter(s), byte-identical to what the plan recorded
-  renamedFrom?: string; // present iff status begins with R or C
-}
-
-type AssertTrue<T extends true> = T;
-/**
- * Compile-time drift guard. If a field is added to either shape and not the other, the exact
- * comparison in ingest silently stops covering it (a claimed field the plan never recorded is
- * unverifiable; a recorded field the claim omits is unchecked). Divergence makes this `false`,
- * which fails the `extends true` constraint and breaks the build.
- */
-export type DivergenceShapeGuard = AssertTrue<
-  DivergenceFileChange extends PreparedGitFileChange
-    ? PreparedGitFileChange extends DivergenceFileChange
-      ? true
-      : false
-    : false
->;
+// Projected FROM PreparedGitFileChange rather than declared beside it, because ingest validates
+// a claim by exact field-for-field comparison against the plan's prepared change under the
+// validated commit SHA. A field added to the prepared shape lands here automatically, so the
+// comparison cannot silently stop covering it; a field the projection does not name is a
+// deliberate exclusion the compiler will point at. The two are still distinct types because the
+// provenance differs: a PreparedGitFileChange is what the CLI read out of git, a
+// DivergenceFileChange is what a model claims it read out of the brief, and the entire point of
+// the check is that those are not the same thing until they are proven equal.
+export type DivergenceFileChange = Pick<PreparedGitFileChange, "path" | "status" | "renamedFrom">;
 
 // The claim classes v1 can PROVE from a commit's porcelain status letter alone.
 //
@@ -263,13 +343,166 @@ export function statusProvesClaimViolation(claimClass: DocClaimClass, status: st
       return letter === "A";
     case "never_delete":
       return letter === "D";
-    // R and C both land a governed path at a NEW location, which is what "never move this"
-    // forbids; the plan records `renamedFrom` for exactly these two statuses.
+    // `R` only. A copy (`C`) leaves the governed path exactly where the document put it and adds
+    // a SECOND file next to it, so nothing the document named was renamed; reading `C` as a
+    // rename reports a violation that did not happen. Prohibiting copies is a real rule and a
+    // DIFFERENT one (`never_copy`), deferred until a claim class states it explicitly.
     case "never_rename":
-      return letter === "R" || letter === "C";
+      return letter === "R";
     default:
       return assertNever(claimClass, "statusProvesClaimViolation");
   }
+}
+
+// What a reconciliation run actually checked, in one sentence, built from the closed class list
+// through a TOTAL map so a fifth claim class cannot ship without this copy following it.
+//
+// This exists for the zero-result line. "No inconsistencies" is a clean bill of health for the
+// repository, and no run ever earned one: the scout reads the documents this run planned and the
+// commits this run listed, and of everything those two could disagree about it can prove exactly
+// the four file operations below. A zero result stated wider than its coverage is the single
+// worst thing this command can print, because it is the one output that makes the operator stop
+// looking. The sentence is a constant rather than prose at each call site so the ingest screen,
+// the resolve review, and the agent-facing skill cannot drift into three different claims.
+const CLAIM_CLASS_GERUND: Record<DocClaimClass, string> = {
+  never_modify: "modifying",
+  never_add: "adding",
+  never_delete: "deleting",
+  never_rename: "renaming",
+};
+
+function orList(items: readonly string[]): string {
+  if (items.length <= 1) return items[0] ?? "";
+  if (items.length === 2) return `${items[0]} or ${items[1]}`;
+  return `${items.slice(0, -1).join(", ")}, or ${items[items.length - 1]}`;
+}
+
+export const FILE_OPERATION_CHECK_SENTENCE =
+  `This run checked one thing: a document that forbids ` +
+  `${orList(DOC_CLAIM_CLASSES.map((c) => CLAIM_CLASS_GERUND[c]))} a path, ` +
+  `and a listed commit that did it anyway.`;
+
+/** The zero-result line. Scoped to what the run could prove, on both axes (evidence and question). */
+export const NO_FILE_OPERATION_FINDINGS = `No file-operation findings. ${FILE_OPERATION_CHECK_SENTENCE}`;
+
+// --- The claim grammar: what the document must actually SAY ----------------------
+//
+// `claimClass` and `claimScope` arrive as model output, and a model that reads a descriptive
+// sentence as a prohibition manufactures a governance violation out of a document that never
+// governed anything. Both fields are therefore checked against the quote itself, and the quote
+// is the one part of a finding the CLI proves verbatim out of the repository at headCommit.
+//
+// The grammar is a fixed phrase table on purpose. It is not language understanding, it makes no
+// attempt at coverage, and a real rule phrased outside it is REJECTED rather than guessed at. A
+// missed finding costs nothing; an invented one costs the feature its credibility.
+
+// Prohibition frames, matched case-insensitively against the normalized quote. Descriptive
+// forms ("is generated", "are never edited in practice") are deliberately absent: a description
+// of what happens is not a rule about what may happen.
+const PASSIVE_PROHIBITIONS = [
+  "must never be",
+  "must not be",
+  "should never be",
+  "should not be",
+  "may never be",
+  "may not be",
+  "cannot be",
+  "can never be",
+  "shall never be",
+  "shall not be",
+  "is never to be",
+  "are never to be",
+] as const;
+
+const IMPERATIVE_PROHIBITIONS = ["never", "do not", "don't"] as const;
+
+// The verbs each class owns, in the two forms the frames above take. A verb belongs to exactly
+// one class: a delete prohibition read as a modify prohibition is a fabricated rule, and the
+// porcelain status letter cannot tell the two apart because it only proves SOME change landed.
+const CLAIM_CLASS_VERBS: Record<DocClaimClass, { passive: readonly string[]; imperative: readonly string[] }> = {
+  never_modify: {
+    passive: ["edited", "modified", "changed", "hand-edited", "touched"],
+    imperative: ["edit", "modify", "change", "hand-edit", "touch"],
+  },
+  never_add: {
+    passive: ["added", "re-added", "readded", "reintroduced", "recreated", "restored"],
+    imperative: ["add", "re-add", "readd", "reintroduce", "recreate", "restore"],
+  },
+  never_delete: {
+    passive: ["deleted", "removed"],
+    imperative: ["delete", "remove"],
+  },
+  never_rename: {
+    passive: ["renamed", "moved", "relocated"],
+    imperative: ["rename", "move", "relocate"],
+  },
+};
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Every approved phrase for a class, precompiled once. Word-bounded so "never add" does not
+// match inside "never address".
+const CLAIM_CLASS_PHRASES: Record<DocClaimClass, readonly RegExp[]> = (() => {
+  const built = {} as Record<DocClaimClass, readonly RegExp[]>;
+  for (const cls of DOC_CLAIM_CLASSES) {
+    const verbs = CLAIM_CLASS_VERBS[cls];
+    const phrases: string[] = [];
+    for (const frame of PASSIVE_PROHIBITIONS) for (const verb of verbs.passive) phrases.push(`${frame} ${verb}`);
+    for (const frame of IMPERATIVE_PROHIBITIONS) for (const verb of verbs.imperative) phrases.push(`${frame} ${verb}`);
+    built[cls] = phrases.map((p) => new RegExp(`\\b${escapeRegExp(p)}\\b`, "i"));
+  }
+  return built;
+})();
+
+// One canonical phrasing per class, derived from the SAME tables the matcher compiles, so the
+// examples a scout brief prints cannot drift from what ingest will accept. Showing the shape is
+// what makes the grammar usable: a scout told only "state a prohibition" guesses, and a guess
+// that misses costs a whole candidate.
+export function claimClassPhraseExamples(claimClass: DocClaimClass): {
+  passive: string;
+  imperative: string;
+} {
+  const verbs = CLAIM_CLASS_VERBS[claimClass];
+  return {
+    passive: `${PASSIVE_PROHIBITIONS[0]} ${verbs.passive[0]}`,
+    imperative: `${IMPERATIVE_PROHIBITIONS[0]} ${verbs.imperative[0]}`,
+  };
+}
+
+// Does the quote state a prohibition belonging to THIS class? Returns false for a quote that
+// prohibits nothing and for a quote that prohibits something else.
+export function quoteStatesClaimClass(claimClass: DocClaimClass, quote: string): boolean {
+  return CLAIM_CLASS_PHRASES[claimClass].some((re) => re.test(quote));
+}
+
+// Path-shaped tokens the quote writes out literally. Anything else (a bare word, a sentence
+// fragment, an inferred parent directory) is not a token, which is what makes a broadened scope
+// unrepresentable rather than merely discouraged.
+const PATH_TOKEN = /[A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)*\/?/g;
+const DOTTED_FILENAME = /^[A-Za-z0-9_@+-]+(?:\.[A-Za-z0-9_@+-]+)+$/;
+
+export function quotedPathTokens(quote: string): string[] {
+  const tokens: string[] = [];
+  for (const match of quote.match(PATH_TOKEN) ?? []) {
+    const token = match.replace(/[.,;:!?)\]}"']+$/, "");
+    if (token.length === 0) continue;
+    // A token qualifies as a path only if it carries a separator or looks like a filename. This
+    // keeps ordinary prose words ("hand", "generated") from becoming addressable scopes.
+    if (token.includes("/") || DOTTED_FILENAME.test(token)) tokens.push(token);
+  }
+  return tokens;
+}
+
+// Is `scope` a path the quote itself names? Equality against a literal token, never a prefix of
+// one: `src/generated/` derived from a quote that only names `src/generated/api.ts` would turn
+// a rule about one file into a rule about every neighbour, and every neighbour's commit then
+// reads as a violation. A document that genuinely governs a directory writes the directory out.
+export function quoteNamesClaimScope(quote: string, scope: string): boolean {
+  const wanted = scope.trim();
+  if (wanted.length === 0) return false;
+  return quotedPathTokens(quote).includes(wanted);
 }
 
 // Which side of the change the claim's scope must cover. For a rename or copy the plan records
@@ -318,9 +551,10 @@ export interface DocCodeInconsistency {
   claimText: string;
   // The exact path, or the directory scope (trailing slash), the claim governs. Without it,
   // "merged migrations are never edited" is proven violated by any commit touching any file.
+  // Must be a path `claimText` writes out literally: a scope nothing quoted is a broadening.
   claimScope: string;
-  // The rule kind a `code_diverged` resolution would mint. The model proposes; the human's
-  // selection is the approval.
+  // The rule kind a `code_diverged` resolution would mint. Set by the CLI to
+  // FINDING_PROPOSED_RULE_KIND, never sent by a scout; the human's selection is the approval.
   proposedRuleKind: ProposedRuleKind;
   // The single changed file that contradicts the claim, verified field-for-field against the
   // plan's prepared evidence for the validated commit.
@@ -589,7 +823,10 @@ export function findingToRuleCandidate(record: {
   const inconsistency = record.inconsistency;
   if (!inconsistency) return null;
   return {
-    kind: inconsistency.proposedRuleKind,
+    // The constant, never the record's stored copy. A sidecar written before the kind moved into
+    // trusted code carries whatever a model picked, and a stale file is exactly the path by which
+    // discretion the wire no longer accepts would still reach the mint.
+    kind: FINDING_PROPOSED_RULE_KIND,
     statement: inconsistency.claimText,
     evidence: record.evidence,
     sourceScout: record.sourceScouts?.[0] ?? "reconciliation",
@@ -859,7 +1096,9 @@ const CANDIDATE_FIELDS = new Set([
 ]);
 const FILE_EVIDENCE_FIELDS = new Set(["type", "path", "startLine", "endLine"]);
 const COMMIT_EVIDENCE_FIELDS = new Set(["type", "commit", "path"]);
-const INCONSISTENCY_FIELDS = new Set(["claimClass", "claimText", "claimScope", "proposedRuleKind", "divergence"]);
+// `proposedRuleKind` and `attribution` are absent on purpose: both are stamped by the CLI, so a
+// candidate carrying either is rejected as an unknown field rather than trusted.
+const INCONSISTENCY_FIELDS = new Set(["claimClass", "claimText", "claimScope", "divergence"]);
 const DIVERGENCE_FIELDS = new Set(["path", "status", "renamedFrom"]);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -1074,14 +1313,22 @@ function validateInconsistency(
     }
   }
 
-  const proposed = value.proposedRuleKind;
-  const proposedOk =
-    typeof proposed === "string" && (MINTABLE_ENRICHMENT_KINDS as readonly string[]).includes(proposed);
-  if (!proposedOk) {
+  // The claim grammar. Both checks read the quote, which is the one field ingest proves verbatim
+  // against the repository, so an accepted finding's class and scope are backed by text a human
+  // can go read. They run BEFORE the divergence cross-checks so a broadened scope is reported as
+  // the broadening it is, not only as the mismatch it happens to produce.
+  if (claimClassOk && claimText.length > 0 && !quoteStatesClaimClass(claimClass as DocClaimClass, claimText)) {
     err(
-      "bad_proposed_rule_kind",
-      `proposedRuleKind must be one of: ${MINTABLE_ENRICHMENT_KINDS.join(", ")}`,
-      "inconsistency.proposedRuleKind",
+      "claim_class_not_stated",
+      `the quoted text states no ${claimClass as string} prohibition; a description is not a rule`,
+      "inconsistency.claimClass",
+    );
+  }
+  if (claimText.length > 0 && claimScope.length > 0 && !quoteNamesClaimScope(claimText, claimScope)) {
+    err(
+      "claim_scope_not_in_quote",
+      `claimScope "${claimScope}" is not a path the quoted text names; scopes are quoted, never inferred or widened`,
+      "inconsistency.claimScope",
     );
   }
 
@@ -1110,14 +1357,14 @@ function validateInconsistency(
     }
   }
 
-  if (!claimClassOk || !proposedOk || !divergence || claimText.length < 1 || claimScope.length < 1) {
+  if (!claimClassOk || !divergence || claimText.length < 1 || claimScope.length < 1) {
     return undefined;
   }
   return {
     claimClass: claimClass as DocClaimClass,
     claimText,
     claimScope,
-    proposedRuleKind: proposed as ProposedRuleKind,
+    proposedRuleKind: FINDING_PROPOSED_RULE_KIND,
     divergence,
   };
 }

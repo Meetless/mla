@@ -20,12 +20,21 @@ import type { BuildInfo } from "../../src/lib/observability";
 
 type Mod = typeof import("../../src/lib/upgrade-apply");
 
+// Two roots, deliberately different, because they ARE different in production
+// and conflating them is what shipped a no-op `mla upgrade` in 0.2.29/0.2.30:
+//   home      = MEETLESS_HOME, the mla STATE root (config, queue, logs, staging)
+//   installed = where install.sh put the binary, under the OS home
+// A test that derives both from one root cannot see them disagree.
 let home: string;
+let osHome: string;
+let installed: string;
 let prevHome: string | undefined;
 let mod: Mod;
 
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), "mla-upgrade-"));
+  osHome = fs.mkdtempSync(path.join(os.tmpdir(), "mla-oshome-"));
+  installed = path.join(osHome, ".meetless", "bin", "mla");
   prevHome = process.env.MEETLESS_HOME;
   process.env.MEETLESS_HOME = home;
   jest.resetModules();
@@ -36,6 +45,7 @@ afterEach(() => {
   if (prevHome === undefined) delete process.env.MEETLESS_HOME;
   else process.env.MEETLESS_HOME = prevHome;
   fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(osHome, { recursive: true, force: true });
   jest.resetModules();
 });
 
@@ -84,42 +94,57 @@ describe("sha256File", () => {
 
 describe("atomicSwapBinary", () => {
   it("replaces the live binary and snapshots the old one to mla.prev", () => {
-    const live = mod.liveBinaryPath();
-    const prev = mod.prevBinaryPath();
+    const live = installed;
+    const prev = installed + ".prev";
     writeExec(live, "#!/bin/sh\nexit 7\n");
     const src = path.join(home, "src-mla");
     writeExec(src, "#!/bin/sh\nexit 0\n");
 
-    expect(mod.atomicSwapBinary({ newBinaryPath: src })).toBe(true);
+    expect(mod.atomicSwapBinary({ newBinaryPath: src, live })).toBe(true);
     expect(fs.readFileSync(live, "utf8")).toBe("#!/bin/sh\nexit 0\n");
     expect(fs.readFileSync(prev, "utf8")).toBe("#!/bin/sh\nexit 7\n");
     expect(fs.statSync(live).mode & 0o111).toBeTruthy(); // executable
   });
 
   it("works as a fresh install with no prior live binary (no prev written)", () => {
-    const live = mod.liveBinaryPath();
+    const live = installed;
     const src = path.join(home, "src-mla");
     writeExec(src, "#!/bin/sh\nexit 0\n");
 
-    expect(mod.atomicSwapBinary({ newBinaryPath: src })).toBe(true);
+    expect(mod.atomicSwapBinary({ newBinaryPath: src, live })).toBe(true);
     expect(fs.readFileSync(live, "utf8")).toBe("#!/bin/sh\nexit 0\n");
-    expect(fs.existsSync(mod.prevBinaryPath())).toBe(false);
+    expect(fs.existsSync(live + ".prev")).toBe(false);
+  });
+
+  // The default target is the process, not a path assembled from an env var. A
+  // test process is `node`, so there is no installed mla to replace and the swap
+  // must refuse rather than invent one. See the canary describe at the bottom.
+  it("refuses to guess a target when this process is not an mla binary", () => {
+    const src = path.join(home, "src-mla");
+    writeExec(src, "#!/bin/sh\nexit 0\n");
+    expect(() => mod.atomicSwapBinary({ newBinaryPath: src })).toThrow(/not an installed mla binary/);
   });
 });
 
 describe("rollbackBinary", () => {
   it("restores the previous binary over the live path", () => {
-    const live = mod.liveBinaryPath();
-    const prev = mod.prevBinaryPath();
+    const live = installed;
+    const prev = installed + ".prev";
     writeExec(live, "BAD");
     writeExec(prev, "GOOD");
 
-    expect(mod.rollbackBinary()).toBe(true);
+    expect(mod.rollbackBinary({ live })).toBe(true);
     expect(fs.readFileSync(live, "utf8")).toBe("GOOD");
     expect(fs.existsSync(prev)).toBe(false); // rollback consumes the slot
   });
 
   it("returns false when there is nothing to roll back to", () => {
+    expect(mod.rollbackBinary({ live: installed })).toBe(false);
+  });
+
+  // Same refusal as the swap, but rollback runs inside catch blocks that must
+  // never throw, so it returns false instead.
+  it("returns false when this process is not an mla binary", () => {
     expect(mod.rollbackBinary()).toBe(false);
   });
 });
@@ -287,10 +312,19 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
     return mod.stageBinary({ binaryPath: src, version: "0.9.9", triple, now: 1 });
   }
 
+  // Every call goes through here so the promote target is the binary install.sh
+  // wrote under the OS home, and never a path assembled from MEETLESS_HOME. The
+  // default target is the running process, which under jest is `node`; these
+  // tests used to derive the target from the same function they were grading,
+  // which is why none of them could see it name the wrong file. See the describe
+  // at the bottom of this file.
+  const promote = (opts: Parameters<Mod["maybePromoteStagedAndReExec"]>[0]) =>
+    mod.maybePromoteStagedAndReExec({ live: installed, ...opts });
+
   it("no-ops under the re-exec loop guard without touching the staged binary", async () => {
     writeAutoApplyConfig(true);
     stageValid(currentTriple(process.platform, process.arch) ?? "t");
-    const r = await mod.maybePromoteStagedAndReExec({
+    const r = await promote({
       command: "whoami",
       env: curlEnv({ [mod.REEXEC_GUARD_ENV]: "1" }),
     });
@@ -301,12 +335,12 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
   it("no-ops for the internal check child, an explicit upgrade, and the mcp daemon", async () => {
     writeAutoApplyConfig(true);
     stageValid(currentTriple(process.platform, process.arch) ?? "t");
-    expect(await mod.maybePromoteStagedAndReExec({ command: "_internal", env: curlEnv() })).toEqual({ reExeced: false });
-    expect(await mod.maybePromoteStagedAndReExec({ command: "upgrade", env: curlEnv() })).toEqual({ reExeced: false });
+    expect(await promote({ command: "_internal", env: curlEnv() })).toEqual({ reExeced: false });
+    expect(await promote({ command: "upgrade", env: curlEnv() })).toEqual({ reExeced: false });
     // `mcp` is the long-lived stdio daemon; it self-heals a stale dist in-band
     // (worker exits with the restart sentinel, supervisor respawns), so a
     // launch-time re-exec must never fire under it. See Tier 1 Phase 3.
-    expect(await mod.maybePromoteStagedAndReExec({ command: "mcp", env: curlEnv() })).toEqual({ reExeced: false });
+    expect(await promote({ command: "mcp", env: curlEnv() })).toEqual({ reExeced: false });
     expect(mod.readUpdateState().staged).toBeTruthy();
   });
 
@@ -314,17 +348,17 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
     writeAutoApplyConfig(true);
     stageValid(currentTriple(process.platform, process.arch) ?? "t");
     expect(
-      await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv({ MLA_DISABLE_UPGRADE: "1" }) }),
+      await promote({ command: "whoami", env: curlEnv({ MLA_DISABLE_UPGRADE: "1" }) }),
     ).toEqual({ reExeced: false });
 
     writeAutoApplyConfig(false);
-    expect(await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() })).toEqual({ reExeced: false });
+    expect(await promote({ command: "whoami", env: curlEnv() })).toEqual({ reExeced: false });
   });
 
   it("no-ops for a non-curl (package-manager) install", async () => {
     writeAutoApplyConfig(true);
     stageValid(currentTriple(process.platform, process.arch) ?? "t");
-    const r = await mod.maybePromoteStagedAndReExec({
+    const r = await promote({
       command: "whoami",
       env: curlEnv({ MLA_INSTALL_METHOD: "homebrew" }),
     });
@@ -333,14 +367,14 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
 
   it("no-ops when nothing is staged", async () => {
     writeAutoApplyConfig(true);
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
     expect(r).toEqual({ reExeced: false });
   });
 
   it("clears a staged binary whose triple does not match this machine", async () => {
     writeAutoApplyConfig(true);
     stageValid("totally-wrong-triple");
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
     expect(r).toEqual({ reExeced: false });
     expect(mod.readUpdateState().staged ?? null).toBeNull(); // pruned
     expect(fs.existsSync(mod.stagedDir())).toBe(false);
@@ -354,23 +388,23 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
     stageValid(triple as string);
     // Corrupt the staged file so the promote-time re-verify fails.
     fs.writeFileSync(mod.stagedBinaryPath(), "corrupted");
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
     expect(r).toEqual({ reExeced: false });
     expect(mod.readUpdateState().staged ?? null).toBeNull();
   });
 
   maybeIt("promotes the staged binary, swaps it in, and re-execs the command", async () => {
     writeAutoApplyConfig(true);
-    const live = mod.liveBinaryPath();
+    const live = installed;
     writeExec(live, "#!/bin/sh\nexit 3\n"); // the currently-running binary
     stageValid(triple as string, "#!/bin/sh\nexit 0\n");
 
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
 
     expect(r.reExeced).toBe(true);
     expect(r.code).toBe(0); // the re-exec'd stub exits 0
     expect(fs.readFileSync(live, "utf8")).toBe("#!/bin/sh\nexit 0\n"); // swapped in
-    expect(fs.readFileSync(mod.prevBinaryPath(), "utf8")).toBe("#!/bin/sh\nexit 3\n"); // rollback slot
+    expect(fs.readFileSync(installed + ".prev", "utf8")).toBe("#!/bin/sh\nexit 3\n"); // rollback slot
     expect(mod.readUpdateState().staged ?? null).toBeNull(); // cleared after promote
     expect(fs.existsSync(mod.stagedDir())).toBe(false);
   });
@@ -379,11 +413,11 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
     // The whole point of the 20260615 fix: a curl user who never touched their
     // config still gets the silent apply-on-launch. No writeAutoApplyConfig call.
     writeConfigWithoutUpdateBlock();
-    const live = mod.liveBinaryPath();
+    const live = installed;
     writeExec(live, "#!/bin/sh\nexit 3\n");
     stageValid(triple as string, "#!/bin/sh\nexit 0\n");
 
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
 
     expect(r.reExeced).toBe(true);
     expect(r.code).toBe(0);
@@ -393,11 +427,11 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
 
   maybeIt("arms auto-apply by default when no config file exists at all", async () => {
     // First-run curl install: no cli-config.json on disk yet. Default must be ON.
-    const live = mod.liveBinaryPath();
+    const live = installed;
     writeExec(live, "#!/bin/sh\nexit 3\n");
     stageValid(triple as string, "#!/bin/sh\nexit 0\n");
 
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
 
     expect(r.reExeced).toBe(true);
     expect(fs.readFileSync(live, "utf8")).toBe("#!/bin/sh\nexit 0\n");
@@ -408,22 +442,22 @@ describe("maybePromoteStagedAndReExec (apply-on-launch decision tree)", () => {
     // deliberate opt-out, not the absent-default, so it must NOT arm.
     writeAutoApplyConfig(false);
     stageValid(currentTriple(process.platform, process.arch) ?? "t", "#!/bin/sh\nexit 0\n");
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
     expect(r).toEqual({ reExeced: false });
     expect(mod.readUpdateState().staged).toBeTruthy(); // untouched
   });
 
   maybeIt("does not re-promote when another process holds the upgrade lock", async () => {
     writeAutoApplyConfig(true);
-    writeExec(mod.liveBinaryPath(), "#!/bin/sh\nexit 3\n");
+    writeExec(installed, "#!/bin/sh\nexit 3\n");
     stageValid(triple as string);
     // Simulate a concurrent upgrade by holding a fresh lock.
     fs.writeFileSync(path.join(home, "upgrade.lock"), "999");
 
-    const r = await mod.maybePromoteStagedAndReExec({ command: "whoami", env: curlEnv() });
+    const r = await promote({ command: "whoami", env: curlEnv() });
     expect(r).toEqual({ reExeced: false });
     // The live binary is untouched because the swap never ran.
-    expect(fs.readFileSync(mod.liveBinaryPath(), "utf8")).toBe("#!/bin/sh\nexit 3\n");
+    expect(fs.readFileSync(installed, "utf8")).toBe("#!/bin/sh\nexit 3\n");
   });
 });
 
@@ -615,5 +649,167 @@ describe("runUpgrade refreshes the update cache before returning", () => {
     } finally {
       await srv.close();
     }
+  });
+});
+
+// --- the self-update defect (canary-self-update, red on 0.2.27 and 0.2.30) ---
+//
+// `mla upgrade` replaced a file nothing executes, and said it had upgraded you.
+//
+//   canary[self-update]: mla upgrade -> 0.2.30
+//   Downloading mla 0.2.30 for aarch64-apple-darwin...
+//   Upgraded mla 0.2.29 -> 0.2.30. The new version takes effect on your next command.
+//   canary[self-update]: FAIL: version mismatch: installed '0.2.29', expected '0.2.30'
+//
+// Two halves of one decision read two different roots:
+//
+//   detectInstallMethod()  AUTHORIZES the self-replace off the OS home, because
+//                          that is where install.sh puts the binary
+//                          (${MLA_INSTALL_DIR:-$HOME/.meetless/bin}, which never
+//                          reads MEETLESS_HOME).
+//   liveBinaryPath()       NAMED the file to replace off the mla STATE home,
+//                          which does honor MEETLESS_HOME.
+//
+// They coincide only in the default configuration, and the canary is the one
+// harness in the tree that sets them apart (scripts/canary/lib.sh points HOME and
+// MEETLESS_HOME at two subdirs of one sandbox). With the roots divergent, upgrade
+// downloaded, verified and swapped the new bytes into $MEETLESS_HOME/bin/mla,
+// wrote no rollback slot (nothing was at the phantom path to snapshot), left the
+// real binary at the old version, and exited 0. That is what every operator with
+// MEETLESS_HOME set was getting. It was read as a canary bug for two releases.
+//
+// Why no test caught it: every swap/promote case above derives BOTH the file it
+// writes and the file it asserts from mod.liveBinaryPath(). The function is
+// graded against itself, so the two roots can never be observed to disagree.
+// These two cases name the installed path independently, the way the canary does.
+describe("the live binary is the one that is running, not one derived from MEETLESS_HOME", () => {
+  const triple = currentTriple(process.platform, process.arch);
+  const maybeIt = triple ? it : it.skip;
+
+  // The canary's shape comes from the file-level beforeEach: `installed` under
+  // `osHome` is what install.sh wrote, `home` is MEETLESS_HOME, and they are two
+  // different directories. Only the execPath stub is local to these cases.
+  let realExecPath: string;
+
+  beforeEach(() => {
+    realExecPath = process.execPath;
+  });
+
+  afterEach(() => {
+    process.execPath = realExecPath;
+  });
+
+  it("resolves the running executable and never the state home", () => {
+    expect(mod.liveBinaryPath({ execPath: installed })).toBe(installed);
+    expect(mod.prevBinaryPath({ execPath: installed })).toBe(installed + ".prev");
+    // The state home decides where config/queue/logs live. It has never decided
+    // where the binary lives, and a rename(2) is the one mistake this module
+    // cannot take back.
+    const stateHome = process.env.MEETLESS_HOME as string;
+    expect(mod.liveBinaryPath({ execPath: installed })).not.toContain(stateHome);
+  });
+
+  it("refuses to name a live binary when this process is not one", () => {
+    // Under `node dist/cli.js` (dev) and under jest, execPath is the node
+    // runtime. Deriving a path from HOME here fabricated a plausible-looking
+    // target; the honest answer is that there is nothing to self-replace, and it
+    // is the answer that cannot rename over the node binary.
+    expect(mod.liveBinaryPath({ execPath: "/usr/local/bin/node" })).toBeNull();
+    expect(mod.prevBinaryPath({ execPath: "/usr/local/bin/node" })).toBeNull();
+  });
+
+  // Serve a signed manifest AND the artifact it points at, so this drives the
+  // real download -> sha256 verify -> tar -xzf -> swap path end to end. The
+  // manifest can only be built (and therefore signed) once the port is known, so
+  // it comes in as a factory over the base URL.
+  async function serveRelease(
+    privateKey: crypto.KeyObject,
+    tarball: Buffer,
+    buildManifest: (base: string) => Manifest,
+  ): Promise<{ url: string; close: () => Promise<void> }> {
+    let body = "";
+    let sig = "";
+    const server = http.createServer((req, res) => {
+      if (req.url === "/manifest.json") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(body);
+      } else if (req.url === "/manifest.json.sig") {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end(sig);
+      } else if (req.url === "/mla.tar.gz") {
+        res.writeHead(200, { "content-type": "application/gzip" });
+        res.end(tarball);
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as AddressInfo).port;
+    const base = `http://127.0.0.1:${port}`;
+    body = JSON.stringify(buildManifest(base));
+    sig = crypto.sign(null, Buffer.from(body), privateKey).toString("base64");
+    return {
+      url: `${base}/manifest.json`,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  maybeIt("upgrades the binary the installer wrote, and leaves its rollback slot beside it", async () => {
+    const OLD = "#!/bin/sh\necho 0.5.0\n";
+    const NEW = "#!/bin/sh\necho 9.9.9\n";
+    writeExec(installed, OLD);
+
+    // A real release-layout tarball: the binary at the archive root, named `mla`.
+    const stage = fs.mkdtempSync(path.join(os.tmpdir(), "mla-stage-"));
+    writeExec(path.join(stage, "mla"), NEW);
+    const tarPath = path.join(stage, "mla.tar.gz");
+    require("child_process").execFileSync("tar", ["-czf", tarPath, "-C", stage, "mla"]);
+    const tarball = fs.readFileSync(tarPath);
+    const sha256 = crypto.createHash("sha256").update(tarball).digest("hex");
+
+    const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+    const pem = publicKey.export({ type: "spki", format: "pem" }).toString();
+    const t = triple as string;
+    const srv = await serveRelease(
+      privateKey as crypto.KeyObject,
+      tarball,
+      (base) => ({
+        schemaVersion: 1,
+        channel: "stable",
+        version: "9.9.9",
+        minVersion: "0.0.1",
+        releasedAt: "2026-08-02T00:00:00Z",
+        artifacts: { [t]: { url: `${base}/mla.tar.gz`, sha256 } },
+      }),
+    );
+
+    // This is the canary, in-process: we ARE the installed binary.
+    process.execPath = installed;
+    const lines: string[] = [];
+    try {
+      const code = await mod.runUpgrade({
+        argv: [],
+        env: {
+          MLA_INSTALL_METHOD: "curl",
+          MLA_UPDATE_MANIFEST_URL: srv.url,
+          MLA_UPDATE_PUBLIC_KEY: pem,
+          PATH: process.env.PATH,
+        } as NodeJS.ProcessEnv,
+        buildInfo: buildInfo({ dirty: true }),
+        log: (l: string) => lines.push(l),
+      });
+      expect(code).toBe(0);
+    } finally {
+      await srv.close();
+      fs.rmSync(stage, { recursive: true, force: true });
+    }
+
+    // What the canary asserts, and what "Upgraded mla X -> Y" is claiming.
+    expect(fs.readFileSync(installed, "utf8")).toBe(NEW);
+    expect(fs.readFileSync(installed + ".prev", "utf8")).toBe(OLD);
+    expect(fs.statSync(installed).mode & 0o111).toBeTruthy();
+    // And nothing was fabricated under the state home.
+    expect(fs.existsSync(path.join(process.env.MEETLESS_HOME as string, "bin", "mla"))).toBe(false);
   });
 });

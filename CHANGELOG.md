@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.2.32 (2026-08-03)
+
+0.2.32 opens with the upgrade path, because it was the one command that could lie to you and still
+exit 0. `mla upgrade` decided it was allowed to self-replace by finding the running binary under
+`MLA_INSTALL_DIR`, then named the file it would actually overwrite from `MEETLESS_HOME`. Set
+`MEETLESS_HOME` anywhere non-default and those two roots part. The upgrade then downloaded the
+release, verified its signature and its checksum, renamed the new binary into a path nothing
+executes, wrote no rollback slot, left the real binary sitting on the old version, printed
+"Upgraded mla 0.2.30 to 0.2.31", and returned success. The binary that gets replaced is now the
+binary that is running. The self-update canary had caught this on both runs it ever made, and both
+times it was read as a bug in the canary.
+
+The rest of the release is about a workspace that has nothing indexed and no way to learn that.
+Measured in prod: 72 of the 80 live repository workspaces are activated with an empty corpus, and
+eight of them served 283 `retrieve_knowledge` pulls over six days that all came back empty. An
+agent reads an empty pull as "this fact was never recorded" rather than "nothing here was ever
+indexed", so it reports an absence of evidence as an absence of the fact. Three changes close that
+gap. The retrieval tools now distinguish a workspace that never ingested from one whose documents
+all landed in a capture lane that cannot ground an answer, and say plainly that retrieval will
+return nothing for every query instead of naming an onboarding step you already ran. `mla activate`
+hands off to onboarding on a standing condition, "this workspace has never been onboarded", rather
+than the one-time edge that reached only whoever ran the very first activate in a folder and never
+a teammate who cloned a committed marker. And a session that opens on an activated but empty
+workspace says so once, to the agent, and stays quiet whenever it cannot find out.
+
+Two more things were quietly wrong. The scan cache was keyed by workspace id alone, so a repository
+checked out three times bound one workspace to a single cache slot and the most recent scan
+darkened the other two roots; `mla doctor` was asking whether any scan existed rather than whether
+this root could read one, and the hook receipt was reporting what a delivery intended rather than
+what it did. Separately, `mla ask` was putting your question on the trace plane twice, once as a
+root span name built from raw argv and once as an argv attribute, through a redactor written to
+strip credentials and paths, which by construction leaves prose alone. Four seams carried it, not
+one. The trace plane now reduces argv the way the analytics plane always has: a known command, a
+known subcommand, approved flag names, and positionals dropped whole.
+
+- `mla upgrade` replaces the binary that is actually running, so an install under a custom
+  `MEETLESS_HOME` can no longer report an upgrade it did not perform
+- the retrieval tools tell an agent when a workspace holds captured documents that will never
+  ground an answer, instead of repeating an onboarding step that has already been run
+- the onboarding hand-off reaches everyone who activates a workspace nobody has onboarded, not only
+  the first person in the folder
+- a session opening on an activated workspace with an empty corpus says so once, and says nothing
+  at all when the check does not come back
+- the scan cache is keyed by root as well as by workspace, so three checkouts of one repository
+  stop erasing each other's scans
+- `mla doctor` reports whether this root can read a scan, and the hook receipt reports what was
+  delivered rather than what was intended
+- `mla ask` no longer sends your question to the trace plane, on any of the four seams that
+  carried it
+- handled failures record why they failed, so a usage mistake and an infrastructure fault stop
+  sharing one undiagnosable bucket
+- `mla enrich resolve` is idempotent: repeating a resolution that already succeeded no longer
+  re-mints the rule, rewrites the rules file, or moves the timestamp the audit trail exists to hold
+- deleting a scout no longer makes every run that ever used it unreadable, and a model can no
+  longer name its own rule class
+- the public mirror's scrub rules are enforced at commit time now, all eleven of them, so a fixture
+  carrying a real name, an internal path, or a real workspace id fails where the cost is one edit
+  rather than silently holding the mirror a version behind
+
 ## 0.2.31 (2026-08-01)
 
 0.2.31 gives `mla enrich` a third scout and somewhere for its findings to go. Reconciliation reads

@@ -5,6 +5,7 @@ import { scanWorkspace } from "../lib/scanner/scan";
 import {
   applyVerdicts,
   readScanCache,
+  readScanCacheAtRoot,
   readVerdicts,
   writeScanCache,
   writeProjectionReceipt,
@@ -254,9 +255,17 @@ export function readScanCacheForRoot(
   workspaceId: string,
   cwd?: string,
 ): ScanResult | null {
+  const root = resolveScanRootIdentity(cwd);
+  // The per-root slot first. It is keyed BY this root, so its content needs no stamp check, and it
+  // is immune to another root's scan: that scan writes its own slot. This is what stops the
+  // three-markers-one-slot stomp (see scanCachePathForRoot).
+  const perRoot = readScanCacheAtRoot(home, workspaceId, root);
+  if (perRoot) return perRoot;
+  // Fallback: the workspace-global slot with the original stamp check, for a cache written by a
+  // build older than per-root slots (or after a prune). Unchanged semantics.
   const cache = readScanCache(home, workspaceId);
   if (!cache || !cache.scanRootPath) return cache;
-  return cache.scanRootPath === resolveScanRootIdentity(cwd) ? cache : null;
+  return cache.scanRootPath === root ? cache : null;
 }
 
 // Decide which workspace to scan and which directory to scan FROM. Pure: takes

@@ -220,6 +220,14 @@ export const EGRESS_RULES: readonly EgressRule[] = [
     //                         sees them. The parent/child edges stay intact.
     //   name, status,
     //   ISO times          -> survive (short, low entropy).
+    // "Short, low entropy" was a claim about the SHAPE names happened to have,
+    // not a property this rule enforces, and it was false the day `mla ask
+    // "<question>"` named its root span after the question. Prose has the
+    // entropy of English and sails through untouched. Span-name safety is now a
+    // CONSTRUCTION guarantee made upstream by traceRootName (observability.ts),
+    // which builds the name only from a fixed command keyword: nothing here
+    // catches it if that reduction is ever removed. See the deliberate
+    // hole-documenting test in test/lib/trace-argv-reduction.spec.ts.
     // What "redact" actually reaches is Span.input / .output / .attributes /
     // .events[].attributes, every one typed `unknown`, which is exactly the
     // agent content this exercise is about. test/lib/egress-policy.spec.ts

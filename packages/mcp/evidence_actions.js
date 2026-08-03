@@ -112,6 +112,9 @@ function maskRetrievalError(err) {
   return e;
 }
 
+/** The corpus states this client has a message for. See `explainEmptyPull`. */
+const CORPUS_STATES = new Set(["empty", "captured_not_indexed", "populated"]);
+
 /**
  * Say WHICH empty a zero-candidate pull is, or null when there is nothing to say.
  *
@@ -129,8 +132,42 @@ function maskRetrievalError(err) {
  *                still not proof.
  *   undefined -> an intel that predates the field. Say "if", never assert.
  * Only ever called with zero candidates, so a served pull carries no warning.
+ *
+ * `corpusState` splits that `true` in half, because one boolean was carrying two
+ * product states with opposite remedies. A workspace that captured nothing and a
+ * workspace that captured hundreds of documents down a NON-GROUNDING lane are both
+ * `corpus_empty=true`, and the message above is a lie to the second one: it has
+ * indexed documents, it did run onboarding, and being told to run it again produces
+ * more of the same unservable rows.
+ *
+ * Prod on 2026-08-02, fleet-wide with zero exceptions: DERIVED_ONLY/agent_turn
+ * capture holds 629 documents and 0 groundable rows, PUBLISHED/git_commit holds 322
+ * and 322. Retrievability is decided entirely by the capture lane. Nine workspaces
+ * held 299 documents in the first state and every one of them was being told it had
+ * indexed nothing.
+ *
+ *   empty                -> nothing was ever captured. "Add something" is true.
+ *   captured_not_indexed -> capture ran, indexing did not. Different remedy.
+ *   populated            -> same as `corpus_empty === false`.
+ *
+ * State wins when we recognize it; otherwise fall back to the boolean, which every
+ * intel has sent since the field shipped. An UNRECOGNIZED state falls back too: a
+ * future fourth state must never reach the agent as a word we cannot explain.
+ *
+ * No message carries a count. The pull crosses an ACL boundary, so corpus size is
+ * not ours to disclose; intel deliberately sends no number and we do not invent one.
  */
-function explainEmptyPull(corpusEmpty) {
+function explainEmptyPull(corpusEmpty, corpusState) {
+  if (corpusState === "captured_not_indexed") {
+    return (
+      "This workspace has captured content, but none of it is in the searchable index, " +
+      "so retrieval returns nothing for EVERY query, not just this one. Agent session " +
+      "memory is kept for review and is never indexed, and anything added in the last " +
+      "few minutes may still be processing. Index a document to make it answerable " +
+      "(`mla kb add <path>`, or the /mla onboard skill for this repository). Do NOT " +
+      "report the absence of evidence as an absence of the fact."
+    );
+  }
   if (corpusEmpty === true) {
     return (
       "This workspace has no indexed documents, so retrieval returns nothing for EVERY " +
@@ -236,8 +273,14 @@ export async function runRetrieveKnowledge(args, deps) {
   if (candidates.length === 0) {
     const corpusEmpty =
       typeof response.corpus_empty === "boolean" ? response.corpus_empty : undefined;
+    // Allow-listed, never echoed: an unrecognized state must not reach the agent as
+    // a product word we have no message for.
+    const corpusState = CORPUS_STATES.has(response.corpus_state)
+      ? response.corpus_state
+      : undefined;
     if (corpusEmpty !== undefined) result.corpus_empty = corpusEmpty;
-    result.warnings = [explainEmptyPull(corpusEmpty)];
+    if (corpusState !== undefined) result.corpus_state = corpusState;
+    result.warnings = [explainEmptyPull(corpusEmpty, corpusState)];
   }
 
   return result;

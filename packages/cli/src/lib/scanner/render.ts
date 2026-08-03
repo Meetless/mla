@@ -266,12 +266,18 @@ export function renderScopedUnavailableMarker(): string {
   return `<meetless-context kind="scoped-unavailable" trust="must-follow">\n${SCOPED_UNAVAILABLE_MARKER_TEXT}\n</meetless-context>`;
 }
 
-// `incomplete delivery`: the local rule cache is missing or unreadable and there is no usable
-// last-known-good, so neither floor nor scoped delivery can be trusted this turn.
+// `incomplete delivery`: no cache is readable FOR THIS ROOT, so path-specific delivery cannot be
+// trusted this turn. The workspace-global floor may still ride beneath this marker (see Row 5 in
+// assemble-context.ts), which is why the text no longer claims nothing was delivered.
+//
+// The "written from a different checkout" clause is not hypothetical: one workspace id is bound by
+// several `.meetless.json` markers in this tree, and before per-root cache slots landed the last
+// scan won the single slot and every other root read this branch. Naming the cause in the marker is
+// what turns a mystified "why are my rules gone" into "run mla scan HERE".
 export const INCOMPLETE_DELIVERY_MARKER_TEXT =
-  "Rule delivery is incomplete this turn: the local rule cache is missing or unreadable " +
-  "(run mla scan). Some MUST/should rules may not be surfaced here; do not assume a rule is " +
-  "absent because it was not shown.";
+  "Rule delivery is incomplete this turn: the local rule cache for this directory is missing, " +
+  "unreadable, or was written from a different checkout (run mla scan here). Some MUST/should " +
+  "rules may not be surfaced here; do not assume a rule is absent because it was not shown.";
 export function renderIncompleteDeliveryMarker(): string {
   return `<meetless-context kind="delivery-incomplete" trust="must-follow">\n${INCOMPLETE_DELIVERY_MARKER_TEXT}\n</meetless-context>`;
 }

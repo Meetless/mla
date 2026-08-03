@@ -95,16 +95,55 @@ export function stampLatestFromManifest(manifest: Manifest): void {
 
 // --- filesystem layout -------------------------------------------------------
 
-// The curl install puts the binary here (install.sh: $HOME/.meetless/bin/mla),
-// as a plain file (no symlink), so rename(2) over this path atomically swaps the
-// inode. HOME honors MEETLESS_HOME, so a throwaway home makes eval hermetic.
-export function liveBinaryPath(): string {
-  return path.join(HOME, "bin", "mla");
+// The binary this process IS. `process.execPath` for a pkg-packaged mla is the
+// artifact itself, installed as a plain file (no symlink) by install.sh, so
+// rename(2) over it atomically swaps the inode; the running process keeps its
+// open inode and the next exec gets the new bytes.
+//
+// It is deliberately NOT derived from HOME. HOME is the mla STATE root and it
+// honors MEETLESS_HOME, which relocates config, queue and logs. It has never
+// relocated the binary: install.sh installs to ${MLA_INSTALL_DIR:-$HOME/.meetless/bin}
+// and never reads MEETLESS_HOME, and detectInstallMethod calls an install "curl"
+// by looking under the OS home. So the old derivation had the half of the
+// decision that AUTHORIZES a self-replace reading one root while the half that
+// NAMES the file read another, and with MEETLESS_HOME set they point at
+// different directories: `mla upgrade` downloaded, verified and swapped the new
+// binary into $MEETLESS_HOME/bin/mla, which nothing executes, wrote no rollback
+// slot (nothing was at the phantom path to snapshot), left the real binary at
+// the old version, printed "Upgraded mla X -> Y" and exited 0. canary-self-update
+// caught it on both runs it ever made (0.2.27, 0.2.30) and it was read twice as a
+// canary bug; it is what every operator with MEETLESS_HOME set was getting.
+//
+// Returns null when this process is not a packaged mla binary (a dev
+// `node dist/cli.js`, or a test): there is then nothing to self-replace, and
+// "nothing" is the only answer that cannot rename over the node runtime. A
+// rename over the wrong file is the one mistake this module cannot take back, so
+// it answers with the artifact it can demonstrate it is running, or not at all.
+export function liveBinaryPath(opts: { execPath?: string } = {}): string | null {
+  const execPath = opts.execPath ?? process.execPath;
+  const base = path.basename(execPath).toLowerCase();
+  if (base !== "mla" && base !== "mla.exe") return null;
+  return execPath;
 }
 
-// The single rollback slot (D4: keep exactly one previous binary).
-export function prevBinaryPath(): string {
-  return path.join(HOME, "bin", "mla.prev");
+// The single rollback slot (D4: keep exactly one previous binary), always beside
+// the live binary so the rename in rollbackBinary stays on one filesystem.
+export function prevBinaryPath(opts: { execPath?: string } = {}): string | null {
+  const live = liveBinaryPath(opts);
+  return live === null ? null : live + ".prev";
+}
+
+// liveBinaryPath for the callers that cannot proceed without one. Throwing here
+// beats defaulting: every caller of atomicSwapBinary already treats a throw as
+// "swap failed, roll back", and no plausible default is safe to rename over.
+function requireLiveBinaryPath(): string {
+  const live = liveBinaryPath();
+  if (live === null) {
+    throw new Error(
+      `cannot self-replace: this process is not an installed mla binary (${process.execPath})`,
+    );
+  }
+  return live;
 }
 
 // Where the background stager parks a verified, ready-to-promote binary so the
@@ -312,8 +351,8 @@ export function atomicSwapBinary(opts: {
   live?: string;
   prev?: string;
 }): boolean {
-  const live = opts.live ?? liveBinaryPath();
-  const prev = opts.prev ?? prevBinaryPath();
+  const live = opts.live ?? requireLiveBinaryPath();
+  const prev = opts.prev ?? live + ".prev";
   const dir = path.dirname(live);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `mla.new.${process.pid}`);
@@ -346,7 +385,8 @@ export function atomicSwapBinary(opts: {
 // never leaves the user stranded). Returns true if a rollback was performed.
 export function rollbackBinary(opts?: { live?: string; prev?: string }): boolean {
   const live = opts?.live ?? liveBinaryPath();
-  const prev = opts?.prev ?? prevBinaryPath();
+  if (live === null) return false; // nothing to restore over
+  const prev = opts?.prev ?? live + ".prev";
   try {
     if (!fs.existsSync(prev)) return false;
     fs.renameSync(prev, live);
@@ -469,7 +509,7 @@ export function reExecAfterUpgrade(opts: {
   argv?: string[];
   env?: NodeJS.ProcessEnv;
 }): number {
-  const live = opts.live ?? liveBinaryPath();
+  const live = opts.live ?? requireLiveBinaryPath();
   // For a pkg binary process.argv is [binary, snapshotEntry, ...userArgs], so the
   // real user args start at slice(2) (the same slice the main entry parses). We
   // spawn `live` directly; pkg re-injects its own snapshot entry as argv[1] in the
@@ -517,6 +557,7 @@ export async function maybePromoteStagedAndReExec(opts: {
   command: string | undefined;
   env?: NodeJS.ProcessEnv;
   buildInfo?: BuildInfo;
+  live?: string; // test seam: the installed binary to swap, defaults to this process
 }): Promise<PromoteResult> {
   try {
     const env = opts.env ?? process.env;
@@ -551,6 +592,12 @@ export async function maybePromoteStagedAndReExec(opts: {
       env,
     });
     if (method !== "curl") return NO_PROMOTE;
+    // The file we would swap has to be the one we are running. If this process
+    // is not a packaged binary there is nothing to promote INTO, and promoting
+    // anyway would fabricate a binary nobody executes while clearStaged() below
+    // discarded the staged bytes: a churn loop that never advances a version.
+    const live = opts.live ?? liveBinaryPath();
+    if (live === null) return NO_PROMOTE;
 
     const state = readUpdateState();
     const staged = state.staged;
@@ -570,19 +617,19 @@ export async function maybePromoteStagedAndReExec(opts: {
     }
 
     const locked = await withUpgradeLock(async () => {
-      atomicSwapBinary({ newBinaryPath: staged.path });
+      atomicSwapBinary({ newBinaryPath: staged.path, live });
       return true;
     });
     if (!locked.ran) return NO_PROMOTE; // another process is mid-upgrade
 
     clearStaged();
-    const code = reExecAfterUpgrade({ env });
+    const code = reExecAfterUpgrade({ env, live });
     return { reExeced: true, code };
   } catch {
     // An apply-on-launch failure must never break the command. Try a rollback
     // (best-effort) and fall through to running the current binary.
     try {
-      rollbackBinary();
+      rollbackBinary({ live: opts.live ?? undefined });
     } catch {
       // ignore
     }
@@ -617,6 +664,7 @@ export async function runUpgrade(opts: {
   env?: NodeJS.ProcessEnv;
   buildInfo?: BuildInfo;
   log?: Logger;
+  live?: string; // test seam: the installed binary to replace, defaults to this process
 }): Promise<number> {
   const env = opts.env ?? process.env;
   const buildInfo = opts.buildInfo ?? loadBuildInfo();
@@ -687,6 +735,20 @@ export async function runUpgrade(opts: {
     return 0;
   }
 
+  // Name the file before fetching a single byte. detectInstallMethod said curl,
+  // which authorizes a self-replace; this is the other half of that decision, and
+  // the two used to read different roots (see liveBinaryPath). Refusing here beats
+  // downloading, verifying and swapping into a path nothing executes and then
+  // reporting success, which is exactly what shipped in 0.2.29 and 0.2.30.
+  const live = opts.live ?? liveBinaryPath();
+  if (live === null) {
+    log(
+      `Could not identify the installed mla binary to replace (running ${process.execPath}). ` +
+        "Re-run the installer: curl -fsSL https://meetless.ai/install.sh | sh",
+    );
+    return 1;
+  }
+
   const artifact = selectArtifact(manifest, triple);
   if (!artifact) {
     log(`No release artifact published for this platform (${triple ?? "unsupported"}).`);
@@ -702,10 +764,10 @@ export async function runUpgrade(opts: {
 
   const result = await withUpgradeLock(async () => {
     try {
-      atomicSwapBinary({ newBinaryPath: extracted.binaryPath });
+      atomicSwapBinary({ newBinaryPath: extracted.binaryPath, live });
       return true;
     } catch {
-      rollbackBinary();
+      rollbackBinary({ live });
       return false;
     }
   });

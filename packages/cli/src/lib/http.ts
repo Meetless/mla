@@ -96,11 +96,15 @@ function startHttpSpan(
 ): { handle: SpanHandle | null; startMs: number } {
   const tracer = getRunTracer();
   if (!tracer) return { handle: null, startMs: Date.now() };
-  const handle = tracer.startSpan({
-    name: `${plane}.${routeNameFromPath(path)}`,
-  });
+  // ONE derivation, used for both the name and the attribute. They were split
+  // before: the name rolled the path up, the attribute kept `path` raw, so
+  // every query string (workspaceId, actorUserId, a document id) and every
+  // id-shaped segment rode out to Langfuse on an attribute whose own doc
+  // comment above claims it is derived via routeNameFromPath.
+  const route = routeNameFromPath(path);
+  const handle = tracer.startSpan({ name: `${plane}.${route}` });
   handle.setAttribute("http.method", method);
-  handle.setAttribute("route", path);
+  handle.setAttribute("route", route);
   return { handle, startMs: Date.now() };
 }
 

@@ -28,7 +28,7 @@ import {
   MAX_CLAIM_TEXT_LENGTH,
   MAX_CLAIM_SCOPE_LENGTH,
   DOC_CLAIM_CLASSES,
-  MINTABLE_ENRICHMENT_KINDS,
+  claimClassPhraseExamples,
   RECONCILIATION_FINDING_KIND,
   SCOUT_CANDIDATE_KINDS,
   scoutMayEmitKind,
@@ -174,7 +174,9 @@ function anchorContract(role: ScoutName): { evidenceExample: string; anchorRule:
 // re-read from the document at the run's head commit and must match verbatim, and the path,
 // status, and renamedFrom must match the commit's prepared file list exactly. So this block is
 // not asking the scout to summarize; it is asking it to COPY, and anything it invents is
-// rejected rather than persisted.
+// rejected rather than persisted. The durable rule kind is deliberately NOT asked for: the CLI
+// stamps it (FINDING_PROPOSED_RULE_KIND) and treats a candidate that carries one as an unknown
+// field, so requesting it here would reject every scout that answered honestly.
 function renderInconsistencyField(role: ScoutName): string[] {
   if (!scoutMayEmitKind(role, RECONCILIATION_FINDING_KIND)) {
     return [];
@@ -183,8 +185,7 @@ function renderInconsistencyField(role: ScoutName): string[] {
     '      "inconsistency": {',
     `        "claimClass": "<one of: ${DOC_CLAIM_CLASSES.join(" | ")}>",`,
     `        "claimText": "<the rule sentence COPIED VERBATIM from the document, ${MAX_CLAIM_TEXT_LENGTH} characters or fewer>",`,
-    `        "claimScope": "<the exact path the rule governs, or a directory prefix ending in /, ${MAX_CLAIM_SCOPE_LENGTH} characters or fewer>",`,
-    `        "proposedRuleKind": "<if a human adopted this rule, which kind it would be: ${MINTABLE_ENRICHMENT_KINDS.join(" | ")}>",`,
+    `        "claimScope": "<a path the quoted sentence itself writes out, ${MAX_CLAIM_SCOPE_LENGTH} characters or fewer>",`,
     '        "divergence": {',
     '          "path": "<the file the commit touched, copied exactly from that commit\'s files list above>",',
     '          "status": "<that file\'s status letter, copied exactly from the same line>",',
@@ -240,6 +241,30 @@ function renderOutputContract(role: ScoutName): string[] {
   ];
 }
 
+// The prohibition grammar, rendered from the validator's own phrase tables. The scout is not
+// asked to judge whether a sentence "is a rule": it is shown the exact shapes the CLI matches,
+// because a class the quote does not state is the single cheapest way to fabricate governance
+// out of a description ("this file is generated" is a fact about the past, not a prohibition).
+function renderClaimGrammar(): string[] {
+  const lines = [
+    "The quote must PROHIBIT something, and the prohibition must belong to the class you",
+    "picked. A sentence that only describes what happens is not a rule and is rejected. The",
+    "CLI matches a small fixed phrase list, so use the document's own wording in one of these",
+    "shapes:",
+  ];
+  for (const cls of DOC_CLAIM_CLASSES) {
+    const ex = claimClassPhraseExamples(cls);
+    lines.push(`  ${cls}: "... ${ex.passive} ..." or "... ${ex.imperative} ..."`);
+  }
+  lines.push(
+    "Close synonyms of those verbs are accepted, as are the other common modals (must not,",
+    "should never, may not, cannot, shall not). A different class's verb is not: a delete",
+    "prohibition filed as `never_modify` is a fabricated rule, and the status letter cannot",
+    "tell them apart because it only proves that SOME change landed.",
+  );
+  return lines;
+}
+
 // What each role does with a contradiction. A switch, not one paragraph shown to everyone: the
 // two extraction scouts each hold half the evidence and must fold a conflict into an ordinary
 // governance candidate, while the reconciliation scout has a kind for exactly this and would be
@@ -266,12 +291,17 @@ function renderContradictionRule(role: ScoutName): string[] {
         "exact quote. `divergence.path`, `divergence.status`, and `divergence.renamedFrom`",
         "must be copied from the commit's files list above, and are checked the same way.",
         "The status letter has to PROVE the claim you picked: `never_modify` needs M,",
-        "`never_add` needs A, `never_delete` needs D, `never_rename` needs R or C. A file",
-        "that was merely modified does not prove a rule about adding files, and a rule you",
-        "cannot state as one of those four classes is not a finding for this run.",
-        "`claimScope` must cover `divergence.path`: the exact path, or a directory prefix",
-        "ending in `/` that the changed file sits under. A rule about one file says nothing",
-        "about its neighbours.",
+        "`never_add` needs A, `never_delete` needs D, `never_rename` needs R. A copy (`C`)",
+        "leaves the governed file exactly where the document put it and adds a second file",
+        "beside it, so it renames nothing. A file that was merely modified does not prove a",
+        "rule about adding files, and a rule you cannot state as one of those four classes",
+        "is not a finding for this run.",
+        ...renderClaimGrammar(),
+        "`claimScope` must be a path the quoted sentence WRITES OUT, character for character:",
+        "the exact file path, or a directory ending in `/` when the document itself wrote the",
+        "directory. The CLI never infers or widens a scope, so a parent directory you derived",
+        "from a filename is rejected, and the scope must still cover `divergence.path`. A rule",
+        "about one file says nothing about its neighbours.",
       ];
     default:
       return assertNever(role, "renderContradictionRule");

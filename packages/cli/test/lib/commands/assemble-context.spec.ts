@@ -77,6 +77,9 @@ async function run(
   // the subcommand falls back to its repoRoot-contained filesystem reader (never invoked here,
   // because no cache below carries reconciliation findings for it to rehash).
   readArtifactBytes?: ArtifactByteReader,
+  // The UNGUARDED workspace-global cache. Only Row 5 reads it, to recover the floor when no cache
+  // is readable for this root. Defaults to null = no global cache on disk either.
+  globalCacheValue: ScanResult | null = null,
 ): Promise<Harness> {
   const audits: PersistedAssembleAudit[] = [];
   const meters: { path: string; json: string }[] = [];
@@ -84,6 +87,7 @@ async function run(
   const deps: AssembleContextDeps = {
     readStdin: () => (typeof stdin === "string" ? stdin : JSON.stringify(stdin)),
     readCache: () => cacheValue,
+    readGlobalCache: () => globalCacheValue,
     writeAudit: (_home, _ws, audit) => {
       audits.push(audit);
     },
@@ -211,6 +215,47 @@ describe("assemble-context — Row 5: missing/unreadable cache (incomplete deliv
     expect(h.stdout).toContain(BASE);
     expect(h.stdout).toContain(INCOMPLETE_DELIVERY_MARKER_TEXT);
     expect(h.audits[0].state).toBe("incomplete");
+  });
+
+  it("still delivers the workspace-global floor when this root has no readable cache", async () => {
+    // The regression this pins: a root mismatch (several `.meetless.json` markers, one workspace
+    // id) makes the guarded per-root read return null, and this branch used to emit base + marker
+    // ONLY. The floor block is bundle-sourced and workspace-global, so it is correct from any
+    // root's scan, and dropping it cost every floor MUST for 8h11m on 2026-08-02. The bash hook
+    // cannot cover this: the head below is non-empty, so the hook's floor fallback never runs.
+    const floorXml =
+      '<meetless-context kind="floor-rules" trust="must-follow">\n- never push without consent\n</meetless-context>';
+    const h = await run(stdin(), null, [], undefined, cache({ floorRulesXml: floorXml }));
+    expect(h.code).toBe(0);
+    expect(h.stdout).toContain(BASE);
+    expect(h.stdout).toContain(INCOMPLETE_DELIVERY_MARKER_TEXT);
+    expect(h.stdout).toContain("never push without consent");
+    // Still a VISIBLE degradation, not a silent floor-only success: the scoped rules for this root
+    // genuinely were not delivered, and the state must keep saying so.
+    expect(h.audits[0].state).toBe("incomplete");
+    // The marker leads, for the same reason as Rows 3/4: the instruction to distrust the missing
+    // scoped rules outranks the floor bullets it precedes.
+    expect(h.stdout.indexOf(INCOMPLETE_DELIVERY_MARKER_TEXT)).toBeLessThan(
+      h.stdout.indexOf("never push without consent"),
+    );
+  });
+
+  it("meters the recovered floor as real always-on bytes", async () => {
+    const floorXml =
+      '<meetless-context kind="floor-rules" trust="must-follow">\n- never push without consent\n</meetless-context>';
+    const h = await run(
+      stdin({ meterFile: "/tmp/meter-row5.json" }),
+      null,
+      [],
+      undefined,
+      cache({ floorRulesXml: floorXml }),
+    );
+    const meter = JSON.parse(h.meters[0].json);
+    // Bytes are true even on a degraded branch (a turn that delivered a floor is not a free turn),
+    // while the rule COUNT stays 0 because a pre-rendered block cannot say how many rules are in it.
+    expect(meter.always_on_bytes).toBe(Buffer.byteLength(floorXml, "utf8"));
+    expect(meter.always_on_rules).toBe(0);
+    expect(meter.degraded).toBe(true);
   });
 });
 

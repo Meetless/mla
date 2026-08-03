@@ -31,6 +31,7 @@ import { intelGet, intelPost } from "../lib/http";
 import { INGEST_TIMEOUT_MS } from "../lib/intel-ingest-budget";
 import type { KbAddReceipt } from "../lib/render";
 import { buildPlan, persistPlan, loadRunRecord } from "../lib/enrichment/plan";
+import { fetchOnboardingStatus } from "../lib/enrichment/onboarding-status-client";
 import {
   acquireOnboardingLock,
   releaseOnboardingLock,
@@ -48,14 +49,18 @@ import { buildScoutPrompt } from "../lib/enrichment/scout-brief";
 import {
   PROTOCOL_VERSION,
   DEFAULT_BUDGET_MS,
-  SCOUT_NAMES,
+  DISPATCH_SCOUT_NAMES,
+  assertDispatchableRole,
   validateCandidateShape,
   assertNever,
   FINDING_RESOLUTIONS,
   RECONCILIATION_FINDING_KIND,
   findingToRuleCandidate,
   isFindingResolution,
+  FINDING_PROPOSED_RULE_KIND,
+  NO_FILE_OPERATION_FINDINGS,
   type FindingResolution,
+  type ProposedRuleKind,
   type FindingResolutionRecord,
   type ScoutName,
   type ScoutIngestOutcome,
@@ -81,6 +86,8 @@ import {
   type DecisionOption,
   type DecisionRequest,
 } from "../lib/machine-output";
+import { noteHandledFailure } from "../lib/analytics/handled-failure";
+import { emitOnboardingFinding } from "../lib/analytics/onboarding-finding";
 import { resolveBackendOperator, type BackendOperator } from "../lib/rules/backend-operator";
 import {
   alreadyMintedHashes,
@@ -92,6 +99,7 @@ import { type RuleAuthorityScope, type RuleClientHttp } from "../lib/rules/contr
 // Delivery is the seam's job, not accept's: every verb that mutates the rule authority carries the
 // change down to the caches an agent reads. See commands/rule-delivery.ts for the three-hop chain.
 import { refreshRuleDelivery } from "./rule-delivery";
+import { terminalSafe } from "../lib/terminal-safe";
 
 const USAGE = `mla enrich: agent-orchestrated onboarding enrichment.
 
@@ -286,20 +294,16 @@ export async function checkWorkspaceOnboarded(
   headCommit: string | null,
 ): Promise<WorkspaceOnboardStatus> {
   if (!headCommit) return { onboarded: false };
-  try {
-    const q = new URLSearchParams({ headCommit, workspaceId: cfg.workspaceId }).toString();
-    const res = await intelGet<{ onboarded?: boolean; completedAt?: string; candidatesPersisted?: number }>(
-      cfg,
-      `/internal/v1/onboarding/status?${q}`,
-    );
-    return {
-      onboarded: !!res.onboarded,
-      completedAt: res.completedAt,
-      candidatesPersisted: res.candidatesPersisted,
-    };
-  } catch {
-    return { onboarded: false }; // fail open: never let a network hiccup block onboarding
-  }
+  const res = await fetchOnboardingStatus(cfg, { headCommit });
+  // Fail OPEN at this call site: the client's `null` (offline, 5xx, un-authed) collapses
+  // to false here, so a network hiccup never blocks onboarding. `activate` reads the same
+  // client and collapses the other way (unknown -> stay silent), which is why the tri-state
+  // lives in the client and the policy lives in each caller.
+  return {
+    onboarded: res.onboarded === true,
+    completedAt: res.completedAt,
+    candidatesPersisted: res.candidatesPersisted,
+  };
 }
 
 // Build the best-effort marker request written after a successful ingest (§4C). Returns
@@ -628,6 +632,41 @@ export interface IngestFindingsView {
   candidates: readonly OnboardingCandidateRecord[];
 }
 
+// How much of each repository-controlled value a terminal row shows.
+//
+// Every value these renderers print comes out of the repository: the quote out of a document, the
+// paths out of git's name-status, the name out of a commit header, the statement out of whatever
+// the mint was handed. On a shared repository the person controlling those bytes is not the
+// person reading the row, and the row is the screen where a human signs a rule into their agent's
+// authority. So each one goes through `terminalSafe`: it may change what the row SAYS, never what
+// the terminal DOES, and never how many lines the report appears to have.
+//
+// The caps are on the RENDERING only. Nothing truncated here is ever stored: the mint and the
+// ancestry proof re-read the quote out of the document, so the sidecar keeps it byte-exact and
+// only the screen gets the short version. The protocol accepts a 600-character claim; a terminal
+// row is not 600 characters wide, and `terminalSafe` marks the cut so a human is never asked to
+// approve a sentence whose remainder they silently never saw.
+const DISPLAY_LEN = {
+  quote: 240,
+  scope: 120,
+  path: 160,
+  status: 8,
+  author: 60,
+  statement: 300,
+} as const;
+
+// A repository-controlled value printed INSIDE double quotes. `terminalSafe` guarantees the value
+// cannot add a line or drive the terminal; it says nothing about the delimiter it lands in, and a
+// straight `"` in the document would close the quote early. On one line that still forges layout:
+//   CLAUDE.md says: "never edit" then run: mla enrich resolve --run-id attacker"
+// reads as a quote that ended and an instruction that did not. Inner quotes become apostrophes so
+// the quoted region has exactly one opening and one closing delimiter, both written by us. This is
+// display only; the sidecar keeps the byte-exact sentence, because the mint and the ancestry proof
+// re-read it out of the document.
+function quoted(value: string, maxLen: number): string {
+  return `"${terminalSafe(value, maxLen).replace(/"/g, "'")}"`;
+}
+
 export function renderIngestSummary(
   outcomes: ScoutIngestOutcome[],
   status: string | undefined,
@@ -641,20 +680,43 @@ export function renderIngestSummary(
   // nobody answers. Neither side is declared wrong here: the headline states the disagreement
   // and the next line is the command that asks the human which one is right.
   const open = (findings?.candidates ?? []).filter((c) => isFinding(c) && !c.resolution);
+
+  // The zero-result sentence asserts something about EVIDENCE, so it prints only where this run
+  // holds that evidence. Three conditions, each able to fail on its own:
+  //
+  //   ran      the reconciliation scout produced an outcome in THIS ingest. No outcome, no claim:
+  //            an examination that never happened cannot report a clean result.
+  //   clean    nothing it proposed was refused and its envelope carried no error. A refused claim
+  //            is one the CLI could not stand behind, not one that proved false, and printing
+  //            "found nothing" over it launders a verification failure into a clean bill.
+  //   empty    no OPEN finding survived. The sidecar answers that exactly when there is one; with
+  //            no sidecar the answer is only knowable when the scout accepted nothing at all,
+  //            because from here an accepted rule and an accepted finding look identical.
+  //
+  // The last one is why the sentence is NOT gated on the findings view: a run whose scout
+  // completed with nothing to report persists nothing, so it writes no sidecar. That is the one
+  // run whose zero result is fully proved, and it used to be the one run that said nothing.
+  const recon = outcomes.find((o) => o.scout === "reconciliation");
+  const provedZero =
+    !!recon &&
+    recon.rejected === 0 &&
+    recon.errors.length === 0 &&
+    (findings ? open.length === 0 : recon.accepted === 0);
+
   if (findings && open.length > 0) {
     lines.push(
-      `  ${open.length} finding${open.length === 1 ? "" : "s"}: a document and a commit disagree, ` +
-        `and neither is assumed right.`,
+      `  ${open.length} finding${open.length === 1 ? "" : "s"}: a document and a commit appear ` +
+        `inconsistent, and neither is assumed right.`,
       ``,
     );
     for (const r of open) lines.push(...renderFindingRow(r));
     lines.push(``, `  Answer ${open.length === 1 ? "it" : "them"}:  mla enrich resolve --run-id ${findings.runId}`, ``);
-  } else if (findings && outcomes.some((o) => o.scout === "reconciliation")) {
-    // Claim ONLY what was examined. The reconciliation scout saw the documents this run planned
-    // and the commits this run listed; it did not read the repository, so "no inconsistencies in
-    // this repo" would be a coverage claim the run never earned. The scope is stated in the
-    // sentence rather than left for the operator to assume.
-    lines.push(`  No inconsistencies between the documents and the commits this run examined.`, ``);
+  } else if (provedZero) {
+    // Claim ONLY what was examined, on both axes: which evidence (the documents this run planned
+    // and the commits it listed, never the repository) and which question (the file operations a
+    // porcelain status letter can prove, never "is this codebase consistent"). The sentence is
+    // the shared constant so this screen and the resolve review cannot drift into two claims.
+    lines.push(`  ${NO_FILE_OPERATION_FINDINGS}`, ``);
   }
   let totalPersisted = 0;
   let totalDeduped = 0;
@@ -680,7 +742,7 @@ export function renderIngestSummary(
       const where = e.index >= 0 ? `candidate ${e.index + 1}` : "scout";
       lines.push(`      - ${where}: ${e.code} (${e.message})`);
       if (e.excerpt && e.index !== excerptShownFor) {
-        lines.push(`        dropped: "${e.excerpt}"`);
+        lines.push(`        dropped: ${quoted(e.excerpt, DISPLAY_LEN.quote)}`);
         excerptShownFor = e.index;
       }
     }
@@ -809,6 +871,21 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
     now: new Date().toISOString(),
   });
 
+  // One analytics row per finding that newly landed (design §9). This is the clock for "time
+  // to first finding" and the denominator side of the share metrics; without it the §9 list is
+  // a set of intentions with no producer. Fail-soft inside the seam: the documents already
+  // landed, and a telemetry fault must not change what this command reports or returns.
+  for (const findingId of res.newFindingIds ?? []) {
+    emitOnboardingFinding(
+      { candidateId: findingId },
+      {
+        workspaceId: cfg.workspaceId,
+        sessionId: (process.env.CLAUDE_CODE_SESSION_ID || "").trim() || null,
+        nowMs: Date.now(),
+      },
+    );
+  }
+
   // Release the active-run lock once the run is fully complete so a new run can start at
   // once. A partial run stays locked (it may resume) until its lock self-expires. Keyed by
   // runId, so this only ever frees THIS run's lock, never a successor that reclaimed it.
@@ -857,8 +934,9 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
     console.log(JSON.stringify(res, null, 2));
   } else {
     // Read the sidecar this ingest just wrote so the summary can lead with the findings. Its
-    // absence is not an error (a run with nothing to persist writes none); it degrades to the
-    // counts-only summary rather than claiming a clean bill of health it cannot support.
+    // absence is not an error: a run with nothing to persist writes none. The summary does not
+    // need it to state the run's scope (the reconciliation OUTCOME carries that), only to name
+    // and quote findings that exist, so the no-sidecar run still gets its honest zero line.
     const sidecar = res.runId ? loadCandidatesSidecar(HOME, cfg.workspaceId, res.runId) : null;
     console.log(
       renderIngestSummary(
@@ -872,10 +950,24 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
 
   // 1 when a scout needs attention (infra failure or a malformed envelope worth a retry);
   // 0 otherwise. A scout that merely "timed_out" is rerunnable state, not an error here.
-  const needsAttention = (res.state ? Object.values(res.state.scouts) : []).some(
+  const attention = (res.state ? Object.values(res.state.scouts) : []).filter(
     (s) => s.status === "persistence_failed" || s.status === "malformed",
   );
-  return needsAttention ? 1 : 0;
+  if (attention.length === 0) return 0;
+
+  // This exit bypasses failInMode (it is a plain non-zero return), so nothing else would
+  // tell analytics WHY: it landed as an unexplained user_error with a null class, which is
+  // how a prod workspace burned three ingest attempts leaving no recoverable reason.
+  // Declare it: neither status is the operator's mistake (one is a KB write that failed,
+  // one is a scout envelope we could not parse) and both are worth a rerun.
+  noteHandledFailure({
+    error_class: attention.some((s) => s.status === "persistence_failed")
+      ? "scout_persistence_failed"
+      : "scout_malformed",
+    outcome: "system_error",
+    retryable: true,
+  });
+  return 1;
 }
 
 interface BriefFlags {
@@ -894,17 +986,18 @@ export function parseBriefArgs(argv: string[]): BriefFlags {
     } else if (a === "--role") {
       const v = argv[++i];
       if (!v) throw new Error("--role requires a value");
-      if (!(SCOUT_NAMES as readonly string[]).includes(v)) {
-        throw new Error(`--role must be one of: ${SCOUT_NAMES.join(", ")}`);
-      }
-      flags.role = v as ScoutName;
+      // Dispatch roster, not the parse roster: a retired scout must be unbriefable, which
+      // is what makes "no new token cost" enforceable rather than merely intended. Old run
+      // records that still name it stay readable; they just cannot be briefed again.
+      flags.role = assertDispatchableRole(v);
     } else if (a === "--workspace") {
       flags.workspace = argv[++i];
       if (!flags.workspace) throw new Error("--workspace requires a workspace id");
     } else throw new Error(`Unknown flag for \`mla enrich brief\`: ${a}`);
   }
   if (!flags.runId) throw new Error("--run-id is required (the id printed by `mla enrich plan`)");
-  if (!flags.role) throw new Error(`--role is required (one of: ${SCOUT_NAMES.join(", ")})`);
+  if (!flags.role)
+    throw new Error(`--role is required (one of: ${DISPATCH_SCOUT_NAMES.join(", ")})`);
   return flags;
 }
 
@@ -1392,12 +1485,22 @@ export function renderAcceptReview(
     for (const c of [...knowledgeOnly].sort(byStatement)) lines.push(row(c));
   }
 
+  lines.push("");
   if (durable.length > 0) {
-    lines.push("");
     lines.push(`Accept all durable rules:  mla enrich accept --run-id ${runId} --all`);
     lines.push(`Accept specific ones:      mla enrich accept --run-id ${runId} --only <id-prefix>[,<id-prefix>...]`);
     lines.push("Preview without minting:   add --dry-run");
     lines.push("Enforce workspace-wide:    add --team (default is PERSONAL: it enforces for you alone)");
+  } else if (knowledgeOnly.length > 0) {
+    // Onboarding worked; it just found decisions, not rules. Saying only "no durable rules"
+    // reads as a failure and ends the session at zero rules, which is exactly where three
+    // prod workspaces stopped. Name the distinction, then hand over a runnable command.
+    lines.push("Governed knowledge is answerable through `mla ask`, but only a rule is injected into an agent's context.");
+    lines.push(`Write one directly:        mla rules add "<statement>" [--personal|--team] [--must]`);
+  } else {
+    lines.push("The scouts surfaced nothing to govern in this run.");
+    lines.push(`Re-run them:               mla enrich plan  (then brief, then ingest)`);
+    lines.push(`Or write a rule directly:  mla rules add "<statement>" [--personal|--team] [--must]`);
   }
   return lines.join("\n");
 }
@@ -1832,10 +1935,10 @@ function renderMintSummary(
   }
   const lines: string[] = [];
   for (const o of minted) {
-    lines.push(`MINTED ${authorityScope} rule ${o.ruleId}: ${o.rule.statement}`);
+    lines.push(`MINTED ${authorityScope} rule ${o.ruleId}: ${terminalSafe(o.rule.statement, DISPLAY_LEN.statement)}`);
   }
   for (const o of alreadyLive) {
-    lines.push(`Already live (not minted again): ${o.rule.statement}`);
+    lines.push(`Already live (not minted again): ${terminalSafe(o.rule.statement, DISPLAY_LEN.statement)}`);
   }
   if (minted.length > 0) {
     // Only claim injection when the local caches were actually refreshed. Saying "injects them now"
@@ -1949,14 +2052,26 @@ function renderFindingRow(record: OnboardingCandidateRecord): string[] {
   const inc = record.inconsistency!;
   const short = record.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN);
   const commit = record.evidence.find((e) => e.type === "commit");
+  const scope = terminalSafe(inc.claimScope, DISPLAY_LEN.scope);
+  const quote = quoted(inc.claimText, DISPLAY_LEN.quote);
+  const status = terminalSafe(inc.divergence.status, DISPLAY_LEN.status);
+  const path = terminalSafe(inc.divergence.path, DISPLAY_LEN.path);
+  const from = inc.divergence.renamedFrom ? terminalSafe(inc.divergence.renamedFrom, DISPLAY_LEN.path) : "";
   const lines = [
-    `  ${short}  ${inc.claimScope} says: "${inc.claimText}"`,
-    `                but ${inc.divergence.status} ${inc.divergence.path}` +
-      (inc.divergence.renamedFrom ? ` (from ${inc.divergence.renamedFrom})` : "") +
+    `  ${short}  ${scope} says: ${quote}`,
+    `                but ${status} ${path}` +
+      (from ? ` (from ${from})` : "") +
       (commit && commit.type === "commit" ? ` in ${commit.commit.slice(0, 12)}` : ""),
   ];
-  if (inc.attribution?.authorName) {
-    lines.push(`                the rule was last written by ${inc.attribution.authorName}`);
+  // "last changed by", not "last wrote": blame names whoever last TOUCHED the anchored range,
+  // which may be whoever reflowed the paragraph. Putting a name on authorship git never claimed
+  // is a small lie printed under a rule someone is about to sign.
+  // An empty name after sanitizing means the commit header held nothing printable; the line is
+  // dropped rather than rendered blank, because "last changed by" with nothing after it reads as
+  // a person the CLI failed to load.
+  const author = inc.attribution?.authorName ? terminalSafe(inc.attribution.authorName, DISPLAY_LEN.author) : "";
+  if (author) {
+    lines.push(`                last changed by ${author}`);
   }
   return lines;
 }
@@ -1978,12 +2093,12 @@ export function renderResolveReview(
     lines.push(
       resolved.length > 0
         ? `Every finding from run ${runId} is resolved (${resolved.length} closed).`
-        : "This run found no doc/code inconsistencies.",
+        : NO_FILE_OPERATION_FINDINGS,
     );
   } else {
     lines.push(
       `${open.length} open finding${open.length === 1 ? "" : "s"} from run ${runId} ` +
-        "(a document and a commit disagree; neither is assumed right):",
+        "(a document and a commit appear inconsistent; neither is assumed right):",
     );
     for (const r of open) lines.push(...renderFindingRow(r));
   }
@@ -2022,7 +2137,9 @@ function buildResolveDecisionRequest(
   const target = open[0];
   const inc = target.inconsistency!;
   const label: Record<FindingResolution, string> = {
-    code_diverged: `The document is right: mint "${inc.claimText}" as a ${inc.proposedRuleKind}`,
+    // The kind the mint will actually use, not the record's stored copy: an old sidecar may name
+    // a kind this version no longer mints, and a prompt that promises one is a lie to the human.
+    code_diverged: `The document is right: mint ${quoted(inc.claimText, DISPLAY_LEN.quote)} as a ${FINDING_PROPOSED_RULE_KIND}`,
     doc_stale: "The change is right: the document is out of date",
     carve_out: "Both were right: this change was a deliberate exception",
   };
@@ -2036,9 +2153,11 @@ function buildResolveDecisionRequest(
     kind: "enrich.resolve",
     subject: { run_id: runId },
     prompt:
-      `${inc.claimScope} says "${inc.claimText}", and commit ` +
+      `${terminalSafe(inc.claimScope, DISPLAY_LEN.scope)} says ` +
+      `${quoted(inc.claimText, DISPLAY_LEN.quote)}, and commit ` +
       `${target.evidence.find((e) => e.type === "commit")?.commit.slice(0, 12) ?? "(unknown)"} ` +
-      `${inc.divergence.status} ${inc.divergence.path} anyway. Which one is right?` +
+      `${terminalSafe(inc.divergence.status, DISPLAY_LEN.status)} ` +
+      `${terminalSafe(inc.divergence.path, DISPLAY_LEN.path)} anyway. Which one is right?` +
       (open.length > 1 ? ` (${open.length - 1} more open after this one.)` : ""),
     options,
   };
@@ -2046,6 +2165,37 @@ function buildResolveDecisionRequest(
 
 const isFinding = (c: OnboardingCandidateRecord): boolean =>
   c.kind === RECONCILIATION_FINDING_KIND && !!c.inconsistency;
+
+/**
+ * What answering a finding does, given what is already recorded on it. Three transitions, named:
+ *
+ *   perform    nothing is recorded. Mint (if the verdict mints), write, stamp. Exactly once.
+ *   settled    the SAME verdict is already recorded. Do nothing at all, and say so.
+ *   conflict   a DIFFERENT verdict is recorded. Refuse; the first answer stands.
+ *
+ * `settled` is the transition worth naming. With only the conflict guard in place a repeat fell
+ * through the entire body: it re-entered the mint (a network call), re-wrote the projection, and
+ * re-stamped `resolvedAt` from the clock, silently moving WHEN the decision was recorded. Retrying
+ * a command that already succeeded (a dropped connection, a re-run script, an agent replaying its
+ * own transcript) is normal, and it must not rewrite the audit trail. So the repeat is a no-op
+ * rather than a second execution that happens to be harmless.
+ *
+ * Total in both arguments, so a fourth resolution or a fourth state cannot slip through unhandled.
+ */
+export type ResolveTransition =
+  | { kind: "perform" }
+  | { kind: "settled"; resolution: FindingResolutionRecord }
+  | { kind: "conflict"; resolution: FindingResolutionRecord };
+
+export function resolveTransition(
+  recorded: FindingResolutionRecord | undefined,
+  asked: FindingResolution,
+): ResolveTransition {
+  if (!recorded) return { kind: "perform" };
+  return recorded.outcome === asked
+    ? { kind: "settled", resolution: recorded }
+    : { kind: "conflict", resolution: recorded };
+}
 
 /**
  * `mla enrich resolve`: close one doc/code finding with one of three answers.
@@ -2074,15 +2224,34 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
     return failInMode(command, "config_error", (e as Error).message, 2);
   }
 
-  const sidecar = loadCandidatesSidecar(HOME, cfg.workspaceId, flags.runId!);
+  // A run that persisted nothing writes no sidecar, and the onboarding skill sends the agent
+  // through this review regardless: run it, and if it lists nothing, say the one scoped line.
+  // Reporting that run's honest zero as an error taught the agent to say the run FAILED, which
+  // is a second false statement about a run that worked. The plan record is the discriminator:
+  // present means the run happened and had nothing to persist, absent means the id is wrong.
+  // Standing in an empty sidecar (rather than branching) keeps ONE review path: the renderer,
+  // the machine envelope, and the "no finding id starts with" refusal all stay exactly as they
+  // are, and a verdict against a run with no findings is still an invalid selection.
+  let sidecar = loadCandidatesSidecar(HOME, cfg.workspaceId, flags.runId!);
   if (!sidecar) {
-    return failInMode(
-      command,
-      "unknown_run",
-      `no candidates sidecar for run ${flags.runId} in workspace ${cfg.workspaceId}. ` +
-        "Run `mla enrich ingest` first, from the same workspace.",
-      2,
-    );
+    const record = loadRunRecord(HOME, cfg.workspaceId, flags.runId!);
+    if (!record) {
+      return failInMode(
+        command,
+        "unknown_run",
+        `no onboarding run ${flags.runId} in workspace ${cfg.workspaceId}. ` +
+          "Run `mla enrich plan` and `mla enrich ingest` first, from the same workspace.",
+        2,
+      );
+    }
+    sidecar = {
+      schemaVersion: 1,
+      workspaceId: cfg.workspaceId,
+      runId: record.runId,
+      repositoryRoot: record.repositoryRoot,
+      updatedAt: record.createdAt,
+      candidates: [],
+    };
   }
 
   const findings = sidecar.candidates.filter(isFinding);
@@ -2099,7 +2268,7 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
         claimText: c.inconsistency!.claimText,
         claimScope: c.inconsistency!.claimScope,
         claimClass: c.inconsistency!.claimClass,
-        proposedRuleKind: c.inconsistency!.proposedRuleKind,
+        proposedRuleKind: FINDING_PROPOSED_RULE_KIND,
         divergence: c.inconsistency!.divergence,
         attribution: c.inconsistency!.attribution,
       })),
@@ -2111,9 +2280,12 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
           decisionRequest: buildResolveDecisionRequest(sidecar.runId, open),
           humanSummary:
             open.length === 0
-              ? "No open doc/code findings in this run."
+              ? // The same scoped sentence the human review prints. "No open doc/code findings"
+                // is a claim about the repository that this run never examined, and an agent
+                // relaying it to its user would widen it further, not narrow it.
+                NO_FILE_OPERATION_FINDINGS
               : `${open.length} open finding${open.length === 1 ? "" : "s"}: a document and a commit ` +
-                "disagree. Nothing is decided until you answer.",
+                "appear inconsistent. Nothing is decided until you answer.",
         }),
         0,
       );
@@ -2150,18 +2322,54 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
     );
   }
   const target = matches[0];
-  // Re-resolving is refused rather than overwritten: the first answer already minted (or explicitly
-  // did not), and silently replacing it would leave a rule live under a verdict that no longer says
-  // it should be. Re-running the SAME answer is a no-op, so a retried command is safe.
-  if (target.resolution && target.resolution.outcome !== flags.as) {
+  const short = target.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN);
+  const transition = resolveTransition(target.resolution, flags.as!);
+
+  // Re-resolving DIFFERENTLY is refused rather than overwritten: the first answer already minted
+  // (or explicitly did not), and silently replacing it would leave a rule live under a verdict that
+  // no longer says it should be.
+  if (transition.kind === "conflict") {
     return failInMode(
       command,
       "already_resolved",
-      `refusing to resolve: finding ${target.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN)} is already ` +
-        `resolved as ${target.resolution.outcome}. Re-run \`mla enrich plan\` to re-surface it if the ` +
-        "repository has changed.",
+      `refusing to resolve: finding ${short} is already resolved as ${transition.resolution.outcome}. ` +
+        "Re-run `mla enrich plan` to re-surface it if the repository has changed.",
       2,
     );
+  }
+
+  // The same answer twice is one decision, not two. Nothing mints, nothing is written, and the
+  // recorded time stays exactly where the first answer put it. Reported as a success (the caller
+  // asked for a state the system is already in) that is explicit about having changed nothing.
+  // `--dry-run` lands here too: a settled finding has no future run to preview.
+  if (transition.kind === "settled") {
+    const settled = transition.resolution;
+    const settledPayload = {
+      runId: sidecar.runId,
+      repositoryRoot: sidecar.repositoryRoot,
+      findingId: target.candidateId,
+      resolution: settled.outcome,
+      resolvedAt: settled.resolvedAt,
+      unchanged: true,
+      dryRun: flags.dryRun,
+      authorityScope: flags.team ? "TEAM" : ("PERSONAL" as RuleAuthorityScope),
+      minted: [],
+      alreadyLive: [],
+      delivered: false,
+      deliveryError: null,
+    };
+    if (isMachineMode()) return emitEnvelope(successEnvelope(command, settledPayload), 0);
+    if (flags.json) {
+      console.log(JSON.stringify(settledPayload, null, 2));
+      return 0;
+    }
+    console.log(`${short} is already resolved as ${settled.outcome} (${settled.resolvedAt}). Nothing changed.`);
+    if (settled.outcome === "code_diverged") {
+      // The projection is not the authority, so a missing or edited file is not a governance hole
+      // and re-resolving is not how it is repaired. Name the verb that actually re-delivers.
+      console.log("The rule is live on the authority; `mla scan` re-delivers it to this machine.");
+    }
+    return 0;
   }
 
   const outcome = flags.as!;
@@ -2172,6 +2380,7 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
   let materialized: MaterializeResult | null = null;
 
   // `code_diverged` is the ONLY answer that touches the authority. The other two record a verdict.
+  let mintedKind: ProposedRuleKind | null = null;
   if (outcome === "code_diverged") {
     const ruleCandidate = findingToRuleCandidate(target);
     if (!ruleCandidate) {
@@ -2182,6 +2391,7 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
         2,
       );
     }
+    mintedKind = ruleCandidate.kind as ProposedRuleKind;
     const managedPath = join(sidecar.repositoryRoot, MANAGED_RULES_PATH);
     materialized = materializeRules(readManagedFile(managedPath), [ruleCandidate]);
 
@@ -2208,19 +2418,56 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
 
   // Stamp the verdict LAST, and never on a dry run: a finding recorded as closed while its rule
   // never reached the authority is the one state this ordering makes unreachable.
+  let resolvedAt: string | null = null;
   if (!flags.dryRun) {
     const resolution: FindingResolutionRecord = {
       outcome,
       resolvedAt: new Date().toISOString(),
-      ...(outcome === "code_diverged" && mintOutcomes.length > 0
-        ? { mintedRuleKind: target.inconsistency!.proposedRuleKind }
+      // The kind that was actually minted, read off the candidate the mint ran on rather than
+      // off the finding, so the audit cannot describe a kind the mint did not use.
+      ...(outcome === "code_diverged" && mintOutcomes.length > 0 && mintedKind
+        ? { mintedRuleKind: mintedKind }
         : {}),
     };
-    upsertCandidatesSidecar(HOME, {
-      ...sidecar,
-      updatedAt: new Date().toISOString(),
-      candidates: [{ ...target, resolution }],
-    });
+    try {
+      upsertCandidatesSidecar(HOME, {
+        ...sidecar,
+        updatedAt: new Date().toISOString(),
+        candidates: [{ ...target, resolution }],
+      });
+      resolvedAt = resolution.resolvedAt;
+      // The verdict row (design §9). Emitted HERE, inside the success branch of the stamp, so
+      // the metric plane can only ever learn about a closure the sidecar actually recorded: a
+      // dry run emits nothing (it decided nothing) and a failed stamp emits nothing (the
+      // finding is still open). `carve_out` counted from these rows IS the kill metric.
+      emitOnboardingFinding(
+        {
+          candidateId: target.candidateId,
+          verdict: outcome,
+          mintedRule: mintOutcomes.some((o) => o.status === "minted"),
+        },
+        {
+          workspaceId: cfg.workspaceId,
+          sessionId: (process.env.CLAUDE_CODE_SESSION_ID || "").trim() || null,
+          nowMs: Date.now(),
+        },
+      );
+    } catch (e) {
+      // The other half already committed and is durable. Report the state that actually exists
+      // rather than crashing on an unhandled write error, and name the recovery: re-running the
+      // SAME verdict is a `perform` (nothing is recorded yet), the mint dedups on payload hash,
+      // and the stamp is retried. That is the accept path's idempotency, reused verbatim.
+      return failInMode(
+        command,
+        "resolution_not_recorded",
+        `finding ${short} could NOT be recorded as ${outcome}: ${(e as Error).message}. ` +
+          (mintOutcomes.length > 0
+            ? "The rule IS live on the authority. The finding is still open. Re-run the same " +
+              "command to close it (an already live rule is never minted twice)."
+            : "The finding is still open. Re-run the same command to close it."),
+        1,
+      );
+    }
   }
 
   const minted = mintOutcomes.filter((o) => o.status === "minted");
@@ -2230,6 +2477,11 @@ export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = 
     repositoryRoot: sidecar.repositoryRoot,
     findingId: target.candidateId,
     resolution: outcome,
+    // Both halves of "what state is this finding in now", so a caller never has to infer that a
+    // command it ran twice only did work once. `unchanged` is always present, never inferred
+    // from a missing key.
+    resolvedAt,
+    unchanged: false,
     dryRun: flags.dryRun,
     authorityScope,
     minted: minted.map((o) => ({ ruleId: o.ruleId, hash: o.hash, statement: o.rule.statement })),
@@ -2269,7 +2521,8 @@ function renderResolveOutcome(
       return `${would} ${short} as code_diverged: the document was right, and its sentence is now a rule.`;
     case "doc_stale":
       return (
-        `${would} ${short} as doc_stale: the change was right and ${target.inconsistency!.claimScope} is out of date. ` +
+        `${would} ${short} as doc_stale: the change was right and ` +
+        `${terminalSafe(target.inconsistency!.claimScope, DISPLAY_LEN.scope)} is out of date. ` +
         "Nothing was minted. Update the document itself; this only records the verdict."
       );
     case "carve_out":

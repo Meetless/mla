@@ -17,17 +17,25 @@
 #   --ask-workspace <id>   workspace to run the read-only ask/mcp proofs against.
 #                          Default: the DISPOSABLE workspace `mla activate` just
 #                          provisioned in this run (guaranteed member, empty corpus)
-#                          -- proves the ask/mcp COMMANDS work + are authed on a
+#                          which proves the ask/mcp COMMANDS work + are authed on a
 #                          first-run workspace, scoring grounding as a WARN (empty).
 #                          Pass a POPULATED workspace the logged-in identity is a
 #                          MEMBER of to upgrade that WARN into a grounded PASS. A
 #                          non-member workspace is reported WARN (correct ACL 403),
 #                          never FAIL.
 #   --reuse-identity <p>   seed a previously-stashed logged-in cli-config.json and
-#                          SKIP the interactive browser login on every channel. Use
-#                          only to re-validate the activate->teardown lane between
-#                          harness iterations; a real release gate runs WITHOUT it
-#                          so the browser login itself is exercised.
+#                          SKIP the interactive browser login on every channel.
+#                          What a release gate owes is that the SHIPPED binary's real
+#                          browser login against prod was exercised in THIS release.
+#                          A stash of unknown provenance (an older run, a dev build)
+#                          does not pay that debt, so do not reuse one blindly.
+#                          capture-identity.sh in this directory does pay it: it runs
+#                          that same login, from the same shipped binary, against the
+#                          same prod, behind a real human click. It exists because the
+#                          login window is 5 minutes and a human is not; it keeps ONE
+#                          authorize tab live and re-mints until you click, so the
+#                          click is once per release instead of once per iteration.
+#                          Capture with the release binary, then reuse freely.
 #   --query <text>         the grounded query for ask + mcp retrieve.
 #   --keep                 do not delete the sandbox test root on exit.
 #   --no-brew-guard        allow --channel brew even if `mla` on PATH looks like a
@@ -81,7 +89,9 @@ fr_init "$ROOT_PARENT"
 
 LOGIN_DONE=0
 # --reuse-identity: pre-seed the run's identity stash and skip interactive login on
-# every channel (iteration convenience; NOT for a real release gate).
+# every channel. Legitimate for a release gate ONLY when the stash came from
+# capture-identity.sh driving the release binary (see the header); otherwise this
+# skips the one lane nothing else in the pipeline covers.
 if [ -n "$REUSE_IDENTITY" ]; then
   [ -f "$REUSE_IDENTITY" ] || fr_die "--reuse-identity: no file at $REUSE_IDENTITY"
   grep -q '"user-token"' "$REUSE_IDENTITY" || fr_die "--reuse-identity: $REUSE_IDENTITY is not a user-token config"

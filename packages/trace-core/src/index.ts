@@ -79,11 +79,47 @@ function newSpanId(): string {
   return crypto.randomBytes(8).toString("hex");
 }
 
-function serializeError(err: unknown): { message: string; name?: string; stack?: string } {
+// An error is REDUCED for the trace plane, the same way argv is (INV-ARGV-1).
+//
+// `message` was the fifth way user content reached the wire, and the last one
+// open after the argv reduction closed the span name, the argv attribute, the
+// Sentry tags and the HTTP route. The CLI interpolates raw argv into its own
+// error text at 133 throw sites, so `mla review --my-unreleased-project` put
+// that flag on the span twice: once as the message, once again inside the
+// stack's header line, which is `${name}: ${message}`.
+//
+// A message is prose by construction, so no redactor can be trusted to inspect
+// it: that is precisely the lesson the argv fix already paid for. What survives
+// here is only what is OURS to say. The type name is our vocabulary, the HTTP
+// status is a number, and the stack FRAMES name our own functions (their file
+// paths are additionally redacted downstream by the egress policy). That keeps
+// the actual triage question, "which code path failed", answerable.
+//
+// The full message is not lost, it is moved behind consent: the user still sees
+// it on their terminal, and `mla bug report --trace-id <id>` is the explicit,
+// opt-in channel that carries the detail.
+function serializeError(err: unknown): {
+  name: string;
+  status?: number;
+  frames?: string[];
+} {
   if (err instanceof Error) {
-    return { message: err.message, name: err.name, stack: err.stack };
+    const status = (err as Error & { status?: unknown }).status;
+    // Drop the header line. `stack` begins with `${name}: ${message}`, so
+    // keeping it would re-admit the message the line above just refused.
+    const frames = (err.stack ?? "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("at "));
+    return {
+      name: err.name,
+      ...(typeof status === "number" ? { status } : {}),
+      ...(frames.length ? { frames } : {}),
+    };
   }
-  return { message: String(err) };
+  // A thrown non-Error can be anything, including a bare string of user text.
+  // Emit its type and nothing else.
+  return { name: `NonError:${typeof err}` };
 }
 
 class SpanImpl implements SpanHandle {

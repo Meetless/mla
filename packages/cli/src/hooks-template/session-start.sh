@@ -73,7 +73,7 @@ fi
 
 # Enforcement backstop (2026-07-11): snapshot the governed forbidden roots BEFORE the
 # agent can touch anything, so the PostToolUse sweep can tell a file the AGENT created
-# from one the repo already shipped — and never deletes a human's pre-existing file.
+# from one the repo already shipped, and never deletes a human's pre-existing file.
 # Keyed by THIS session_id, which is why it must run after the parse above.
 # Best-effort: never blocks session start.
 if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then

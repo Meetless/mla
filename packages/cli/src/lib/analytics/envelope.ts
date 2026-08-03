@@ -44,6 +44,14 @@ export const EVENT_TYPES = [
   // never sets review_status; the human verdict stays orthogonal). Payload is
   // enums + counts only, never a path or transcript text (INV-POSTHOG-PII-1).
   "mla_enforcement_outcome",
+  // Onboarding FINDING lifecycle (20260731-mla-onboarding-drift-finding-design §9). One append
+  // when a doc/code inconsistency lands PENDING at ingest, one when a human closes it at
+  // `mla enrich resolve`. These two rows are the only producer of the §9 metrics: without them
+  // the carve-out rate (the kill metric) has no numerator and no denominator, and "time to first
+  // finding" has no clock. Payload is one opaque id plus two closed enums, so it crosses the
+  // fail-closed projector as ids/enums only (INV-POSTHOG-PII-1). The finding's TEXT, its quote,
+  // its paths, and its commit never leave the device.
+  "mla_onboarding_finding",
   // Rule-injection COST (audit 6.G / 7.10). One append per governed prompt: how many bytes and
   // rules we charged the model's context window for, split ambient (the always-on floor, billed
   // on every turn to every user) vs scoped (this turn's targeted rules). This is the only event
@@ -184,6 +192,23 @@ export type RelationEdgeType = (typeof RELATION_EDGE_TYPES)[number];
 
 export const REVIEW_DECISIONS = ["accept", "reject", "reclassify", "no_relation"] as const;
 export type ReviewDecision = (typeof REVIEW_DECISIONS)[number];
+
+// --- onboarding-finding enums (drift-finding design §9) ---------------------
+// The two points in a finding's life that a metric can be computed from. `persisted`
+// is stamped by `mla enrich ingest` when the finding lands PENDING; `resolved` by
+// `mla enrich resolve` when a human closes it. There is deliberately no `dismissed`
+// or `expired`: a finding is open until a human says otherwise, and inventing a
+// third phase here would put a state in the metrics that the product does not have.
+export const ONBOARDING_FINDING_PHASES = ["persisted", "resolved"] as const;
+export type OnboardingFindingPhase = (typeof ONBOARDING_FINDING_PHASES)[number];
+
+// The three human verdicts, mirrored from the enrichment protocol's FINDING_RESOLUTIONS.
+// The seam assigns a protocol `FindingResolution` into this field, so dropping a verdict
+// here (or adding one there without adding it here) is a COMPILE error rather than a
+// silently uncounted resolution: `carve_out` is the kill metric's numerator, and a verdict
+// that never reaches the payload would make the gate read healthier than the product is.
+export const ONBOARDING_FINDING_VERDICTS = ["code_diverged", "doc_stale", "carve_out"] as const;
+export type OnboardingFindingVerdict = (typeof ONBOARDING_FINDING_VERDICTS)[number];
 
 // --- enforcement-incident enums (§5.1, the deny tile) -----------------------
 // The closed wire forms for the PreToolUse enforcement event. Every value is a
@@ -589,6 +614,32 @@ export interface RuleMeterFile {
   base_invariant: boolean;
 }
 
+// One row per onboarding-finding lifecycle point (drift-finding design §9).
+//
+// Deliberately four fields. Every §9 metric is a count, a ratio, or a time difference over
+// these rows joined to the envelope it already rides on: `created_at` gives the clock,
+// `repo_fingerprint` the repository dimension the kill rule's 40% cap needs, `session_id` the
+// same-session test, and `run_id` the invocation. Nothing about WHAT the finding says appears
+// here, because no §9 metric is about the content and the content is exactly what must not
+// leave the device.
+export interface OnboardingFindingPayload {
+  // The candidate's sha256 identity, truncated to a display-length prefix. It joins a
+  // `resolved` row to its `persisted` row (that join IS "time to resolution") and dedups a
+  // re-emitted row. A one-way hash prefix of the finding statement: not reversible, and never
+  // the statement itself (INV-OPAQUE-ID-1).
+  finding_id: string;
+  finding_phase: OnboardingFindingPhase;
+  // The human verdict. null on `persisted` (nobody has decided yet), always present on
+  // `resolved`. Null rather than an "open" token so a mis-filtered query counts zero
+  // carve-outs instead of silently counting open findings as decided ones.
+  finding_verdict: OnboardingFindingVerdict | null;
+  // Whether closing this finding minted a durable rule. True only for a `code_diverged`
+  // resolution that actually reached the authority (a --dry-run preview mints nothing), so
+  // the adoption story ("findings that became governance") has a real field behind it
+  // instead of being inferred from the verdict alone.
+  minted_rule: boolean;
+}
+
 // The emitted rule-injection payload: the measured meter, plus its turn coordinate and the
 // derived token estimates. Tokens sit ALONGSIDE the bytes rather than replacing them: bytes are
 // the measurement, tokens are a 4-bytes-per-token convention, and keeping both means a real
@@ -633,6 +684,9 @@ export type AnalyticsEvent =
   | (AnalyticsEnvelope & {
       event_type: "mla_enforcement_outcome";
     } & EnforcementOutcomePayload)
+  | (AnalyticsEnvelope & {
+      event_type: "mla_onboarding_finding";
+    } & OnboardingFindingPayload)
   | (AnalyticsEnvelope & { event_type: "mla_rule_injection" } & RuleInjectionPayload);
 
 // --- envelope construction --------------------------------------------------

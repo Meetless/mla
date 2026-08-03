@@ -17,7 +17,8 @@ import {
   maybePrintDeepLink,
   mintRunId,
   mintTraceId,
-  redactArgvForSpan,
+  reduceArgvForSpan,
+  traceRootName,
   setRepoFingerprint,
   setRunId,
   setRunSessionId,
@@ -29,6 +30,11 @@ import {
 import { computeRepoFingerprint } from "./lib/git";
 import { traceUploadEnabled } from "./lib/analytics/consent";
 import { captureCommandEvent } from "./lib/analytics/capture";
+import {
+  getHandledFailure,
+  noteHandledFailure,
+  resetHandledFailure,
+} from "./lib/analytics/handled-failure";
 import { deriveInvoker } from "./lib/analytics/invoker";
 import {
   classifyOutcome,
@@ -667,7 +673,8 @@ export const COMMANDS: CommandSpec[] = [
                      brief; \`ingest\` validates + persists the scouts' candidates born
                      PENDING in governed knowledge; \`accept\` mints a run's durable
                      rules into the authority; \`resolve\` answers a doc/code finding
-                     (a document and a commit disagree) one of three ways;
+                     (a document and a commit appear inconsistent) one of three
+                     ways;
                      \`materialize\` regenerates the committed .meetless/rules.md mirror
                      from the accepted rule set (a human-readable projection for git
                      visibility; the backend store + scan cache are the inject source,
@@ -1138,12 +1145,19 @@ export async function dispatch(argv: string[]): Promise<number> {
   //     to `mla help` for the full catalog (that is help's job, not the error
   //     path's), and the stale-command hint a piped agent needs to tell "mla
   //     cannot do this" from "your mla is out of date". Exit stays 2.
+  // Both dead ends exit 2 without throwing, so analytics would otherwise record them as
+  // an unexplained user_error with a null class. They are the CLI's largest failing
+  // bucket in production, and they are two DIFFERENT signals worth telling apart: a typo
+  // is a typo, but someone reaching for `mla onboard` is a naming/docs miss we should be
+  // able to count. The word itself is never emitted (INV-ARGV-1); only the class is.
   if (cmd === "onboard") {
+    noteHandledFailure({ error_class: "onboard_is_a_skill" });
     console.error(
       "onboard is an agent skill, not a CLI command; in your coding agent, run /mla onboard",
     );
     return 2;
   }
+  noteHandledFailure({ error_class: "unknown_command" });
   const near = nearestCommands(COMMANDS, cmd);
   const didYouMean = near.length ? `\nDid you mean: ${near.join(", ")}?` : "";
   console.error(
@@ -1296,6 +1310,15 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   const cmdName = cmd ?? "(none)";
   const subName = sub ?? null;
 
+  // The same argv, reduced to the shape that is safe to EXPORT (INV-ARGV-1).
+  // cmdName/subName above are the RAW tokens and stay raw because dispatch,
+  // the teardown check and the background-check gate all key on them. They are
+  // not safe to put on a wire: for `mla ask "<question>"`, subName IS the
+  // question. Every telemetry seam below uses these reduced values instead.
+  const shape = reduceArgvForSpan(argv);
+  const safeCommand = shape.command;
+  const safeSub = shape.subcommand;
+
   // Machine-output transport (§4.1, §4.10). Consume the env request and CONTAIN
   // it (delete it from this process's env) so no child this run spawns -- the
   // detached background check just below, a promote re-exec, a hook subprocess --
@@ -1319,6 +1342,10 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   delete process.env.MEETLESS_OUTPUT;
   resetOutputMode();
   resetMachineCommand();
+  // Same lifecycle, same reason: a process-level slot the command fills on its way out and
+  // finalize reads. Cleared here so a re-exec (or an in-process test) can never inherit the
+  // previous run's reason.
+  resetHandledFailure();
   if (cmdName === "mcp") {
     if (hasOutputFlag(argv)) {
       console.error(
@@ -1387,15 +1414,16 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
       : null;
   const tracer: Tracer = createRunTracer({
     traceId,
-    rootName: `mla.${cmdName}.${subName ?? "none"}`,
+    rootName: traceRootName(argv),
     buildInfo,
     flushFn,
   });
-  // Stamp the redacted argv on the root span before dispatch. Doing it here
+  // Stamp the REDUCED argv on the root span before dispatch. Doing it here
   // (not inside dispatch) keeps the attribute on the root regardless of which
-  // command runs, and the redactor strips any token-shaped flag values that a
-  // user pasted on the command line.
-  tracer.root.setAttribute("argv", redactArgvForSpan(argv));
+  // command runs. The attribute is named for what it now holds: a command
+  // shape, not an argv. It carries the known command, the known subcommand and
+  // approved flag NAMES; every positional and every flag value is dropped.
+  tracer.root.setAttribute("command_shape", shape);
   setRunTracer(tracer);
 
   let code = 1;
@@ -1406,8 +1434,8 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
     if (code !== 0) {
       captureCliNonZeroExit({
         traceId,
-        command: cmdName,
-        sub: subName,
+        command: safeCommand,
+        sub: safeSub,
         exitCode: code,
       });
     }
@@ -1445,7 +1473,7 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
           `  mla bug report --trace-id ${traceId}`,
       );
     }
-    captureCliError(err, { traceId, command: cmdName, sub: subName });
+    captureCliError(err, { traceId, command: safeCommand, sub: safeSub });
     code = 1;
   }
 
@@ -1491,6 +1519,10 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
       invoker,
       startedAtMs,
       nowMs: Date.now(),
+      // Why this run failed, when it failed on purpose (every failInMode call site and the
+      // enrich-ingest exit-1). A handled failure throws nothing, so without this the event
+      // records error_class null and the reason is unrecoverable.
+      handledFailure: getHandledFailure(),
       cfg: cfg ?? null,
     });
   }

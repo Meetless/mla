@@ -19,6 +19,11 @@ import {
   successEnvelope,
   type MachineEnvelope,
 } from "../../src/lib/machine-output";
+import {
+  getHandledFailure,
+  noteHandledFailure,
+  resetHandledFailure,
+} from "../../src/lib/analytics/handled-failure";
 
 // The pure half of the machine-output contract (§4.1-§4.2). Every invariant the
 // connector relies on is asserted here: the discriminator, the exactly-one-of
@@ -32,6 +37,7 @@ import {
 beforeEach(() => {
   resetOutputMode();
   resetMachineCommand();
+  resetHandledFailure();
 });
 
 describe("output mode singleton", () => {
@@ -296,5 +302,57 @@ describe("failInMode (§4.2 drop-in for console.error; return N)", () => {
       outSpy.mockRestore();
       errSpy.mockRestore();
     }
+  });
+
+  // The `code` argument is the only class token a handled failure ever produces, and it
+  // used to reach the machine envelope alone: in human mode (the overwhelming majority of
+  // runs) it was dropped on the floor, so analytics recorded error_class NULL for every
+  // one of the 35 call sites. Declaring it here is what makes the human path diagnosable.
+  describe("handled-failure declaration for analytics", () => {
+    it("records the class token in HUMAN mode (the path that used to drop it entirely)", () => {
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        failInMode("enrich.plan", "not_activated", "run mla activate first", 2);
+        expect(getHandledFailure()).toEqual({ error_class: "not_activated" });
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
+
+    it("records the class token in MACHINE mode too (one source of truth, both modes)", () => {
+      setOutputMode("machine-best-effort");
+      const outSpy = jest
+        .spyOn(process.stdout, "write")
+        .mockImplementation((): boolean => true);
+      try {
+        failInMode("enrich.accept", "invalid_selection", "no such candidate", 2);
+        expect(getHandledFailure()).toEqual({ error_class: "invalid_selection" });
+      } finally {
+        outSpy.mockRestore();
+      }
+    });
+
+    it("keeps the FIRST declaration: the proximate cause outranks a coarser outer handler", () => {
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        failInMode("enrich.accept", "not_authenticated", "log in first", 1);
+        failInMode("enrich.accept", "runtime_error", "giving up", 1);
+        expect(getHandledFailure()).toEqual({ error_class: "not_authenticated" });
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
+
+    it("is empty until something fails, and reset clears it (no leak across runs in one process)", () => {
+      expect(getHandledFailure()).toBeNull();
+      noteHandledFailure({ error_class: "scout_malformed", outcome: "system_error", retryable: true });
+      expect(getHandledFailure()).toEqual({
+        error_class: "scout_malformed",
+        outcome: "system_error",
+        retryable: true,
+      });
+      resetHandledFailure();
+      expect(getHandledFailure()).toBeNull();
+    });
   });
 });

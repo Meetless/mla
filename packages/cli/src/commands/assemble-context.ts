@@ -24,6 +24,7 @@ import { Buffer } from "node:buffer";
 import { ScanResult, SCAN_SCHEMA_VERSION } from "../lib/scanner/types";
 import {
   PersistedAssembleAudit,
+  readScanCache,
   writeAssembleAudit,
 } from "../lib/scanner/cache";
 import { ArtifactByteReader } from "../lib/scanner/reconciliation-rehash";
@@ -76,6 +77,11 @@ export const SAFE_TOTAL = 6000;
 export interface AssembleContextDeps {
   readStdin?: () => string;
   readCache?: (home: string | undefined, workspaceId: string) => ScanResult | null;
+  // The UNGUARDED workspace-global cache, used ONLY to recover the floor on Row 5. Separate from
+  // `readCache` on purpose: `readCache` is root-guarded because scoped rules belong to one
+  // checkout, but the floor block is bundle-sourced and workspace-global, so it is correct to
+  // deliver from any root's scan. See Row 5.
+  readGlobalCache?: (home: string | undefined, workspaceId: string) => ScanResult | null;
   writeAudit?: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
   writeMeter?: (path: string, json: string) => void;
   // Byte reader for the reconciliation rehash gate (ADR §3.3 item 9). Injected in tests to feed
@@ -166,6 +172,7 @@ interface AssembleCtx {
   home: string | undefined;
   now: () => string;
   readCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
+  readGlobalCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
   writeAudit: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
   // Reads one repo-relative instruction file's bytes for the rehash gate; null when unreadable.
   readArtifactBytes: ArtifactByteReader;
@@ -307,15 +314,32 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
     base_invariant: false,
   });
 
-  // Row 5: invalid cache, no usable last-good -> base + visible incomplete-delivery marker.
+  // Row 5: no cache readable FOR THIS ROOT -> base + visible incomplete-delivery marker, and the
+  // workspace-global floor whenever one exists.
+  //
+  // The floor recovery is the whole point of this branch's second read. The root guard on
+  // `readCache` is correct and must stay: scoped rules are parsed from ONE checkout and injecting a
+  // sibling checkout's would be worse than injecting nothing. But the floor block is bundle-sourced
+  // and workspace-global, so a root mismatch is no reason to withhold it, and withholding it is
+  // exactly what happened for 8h11m on 2026-08-02.
+  //
+  // The old code's comment (still visible at the readCache wiring below, now corrected) assumed the
+  // bash hook's floor fallback would cover this branch. It cannot: this branch returns a NON-EMPTY
+  // head, the hook takes its `if [[ -n "$ASSEMBLE_HEAD" ]]` path, and the `else` arm that appends
+  // FLOOR_RULES never runs. A degraded head is a success output as far as the caller is concerned,
+  // so anything this branch does not emit is simply not delivered. Recovering the floor HERE is the
+  // only place it can happen.
   if (!cache) {
-    const text = joinSegments([input.base, renderIncompleteDeliveryMarker()]);
+    const globalFloorXml = ctx.readGlobalCache(ctx.home, input.workspaceId)?.floorRulesXml ?? "";
+    const text = joinSegments([input.base, renderIncompleteDeliveryMarker(), globalFloorXml]);
     emitAudit("incomplete", text, false, [], []);
     return {
       head: text,
       overflow: false,
       blockedVersions: [],
-      meter: degradedMeter(text, 0),
+      // Same accounting as Rows 3/4: the floor XML really rode, so its bytes are real always-on
+      // cost, but a pre-rendered block cannot tell us how many rules are inside it.
+      meter: degradedMeter(text, byteLength(globalFloorXml)),
       reconciliationBlock,
     };
   }
@@ -460,12 +484,19 @@ export async function runAssembleContext(
       // already resolves against the scan root) still listed the finding as live.
       readArtifactBytes: deps.readArtifactBytes ?? makeArtifactByteReader(resolveScanRoot(process.cwd())),
       // Guarded read: the assembler injects locally-parsed scopedRules, which belong to ONE
-      // checkout. A workspace shared by several checkouts writes one scan-cache.json, so an
-      // unguarded read could inject a sibling checkout's scoped rules into this session. On a
-      // mismatch this returns null and the assembler degrades to the bash floor fallback (the
-      // floor block is bundle-sourced and workspace-global, so it stays correct). cwd defaults to
+      // checkout, so an unguarded read could inject a sibling checkout's scoped rules into this
+      // session. On a mismatch this returns null and the assembler takes Row 5. cwd defaults to
       // process.cwd() = the session repo here in the hook.
+      //
+      // CORRECTION (2026-08-02): this comment used to end "and the assembler degrades to the bash
+      // floor fallback (the floor block is bundle-sourced and workspace-global, so it stays
+      // correct)". That was false in the only way that matters. Row 5 returns a non-empty head, so
+      // the hook never reaches its fallback arm, and the floor was silently dropped on every root
+      // mismatch. The floor is now recovered inside Row 5 via readGlobalCache; the claim about the
+      // floor being workspace-global was right, the claim about who delivers it was not.
       readCache: deps.readCache ?? readScanCacheForRoot,
+      // Unguarded by design, and used on Row 5 only. See AssembleContextDeps.readGlobalCache.
+      readGlobalCache: deps.readGlobalCache ?? readScanCache,
       writeAudit: deps.writeAudit ?? writeAssembleAudit,
     };
     const log = deps.log ?? ((out: string) => process.stdout.write(out));

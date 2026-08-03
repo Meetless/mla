@@ -86,7 +86,7 @@ import {
 } from "../../lib/wire";
 import {
   MANAGED_SKILL_DIRS,
-  SCOUT_AGENT_FILES,
+  INSTALLED_SCOUT_AGENT_FILES,
   removeMeetlessHooks,
   removeMeetlessMcp,
   removeMeetlessSkills,
@@ -183,10 +183,15 @@ function countLegacySkills(skillsDir: string): { present: number; total: number 
   return { present, total };
 }
 
-// Present/total over every SCOUT_AGENT_FILES entry (agentsAny vs agentsComplete).
+// Present/total over the agent files THIS version installs (agentsAny vs agentsComplete).
+//
+// Counted against INSTALLED_SCOUT_AGENT_FILES, not the full removal set: a retired scout's
+// file is one the installer deliberately no longer writes, so measuring completeness against
+// the superset would report a correctly wired home as a partial legacy install forever, and
+// the migration would offer to repair something that is already right.
 function countLegacyAgents(agentsDir: string): { present: number; total: number } {
-  const total = SCOUT_AGENT_FILES.length;
-  const present = SCOUT_AGENT_FILES.filter((file) =>
+  const total = INSTALLED_SCOUT_AGENT_FILES.length;
+  const present = INSTALLED_SCOUT_AGENT_FILES.filter((file) =>
     fs.existsSync(path.join(agentsDir, file)),
   ).length;
   return { present, total };

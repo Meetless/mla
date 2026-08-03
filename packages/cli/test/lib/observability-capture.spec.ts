@@ -90,7 +90,17 @@ describe("runCliBootstrap non-zero exit (P0.T4)", () => {
       expect.stringContaining("exited 2"),
     );
     expect(scope.setTag).toHaveBeenCalledWith("exit_code", "2");
-    expect(scope.setTag).toHaveBeenCalledWith("command", "garbage-command");
+    // The command tag carries the REDUCED command, not the raw argv[0]. An
+    // unrecognized first token is exactly where a pasted secret or an absolute
+    // path ends up, so it collapses to "unknown" rather than riding out to
+    // Sentry verbatim (INV-ARGV-1; see trace-argv-reduction.spec.ts). This
+    // assertion used to read "garbage-command", which is the leak.
+    expect(scope.setTag).toHaveBeenCalledWith("command", "unknown");
+    expect(
+      (scope.setTag as jest.Mock).mock.calls.some((c) =>
+        String(c[1]).includes("garbage-command"),
+      ),
+    ).toBe(false);
     expect(scope.setLevel).toHaveBeenCalledWith("warning");
     // trace_id tag is non-empty and 32-hex
     const traceTagCalls = (scope.setTag as jest.Mock).mock.calls.filter(

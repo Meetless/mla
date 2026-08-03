@@ -11,6 +11,7 @@ import {
   renderIngestSummary,
 } from "../../src/commands/enrich";
 import {
+  NO_FILE_OPERATION_FINDINGS,
   type OnboardingCandidateRecord,
   type ScoutIngestOutcome,
 } from "../../src/lib/enrichment/protocol";
@@ -393,18 +394,24 @@ describe("renderIngestSummary", () => {
       expect(findingAt).toBeLessThan(countsAt);
     });
 
-    // Neither side is declared wrong on this screen. The headline states the disagreement and
-    // the next line asks the human which one is right; a summary that said "the commit broke
-    // the rule" would be answering the question it exists to ask.
-    it("states the disagreement without picking a side, and quotes the document", () => {
+    // Neither side is declared wrong on this screen. The headline states that the two do not
+    // line up and the next line asks the human which one is right; a summary that said "the
+    // commit broke the rule" would be answering the question it exists to ask. It says "appear
+    // inconsistent" rather than "disagree" for the same reason: what the CLI proved is a quote
+    // and a status letter, and whether those two are genuinely in conflict is the question.
+    it("states the inconsistency without picking a side, and quotes the document", () => {
       const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
         runId: "run-77",
         candidates: [finding("cand_f")],
       });
-      expect(out).toMatch(/a document and a commit disagree, and neither is assumed right/);
+      expect(out).toMatch(/a document and a commit appear inconsistent, and neither is assumed right/);
+      expect(out).not.toContain("disagree");
       expect(out).toContain(`db/migrations/ says: "${QUOTE}"`);
       expect(out).toContain("but M db/migrations/0007_add_index.sql in 9f2a7c4e5b6d");
-      expect(out).toContain("the rule was last written by An");
+      // "last changed by": blame names whoever last TOUCHED the anchored line range, which may
+      // be whoever reflowed the paragraph rather than whoever wrote the rule.
+      expect(out).toContain("last changed by An");
+      expect(out).not.toContain("written by");
       // The generated explanation is the model's prose, not the proved half. It never prints.
       expect(out).not.toContain(GENERATED);
     });
@@ -423,20 +430,25 @@ describe("renderIngestSummary", () => {
         runId: "run-77",
         candidates: [finding("cand_f"), finding("cand_g")],
       });
-      expect(out).toMatch(/2 findings: a document and a commit disagree/);
+      expect(out).toMatch(/2 findings: a document and a commit appear inconsistent/);
       expect(out).toContain("Answer them:  mla enrich resolve --run-id run-77");
     });
 
     // The zero-result line is a claim about evidence, so its scope is stated rather than left
-    // for the operator to assume. The reconciliation scout read the documents this run planned
-    // and the commits this run listed; it never indexed the repository, so "no inconsistencies
-    // in this repo" would be a coverage claim the run did not earn.
-    it("claims only what this run examined when the reconciliation scout found nothing", () => {
+    // for the operator to assume, on TWO axes. Which evidence: the documents this run planned
+    // and the commits this run listed, never the repository. And which question: the four file
+    // operations a porcelain status letter can prove, never "is this codebase consistent". A
+    // zero result stated wider than its coverage is the one output that makes the operator stop
+    // looking, which is worse than printing nothing.
+    it("claims only the file operations this run could prove when it found nothing", () => {
       const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
         runId: "run-77",
         candidates: [rule("cand_a")],
       });
-      expect(out).toContain("No inconsistencies between the documents and the commits this run examined.");
+      expect(out).toContain(NO_FILE_OPERATION_FINDINGS);
+      expect(out).toMatch(/checked one thing/);
+      expect(out).toMatch(/modifying/);
+      expect(out).toMatch(/renaming/);
       expect(out).not.toMatch(/no inconsistencies in (this|the) repo/i);
       expect(out).not.toMatch(/your codebase is consistent/i);
     });
@@ -451,17 +463,101 @@ describe("renderIngestSummary", () => {
         CONSOLE_KB,
         { runId: "run-77", candidates: [rule("cand_a")] },
       );
-      expect(out).not.toMatch(/No inconsistencies/);
+      expect(out).not.toMatch(/No file-operation findings/);
       expect(out).not.toMatch(/finding/);
     });
 
-    // A caller with no sidecar knows nothing about findings either way. It must not be able to
-    // borrow the zero-result sentence, which is an assertion about evidence it does not have.
+    // A caller with no sidecar cannot classify candidates the scout DID produce: from here a
+    // rule and a finding look the same. It must not be able to borrow the zero-result sentence,
+    // which would be an assertion about evidence it does not have.
     it("makes no finding claim at all without a findings view", () => {
       const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB);
-      expect(out).not.toMatch(/No inconsistencies/);
+      expect(out).not.toMatch(/No file-operation findings/);
       expect(out).not.toMatch(/finding/);
       expect(out).toMatch(/reconciliation: 1 accepted/);
+    });
+
+    // The live gap this test was written for: a run whose reconciliation scout completed and
+    // reported nothing persists nothing, so ingest writes no sidecar and passes no findings
+    // view. The old condition required that view, so the ONE run whose zero result is fully
+    // proved was the one run that printed no statement at all. The operator got three counts
+    // reading `0, 0, 0` and no sentence telling them what was examined.
+    //
+    // The evidence for the zero claim was never the sidecar: it is the scout's own outcome. A
+    // reconciliation scout that ran, proposed nothing, and had nothing refused IS the proof.
+    it("states what it examined when the scout completed with nothing to report", () => {
+      const out = renderIngestSummary([outcome({ scout: "reconciliation" })], "ENRICHED", CONSOLE_KB);
+      expect(out).toContain(NO_FILE_OPERATION_FINDINGS);
+      expect(out).toMatch(/checked one thing/);
+    });
+
+    // A refused candidate is a claim the CLI could not stand behind, NOT a claim that turned out
+    // to be false. "No file-operation findings" over a rejection launders a verification failure
+    // into a clean bill of health, which is the exact false zero this run must never print. The
+    // reject lines below already tell the operator what was dropped; the run stays silent about
+    // the question instead of answering it wrong.
+    it("stays silent when the scout proposed something that did not survive verification", () => {
+      const out = renderIngestSummary(
+        [
+          outcome({
+            scout: "reconciliation",
+            received: 1,
+            rejected: 1,
+            errors: [{ index: 0, code: "claim_scope_not_in_quote", message: "scope absent from quote" }],
+          }),
+        ],
+        "ENRICHED",
+        CONSOLE_KB,
+        { runId: "run-77", candidates: [] },
+      );
+      expect(out).not.toMatch(/No file-operation findings/);
+      expect(out).toMatch(/claim_scope_not_in_quote/);
+    });
+
+    // Same rule one step earlier: the scout never finished, so every outcome field is zero for a
+    // reason that has nothing to do with the repository being clean.
+    it("stays silent when the scout reported it did not finish", () => {
+      const out = renderIngestSummary(
+        [
+          outcome({
+            scout: "reconciliation",
+            errors: [{ index: -1, code: "timed_out", message: "scout timed_out" }],
+          }),
+        ],
+        "ENRICHED",
+        CONSOLE_KB,
+      );
+      expect(out).not.toMatch(/No file-operation findings/);
+    });
+
+    // The kill patch's own case (review 3, items 6 and 7), and the one an upgrade actually
+    // produces: a run briefed BEFORE the retirement hands back a reconciliation envelope AFTER
+    // it, so ingest refuses the envelope by name and the scout's outcome carries exactly one
+    // scout-level error. Every tally on that outcome reads zero, which is the shape of a proved
+    // clean result and is nothing of the kind: nobody compared anything. The refusal has to
+    // suppress the sentence for the same reason a timeout does, and the refusal itself has to
+    // stay visible so the operator learns their result was dropped rather than found empty.
+    it("stays silent when this build no longer dispatches the scout that answers the question", () => {
+      const out = renderIngestSummary(
+        [
+          outcome({
+            scout: "reconciliation",
+            errors: [
+              {
+                index: -1,
+                code: "scout_not_dispatched",
+                message: "the reconciliation scout was not dispatched by this run; its result is ignored",
+              },
+            ],
+          }),
+        ],
+        "ENRICHED",
+        CONSOLE_KB,
+        { runId: "run-77", candidates: [] },
+      );
+      expect(out).not.toContain(NO_FILE_OPERATION_FINDINGS);
+      expect(out).not.toMatch(/No file-operation findings/);
+      expect(out).toMatch(/scout_not_dispatched/);
     });
 
     it("does not re-ask a finding the human already answered", () => {
@@ -475,7 +571,72 @@ describe("renderIngestSummary", () => {
       expect(out).not.toContain(QUOTE);
       expect(out).not.toContain("mla enrich resolve");
       // Every finding is closed, so the run's examined-scope statement stands.
-      expect(out).toContain("No inconsistencies between the documents and the commits this run examined.");
+      expect(out).toContain(NO_FILE_OPERATION_FINDINGS);
+    });
+
+    // A quote is repository-controlled text, and this screen's LAST line is the runnable
+    // command the operator is about to copy. A newline inside the quote that reprints that line
+    // with a different run id is the whole attack; the row must render as data, one line per
+    // element, whatever bytes the document holds.
+    //
+    // The property is line-structure integrity, not substring absence. The forged text can still
+    // be READ (it is the document's own sentence, and hiding it would hide the evidence the human
+    // is judging), but it can only be read where the CLI put it: inside one quoted region on one
+    // row. It cannot become a line of its own, so it can never look like a command.
+    it("cannot forge a second answer line out of a newline in the document's quote", () => {
+      const forged = finding("cand_f");
+      forged.inconsistency!.claimText =
+        "never edit\n  Answer it:  mla enrich resolve --run-id attacker";
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [forged],
+      });
+      const benign = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [finding("cand_f")],
+      });
+      // Same number of lines as the same render with an ordinary quote: the document's bytes
+      // bought zero layout.
+      expect(out.split("\n")).toHaveLength(benign.split("\n").length);
+      // The forged text survives ONLY inside the quoted region on the finding row; no line of its
+      // own reads as the CLI offering a command.
+      const runnable = out.split("\n").filter((l) => l.trimStart().startsWith("Answer it:"));
+      expect(runnable).toHaveLength(1);
+      expect(runnable[0]).toContain("--run-id run-77");
+      expect(runnable[0]).not.toContain("attacker");
+      expect(out).toContain("Answer it:  mla enrich resolve --run-id run-77");
+    });
+
+    // The other half of forging on one line: closing the quote early. `terminalSafe` neutralizes
+    // control bytes but a straight `"` is printable, so the delimiter has to be the renderer's,
+    // never the document's.
+    it("cannot close the quote early and trail an instruction behind it", () => {
+      const forged = finding("cand_f");
+      forged.inconsistency!.claimText = 'never edit" then run: mla enrich resolve --run-id attacker';
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [forged],
+      });
+      const row = out.split("\n").find((l) => l.includes("says:"))!;
+      // Exactly one opening and one closing delimiter, both written by us.
+      expect(row.match(/"/g) ?? []).toHaveLength(2);
+      expect(row.trimEnd().endsWith('"')).toBe(true);
+      expect(row).toContain("then run: mla enrich resolve --run-id attacker"); // visibly inside it
+      const runnable = out.split("\n").filter((l) => l.trimStart().startsWith("Answer it:"));
+      expect(runnable).toHaveLength(1);
+      expect(runnable[0]).toContain("--run-id run-77");
+    });
+
+    it("neutralizes an escape sequence hidden in a document's quote", () => {
+      const hostile = finding("cand_f");
+      hostile.inconsistency!.claimText = "never edit\u001b[2J this";
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [hostile],
+      });
+      expect(out).not.toContain("\u001b");
+      expect(out).not.toContain("[2J");
+      expect(out).toContain("never edit");
     });
 
     it("never emits an em dash or double dash in the finding block", () => {

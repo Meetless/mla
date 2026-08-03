@@ -45,4 +45,20 @@ describe("hook-template newline source contract", () => {
       expect(content.endsWith("\n\n")).toBe(false);
     },
   );
+
+  // House style, and here it is not only style: build_layer1 in user-prompt-submit.sh is
+  // PRODUCT TEXT, injected verbatim into every single turn of every wired agent. An em
+  // dash sitting in it (there was one, in the retrieve_knowledge-before-you-write line)
+  // is the tell we most want out of our own output, shipped at the highest possible
+  // frequency. Neither character has any legitimate use in a shell script, so the guard
+  // covers whole files, comments included, and has no false-positive surface.
+  it.each(EXPECTED_TEMPLATES)("%s contains no em or en dash", (name) => {
+    const content = fs.readFileSync(path.join(TEMPLATE_DIR, name), "utf8");
+    const offenders = content
+      .split("\n")
+      .map((line, i) => ({ line, n: i + 1 }))
+      .filter((l) => /[–—]/.test(l.line))
+      .map((l) => `${name}:${l.n}: ${l.line.trim()}`);
+    expect(offenders).toEqual([]);
+  });
 });

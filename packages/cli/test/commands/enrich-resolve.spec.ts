@@ -25,7 +25,7 @@
 // `enrich.resolve.apply`: every machine envelope captured here runs through the shared §5.1
 // law (assertEnvelopeBoundary), including the NEW `resolve` typed selection.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,9 +36,10 @@ process.env.MEETLESS_HOME = HOME;
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const enrich = require("../../src/commands/enrich") as typeof import("../../src/commands/enrich");
-const { runEnrichResolve, parseResolveArgs, renderResolveReview } = enrich;
+const { runEnrichResolve, parseResolveArgs, renderResolveReview, resolveTransition } = enrich;
 
 import { loadCandidatesSidecar, upsertCandidatesSidecar } from "../../src/lib/enrichment/ingest";
+import { buildOnboardingRun, writeRunRecord } from "../../src/lib/enrichment/plan";
 import { MANAGED_RULES_PATH } from "../../src/lib/scanner/managed-rules";
 import {
   resetMachineCommand,
@@ -51,6 +52,13 @@ import {
 import { assertEnvelopeBoundary } from "../support/envelope-boundary";
 import type { WorkspaceCliConfig } from "../../src/lib/config";
 import type { RuleClientHttp, RuleNodeView } from "../../src/lib/rules/control-rule-client";
+import {
+  DISPATCH_SCOUT_NAMES,
+  FINDING_RESOLUTIONS as RESOLUTIONS,
+  NO_FILE_OPERATION_FINDINGS,
+  RECONCILIATION_FINDING_KIND,
+  scoutMayEmitKind,
+} from "../../src/lib/enrichment/protocol";
 import type {
   DocCodeInconsistency,
   EnrichmentKind,
@@ -216,6 +224,39 @@ describe("parseResolveArgs", () => {
   });
 });
 
+// The transition is a total function of (what is recorded, what is being asked), which is what
+// lets the command branch on a name instead of on the absence of a guard.
+describe("resolveTransition", () => {
+  const at = "2026-07-10T00:00:00.000Z";
+
+  it("pending plus any verdict performs", () => {
+    for (const outcome of RESOLUTIONS) {
+      expect(resolveTransition(undefined, outcome)).toEqual({ kind: "perform" });
+    }
+  });
+
+  it("resolved plus the same verdict is settled, and carries the record that already exists", () => {
+    for (const outcome of RESOLUTIONS) {
+      expect(resolveTransition({ outcome, resolvedAt: at }, outcome)).toEqual({
+        kind: "settled",
+        resolution: { outcome, resolvedAt: at },
+      });
+    }
+  });
+
+  it("resolved plus a different verdict is a conflict, for every pair", () => {
+    for (const recorded of RESOLUTIONS) {
+      for (const asked of RESOLUTIONS) {
+        if (recorded === asked) continue;
+        expect(resolveTransition({ outcome: recorded, resolvedAt: at }, asked)).toEqual({
+          kind: "conflict",
+          resolution: { outcome: recorded, resolvedAt: at },
+        });
+      }
+    }
+  });
+});
+
 describe("renderResolveReview", () => {
   const RUN_ID = "run_7c3f9a2e10b4";
   const open = [finding("aaaaaaaaaaaaaaaa")];
@@ -229,16 +270,26 @@ describe("renderResolveReview", () => {
     expect(text).not.toContain(GENERATED);
   });
 
-  it("names the divergence, the commit, and who last wrote the rule", () => {
+  it("names the divergence, the commit, and who last changed the quoted line", () => {
     const text = renderResolveReview(RUN_ID, open, []);
     expect(text).toContain("but M db/migrations/0007_add_index.sql");
     expect(text).toContain(BAD_COMMIT.slice(0, 12));
-    expect(text).toContain("the rule was last written by An");
+    // "last changed by", not "last wrote the rule": blame names whoever last TOUCHED the anchored
+    // line range. That may be the author of the sentence, or it may be whoever reflowed the
+    // paragraph. Claiming authorship from a blame line puts a name on a rule they never wrote.
+    expect(text).toContain("last changed by An");
+    expect(text).not.toContain("written by");
   });
 
   it("frames the finding as a question, not a verdict (neither side is assumed right)", () => {
     const text = renderResolveReview(RUN_ID, open, []);
-    expect(text).toMatch(/1 open finding from run run_7c3f9a2e10b4 \(a document and a commit disagree; neither is assumed right\)/);
+    // "appear inconsistent", not "disagree". The CLI proved a quote and a status letter; whether
+    // the two are genuinely in conflict is the question being asked, and stating it as fact is
+    // the CLI answering its own question before the human sees it.
+    expect(text).toMatch(
+      /1 open finding from run run_7c3f9a2e10b4 \(a document and a commit appear inconsistent; neither is assumed right\)/,
+    );
+    expect(text).not.toContain("disagree");
   });
 
   it("offers all three answers as runnable commands with the REAL run id and finding prefix", () => {
@@ -264,9 +315,17 @@ describe("renderResolveReview", () => {
     expect(text.indexOf("1 open finding")).toBeLessThan(text.indexOf("1 already resolved:"));
   });
 
-  it("says the run found nothing when there is nothing at all, and offers no commands", () => {
+  it("scopes the zero result to what the run could actually prove, and offers no commands", () => {
+    // "No doc/code inconsistencies" is a clean bill of health for the repository, and this run
+    // never examined the repository: it read the documents it planned and the commits it listed,
+    // and it can only prove the four file operations. A zero result stated wider than its
+    // coverage is the one output that makes the operator stop looking.
     const text = renderResolveReview(RUN_ID, [], []);
-    expect(text).toBe("This run found no doc/code inconsistencies.");
+    expect(text).toBe(NO_FILE_OPERATION_FINDINGS);
+    expect(text).toMatch(/checked one thing/);
+    expect(text).toMatch(/modifying/);
+    expect(text).toMatch(/renaming/);
+    expect(text).not.toMatch(/no doc\/code inconsistencies/i);
   });
 
   it("distinguishes `all closed` from `never found any`", () => {
@@ -285,6 +344,130 @@ describe("renderResolveReview", () => {
     const text = renderResolveReview(RUN_ID, open, []);
     expect(text).not.toContain("—");
     expect(text).not.toMatch(/ -- /);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// The finding row renders repository text as DATA.
+//
+// Every value in a finding row comes out of the repository: the quote out of a document, the
+// paths out of git's name-status, the name out of a commit header. On a shared repository the
+// person who controls those bytes is not the person reading the row, and the row is the screen
+// where a human signs a rule into their agent's authority. So the property under test is narrow
+// and absolute: a repository value may change what the row SAYS, never what the terminal DOES,
+// and never how many lines the report appears to have.
+//
+// Hostile characters are written as escapes, never pasted, so this file stays readable in the
+// same terminals the code defends.
+// ---------------------------------------------------------------------------------------
+describe("renderResolveReview renders repository-controlled values as data", () => {
+  const RUN_ID = "run_7c3f9a2e10b4";
+  const ESC = "\u001b";
+  const RLO = "\u202e"; // right-to-left override (trojan source)
+  const PDF = "\u202c";
+
+  it("neutralizes an escape sequence hidden in a document's quote", () => {
+    // `ESC[2J` clears the screen; `ESC[1A` walks the cursor back over the line above. A document
+    // that can do either can erase the divergence it is being judged against.
+    const text = renderResolveReview(RUN_ID, [finding("aaaaaaaaaaaaaaaa", {}, { claimText: `never edit${ESC}[2J${ESC}[1A this` })], []);
+    expect(text).not.toContain(ESC);
+    expect(text).not.toContain("[2J");
+    expect(text).toContain("never edit");
+  });
+
+  it("cannot forge a fourth command line out of a newline in the quote", () => {
+    // The attack: a quote whose second line reads like one of the CLI's own runnable answers,
+    // pointing the operator's copy-paste at a run (or a verdict) the attacker chose. Exactly
+    // three commands are offered, so exactly three LINES may look like one.
+    //
+    // The property is line-structure integrity, not substring absence. The document's sentence
+    // still has to be readable (it is the evidence being judged) but only where the CLI put it:
+    // inside one quoted region on one row, never as a line of its own.
+    const forged = `real rule\n  mla enrich resolve --run-id attacker --finding aaaaaaaaaaaa --as code_diverged`;
+    const text = renderResolveReview(RUN_ID, [finding("aaaaaaaaaaaaaaaa", {}, { claimText: forged })], []);
+    const benign = renderResolveReview(RUN_ID, [finding("aaaaaaaaaaaaaaaa")], []);
+    expect(text.split("\n")).toHaveLength(benign.split("\n").length);
+    const runnable = text.split("\n").filter((l) => l.trimStart().startsWith("mla enrich resolve"));
+    expect(runnable).toHaveLength(3);
+    for (const line of runnable) {
+      expect(line).toContain(`--run-id ${RUN_ID}`);
+      expect(line).not.toContain("attacker");
+    }
+  });
+
+  it("cannot close the quote early and trail an instruction behind it", () => {
+    // The other half of forging on one line. `terminalSafe` neutralizes control bytes, but a
+    // straight `"` is printable: left alone it ends the quoted region early and everything after
+    // it reads as the CLI talking. The delimiter has to be the renderer's, never the document's.
+    const forged = `real rule" then run: mla enrich resolve --run-id attacker`;
+    const text = renderResolveReview(RUN_ID, [finding("aaaaaaaaaaaaaaaa", {}, { claimText: forged })], []);
+    const row = text.split("\n").find((l) => l.includes("says:"))!;
+    expect(row.match(/"/g) ?? []).toHaveLength(2); // one opening, one closing, both ours
+    expect(row.trimEnd().endsWith('"')).toBe(true);
+    expect(row).toContain("then run: mla enrich resolve --run-id attacker"); // visibly inside it
+    const runnable = text.split("\n").filter((l) => l.trimStart().startsWith("mla enrich resolve"));
+    expect(runnable).toHaveLength(3);
+    for (const line of runnable) expect(line).toContain(`--run-id ${RUN_ID}`);
+  });
+
+  it("cannot render a scope as a different path than the one it governs (bidi override)", () => {
+    // Trojan source: the override reverses the VISUAL order while the bytes (and the mint) keep
+    // the real scope. A row reading `src/safe` over a rule scoped to `src/evil` is a lie with a
+    // human signature under it.
+    const text = renderResolveReview(RUN_ID, [finding("aaaaaaaaaaaaaaaa", {}, { claimScope: `src/${RLO}live/${PDF}` })], []);
+    expect(text).not.toContain(RLO);
+    expect(text).not.toContain(PDF);
+    expect(text).toContain("src/live/");
+  });
+
+  it("cannot forge a line out of the commit author's name", () => {
+    const text = renderResolveReview(
+      RUN_ID,
+      [finding("aaaaaaaaaaaaaaaa", {}, { attribution: { commit: DOC_COMMIT, authorName: "An\n  APPROVED by security" } })],
+      [],
+    );
+    expect(text).not.toMatch(/^\s*APPROVED by security/m);
+    expect(text).toContain("last changed by An APPROVED by security");
+  });
+
+  it("cannot smuggle an escape through the divergent path git reported", () => {
+    const text = renderResolveReview(
+      RUN_ID,
+      [finding("aaaaaaaaaaaaaaaa", {}, { divergence: { path: `db/${ESC}[31mmigrations/x.sql`, status: "M" } })],
+      [],
+    );
+    expect(text).not.toContain(ESC);
+    expect(text).toContain("db/migrations/x.sql");
+  });
+
+  it("truncates an over-long quote and marks that it truncated", () => {
+    // The protocol accepts a 600-character claim; a terminal row is not 600 characters wide.
+    // Cutting is fine, cutting SILENTLY is not: the human would be signing off on a sentence
+    // whose remainder they never saw.
+    const long = "never edit " + "x".repeat(560);
+    const text = renderResolveReview(RUN_ID, [finding("aaaaaaaaaaaaaaaa", {}, { claimText: long })], []);
+    expect(text).toContain("never edit xxx");
+    expect(text).not.toContain(long);
+    expect(text).toContain("...");
+  });
+
+  it("drops the attribution line when git's name was nothing but control bytes", () => {
+    // An empty "last changed by" reads as a missing person, which is worse than no line at all.
+    const text = renderResolveReview(
+      RUN_ID,
+      [finding("aaaaaaaaaaaaaaaa", {}, { attribution: { commit: DOC_COMMIT, authorName: `${ESC}[0m` } })],
+      [],
+    );
+    expect(text).not.toContain("last changed by");
+  });
+
+  it("keeps the stored quote byte-exact; sanitization is a display transform only", () => {
+    // The mint and the ancestry proof re-read this string out of the document. Normalize what is
+    // STORED and the finding stops matching the file it came from.
+    const raw = `never edit${ESC}[2J this`;
+    const record = finding("aaaaaaaaaaaaaaaa", {}, { claimText: raw });
+    renderResolveReview(RUN_ID, [record], []);
+    expect(record.inconsistency!.claimText).toBe(raw);
   });
 });
 
@@ -369,6 +552,29 @@ describe("mla enrich resolve (end to end, real sidecar + mint + file write)", ()
     };
   }
 
+  /**
+   * A fake that REMEMBERS: GET returns what POST has already accepted, which is what makes a
+   * second run's hash lookup meaningful. A fake that always answers "nothing is live" would
+   * prove only that the command posts twice against a backend that never existed. Every test
+   * about a REPEATED verdict needs this one, and must pass the SAME instance to both runs.
+   */
+  function statefulHttp(): RuleClientHttp {
+    const live: RuleNodeView[] = [];
+    return {
+      get: (async () => live) as unknown as RuleClientHttp["get"],
+      post: (async (_cfg: unknown, p: string, body: unknown) => {
+        const b = body as MintBody;
+        posts.push({ path: p, body: b });
+        const node = ruleNode(`node_${posts.length}`, b.canonicalPayloadHash);
+        live.push(node);
+        return node;
+      }) as unknown as RuleClientHttp["post"],
+      patch: (async () => {
+        throw new Error("unexpected patch");
+      }) as unknown as RuleClientHttp["patch"],
+    };
+  }
+
   function deps(over: Partial<Parameters<typeof runEnrichResolve>[1]> = {}) {
     return {
       loadConfig: () => wsCfg(),
@@ -445,15 +651,52 @@ describe("mla enrich resolve (end to end, real sidecar + mint + file write)", ()
     upsertCandidatesSidecar(HOME, sidecar);
   }
 
+  /** The plan record `enrich plan` writes: proof the run happened, independent of what it persisted. */
+  function runRecord(runId: string) {
+    return buildOnboardingRun({
+      runId,
+      workspaceId: WS,
+      repositoryRoot: root,
+      now: "2026-07-10T00:00:00.000Z",
+      documentationTargets: [],
+      historyEvidence: [],
+    });
+  }
+
   /** One open finding plus one ordinary durable rule: the run `resolve` and `accept` share. */
   function seedMixed(): void {
     seed([finding(F1), rule("c3c3c3c3c3c3c3c3", "convention", "Prefer relative imports.")]);
   }
 
-  it("exits 2 with a helpful message when no sidecar exists for the run", async () => {
+  it("exits 2 with a helpful message when the run itself is unknown", async () => {
     const code = await resolve(["--run-id", "run_missing"]);
     expect(code).toBe(2);
-    expect(err.join("\n")).toMatch(/no candidates sidecar for run run_missing/);
+    expect(err.join("\n")).toMatch(/no onboarding run run_missing/);
+    expect(existsSync(managedPath)).toBe(false);
+  });
+
+  // A run that persisted nothing writes no sidecar, and the onboarding skill sends the agent
+  // here anyway: run the review, and if it lists nothing, say the one scoped line. Reporting a
+  // known run's honest zero as an error taught the agent to say the run FAILED, which is a
+  // second false statement about a run that worked. The run record is what separates the two:
+  // present means the run happened and produced nothing, absent means the id is wrong.
+  it("reports a known run that persisted nothing as a zero result, not an error", async () => {
+    writeRunRecord(HOME, runRecord(RUN));
+    const code = await resolve(["--run-id", RUN]);
+    expect(code).toBe(0);
+    expect(err.join("\n")).toBe("");
+    expect(out.join("\n")).toContain(NO_FILE_OPERATION_FINDINGS);
+    expect(existsSync(managedPath)).toBe(false);
+  });
+
+  // The zero-result path still has no finding to resolve. A verdict against it is a bad
+  // selection, and it must not silently succeed just because the run is known.
+  it("refuses a verdict against a run that persisted no findings", async () => {
+    writeRunRecord(HOME, runRecord(RUN));
+    const code = await resolve(["--run-id", RUN, "--finding", "aaaaaa", "--as", "code_diverged"]);
+    expect(code).toBe(2);
+    expect(err.join("\n")).toMatch(/no finding/i);
+    expect(posts).toHaveLength(0);
     expect(existsSync(managedPath)).toBe(false);
   });
 
@@ -653,43 +896,224 @@ describe("mla enrich resolve (end to end, real sidecar + mint + file write)", ()
     expect(persisted(F1)?.resolution?.outcome).toBe("carve_out"); // and never overwrote the first
   });
 
-  it("re-running the SAME answer is a no-op, so a retried command is safe", async () => {
-    seedMixed();
-    expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).toBe(0);
-    expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).toBe(0);
-    expect(persisted(F1)?.resolution?.outcome).toBe("doc_stale");
-    expect(posts).toHaveLength(0);
+  // -------------------------------------------------------------------------------------
+  // The three transitions, stated as behavior rather than as a fall-through.
+  //
+  //   pending  + any verdict        performs, exactly once
+  //   resolved + the SAME verdict   no-op: nothing minted, nothing written, nothing re-stamped
+  //   resolved + a DIFFERENT one    conflict, refused above
+  //
+  // The middle one is the one that used to be implicit: with only the conflict branch guarding
+  // the body, a repeat fell through the WHOLE thing. It re-entered the mint (a network call), it
+  // re-wrote the projection, and it re-stamped `resolvedAt` with a fresh clock reading, which
+  // silently moved WHEN the decision was recorded. An audit trail whose timestamp moves every
+  // time someone retries a command is not an audit trail.
+  // -------------------------------------------------------------------------------------
+  describe("resolution transitions", () => {
+    it("resolved plus the SAME verdict changes nothing, including the audit timestamp", async () => {
+      seedMixed();
+      const http = statefulHttp();
+      const argv = ["--run-id", RUN, "--finding", "a1a1a1", "--as", "code_diverged"];
+      expect(await resolve(argv, { http })).toBe(0);
+      const first = persisted(F1)!.resolution!;
+
+      // Delete the projection first: anything the retry re-writes is work that a no-op did not
+      // do. The rule is live on the authority either way; this file is only its local rendering.
+      rmSync(managedPath);
+      out = [];
+
+      expect(await resolve(argv, { http })).toBe(0);
+      expect(posts).toHaveLength(1); // no second mint
+      expect(deliveries).toHaveLength(1); // no second delivery refresh
+      expect(existsSync(managedPath)).toBe(false); // no second write
+      expect(persisted(F1)!.resolution).toEqual(first); // resolvedAt byte-identical
+
+      const said = out.join("\n");
+      expect(said).toContain("is already resolved as code_diverged");
+      expect(said).not.toContain("its sentence is now a rule"); // it was not resolved again
+    });
+
+    it("a repeated non-minting verdict is equally frozen", async () => {
+      seedMixed();
+      const argv = ["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"];
+      expect(await resolve(argv)).toBe(0);
+      const first = persisted(F1)!.resolution!;
+      out = [];
+      expect(await resolve(argv)).toBe(0);
+      expect(persisted(F1)!.resolution).toEqual(first);
+      expect(posts).toHaveLength(0);
+      expect(out.join("\n")).toContain("is already resolved as doc_stale");
+    });
+
+    // A dry run on a settled finding used to print "Would resolve ...", which is a claim about a
+    // future run that would in fact do nothing.
+    it("--dry-run on a settled finding says it is settled, not that it WOULD resolve it", async () => {
+      seedMixed();
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "carve_out"])).toBe(0);
+      out = [];
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "carve_out", "--dry-run"])).toBe(0);
+      const said = out.join("\n");
+      expect(said).not.toContain("Would resolve");
+      expect(said).toContain("is already resolved as carve_out");
+    });
   });
 
-  // The retry case for the answer that DOES touch the authority. A repeat is allowed (it is the
-  // same verdict, not a contradicting one) and must not mint the sentence twice: the dedup is by
-  // payload hash, so the second run sees it live and skips.
-  it("re-running code_diverged reports the rule already live instead of minting it twice", async () => {
-    seedMixed();
-    // A fake that REMEMBERS: GET returns what POST has already accepted, which is what makes the
-    // second run's hash lookup meaningful. A fake that always answers "nothing is live" would prove
-    // only that the command posts twice against a backend that never existed.
-    const live: RuleNodeView[] = [];
-    const stateful: RuleClientHttp = {
-      get: (async () => live) as unknown as RuleClientHttp["get"],
-      post: (async (_cfg: unknown, p: string, body: unknown) => {
-        const b = body as MintBody;
-        posts.push({ path: p, body: b });
-        const node = ruleNode(`node_${posts.length}`, b.canonicalPayloadHash);
-        live.push(node);
-        return node;
-      }) as unknown as RuleClientHttp["post"],
-      patch: (async () => {
-        throw new Error("unexpected patch");
-      }) as unknown as RuleClientHttp["patch"],
-    };
-    const argv = ["--run-id", RUN, "--finding", "a1a1a1", "--as", "code_diverged"];
-    expect(await resolve(argv, { http: stateful })).toBe(0);
-    out = [];
-    expect(await resolve(argv, { http: stateful })).toBe(0);
-    expect(posts).toHaveLength(1); // the second run minted nothing
-    expect(out.join("\n")).toContain(`Already live (not minted again): ${QUOTE}`);
-    expect(persisted(F1)?.resolution?.outcome).toBe("code_diverged");
+  // -------------------------------------------------------------------------------------
+  // Failure injection around the two durable writes.
+  //
+  // `code_diverged` writes twice, in this order: the MINT (remote authority, then the local
+  // projection) and the CLOSURE (the sidecar stamp). Either half can fail alone. The ordering
+  // makes one state unreachable (a finding closed under a rule that never reached the
+  // authority) and leaves the other recoverable (rule live, finding still open) with the RETRY
+  // as its recovery: the mint dedups by payload hash, so re-running the same verdict finds the
+  // rule already live, mints nothing, and closes the finding.
+  // -------------------------------------------------------------------------------------
+  describe("failure injection", () => {
+    const runsDir = (): string => join(HOME, "workspaces", WS, "onboarding-runs");
+
+    it("a closure that fails after a successful mint reports the true state instead of crashing", async () => {
+      seedMixed();
+      const http = statefulHttp();
+      const argv = ["--run-id", RUN, "--finding", "a1a1a1", "--as", "code_diverged"];
+
+      let code: number;
+      try {
+        // Real failure injection, no seam: the stamp is an atomic temp+rename, so a directory
+        // that cannot take a new file fails the write exactly as a full disk would.
+        chmodSync(runsDir(), 0o500);
+        code = await resolve(argv, { http });
+      } finally {
+        chmodSync(runsDir(), 0o700);
+      }
+
+      expect(code).not.toBe(0);
+      expect(posts).toHaveLength(1); // the rule DID reach the authority
+      expect(existsSync(managedPath)).toBe(true); // and the projection matches it
+      expect(persisted(F1)?.resolution).toBeUndefined(); // only the closure is missing
+      const said = err.join("\n");
+      expect(said).toMatch(/live on the authority/i);
+      expect(said).toMatch(/still open/i);
+      expect(said).toMatch(/re-run/i);
+
+      // The retry is the recovery, and it is not a second mint.
+      expect(await resolve(argv, { http })).toBe(0);
+      expect(posts).toHaveLength(1);
+      expect(persisted(F1)?.resolution?.outcome).toBe("code_diverged");
+      expect(persisted(F1)?.resolution?.mintedRuleKind).toBe("constraint");
+    });
+
+    it("a closure that fails on a non-minting verdict leaves the finding open, and the retry closes it", async () => {
+      seedMixed();
+      const argv = ["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"];
+      let code: number;
+      try {
+        chmodSync(runsDir(), 0o500);
+        code = await resolve(argv);
+      } finally {
+        chmodSync(runsDir(), 0o700);
+      }
+      expect(code).not.toBe(0);
+      expect(posts).toHaveLength(0);
+      expect(persisted(F1)?.resolution).toBeUndefined();
+      // Nothing was minted, so the message must claim nothing about a rule: neither that one is
+      // live nor that a retry will avoid minting it twice.
+      expect(err.join("\n")).not.toMatch(/live on the authority/i);
+      expect(err.join("\n")).not.toMatch(/minted twice/i);
+      expect(err.join("\n")).toMatch(/still open. Re-run the same command to close it\./);
+
+      expect(await resolve(argv)).toBe(0);
+      expect(persisted(F1)?.resolution?.outcome).toBe("doc_stale");
+    });
+  });
+
+  // -------------------------------------------------------------------------------------
+  // The §9 metric row. The design's kill rule is computed from `carve_out` share, and the
+  // resolution-rate metric needs the closure side of the pair, so this command is the only
+  // producer of half the measurement plane. What matters is not just that a row is written but
+  // WHEN: a row for a closure the sidecar never recorded would report governance that does not
+  // exist, and the kill rule would be evaluated on it.
+  // -------------------------------------------------------------------------------------
+  describe("the resolved analytics row (design §9)", () => {
+    const runsDir = (): string => join(HOME, "workspaces", WS, "onboarding-runs");
+    let baseline: number;
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const store = require("../../src/lib/analytics/store") as typeof import("../../src/lib/analytics/store");
+
+    beforeEach(() => {
+      // The spool is append-only and shared by every test in this file, so each case reads only
+      // what IT appended rather than a global tally that neighbours can move.
+      baseline = store.readEvents().length;
+    });
+
+    function rows(): Record<string, unknown>[] {
+      return (store.readEvents() as unknown as Record<string, unknown>[])
+        .slice(baseline)
+        .filter((e) => e.event_type === "mla_onboarding_finding");
+    }
+
+    it("stamps one resolved row carrying the verdict and the truncated finding id", async () => {
+      seedMixed();
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).toBe(0);
+      const emitted = rows();
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]).toMatchObject({
+        finding_phase: "resolved",
+        finding_verdict: "doc_stale",
+        minted_rule: false,
+        finding_id: F1.slice(0, 12),
+        workspace_id: WS,
+      });
+    });
+
+    it("records minted_rule only when a rule actually reached the authority", async () => {
+      seedMixed();
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "code_diverged"])).toBe(0);
+      expect(posts).toHaveLength(1);
+      expect(rows()[0]).toMatchObject({ finding_verdict: "code_diverged", minted_rule: true });
+    });
+
+    it("counts a carve_out verbatim: this row IS the kill metric", async () => {
+      seedMixed();
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "carve_out"])).toBe(0);
+      expect(rows()[0]).toMatchObject({ finding_verdict: "carve_out", minted_rule: false });
+    });
+
+    it("emits NOTHING on a dry run: nothing was decided, so there is nothing to count", async () => {
+      seedMixed();
+      expect(
+        await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "carve_out", "--dry-run"]),
+      ).toBe(0);
+      expect(persisted(F1)?.resolution).toBeUndefined();
+      expect(rows()).toHaveLength(0);
+    });
+
+    it("emits NOTHING on a settled repeat, so one closure counts once", async () => {
+      seedMixed();
+      const argv = ["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"];
+      expect(await resolve(argv)).toBe(0);
+      expect(rows()).toHaveLength(1);
+      expect(await resolve(argv)).toBe(0);
+      expect(rows()).toHaveLength(1); // the second run performed nothing, so it counted nothing
+    });
+
+    it("emits NOTHING when the closure itself failed (the finding is still open)", async () => {
+      seedMixed();
+      try {
+        chmodSync(runsDir(), 0o500);
+        expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).not.toBe(0);
+      } finally {
+        chmodSync(runsDir(), 0o700);
+      }
+      expect(persisted(F1)?.resolution).toBeUndefined();
+      expect(rows()).toHaveLength(0);
+    });
+
+    it("emits NOTHING in review mode (no verdict was asked for)", async () => {
+      seedMixed();
+      expect(await resolve(["--run-id", RUN])).toBe(0);
+      expect(rows()).toHaveLength(0);
+    });
   });
 
   // A resolved finding must survive the next ingest. Ingest rewrites a record in place (that is
@@ -821,7 +1245,11 @@ describe("mla enrich resolve (end to end, real sidecar + mint + file write)", ()
       expect(env.ok).toBe(true);
       if (!env.ok) return;
       expect(env.decision_request).toBeUndefined();
-      expect(env.human_summary).toContain("No open doc/code findings");
+      // The agent surface gets the SAME scoped sentence the human review prints, not a looser
+      // paraphrase of it. An agent handed "no doc/code findings" relays it to its user as a
+      // clean repository, which widens a claim this run never made; the constant is the only
+      // wording all three surfaces (ingest screen, review, skill) are allowed to say.
+      expect(env.human_summary).toBe(NO_FILE_OPERATION_FINDINGS);
     });
 
     it("apply: the mutation emits a result envelope naming the finding, the verdict and the mint", async () => {
@@ -872,6 +1300,39 @@ describe("mla enrich resolve (end to end, real sidecar + mint + file write)", ()
       expect(posts).toHaveLength(0);
     });
 
+    // A repeat is a SUCCESS, not an error: the caller asked for a state the system is already in.
+    // But a caller that cannot tell "I just closed it" from "it was already closed" will report
+    // work that did not happen, so the envelope says which one it was and when it happened.
+    it("apply: a repeated verdict is a success envelope that says nothing changed", async () => {
+      seedMixed();
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).toBe(0);
+      const first = persisted(F1)!.resolution!;
+
+      setOutputMode("machine-best-effort");
+      setMachineCommand("enrich.resolve.apply");
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).toBe(0);
+
+      const env = envelope();
+      if (!env.ok) throw new Error("expected a success envelope");
+      const result = env.result as { unchanged: boolean; resolution: string; resolvedAt: string | null };
+      expect(result.unchanged).toBe(true);
+      expect(result.resolution).toBe("doc_stale");
+      expect(result.resolvedAt).toBe(first.resolvedAt);
+      expect(persisted(F1)!.resolution).toEqual(first);
+    });
+
+    it("apply: the FIRST verdict is a success envelope that says it changed something", async () => {
+      seedMixed();
+      setOutputMode("machine-best-effort");
+      setMachineCommand("enrich.resolve.apply");
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).toBe(0);
+      const env = envelope();
+      if (!env.ok) throw new Error("expected a success envelope");
+      const result = env.result as { unchanged: boolean; resolvedAt: string | null };
+      expect(result.unchanged).toBe(false);
+      expect(result.resolvedAt).toBe(persisted(F1)!.resolution!.resolvedAt);
+    });
+
     it("apply: a refused verdict emits a boundary-valid ERROR envelope, not a human line", async () => {
       seedMixed();
       expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "carve_out"])).toBe(0);
@@ -901,6 +1362,60 @@ describe("mla enrich resolve (end to end, real sidecar + mint + file write)", ()
       if (env.ok) return;
       expect(env.error.code).toBe("usage_error");
       expect(env.error.message).toMatch(/--as also requires --finding/);
+    });
+  });
+
+  // -------------------------------------------------------------------------------------
+  // Backward compatibility of the kill patch (review 3, item 7).
+  //
+  // The retirement of a finding-producing scout is a one-line edit to RETIRED_SCOUT_NAMES.
+  // It stops DISPATCH. It must not strand a finding a user already has on disk: the record
+  // is the same record, and answering it is the same answer. These pin that resolution is a
+  // pure function of the STORED record and never consults the onboarding roster, so the
+  // kill can be performed (or reverted) without a data migration.
+  //
+  // RETIRED is derived, not spelled: the scout that produces findings today is the one a
+  // retirement would remove, and deriving it means this file cannot drift from the roster.
+  // -------------------------------------------------------------------------------------
+  describe("a finding minted by a scout the build no longer dispatches", () => {
+    const RETIRED = DISPATCH_SCOUT_NAMES.filter((role) =>
+      scoutMayEmitKind(role, RECONCILIATION_FINDING_KIND),
+    )[0];
+    const REDUCED = DISPATCH_SCOUT_NAMES.filter((role) => role !== RETIRED);
+
+    /** The record as an older run wrote it, whose scout the reduced roster does not brief. */
+    const seedOld = (): void => {
+      expect(REDUCED).not.toContain(RETIRED); // the post-kill roster, by construction
+      seed([finding(F1, { sourceScouts: [RETIRED] })]);
+    };
+
+    it("still renders, with its quote, its divergence, and all three answers", async () => {
+      seedOld();
+      expect(await resolve(["--run-id", RUN])).toBe(0);
+      const text = out.join("\n");
+      expect(text).toContain(QUOTE);
+      expect(text).toContain("db/migrations/0007_add_index.sql");
+      for (const outcome of ["code_diverged", "doc_stale", "carve_out"]) {
+        expect(text).toContain(`--finding a1a1a1a1a1a1 --as ${outcome}`);
+      }
+    });
+
+    it("still resolves, and still mints through the same authority path", async () => {
+      seedOld();
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "code_diverged"])).toBe(0);
+      expect(posts).toHaveLength(1);
+      expect(posts[0].body.payload.text).toBe(QUOTE);
+      expect(persisted(F1)?.resolution).toMatchObject({ outcome: "code_diverged" });
+      // The stored provenance is preserved verbatim: closing a finding never rewrites who
+      // found it, so a later audit can still say which scout this came from.
+      expect(persisted(F1)?.sourceScouts).toEqual([RETIRED]);
+    });
+
+    it("still records a non-minting verdict", async () => {
+      seedOld();
+      expect(await resolve(["--run-id", RUN, "--finding", "a1a1a1", "--as", "doc_stale"])).toBe(0);
+      expect(posts).toHaveLength(0);
+      expect(persisted(F1)?.resolution).toMatchObject({ outcome: "doc_stale" });
     });
   });
 });

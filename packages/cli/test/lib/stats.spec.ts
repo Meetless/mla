@@ -532,6 +532,164 @@ describe("runStats", () => {
     });
   });
 
+  // --- the THIRD state (notes/20260801-value-dashboard-empty-root-cause.md) ----
+  // has_any_events answers "is the CLI syncing"; has_governed_events answers "has
+  // any instrument this dashboard reads ever fired". In production they came apart:
+  // every workspace synced and none had produced a governed event, so --global
+  // printed a full dashboard of zeros as if it had measured a failure.
+
+  it("prints the nothing-governed block instead of a wall of zeros", async () => {
+    const fetchGlobal = jest.fn().mockResolvedValue(
+      rollup({
+        hasAnyEvents: true,
+        hasGovernedEvents: false,
+        workspaces: 1,
+        activity: {
+          commands: 143,
+          sessions: 21,
+          rule_injections: 88,
+          head_tokens: 26752,
+          hook_invocations: 91,
+          hook_failures: 4,
+          rules_configured: 0,
+          last_active_at: "2026-07-31T18:04:11.000Z",
+        },
+      }),
+    );
+    const code = await runStats(["--global"], { env: { MEETLESS_TELEMETRY: "on" }, fetchGlobal });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls[0][0] as string;
+
+    expect(out).toContain("global: 1 workspace you can view");
+    expect(out).toContain("Nothing governed yet");
+    // The work that DID happen, so the terminal is not a dead end.
+    expect(out).toContain("143 command(s) across 21 session(s)");
+    expect(out).toContain("88 rule injection(s), 26,752 tokens of context");
+    expect(out).toContain("4 of 91 hook invocation(s) failed");
+    // The actual production cause, with the one action that changes it.
+    expect(out).toContain("No rules are configured");
+    expect(out).toContain("mla onboard");
+
+    // NOT the zero wall: no rate lines, no enforcement headline.
+    expect(out).not.toContain("Injection Utilization");
+    expect(out).not.toContain("Evidence followthrough");
+    expect(out).not.toContain("mla flagged 0");
+  });
+
+  it("reads a workspace WITH rules as quiet, not broken", async () => {
+    const fetchGlobal = jest.fn().mockResolvedValue(
+      rollup({
+        hasAnyEvents: true,
+        hasGovernedEvents: false,
+        workspaces: 1,
+        activity: {
+          commands: 143,
+          sessions: 21,
+          rule_injections: 88,
+          head_tokens: 26752,
+          hook_invocations: 91,
+          hook_failures: 0,
+          rules_configured: 12,
+          last_active_at: "2026-07-31T18:04:11.000Z",
+        },
+      }),
+    );
+    const code = await runStats(["--global"], { env: { MEETLESS_TELEMETRY: "on" }, fetchGlobal });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls[0][0] as string;
+    expect(out).toContain("12 rule(s) in force");
+    expect(out).toContain("nothing has tripped them");
+    expect(out).not.toContain("No rules are configured");
+    // A healthy hook is not worth a line; only failures are.
+    expect(out).not.toContain("hook invocation(s) failed");
+  });
+
+  it("dates the last activity against the rollup's own clock, not the reader's", async () => {
+    // `Last active: 2026-05-28T09:15:00.000Z` is a machine timestamp shown to a
+    // human who is trying to answer one question: is this install dead or just
+    // quiet? The age answers it; the milliseconds never did. The reference clock
+    // is the rollup's own `generated_at` (server-stamped, already on the wire),
+    // so the line is deterministic and does not drift with the reader's clock.
+    const fetchGlobal = jest.fn().mockResolvedValue(
+      rollup({
+        hasAnyEvents: true,
+        hasGovernedEvents: false,
+        workspaces: 1,
+        activity: {
+          commands: 5,
+          sessions: 2,
+          rule_injections: 0,
+          head_tokens: 0,
+          hook_invocations: 0,
+          hook_failures: 0,
+          rules_configured: 0,
+          last_active_at: "2026-05-28T09:15:00.000Z",
+        },
+      }),
+    );
+    const code = await runStats(["--global"], { env: { MEETLESS_TELEMETRY: "on" }, fetchGlobal });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls[0][0] as string;
+
+    expect(out).toContain("Last active: 2026-05-28 (10 days ago)");
+    expect(out).not.toContain("T09:15:00.000Z");
+  });
+
+  it("never renders a negative age when last_active_at is ahead of generated_at", async () => {
+    // Defensive: a skewed clock (or a rollup replayed later) must degrade to the
+    // bare date, never to "(-54 days ago)", which reads as a bug in mla itself.
+    const fetchGlobal = jest.fn().mockResolvedValue(
+      rollup({
+        hasAnyEvents: true,
+        hasGovernedEvents: false,
+        workspaces: 1,
+        activity: {
+          commands: 5,
+          sessions: 2,
+          rule_injections: 0,
+          head_tokens: 0,
+          hook_invocations: 0,
+          hook_failures: 0,
+          rules_configured: 0,
+          last_active_at: "2026-07-31T18:04:11.000Z",
+        },
+      }),
+    );
+    const code = await runStats(["--global"], { env: { MEETLESS_TELEMETRY: "on" }, fetchGlobal });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls[0][0] as string;
+
+    expect(out).toContain("Last active: 2026-07-31");
+    expect(out).not.toContain("ago");
+  });
+
+  it("passes the third state through --json so a machine sees the flag, not a false zero", async () => {
+    const fetchGlobal = jest.fn().mockResolvedValue(
+      rollup({ hasAnyEvents: true, hasGovernedEvents: false, workspaces: 1 }),
+    );
+    const code = await runStats(["--global", "--json"], {
+      env: { MEETLESS_TELEMETRY: "on" },
+      fetchGlobal,
+    });
+    expect(code).toBe(0);
+    const printed = JSON.parse(logSpy.mock.calls[0][0] as string);
+    expect(printed.has_any_events).toBe(true);
+    expect(printed.has_governed_events).toBe(false);
+    expect(printed.injections).toBe(0);
+  });
+
+  it("renders the normal dashboard when an older control omits has_governed_events", async () => {
+    const older = rollup({ hasAnyEvents: true, workspaces: 1, injections: 4 });
+    delete older.has_governed_events;
+    delete older.activity;
+    const fetchGlobal = jest.fn().mockResolvedValue(older);
+    const code = await runStats(["--global"], { env: { MEETLESS_TELEMETRY: "on" }, fetchGlobal });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls[0][0] as string;
+    expect(out).toContain("Evidence followthrough");
+    expect(out).not.toContain("Nothing governed yet");
+  });
+
   it("surfaces a control reachability failure as an error (exit 1, not a silent zero)", async () => {
     const fetchGlobal = jest.fn().mockRejectedValue(new Error("ECONNREFUSED"));
     const code = await runStats(["--global"], { env: { MEETLESS_TELEMETRY: "on" }, fetchGlobal });
@@ -657,6 +815,8 @@ describe("mla_stats_viewed (T7.2 value-checking signal)", () => {
 function rollup(
   opts: {
     hasAnyEvents: boolean;
+    hasGovernedEvents?: boolean;
+    activity?: GlobalRollup["activity"];
     workspaces?: number;
     injections?: number;
     evidence?: Partial<MetricFamily>;
@@ -684,6 +844,17 @@ function rollup(
     window_days: 30,
     workspaces: opts.workspaces ?? 0,
     has_any_events: opts.hasAnyEvents,
+    has_governed_events: opts.hasGovernedEvents ?? opts.hasAnyEvents,
+    activity: opts.activity ?? {
+      commands: 0,
+      sessions: 0,
+      rule_injections: 0,
+      head_tokens: 0,
+      hook_invocations: 0,
+      hook_failures: 0,
+      rules_configured: 0,
+      last_active_at: null,
+    },
     generated_at: new Date(NOW).toISOString(),
     evidence,
     injections: opts.injections ?? 0,

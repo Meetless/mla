@@ -18,6 +18,7 @@ import { describeEgressRefusal } from "./egress/policy";
 import * as Sentry from "@sentry/node";
 import type { FlushFn, FlushPayload, Tracer, TracerOptions } from "@meetless/trace-core";
 import { redact } from "./redactor";
+import { normalizeCommand } from "./analytics/command-event";
 import { redactStructured } from "./redact-structured";
 import { telemetryDisabled } from "./config";
 import { recordTelemetryUploadFailure } from "./failure-telemetry";
@@ -142,6 +143,53 @@ export { telemetryDisabled };
 
 let sentryAvailable = false;
 
+// What replaces a dropped exception message. A constant, so it never becomes a
+// grouping key, and it names the channel that WILL carry the text if the user
+// chooses to send it.
+export const SENTRY_MESSAGE_WITHHELD = "<message withheld: mla bug report --trace-id>";
+
+// The integrations a CLI actually needs. This is an ALLOWLIST replacing the
+// SDK's 43 defaults, and it is a privacy control, not a startup optimization
+// (though it is that too: most of the 43 are framework auto-instrumentations
+// that patch modules at require time and cannot fire in a CLI at all).
+//
+// Three defaults collect free text by construction and are deliberately absent:
+//
+//   Console            every line the CLI prints becomes a breadcrumb. `mla ask`
+//                      prints the answer; `mla kb show` prints the document.
+//   Http / NodeFetch   every outbound call becomes a breadcrumb carrying the raw
+//                      path and query string. The run-trace plane rolls those up
+//                      to `coordination-cases.:id` for exactly this reason; the
+//                      Sentry plane was shipping `?q=<the user's question>`.
+//
+// Stated as an allowlist rather than a filter so that a future SDK release
+// adding a 44th default collector cannot switch on a new capture source
+// silently. sentry-event-reduction.spec.ts pins the ACTIVE set to this list.
+function cliIntegrations() {
+  return [
+    Sentry.inboundFiltersIntegration(),
+    Sentry.functionToStringIntegration(),
+    Sentry.linkedErrorsIntegration(),
+    Sentry.nodeContextIntegration(),
+    Sentry.contextLinesIntegration(),
+    Sentry.modulesIntegration(),
+    Sentry.onUncaughtExceptionIntegration(),
+    Sentry.onUnhandledRejectionIntegration(),
+  ];
+}
+
+// A FUNCTION, not a module-level constant. Building the list at import time
+// constructs eight integration objects on every `mla` start, including the
+// overwhelming majority of runs where no DSN is baked and Sentry never
+// initializes at all, and it makes merely importing this module require the
+// full SDK surface. observability-capture.spec.ts and
+// observability-safe-context.spec.ts import it against a small hand-rolled
+// `@sentry/node` mock and went red the moment the constant existed: that is the
+// regression guard, and it is a real one, not a test artifact.
+export function sentryCliIntegrationNames(): string[] {
+  return cliIntegrations().map((i) => i.name);
+}
+
 // beforeSend hook: scrub every event before it leaves the process. On any
 // redaction error we DROP the event (return null) rather than risk shipping an
 // unscrubbed payload.
@@ -158,6 +206,52 @@ export function redactSentryEvent<T>(event: T): T | null {
   if (event === null || event === undefined) return event;
   try {
     return redactStructured(event, { keyAware: true, profile: "full" });
+  } catch {
+    return null;
+  }
+}
+
+// The reduction half, which the walker above cannot do.
+//
+// An exception's `value` is the message the throw site wrote, and this CLI
+// interpolates raw argv into 133 of them, so `mla review --my-unreleased-thing`
+// shipped that flag to Sentry verbatim. A key-aware walker cannot help: the
+// field is legitimately named `value` and its content is legitimately English.
+// So the message goes, on the same rule the run-trace plane already applies
+// (trace-core serializeError): what leaves is what is OURS to say. The `type`,
+// the `stacktrace` and the `mechanism` all survive, which is what triage and
+// grouping actually run on.
+//
+// EVERY value in the array, not `values[0]`: linkedErrorsIntegration expands an
+// `error.cause` chain into one entry per link, and a cause built from a template
+// string is the same leak one index further in.
+//
+// `event.message` (captureMessage) is deliberately untouched: the only caller is
+// captureCliNonZeroExit, whose string is `mla ${command} exited ${code}` where
+// command is already the reduced keyword.
+function reduceSentryEvent<T>(event: T): T {
+  const values = (event as { exception?: { values?: unknown } } | null | undefined)?.exception
+    ?.values;
+  if (!Array.isArray(values)) return event;
+  for (const entry of values) {
+    if (entry && typeof entry === "object") {
+      const v = entry as { value?: unknown };
+      if (typeof v.value === "string" && v.value.length > 0) v.value = SENTRY_MESSAGE_WITHHELD;
+    }
+  }
+  return event;
+}
+
+// The actual beforeSend: reduce the prose, then run the shared credential
+// walker over what is left. Kept separate from redactSentryEvent so the walker
+// stays byte-identical to the egress plane's (egress-structured-sanitizer.spec
+// pins the two to the same output for the same input) while the Sentry-shaped
+// reduction lives where only Sentry sees it. Fail closed on any throw: a
+// dropped event beats an unscrubbed one.
+export function scrubSentryEvent<T>(event: T): T | null {
+  if (event === null || event === undefined) return event;
+  try {
+    return redactStructured(reduceSentryEvent(event), { keyAware: true, profile: "full" });
   } catch {
     return null;
   }
@@ -188,10 +282,21 @@ export function initSentry(buildInfo: BuildInfo): boolean {
     // Pure CLI: no transaction sampling, no tracing integrations.
     // Errors and explicit captureMessage only.
     tracesSampleRate: 0,
+    // Allowlist, not the SDK defaults. See cliIntegrations: three of the 43
+    // defaults collect free text by construction (Console breadcrumbs of
+    // everything we print, Http/NodeFetch breadcrumbs of every raw path and
+    // query string).
+    // The FUNCTION form, never the array form. An array is MERGED with the
+    // defaults (it can add and override, it cannot subtract), so passing the
+    // allowlist as an array leaves Console and Http running and the whole
+    // control is a no-op that reads like a control. The function receives the
+    // defaults and its return value replaces them.
+    integrations: () => cliIntegrations(),
     // §9 redaction invariant (Finding K / P7): scrub credentials out of every
     // event before transport. Must exist before any token-capturing path (login
-    // / refresh) can land a token in a breadcrumb or stack var.
-    beforeSend: (event) => redactSentryEvent(event),
+    // / refresh) can land a token in a breadcrumb or stack var. Now also reduces
+    // the exception message, which is prose the walker cannot see into.
+    beforeSend: (event) => scrubSentryEvent(event),
   });
   Sentry.setTags({
     mla_version: `${buildInfo.version} (${buildInfo.sha}${buildInfo.dirty ? "-dirty" : ""})`,
@@ -780,13 +885,42 @@ export function routeNameFromPath(rawPath: string): string {
   return sanitized.join(".") || "root";
 }
 
-// Argv redaction for the root span attribute (P2.2 + spec §10.P2 must-test 6).
-// Reuses the shared secret redactor so a token leaked on the command line is
-// stripped before the trace reaches Langfuse. The redactor returns the input
-// unchanged for empty strings, otherwise a transformed string; the cast is
-// safe because every input here is already a string.
-export function redactArgvForSpan(argv: string[]): string[] {
-  return argv.map((arg) => redact(arg) as string);
+// Argv REDUCTION for the root span (P2.2 + spec §10.P2 must-test 6, INV-ARGV-1).
+//
+// This used to be `redactArgvForSpan`, which mapped every element through the
+// shared SECRET redactor. That strips token shapes and filesystem paths and
+// leaves ordinary prose alone, so `mla ask "<question>"` put the entire
+// question on the root span and, once the run-trace relay is enabled, into
+// Langfuse Cloud. "Redacted" was a claim about the redactor's name, not about
+// what survived it.
+//
+// The trace plane now reduces argv exactly the way the PostHog plane does
+// (lib/analytics/command-event.ts): a known command, a known subcommand, and
+// approved flag NAMES. Positionals are dropped wholesale rather than filtered,
+// because a positional is where user content lives: a question, a path, an id.
+// normalizeCommand is REUSED rather than reimplemented so there is one command
+// allowlist to keep in step with cli.ts's COMMANDS registry; a second copy
+// would drift, and drift there silently collapses commands to "unknown".
+export interface ReducedArgv {
+  command: string;
+  subcommand: string | null;
+  flags: string[];
+}
+
+export function reduceArgvForSpan(argv: string[]): ReducedArgv {
+  const { command, subcommand, flags_shape } = normalizeCommand(argv);
+  return { command, subcommand, flags: flags_shape };
+}
+
+// The root span NAME, from the same reduction. The name is the field Langfuse
+// renders first, and it was built inline in cli.ts from the raw argv[0] and
+// argv[1], which made it the second copy of the same leak: for `mla ask "<q>"`
+// the name was literally `mla.ask.<the whole question>`. Keeping the name in
+// this module, next to the reduction it depends on, is what stops the two from
+// drifting apart again.
+export function traceRootName(argv: string[]): string {
+  const { command, subcommand } = reduceArgvForSpan(argv);
+  return `mla.${command}.${subcommand ?? "none"}`;
 }
 
 // Canonical Langfuse trace URL. ONE algorithm, mirrored byte-for-byte by the

@@ -44,7 +44,10 @@ const {
   renderMarketplaceCatalog,
   renderResolverScript,
 } = artifact;
-const SCOUT_NAMES = protocol.SCOUT_NAMES;
+// DISPATCH roster, not the parse roster: the plugin ships an agent file only for the roles
+// this build actually briefs. A retired role stays parseable (SCOUT_NAMES) so old run
+// records and findings still load, but it is no longer installed into anyone's home dir.
+const DISPATCH_SCOUT_NAMES = protocol.DISPATCH_SCOUT_NAMES;
 const MANAGED_HOOK_SCRIPTS = contract.MANAGED_HOOK_SCRIPTS;
 
 // SOURCE stays the real hooks-template (single source of truth). Only the DEST
@@ -133,7 +136,7 @@ function desiredFiles() {
   put(path.join("skills", "cli", "SKILL.md"), renderCliSkill(PLUGIN_SURFACE));
   put(path.join("skills", "onboard", "SKILL.md"), renderOnboardSkill(PLUGIN_SURFACE));
   // Agents: file basename == PLUGIN_SURFACE.scoutAgentName[role].
-  for (const role of SCOUT_NAMES) {
+  for (const role of DISPATCH_SCOUT_NAMES) {
     const base = PLUGIN_SURFACE.scoutAgentName[role];
     put(path.join("agents", `${base}.md`), renderScoutAgent(role, PLUGIN_SURFACE));
   }

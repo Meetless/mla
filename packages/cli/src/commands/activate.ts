@@ -17,6 +17,7 @@ import {
   loadWorkspaceConfig,
   QUEUE_DIR,
   readConfig,
+  readKbConfig,
   SESSION_GATE_DIR,
   writeConfig,
   type WorkspaceCliConfig,
@@ -48,6 +49,7 @@ import {
   renderAgenticInvitation,
 } from "../lib/scanner/scout-mission";
 import { scoutCountWord } from "../lib/enrichment/protocol";
+import { fetchOnboardingStatus } from "../lib/enrichment/onboarding-status-client";
 import { rescanAndCache } from "./scan-context";
 import { removeOwnedProjection } from "../lib/scanner/floor-projection-writer";
 import { FLOOR_PROJECTION_RELPATH } from "../lib/scanner/floor-projection";
@@ -1076,18 +1078,33 @@ async function runRepair(cwd: string): Promise<number> {
 // shell (where no skill is watching stdout). Pure: returns the text, or null to stay
 // silent.
 //
-// Emitted only when BOTH hold:
-//   - inSession: there is a live Claude Code session, so the mla-onboard skill is
-//     actually invokable (the sentinel is inert noise from a bare shell).
-//   - justProvisioned: this run created a brand-new workspace, whose governed KB is
-//     empty: exactly the moment onboarding pays off. Re-running `mla activate` on an
-//     already-bound folder takes the bind path (no provision), so the hand-off is
-//     naturally one-time per workspace without any persisted sentinel state.
+// Emitted only inside a live Claude Code session (`inSession`), where the mla-onboard
+// skill is actually invokable; the sentinel is inert noise from a bare shell.
+//
+// Inside a session, the workspace must never have been onboarded. Two independent ways
+// to know that, because they fail differently:
+//   - justProvisioned: this run created a brand-new workspace. LOCAL truth, no network:
+//     a workspace born this second cannot have a marker, so the hand-off must not depend
+//     on intel being reachable at that exact moment.
+//   - workspaceOnboarded === false: intel affirmatively has no marker for this workspace.
+//     This is what makes the hand-off RECOVERABLE. It used to key on justProvisioned
+//     alone, which made it an EDGE trigger reaching exactly one person: whoever ran the
+//     first activate in a folder, in a session. A teammate cloning a committed
+//     `.meetless.json` binds (justProvisioned=false) forever, and an operator whose first
+//     activate ran outside a session burned the single edge with no way back. Measured in
+//     prod: 22 of the 29 workspaces that ever ran an mla command hold zero rules.
+//
+// `null` (unknown: offline, 5xx, un-authed) stays SILENT. A nudge is not a gate, so unlike
+// `enrich plan` (which fails open so a network hiccup never BLOCKS onboarding) this fails
+// quiet, and a hiccup never turns a one-shot hand-off into a nag on every activate.
 export function onboardRecommendation(opts: {
   inSession: boolean;
   justProvisioned: boolean;
+  workspaceOnboarded?: boolean | null;
 }): string | null {
-  if (!opts.inSession || !opts.justProvisioned) return null;
+  if (!opts.inSession) return null;
+  const neverOnboarded = opts.justProvisioned || opts.workspaceOnboarded === false;
+  if (!neverOnboarded) return null;
   return [
     // Machine sentinel (rule 6 of the /mla skill): its own line so a stdout scan can
     // match it unambiguously even when other text surrounds it. Do NOT reword.
@@ -1100,6 +1117,20 @@ export function onboardRecommendation(opts: {
     "  at session start. If onboarding reports a scout agent is not found, restart Claude",
     "  Code (or open a new session) and run `/mla onboard` again. Nothing is lost.",
   ].join("\n");
+}
+
+// Has this workspace EVER been onboarded? Tri-state: true / false / null when we could
+// not find out (no marker to resolve a workspace from, no actorUserId, intel offline,
+// 5xx). The caller treats null as silence, so every failure here is a quiet no-op and
+// this can never fail activation.
+async function workspaceEverOnboarded(): Promise<boolean | null> {
+  try {
+    // Workspace-grain: no headCommit, so the answer is "any marker in this workspace",
+    // not "a marker at this exact commit" (which reads false at every new HEAD).
+    return (await fetchOnboardingStatus(readKbConfig())).onboarded;
+  } catch {
+    return null;
+  }
 }
 
 // Activate is the BACKSTOP migrator (design §6.7): `mla doctor --fix` is the primary
@@ -1161,11 +1192,11 @@ export function reconcileWiringBackstop(
 // scout mission (fast = review bundle only; agentic/full = bundle + mission).
 // recommendOnboard is set only by the provision path, so the `/mla onboard` nudge
 // fires once per fresh workspace (see onboardRecommendation).
-function finishActivate(
+async function finishActivate(
   cwd: string,
   tier: BootstrapTier,
   recommendOnboard = false,
-): number {
+): Promise<number> {
   // Re-running `mla activate` inside a session that was previously muted with
   // `mla mute` is one supported way to turn it back ON (the other is
   // `mla unmute`): clear the per-session sentinel FIRST, so the bootstrap below
@@ -1291,9 +1322,15 @@ function finishActivate(
 
   // A live Claude Code session is what makes `/mla onboard` invokable; key off the
   // session id (present even if the bootstrap hook itself could not run), not boot.ok.
+  //
+  // Ask the workspace-grain marker ONLY when this run did not just provision (a fresh
+  // workspace already knows the answer locally) and only inside a session (outside one
+  // the hand-off is suppressed regardless, so the round-trip would buy nothing).
   const onboard = onboardRecommendation({
     inSession: !!boot.sessionId,
     justProvisioned: recommendOnboard,
+    workspaceOnboarded:
+      recommendOnboard || !boot.sessionId ? null : await workspaceEverOnboarded(),
   });
 
   // Machine mode: the whole activation collapses to ONE success envelope. The onboarding

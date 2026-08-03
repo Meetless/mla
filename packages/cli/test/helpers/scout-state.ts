@@ -1,4 +1,9 @@
-import { SCOUT_NAMES, ScoutName, ScoutRunState } from "../../src/lib/enrichment/protocol";
+import {
+  SCOUT_NAMES,
+  DISPATCH_SCOUT_NAMES,
+  ScoutName,
+  ScoutRunState,
+} from "../../src/lib/enrichment/protocol";
 
 /**
  * Build a TOTAL per-scout state record for an `OnboardingState` fixture.
@@ -26,11 +31,15 @@ export function scoutStates(
 /**
  * Complete the roster of an `ingestRun` results array.
  *
- * A run reaches `status: "complete"` only when EVERY role in SCOUT_NAMES is complete, so a
+ * A run reaches `status: "complete"` only when every DISPATCHED role is complete, so a
  * test that hand-lists two results and asserts "complete" is really asserting the roster
  * size. Appending an empty complete envelope for each unnamed role states the intent that
  * such a test actually has ("the scouts under test finished, nothing else is outstanding")
  * without pinning the roster.
+ *
+ * Fills from DISPATCH_SCOUT_NAMES, not SCOUT_NAMES: submitting a result for a retired role
+ * is exactly what `scout_not_dispatched` refuses, so filling from the parse roster would
+ * make every one of these fixtures fail the day a scout is retired.
  *
  * Zero candidates with status `complete` is a genuinely finished scout, not a stranded one:
  * completion keys off `received > 0 && accepted === 0`, so an empty envelope lands complete.
@@ -43,7 +52,7 @@ export function withIdleScouts(
   const named = new Set(results.map((r) => r.scout));
   return [
     ...results,
-    ...SCOUT_NAMES.filter((role) => !named.has(role)).map((role) => ({
+    ...DISPATCH_SCOUT_NAMES.filter((role) => !named.has(role)).map((role) => ({
       scout: role,
       status: "complete",
       candidates: [],

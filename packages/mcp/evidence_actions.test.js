@@ -537,3 +537,97 @@ test("a served pull carries no warning and no corpus verdict", async () => {
   assert.equal(out.warnings, undefined);
   assert.equal(out.corpus_empty, undefined);
 });
+
+// ---------- one boolean cannot carry two opposite remedies --------------------
+//
+// `corpus_empty=true` renders "This workspace has no indexed documents ... run the
+// /mla onboard skill to index this repository". For a workspace that indexed
+// nothing that is true and the remedy works. For a workspace that captured
+// hundreds of documents down a NON-GROUNDING lane, every clause is false and the
+// remedy is the exact thing the user already did.
+//
+// Measured on prod 2026-08-02, fleet-wide, zero exceptions: 629 documents captured
+// as DERIVED_ONLY/agent_turn hold 0 groundable rows, while 322 captured as
+// PUBLISHED/git_commit hold 322. Retrievability is decided entirely by the capture
+// lane. Nine workspaces sat on 299 documents in that state; workspace `cms2gxorx`
+// captured 170 and was told it had none. intel now returns `corpus_state`, which
+// splits the boolean's `true` into the two states that share it.
+
+test("a workspace that captured nothing still gets the onboarding remedy", async () => {
+  const cf = stubFetch({ candidates: [], corpus_empty: true, corpus_state: "empty" });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_state, "empty");
+  assert.equal(out.corpus_empty, true);
+  assert.match(out.warnings[0], /no indexed documents/);
+  assert.match(out.warnings[0], /\/mla onboard/);
+});
+
+test("a workspace that captured plenty is never told it has nothing", async () => {
+  const cf = stubFetch({
+    candidates: [],
+    corpus_empty: true,
+    corpus_state: "captured_not_indexed",
+  });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_state, "captured_not_indexed");
+  // Still empty in the servable sense: the legacy boolean keeps its meaning.
+  assert.equal(out.corpus_empty, true);
+  // The lie that shipped. 170 documents, told it had none.
+  assert.ok(!/no indexed documents/.test(out.warnings[0]));
+  assert.match(out.warnings[0], /captured/);
+  assert.match(out.warnings[0], /never indexed/);
+});
+
+test("the captured-not-indexed remedy names the indexing lane, not a repeat of onboarding", async () => {
+  const cf = stubFetch({ candidates: [], corpus_empty: true, corpus_state: "captured_not_indexed" });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  // `mla kb add` is the lane that produces groundable rows; every prod workspace
+  // with grounding > 0 ran it, and every zero-grounding one never did.
+  assert.match(out.warnings[0], /mla kb add/);
+});
+
+test("no corpus message ever discloses how much the workspace holds", async () => {
+  // The pull crosses an ACL boundary: a rendered count would leak corpus size to a
+  // caller who cannot see the documents. intel deliberately sends no number, and
+  // the client must not invent one.
+  for (const state of ["empty", "captured_not_indexed", "populated"]) {
+    const cf = stubFetch({ candidates: [], corpus_empty: state !== "populated", corpus_state: state });
+    const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+    assert.ok(!/\d/.test(out.warnings[0]), `${state} warning leaked a digit`);
+  }
+});
+
+test("a populated corpus that missed stays a retriever miss", async () => {
+  const cf = stubFetch({ candidates: [], corpus_empty: false, corpus_state: "populated" });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_state, "populated");
+  assert.match(out.warnings[0], /has indexed documents but none matched/);
+  assert.ok(!/\/mla onboard/.test(out.warnings[0]));
+});
+
+test("an intel that predates corpus_state falls back to the boolean", async () => {
+  // Rollout order is not guaranteed: an older intel serves a newer client. The
+  // boolean must keep working exactly as it did, with no state field invented.
+  const cf = stubFetch({ candidates: [], corpus_empty: true });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_state, undefined);
+  assert.equal(out.corpus_empty, true);
+  assert.match(out.warnings[0], /no indexed documents/);
+});
+
+test("an unrecognized corpus_state is ignored rather than rendered", async () => {
+  // Forward compatibility: a future intel may mint a fourth state. Echoing an
+  // unknown string into guidance would put a word we have never defined in front
+  // of the agent; fall back to the boolean, which we do understand.
+  const cf = stubFetch({ candidates: [], corpus_empty: true, corpus_state: "quarantined" });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_state, undefined);
+  assert.match(out.warnings[0], /no indexed documents/);
+});
+
+test("a served pull carries no corpus state either", async () => {
+  const cf = stubFetch({ candidates: [DTO], corpus_empty: true, corpus_state: "empty" });
+  const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
+  assert.equal(out.corpus_state, undefined);
+  assert.equal(out.warnings, undefined);
+});

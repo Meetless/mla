@@ -20,6 +20,7 @@
  */
 
 import { getRunTraceId } from "./observability";
+import { noteHandledFailure } from "./analytics/handled-failure";
 // Type-only, and one direction: enrichment/protocol.ts imports nothing from here, so naming its
 // closed resolution union in the envelope costs no runtime edge. Derived, never restated: the
 // envelope and the CLI must agree on what the three outcomes ARE, and a copied union is how those
@@ -307,6 +308,11 @@ export function failInMode(
   message: string,
   exitCode: number,
 ): number {
+  // `code` is the call site's own reason token. It used to reach the machine envelope and
+  // nowhere else, so in human mode (most runs) analytics recorded this failure as
+  // outcome=user_error / error_class=null: 35 distinct reasons flattened to one
+  // undiagnosable bucket. Declaring it here, in BOTH modes, is what finalize reads.
+  noteHandledFailure({ error_class: code });
   if (isMachineMode()) {
     return emitEnvelope(
       errorEnvelope(command, { code, message, trace_id: getRunTraceId() ?? "" }),
