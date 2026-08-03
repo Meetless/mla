@@ -9,6 +9,7 @@ import {
   LegacyWiringInspection,
 } from "../../src/connectors/claude-code/plugin-migrate";
 import { MANAGED_HOOK_SCRIPTS, HOOKS_DIR, MCP_SERVER_KEY } from "../../src/lib/wire";
+import { SCOUT_AGENT_FILES } from "../../src/lib/unwire";
 import type { PluginOwnership } from "../../src/connectors/claude-code/plugin-detect";
 
 // --- inspectLegacyWiring: build real home-dir surfaces in a temp dir --------------
@@ -121,21 +122,29 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
     }
   });
 
-  it("agentsAny/agentsComplete: one-of-two agents is Any-not-Complete, both is Complete", () => {
+  it("agentsAny/agentsComplete: a partial scout roster is Any-not-Complete, the full roster is Complete", () => {
+    // Driven off SCOUT_AGENT_FILES rather than two hardcoded filenames. A roster-sized
+    // literal here would have silently become "all agents present" the moment a third scout
+    // joined, which is exactly the degraded install this flag exists to catch.
     const tmp = mkHome();
     try {
       const paths = legacyWiringPaths(tmp);
       fs.mkdirSync(paths.agentsDir, { recursive: true });
       expect(inspectLegacyWiring(paths).agentsAny).toBe(false);
-      // Seed ONLY the doc scout (one of the two SCOUT_AGENT_FILES).
-      fs.writeFileSync(path.join(paths.agentsDir, "meetless-doc-scout.md"), "---\n");
+      expect(SCOUT_AGENT_FILES.length).toBeGreaterThan(1); // else Any-not-Complete cannot exist
+      const [first, ...rest] = SCOUT_AGENT_FILES;
+      // Seed ONE agent file: something is installed, the install is not whole.
+      fs.writeFileSync(path.join(paths.agentsDir, first), "---\n");
       let insp = inspectLegacyWiring(paths);
       expect(insp.agentsAny).toBe(true);
       expect(insp.agentsComplete).toBe(false);
-      // Seed the history scout too -> now Complete.
-      fs.writeFileSync(path.join(paths.agentsDir, "meetless-history-scout.md"), "---\n");
-      insp = inspectLegacyWiring(paths);
-      expect(insp.agentsComplete).toBe(true);
+      // Seed every remaining one, checking after each that a still-partial roster stays
+      // incomplete: a "present > 0" bug would flip Complete on the first extra file.
+      for (const [i, file] of rest.entries()) {
+        fs.writeFileSync(path.join(paths.agentsDir, file), "---\n");
+        insp = inspectLegacyWiring(paths);
+        expect(insp.agentsComplete).toBe(i === rest.length - 1);
+      }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

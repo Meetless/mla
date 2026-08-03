@@ -4,6 +4,8 @@ import {
   BootstrapResult,
 } from "../../src/commands/activate";
 import { WireResult, McpServerAction } from "../../src/lib/wire";
+import { SCOUT_AGENT_NAME } from "../../src/lib/enrichment/scout-brief";
+import { SCOUT_NAMES } from "../../src/lib/enrichment/protocol";
 
 // `mla activate` ends by printing two independent facts: is capture running, and did the
 // self-heal just install wiring that Claude Code only loads at session start. They used
@@ -26,7 +28,9 @@ function wired(opts: {
     settingsPath: "/home/u/.claude/settings.json",
     skillDir: "/home/u/.claude/skills/mla",
     onboardSkillDir: "/home/u/.claude/skills/mla-onboard",
-    scoutAgents: ["meetless-doc-scout", "meetless-history-scout"],
+    // The real roster, not a hardcoded pair: the restart copy counts these entries, so a
+    // stale two-element fixture would keep asserting a count the installer stopped producing.
+    scoutAgents: SCOUT_NAMES.map((role) => SCOUT_AGENT_NAME[role]),
     flock: { ok: true, detail: "flock present" },
     projectRules: null,
     mcp: { path: "/home/u/.claude.json", action: opts.mcp ?? "unchanged" },

@@ -10,7 +10,10 @@ import {
   resolveBudgetMs,
   renderIngestSummary,
 } from "../../src/commands/enrich";
-import { type ScoutIngestOutcome } from "../../src/lib/enrichment/protocol";
+import {
+  type OnboardingCandidateRecord,
+  type ScoutIngestOutcome,
+} from "../../src/lib/enrichment/protocol";
 import { materializeRules } from "../../src/lib/enrichment/materialize-rules";
 
 describe("parsePlanArgs", () => {
@@ -317,6 +320,172 @@ describe("renderIngestSummary", () => {
     expect(out).toContain(CONSOLE_KB);
     expect(out).not.toMatch(/—/);
     expect(out).not.toMatch(/ -- /);
+  });
+
+  // --- the finding-first terminal state (§5.10) ---------------------------------
+  //
+  // Ingest's last screen is where onboarding either earns the operator's next minute or
+  // spends it. A finding is the only line in this summary that is a QUESTION, and a
+  // question printed beneath twenty tallies is a question nobody answers. These pin three
+  // things the wording is load-bearing for: the finding leads, the answer is a runnable
+  // command carrying the REAL run id, and the "found nothing" line claims only what this
+  // run actually examined.
+  describe("finding-first terminal state", () => {
+    const QUOTE = "Merged migrations are never edited in place.";
+    const GENERATED = "CLAUDE.md forbids editing merged migrations, and 9f2a7c4 modified one anyway.";
+    const BAD_COMMIT = "9f2a7c4e5b6d8a90112233445566778899aabbcc";
+
+    function finding(
+      candidateId: string,
+      over: Partial<OnboardingCandidateRecord> = {},
+    ): OnboardingCandidateRecord {
+      return {
+        candidateId,
+        kind: "doc_code_inconsistency",
+        statement: GENERATED,
+        evidence: [
+          { type: "file", path: "CLAUDE.md", startLine: 12, endLine: 12 },
+          { type: "commit", commit: BAD_COMMIT, path: "db/migrations/0007_add_index.sql" },
+        ],
+        sourceScouts: ["reconciliation"],
+        rationale: null,
+        rationaleSource: null,
+        relPath: `onboarding/${candidateId}-x.md`,
+        landed: "ingested",
+        inconsistency: {
+          claimClass: "never_modify",
+          claimText: QUOTE,
+          claimScope: "db/migrations/",
+          proposedRuleKind: "constraint",
+          divergence: { path: "db/migrations/0007_add_index.sql", status: "M" },
+          attribution: { commit: "1".repeat(40), authorName: "An", authorTime: "2026-06-01T00:00:00.000Z" },
+        },
+        ...over,
+      };
+    }
+
+    /** An ordinary durable candidate. It is a rule, not a question, so it never leads. */
+    const rule = (candidateId: string): OnboardingCandidateRecord => ({
+      candidateId,
+      kind: "constraint",
+      statement: "control is the system of record",
+      evidence: [{ type: "file", path: "CLAUDE.md", startLine: 1, endLine: 2 }],
+      sourceScouts: ["documentation"],
+      rationale: null,
+      rationaleSource: null,
+      relPath: `onboarding/${candidateId}-x.md`,
+      landed: "ingested",
+    });
+
+    const recon = outcome({ scout: "reconciliation", received: 1, accepted: 1, persisted: 1 });
+
+    it("prints the finding ahead of every per-scout count", () => {
+      const out = renderIngestSummary(
+        [outcome({ scout: "documentation", received: 9, accepted: 9, persisted: 9 }), recon],
+        "ENRICHED",
+        CONSOLE_KB,
+        { runId: "run-77", candidates: [rule("cand_a"), finding("cand_f")] },
+      );
+      const findingAt = out.indexOf("1 finding:");
+      const countsAt = out.indexOf("documentation: 9 accepted");
+      expect(findingAt).toBeGreaterThan(-1);
+      expect(countsAt).toBeGreaterThan(-1);
+      expect(findingAt).toBeLessThan(countsAt);
+    });
+
+    // Neither side is declared wrong on this screen. The headline states the disagreement and
+    // the next line asks the human which one is right; a summary that said "the commit broke
+    // the rule" would be answering the question it exists to ask.
+    it("states the disagreement without picking a side, and quotes the document", () => {
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [finding("cand_f")],
+      });
+      expect(out).toMatch(/a document and a commit disagree, and neither is assumed right/);
+      expect(out).toContain(`db/migrations/ says: "${QUOTE}"`);
+      expect(out).toContain("but M db/migrations/0007_add_index.sql in 9f2a7c4e5b6d");
+      expect(out).toContain("the rule was last written by An");
+      // The generated explanation is the model's prose, not the proved half. It never prints.
+      expect(out).not.toContain(GENERATED);
+    });
+
+    it("offers a runnable answer carrying the real run id", () => {
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [finding("cand_f")],
+      });
+      expect(out).toContain("Answer it:  mla enrich resolve --run-id run-77");
+      expect(out).not.toContain("<run-id>");
+    });
+
+    it("pluralizes the headline and the answer line together", () => {
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [finding("cand_f"), finding("cand_g")],
+      });
+      expect(out).toMatch(/2 findings: a document and a commit disagree/);
+      expect(out).toContain("Answer them:  mla enrich resolve --run-id run-77");
+    });
+
+    // The zero-result line is a claim about evidence, so its scope is stated rather than left
+    // for the operator to assume. The reconciliation scout read the documents this run planned
+    // and the commits this run listed; it never indexed the repository, so "no inconsistencies
+    // in this repo" would be a coverage claim the run did not earn.
+    it("claims only what this run examined when the reconciliation scout found nothing", () => {
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [rule("cand_a")],
+      });
+      expect(out).toContain("No inconsistencies between the documents and the commits this run examined.");
+      expect(out).not.toMatch(/no inconsistencies in (this|the) repo/i);
+      expect(out).not.toMatch(/your codebase is consistent/i);
+    });
+
+    // Fixture #20's operator half: with the scout not dispatched there is no outcome for it,
+    // so the run stays silent about code consistency instead of implying a clean bill of health
+    // from an examination that never happened.
+    it("says nothing about consistency when the reconciliation scout did not run", () => {
+      const out = renderIngestSummary(
+        [outcome({ scout: "documentation", received: 2, accepted: 2, persisted: 2 })],
+        "ENRICHED",
+        CONSOLE_KB,
+        { runId: "run-77", candidates: [rule("cand_a")] },
+      );
+      expect(out).not.toMatch(/No inconsistencies/);
+      expect(out).not.toMatch(/finding/);
+    });
+
+    // A caller with no sidecar knows nothing about findings either way. It must not be able to
+    // borrow the zero-result sentence, which is an assertion about evidence it does not have.
+    it("makes no finding claim at all without a findings view", () => {
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB);
+      expect(out).not.toMatch(/No inconsistencies/);
+      expect(out).not.toMatch(/finding/);
+      expect(out).toMatch(/reconciliation: 1 accepted/);
+    });
+
+    it("does not re-ask a finding the human already answered", () => {
+      const answered = finding("cand_f", {
+        resolution: { outcome: "doc_stale", resolvedAt: "2026-07-31T00:00:00.000Z" },
+      });
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [answered],
+      });
+      expect(out).not.toContain(QUOTE);
+      expect(out).not.toContain("mla enrich resolve");
+      // Every finding is closed, so the run's examined-scope statement stands.
+      expect(out).toContain("No inconsistencies between the documents and the commits this run examined.");
+    });
+
+    it("never emits an em dash or double dash in the finding block", () => {
+      const out = renderIngestSummary([recon], "ENRICHED", CONSOLE_KB, {
+        runId: "run-77",
+        candidates: [finding("cand_f"), finding("cand_g")],
+      });
+      expect(out).not.toMatch(/—/);
+      expect(out).not.toMatch(/ -- /);
+    });
   });
 });
 

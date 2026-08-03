@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { buildOnboardingRun, writeRunRecord } from "../../../src/lib/enrichment/plan";
 import { writeState, findCompletedRunWithDigest } from "../../../src/lib/enrichment/ingest";
 import type { OnboardingRun, OnboardingState } from "../../../src/lib/enrichment/protocol";
+import { scoutStates } from "../../helpers/scout-state";
 
 // Unit coverage for the idempotency gate's lookup (findCompletedRunWithDigest). The command
 // wiring is covered end-to-end in test/commands/enrich-idempotency.spec.ts; this isolates the
@@ -35,10 +36,10 @@ function completeState(run: OnboardingRun, counts = { documentation: 3, history:
     schemaVersion: 2,
     status: "complete",
     updatedAt: "2026-06-27T01:00:00.000Z",
-    scouts: {
+    scouts: scoutStates({
       documentation: { status: "complete", candidateCount: counts.documentation },
       history: { status: "complete", candidateCount: counts.history },
-    },
+    }),
   };
 }
 

@@ -10,6 +10,7 @@ import { onboardingLockPath, releaseOnboardingLock } from "../../src/lib/enrichm
 import { runRecordPath } from "../../src/lib/enrichment/plan";
 import { writeState } from "../../src/lib/enrichment/ingest";
 import type { OnboardingRun, ScoutIngestOutcome, ScoutName } from "../../src/lib/enrichment/protocol";
+import { scoutStates } from "../helpers/scout-state";
 
 // Command-boundary + pure-helper coverage for the WORKSPACE-grain half of the onboarding
 // idempotency gate (notes/20260710-mla-onboarding-idempotency-and-activate-autochain.md).
@@ -271,10 +272,10 @@ describe("mla enrich plan: workspace-marker gate wiring", () => {
       schemaVersion: 2,
       status: "complete",
       updatedAt: "2026-07-01T00:00:00.000Z",
-      scouts: {
+      scouts: scoutStates({
         documentation: { status: "complete", candidateCount: counts.documentation },
         history: { status: "complete", candidateCount: counts.history },
-      },
+      }),
     });
     return first;
   }

@@ -33,7 +33,9 @@ export type OperationId =
   | "enrich.plan"
   | "enrich.ingest"
   | "enrich.accept"
-  | "enrich.accept.apply";
+  | "enrich.accept.apply"
+  | "enrich.resolve"
+  | "enrich.resolve.apply";
 
 /**
  * The operations with full machine-envelope coverage (§A6), grown one phase at a
@@ -48,6 +50,11 @@ export type OperationId =
  *   workflow (§4.5, §4.6) on its read-only preview and emits a result envelope on
  *   apply. No other authority operation is converted here.
  *
+ * - Phase 5 (finding resolution): `enrich resolve`'s review form and its
+ *   mutation (`enrich.resolve.apply`). Same argv-shape split as accept: the review
+ *   lists the open doc/code findings and carries an `enrich.resolve`
+ *   decision_request, and naming both a finding and an outcome is the mutation.
+ *
  * The mutation form of `activate` (the diagnostic `activate --repair`) is still
  * absent, deferred to Phase 4.
  */
@@ -61,6 +68,8 @@ export const SUPPORTED_OPERATIONS: ReadonlySet<OperationId> = new Set<OperationI
   "enrich.ingest",
   "enrich.accept",
   "enrich.accept.apply",
+  "enrich.resolve",
+  "enrich.resolve.apply",
 ]);
 
 export function supportsMachineOutput(op: OperationId): boolean {
@@ -77,6 +86,19 @@ function hasAcceptSelection(argv: string[]): boolean {
   return argv.some(
     (a) => a === "--all" || a === "--only" || a.startsWith("--only="),
   );
+}
+
+/**
+ * `enrich resolve` becomes a mutation only when BOTH halves of the verdict are
+ * present: which finding (`--finding`) and which outcome (`--as`). Either alone is
+ * an incomplete verdict, which the parser rejects as a usage error; resolving it
+ * to the read-only id keeps that error inside the review operation rather than
+ * reporting a mutation that never had a subject.
+ */
+function hasResolveVerdict(argv: string[]): boolean {
+  const has = (name: string) =>
+    argv.some((a) => a === name || a.startsWith(`${name}=`));
+  return has("--finding") && has("--as");
 }
 
 /**
@@ -100,6 +122,8 @@ export function resolveOperation(
           return "enrich.ingest";
         case "accept":
           return hasAcceptSelection(argv) ? "enrich.accept.apply" : "enrich.accept";
+        case "resolve":
+          return hasResolveVerdict(argv) ? "enrich.resolve.apply" : "enrich.resolve";
         default:
           return null;
       }

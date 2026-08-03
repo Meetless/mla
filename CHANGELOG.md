@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.31 (2026-08-01)
+
+0.2.31 gives `mla enrich` a third scout and somewhere for its findings to go. Reconciliation reads
+your documentation against your git history and reports where the two have drifted apart: a rule a
+document still states that a commit already broke. A finding like that is an accusation, so the CLI
+refuses to persist one it cannot prove against your repository. The claimed file change is compared
+field for field against what git actually reports, the quote must be an exact substring of the
+document as of the head commit (what gets stored is the CLI's own span, never the model's string),
+and the ordering is settled by `git merge-base --is-ancestor` rather than by dates, because a
+timestamp does not prove which change came first. Anything the CLI cannot check itself is dropped.
+Findings then lead the run summary instead of hiding under twenty tallies, and the new
+`mla enrich resolve` closes one with a real answer: say the code diverged and the rule is minted
+through the same governance path `enrich accept` uses, or record that the doc is stale or that this
+is a deliberate carve-out and nothing is minted. Your pick is the approval; there is no second
+prompt.
+
+Two silent failures also got their voice back. `mla activate` on an already-bound repository used
+to print "Already activated" from local state alone, so a new hire who cloned a repo with a
+committed `.meetless.json` got a green exit and then a 403 on everything afterwards, because
+binding to a workspace marker is not the same as holding membership in it. Activate now asks
+control, and only a real deny answer changes the verdict, so being offline still behaves the way
+it always has. And every command was uploading a trace batch that the server was built to refuse:
+the relay is only permitted for workspaces explicitly opted into tracing, the CLI applied that rule
+to error reporting and not to trace upload, and the resulting refusals were silenced on both sides.
+The CLI now asks permission before it builds the relay, and a withheld relay no longer reports
+success or prints a trace link for a trace that never left your machine.
+
+- the reconciliation scout finds where your docs and your git history disagree, and proves every
+  finding against the repository before persisting it
+- `mla enrich resolve` closes a finding with one of three answers, minting the rule only when you
+  say the code diverged
+- ingest findings now lead the run summary with a runnable next command instead of being written
+  somewhere no surface reads
+- `mla activate` verifies a shared binding grants real membership instead of trusting the marker
+  file
+- no command uploads a trace batch to a workspace the server would refuse, and a suppressed relay
+  no longer claims it succeeded
+- an empty prompt is classified as our plumbing failing rather than as the router declining to
+  answer
+
 ## 0.2.30 (2026-07-29)
 
 0.2.30 carries no user-facing change. Every command, flag, and output behaves exactly as it did in

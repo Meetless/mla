@@ -546,6 +546,29 @@ describe("computeTurnRecap: verdict", () => {
     expect(legacy.abstain_class).toBeNull();
   });
 
+  it("NO_OFFER (empty_prompt): a caller that sent nothing is a plumbing failure, not router debt", () => {
+    // intel split this out of router_low_confidence on 2026-07-31. Before the split
+    // the two were byte-identical on the wire, so a client that failed to send the
+    // prompt at all was indistinguishable from the router honestly declining to
+    // guess -- and only one of those is a defect. It classifies as provider_failure
+    // (OUR plumbing broke) and specifically NOT not_routed, which would credit the
+    // router with a decision it never got to make: `AskRequest.question` has no
+    // min-length validator, so this is a reachable production state.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "empty_prompt" } })],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("provider_failure");
+    expect(r.abstain_class).not.toBe("not_routed");
+    // And the mirror carries it, so the totality test above covers it too. Adding a
+    // reason to intel without adding it here is the drift this array exists to catch.
+    expect(INTEL_NO_OFFER_REASONS).toContain("empty_prompt");
+  });
+
   it("NO_OFFER (provider failure): a degraded surface -> provider_failure, not a recall gap", () => {
     const r = computeTurnRecap(
       "s1",

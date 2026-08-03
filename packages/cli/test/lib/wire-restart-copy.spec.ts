@@ -1,4 +1,6 @@
 import { printWireResult, WireResult, McpServerAction } from "../../src/lib/wire";
+import { SCOUT_AGENT_NAME } from "../../src/lib/enrichment/scout-brief";
+import { SCOUT_NAMES } from "../../src/lib/enrichment/protocol";
 
 // Session-aware restart copy: Claude Code loads MCP servers + scout agents only at
 // session start, so an in-session `mla rewire`/`init` (CLAUDE_CODE_SESSION_ID set)
@@ -13,7 +15,10 @@ function baseResult(mcpAction: McpServerAction): WireResult {
     settingsPath: "/home/u/.claude/settings.json",
     skillDir: "/home/u/.claude/skills/mla",
     onboardSkillDir: "/home/u/.claude/skills/mla-onboard",
-    scoutAgents: ["meetless-doc-scout", "meetless-history-scout"],
+    // The real roster, not a hardcoded pair: printWireResult reports
+    // `${scoutAgents.length} scout subagents`, so a stale two-element fixture would keep
+    // asserting a count the installer no longer produces.
+    scoutAgents: SCOUT_NAMES.map((role) => SCOUT_AGENT_NAME[role]),
     flock: { ok: true, detail: "flock present" },
     projectRules: null,
     mcp: { path: "/home/u/.claude.json", action: mcpAction },

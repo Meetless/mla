@@ -11,6 +11,8 @@ module.exports = {
   globalTeardown: "<rootDir>/test/jest.global-teardown.js",
   setupFiles: ["<rootDir>/test/jest.setup-home.js"],
   transform: {
-    "^.+\\.ts$": ["ts-jest", { tsconfig: "tsconfig.json" }],
+    // tsconfig.spec.json turns on isolatedModules, which keeps ts-jest on
+    // transpileModule instead of a whole-program LanguageService. See that file.
+    "^.+\\.ts$": ["ts-jest", { tsconfig: "<rootDir>/tsconfig.spec.json" }],
   },
 };

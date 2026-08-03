@@ -9,7 +9,7 @@ import { loadRunRecord, writeRunRecord } from "../../src/lib/enrichment/plan";
 // Command-boundary coverage for the scout's wall-clock deadline.
 //
 // `run.deadlineAt` is frozen at PLAN time (createdAt + budgetMs). The scout does NOT start at
-// plan time: between plan and dispatch the agent runs `enrich brief` for both roles and relays
+// plan time: between plan and dispatch the agent runs `enrich brief` for every role and relays
 // each brief verbatim into a Task prompt, and the history brief is tens of kilobytes of git
 // evidence that the orchestrator has to emit token by token. Measured on the real repo, that
 // orchestration alone ate most of the four-minute default budget. A scout handed an

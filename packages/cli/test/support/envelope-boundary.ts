@@ -22,12 +22,17 @@
 // boundary exists to prevent.
 
 import {
+  DECISION_REQUEST_KINDS,
   MACHINE_PROTOCOL,
   MACHINE_SCHEMA_VERSION,
   MachineEnvelope,
   NextAction,
   DecisionRequest,
 } from "../../src/lib/machine-output";
+// The law checks a `resolve` selection's verdict against the SAME closed union the CLI validates
+// and the envelope type names. Restating the three words here is how the wire contract and the
+// domain drift into two spellings, so it is imported.
+import { FINDING_RESOLUTIONS } from "../../src/lib/enrichment/protocol";
 
 // A bare `mla <verb>` imperative in human-facing prose is the leak the whole proposal
 // closes: it is a runnable command handed to a reader. `\bmla\s+[a-z]` matches the CLI
@@ -98,13 +103,32 @@ function assertTypedSelection(sel: unknown, where: string): void {
     check(extra.length === 0, `${where}.selection(only) carries unexpected keys: ${extra.join(", ")}`);
     return;
   }
-  fail(`${where}.selection.mode must be one of all|only|none, got ${JSON.stringify(s.mode)}`);
+  if (s.mode === "resolve") {
+    // One finding, one verdict. Both halves are required: a candidate_id without a resolution is a
+    // subject with no answer, and a resolution without a candidate_id is an answer to no question.
+    check(
+      typeof s.candidate_id === "string" && (s.candidate_id as string).length > 0,
+      `${where}.selection(resolve) must carry a non-empty candidate_id`,
+    );
+    check(
+      typeof s.resolution === "string" &&
+        (FINDING_RESOLUTIONS as readonly string[]).includes(s.resolution as string),
+      `${where}.selection(resolve).resolution must be one of ${FINDING_RESOLUTIONS.join("|")}, got ${JSON.stringify(s.resolution)}`,
+    );
+    const extra = Object.keys(s).filter((k) => k !== "mode" && k !== "candidate_id" && k !== "resolution");
+    check(extra.length === 0, `${where}.selection(resolve) carries unexpected keys: ${extra.join(", ")}`);
+    return;
+  }
+  fail(`${where}.selection.mode must be one of all|only|none|resolve, got ${JSON.stringify(s.mode)}`);
 }
 
 function assertDecisionRequest(dr: unknown): asserts dr is DecisionRequest {
   check(isPlainObject(dr), "decision_request must be an object");
   const o = dr as Record<string, unknown>;
-  check(o.kind === "enrich.accept", `decision_request.kind must be the closed value "enrich.accept", got ${JSON.stringify(o.kind)}`);
+  check(
+    typeof o.kind === "string" && (DECISION_REQUEST_KINDS as readonly string[]).includes(o.kind as string),
+    `decision_request.kind must be one of ${DECISION_REQUEST_KINDS.join("|")}, got ${JSON.stringify(o.kind)}`,
+  );
   check(isPlainObject(o.subject), "decision_request.subject must be an object");
   const subject = o.subject as Record<string, unknown>;
   check(

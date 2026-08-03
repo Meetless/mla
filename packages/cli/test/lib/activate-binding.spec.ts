@@ -313,7 +313,10 @@ describe("mla activate provision-or-bind + repo-root guard (T2.1)", () => {
 
     expect(r.code).toBe(0);
     expect(r.logs.join("\n")).toContain("Already activated");
-    expect(fake.requests).toHaveLength(0);
+    // Nothing is PROVISIONED on the bind path. It does read control once to check
+    // that this session can actually reach the workspace the marker names; see the
+    // bind membership probe in activate-bind-no-membership-e2e.spec.ts.
+    expect(fake.requests.filter((q) => q.method === "POST")).toHaveLength(0);
   });
 
   // --- bind path (marker present) -------------------------------------------
@@ -331,7 +334,15 @@ describe("mla activate provision-or-bind + repo-root guard (T2.1)", () => {
     expect(r.logs.join("\n")).toContain("Already activated");
     // Marker left untouched.
     expect(readMarker(dir).workspaceId).toBe("ws_bound");
-    expect(fake.requests).toHaveLength(0);
+    // Provisions nothing: no POST. The one GET is the membership probe, and it
+    // carries the marker's own workspaceId, never a newly minted one.
+    expect(fake.requests.filter((q) => q.method === "POST")).toHaveLength(0);
+    expect(
+      fake.requests.some(
+        (q) =>
+          q.method === "GET" && q.url.includes("workspaceId=ws_bound"),
+      ),
+    ).toBe(true);
   });
 
   // --- gitignore migration --------------------------------------------------

@@ -87,9 +87,9 @@ export interface WireResult {
   hooksAdded: string[];
   settingsPath: string;
   skillDir: string;
-  // The /mla onboard orchestration skill dir + the two read-only scout subagent
-  // files. Refreshed on every wire (including --skill-only) since they are skill
-  // content; never null (the umbrella always installs them).
+  // The /mla onboard orchestration skill dir + one read-only scout subagent file per
+  // role in SCOUT_NAMES. Refreshed on every wire (including --skill-only) since they
+  // are skill content; never null (the umbrella always installs them).
   onboardSkillDir: string;
   scoutAgents: string[];
   // null when skillOnly skipped the flock check entirely.
@@ -1196,7 +1196,7 @@ function installOnboardSkill(): string {
 ## Run Log
 
 ## Lessons Learned
-- The CLI owns the bookends (\`mla enrich plan\` / \`mla enrich ingest\`); this skill only dispatches the two read-only scouts and relays their JSON.
+- The CLI owns the bookends (\`mla enrich plan\` / \`mla enrich ingest\`); this skill only dispatches the read-only scouts and relays their JSON.
 - A scout that reports status \`timed_out\` is rerunnable, not a failure; re-run \`/mla onboard\`.
 
 ## Preferences & Context
@@ -1211,7 +1211,7 @@ function installOnboardSkill(): string {
   return dir;
 }
 
-// Install the two read-only scout subagents at ~/.claude/agents/<name>.md. Always
+// Install one read-only scout subagent per SCOUT_NAMES role at ~/.claude/agents/<name>.md. Always
 // rewritten from buildScoutAgent so the `tools:` capability boundary (derived from
 // SCOUT_TOOL_ALLOWLIST in surface.ts) can never silently drift from the code. Returns
 // the file paths.

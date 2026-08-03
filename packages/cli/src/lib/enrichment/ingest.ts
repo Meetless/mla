@@ -19,7 +19,10 @@ import {
   validateIngestRequestShape,
   validateScoutResultShape,
   validateCandidateShape,
+  normalizeExactSourceClaim,
+  RECONCILIATION_FINDING_KIND,
   SCOUT_NAMES,
+  scoutCandidateCap,
   type CandidateValidationError,
   type EnrichmentCandidate,
   type EnrichmentEvidence,
@@ -98,12 +101,35 @@ export interface IngestEnv {
   repositoryRoot: string;
 }
 
+// One line of `git blame --line-porcelain`. `author*` only: mixing in the committer would
+// attribute a rule to whoever last rebased the branch.
+export interface BlamedLine {
+  commit: string; // lowercased 40-char SHA
+  authorName: string; // "" when git named none
+  authorTime: string; // epoch seconds as git wrote them; "" when absent
+}
+
 // Filesystem + git probe for the impure candidate checks. Injectable for tests.
+//
+// The last three exist for the reconciliation finding, whose whole claim is historical and
+// therefore unverifiable from the working tree: the quote has to come out of the repository at
+// a pinned commit, and the ordering has to come out of git's ancestry graph. Each returns
+// null/false on ANY failure rather than throwing, because an unprovable finding is dropped, not
+// escalated: one unreadable document must not take the rest of the run down with it.
 export interface FsProbe {
   repoRealpath: string;
   realpath(absPath: string): string; // throws if the path does not exist
   lineCount(absPath: string): number; // throws if the path does not exist
   isTracked(relPath: string): boolean; // present in `git ls-files` (exists at HEAD)
+  // Content of `relPath` AS OF `commit`. null when the path did not exist there, which is what
+  // makes an uncommitted document ineligible rather than silently quoted from the working tree.
+  readFileAtCommit(commit: string, relPath: string): string | null;
+  // Per-line blame of the inclusive 1-based range, as of `commit`. null on any failure.
+  blameRange(commit: string, relPath: string, startLine: number, endLine: number): BlamedLine[] | null;
+  // `git merge-base --is-ancestor`: true ONLY on a clean exit 0. Exit 1 (proven not an
+  // ancestor) and any other failure (unresolvable) both return false, because both mean the
+  // same thing here: the ordering was not proven, so the finding is not emitted.
+  isAncestor(ancestor: string, descendant: string): boolean;
 }
 
 export interface IngestResult {
@@ -114,36 +140,29 @@ export interface IngestResult {
   state?: OnboardingState;
 }
 
-const SCOUT_SLOTS: ScoutName[] = ["documentation", "history"];
+// Iteration order for merge and rendering ONLY. Derived from SCOUT_NAMES so a role can never
+// exist without a slot. Allocation does NOT read this: see allocateScoutBudgets.
+const SCOUT_SLOTS: readonly ScoutName[] = SCOUT_NAMES;
 
 /**
- * Per-scout HARD cap with a run-total backstop, NO reallocation (verdict item 8). Each
- * runnable scout gets at most `perScoutCap` candidates, INDEPENDENT of what the other scout
- * produced: an under-producing scout never cedes its surplus and an over-producer is never
- * handed the other's leftover. This deliberately replaces the old round-robin fair-share,
- * which DID reallocate surplus. The run-total backstop (`totalCap` minus budget already
- * consumed by scouts that completed in a prior ingest) only bites when the per-scout caps
- * could otherwise sum past the total; for the shipped 10/10/20 defaults each runnable scout
- * simply gets its full 10. `runnable` is the set of scouts not already complete from a prior
- * ingest; complete scouts get 0 here (they are skipped in the loop and counted via prior).
- * Caps are dealt in slot order so the backstop is deterministic.
+ * Per-ROLE HARD cap, NO reallocation and NO shared pool (verdict item 8, revised).
+ *
+ * Each runnable scout gets exactly SCOUT_CANDIDATE_CAPS[role], INDEPENDENT of what any other
+ * scout produced and independent of where the role sits in any list. `runnable` is the set of
+ * scouts not already complete from a prior ingest; complete scouts get 0 (they are skipped in
+ * the loop and counted via prior).
+ *
+ * The previous form dealt a scalar cap out of a shared `remainingTotal` in slot order. That
+ * made array order part of the allocation contract and, with the caps summing exactly to the
+ * total, guaranteed that any newly appended role received 0: dispatched, briefed, burning the
+ * full history payload, returning findings, and silently discarded at ingest. Deriving
+ * MAX_CANDIDATES_TOTAL from the caps makes the old backstop unreachable by construction, so
+ * it is gone rather than left as decoration.
  */
-function allocateScoutBudgets(
-  perScoutCap: number,
-  totalCap: number,
-  committedPrior: number,
-  runnable: Set<ScoutName>,
-): Map<ScoutName, number> {
+function allocateScoutBudgets(runnable: Set<ScoutName>): Map<ScoutName, number> {
   const budget = new Map<ScoutName, number>();
-  let remainingTotal = Math.max(0, totalCap - Math.max(0, committedPrior));
-  for (const s of SCOUT_SLOTS) {
-    if (!runnable.has(s)) {
-      budget.set(s, 0);
-      continue;
-    }
-    const cap = Math.max(0, Math.min(Math.max(0, perScoutCap), remainingTotal));
-    budget.set(s, cap);
-    remainingTotal -= cap;
+  for (const role of SCOUT_NAMES) {
+    budget.set(role, runnable.has(role) ? scoutCandidateCap(role) : 0);
   }
   return budget;
 }
@@ -224,6 +243,27 @@ function safeRealpath(p: string): string {
   }
 }
 
+// Parse `git blame --line-porcelain`. Each blamed line opens with "<sha> <orig> <final>[ <n>]"
+// and is followed by its full header block, then a TAB-prefixed copy of the source line.
+// Matched on the exact "author " / "author-time " prefixes so "author-mail", "author-tz", and
+// every "committer*" key are skipped rather than fuzzily absorbed.
+function parseLinePorcelain(out: string): BlamedLine[] {
+  const lines: BlamedLine[] = [];
+  let current: BlamedLine | null = null;
+  for (const raw of out.split("\n")) {
+    const header = /^([0-9a-f]{40}) \d+ \d+(?: \d+)?$/.exec(raw);
+    if (header) {
+      current = { commit: header[1].toLowerCase(), authorName: "", authorTime: "" };
+      lines.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (raw.startsWith("author ")) current.authorName = raw.slice("author ".length).trim();
+    else if (raw.startsWith("author-time ")) current.authorTime = raw.slice("author-time ".length).trim();
+  }
+  return lines;
+}
+
 export function defaultProbe(repoRoot: string, gitRunner: GitRunner = defaultGitRunner(repoRoot)): FsProbe {
   const repoRealpath = safeRealpath(repoRoot);
   let tracked: Set<string> | null = null;
@@ -246,10 +286,47 @@ export function defaultProbe(repoRoot: string, gitRunner: GitRunner = defaultGit
       }
       return tracked.has(relPath);
     },
+    // `<rev>:<path>` is one argv element beginning with a validated 40-hex SHA, so the path can
+    // never be read as an option, and a path with no leading "./" is resolved from the top of
+    // the tree (the runner's cwd is the repo root regardless).
+    readFileAtCommit: (commit, relPath) => {
+      try {
+        return gitRunner(["show", `${commit}:${relPath}`]);
+      } catch {
+        return null;
+      }
+    },
+    // `--` before the path so a document named like a flag stays a path. -L is inclusive on
+    // both ends, matching the evidence anchor's 1-based startLine/endLine.
+    blameRange: (commit, relPath, startLine, endLine) => {
+      try {
+        const out = gitRunner(["blame", commit, "--line-porcelain", "-L", `${startLine},${endLine}`, "--", relPath]);
+        const parsed = parseLinePorcelain(out);
+        return parsed.length > 0 ? parsed : null;
+      } catch {
+        return null;
+      }
+    },
+    isAncestor: (ancestor, descendant) => {
+      try {
+        gitRunner(["merge-base", "--is-ancestor", ancestor, descendant]);
+        return true; // exit 0
+      } catch {
+        return false; // exit 1 (not an ancestor) or anything else (unresolvable): same verdict
+      }
+    },
   };
 }
 
 // --- impure candidate verification (shape already validated upstream) -------------
+
+// The one normalization applied to a claimed repo-relative path before it is compared with
+// anything: git speaks forward slashes and never a leading "./", so a path that differs only
+// that way is the same path. Traversal is NOT normalized away here; it is rejected by the
+// caller, because silently absorbing ".." is how a containment check gets talked out of its job.
+function normalizeEvidencePath(raw: string): string {
+  return raw.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+}
 
 function verifyFileEvidence(
   ev: Extract<EnrichmentEvidence, { type: "file" }>,
@@ -261,7 +338,7 @@ function verifyFileEvidence(
     push("path_traversal", `file path must be repo-relative: ${raw}`);
     return;
   }
-  const norm = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+  const norm = normalizeEvidencePath(raw);
   if (norm.split("/").includes("..")) {
     push("path_traversal", `file path may not contain "..": ${raw}`);
     return;
@@ -313,6 +390,170 @@ export function statementExcerpt(raw: unknown): string | undefined {
   return `${collapsed.slice(0, REJECT_EXCERPT_CHARS)}...`;
 }
 
+const FULL_SHA = /^[0-9a-f]{40}$/;
+// git's "not committed yet" sentinel. A blamed line carrying it names no commit at all, so it
+// can anchor no ordering.
+const NULL_SHA = "0".repeat(40);
+
+// Epoch seconds as git wrote them, rendered for display. Returns undefined on anything
+// unparseable rather than inventing a date: attribution is courtesy, and a wrong timestamp on a
+// governance artifact is worse than a missing one.
+function isoFromEpochSeconds(raw: string): string | undefined {
+  if (!/^\d{1,15}$/.test(raw)) return undefined;
+  const ms = Number(raw) * 1000;
+  if (!Number.isFinite(ms)) return undefined;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+}
+
+/**
+ * Prove the historical half of a doc_code_inconsistency, the half no shape check can reach.
+ *
+ * Shape validation established that the finding is internally coherent: the status letter proves
+ * the claim class, the changed path sits inside the claim's scope. This establishes that it is
+ * TRUE OF THIS REPOSITORY, and it is the only reason the finding is allowed to exist:
+ *
+ *   1. the claimed change is the change the CLI itself read out of that commit, field for field;
+ *   2. the claimed quote is really in that document, read out of the repository at headCommit
+ *      rather than out of the working tree or out of the model;
+ *   3. the document ALREADY SAID IT when the commit landed, proven by ancestry, never by dates.
+ *
+ * (3) is the whole argument. A historical commit and a current document are not automatically
+ * inconsistent: a commit that predates the rule broke nothing, and reporting it as a violation
+ * teaches the reader that these findings are noise. Every unprovable branch below therefore
+ * rejects this ONE candidate and lets the run continue. Zero findings beats a plausible one.
+ */
+function verifyInconsistency(
+  candidate: EnrichmentCandidate,
+  run: OnboardingRun,
+  probe: FsProbe,
+  push: (code: string, message: string) => void,
+): void {
+  const inc = candidate.inconsistency;
+  if (!inc) return; // shape validation guarantees this for the kind; nothing to prove without it
+
+  // Everything below is read AS OF headCommit: the quote, the blame, and the ancestry all have
+  // to describe one snapshot or they describe nothing. A run recorded without one (git was
+  // unavailable at plan time) cannot host a finding, and fails closed rather than falling back
+  // to the working tree, where an uncommitted edit would read as a governed rule.
+  const headCommit = (run.headCommit ?? "").toLowerCase();
+  if (!FULL_SHA.test(headCommit)) {
+    push("no_head_commit", "the run has no recorded headCommit, so no document snapshot can be verified");
+    return;
+  }
+
+  const docAnchor = candidate.evidence.find((e): e is Extract<EnrichmentEvidence, { type: "file" }> => e.type === "file");
+  const commitAnchor = candidate.evidence.find(
+    (e): e is Extract<EnrichmentEvidence, { type: "commit" }> => e.type === "commit",
+  );
+  if (!docAnchor || !commitAnchor) return; // REQUIRED_ANCHOR_TYPES already rejected this
+  const sha = resolveAllowedCommit(commitAllowlist(run), commitAnchor.commit);
+  if (sha === null) return; // already rejected as commit_not_in_allowlist by the caller
+  const docPath = normalizeEvidencePath(docAnchor.path);
+
+  // 1. The claimed change against the change the CLI prepared. The scout was SHOWN this line and
+  // asked to copy it, so any difference is either a transcription error or an invention; neither
+  // is a finding. Compared field for field (DivergenceShapeGuard keeps the two shapes in lockstep
+  // so a new field cannot slip past this).
+  const prepared = run.historyEvidence.find((e) => e.commit.toLowerCase() === sha);
+  const change = prepared?.changedFiles.find((f) => f.path === inc.divergence.path);
+  if (!change) {
+    push(
+      "divergence_not_in_commit",
+      `commit ${sha.slice(0, 12)} did not change "${inc.divergence.path}" according to the plan's own evidence`,
+    );
+    return;
+  }
+  if (change.status !== inc.divergence.status || (change.renamedFrom ?? "") !== (inc.divergence.renamedFrom ?? "")) {
+    push(
+      "divergence_mismatch",
+      `claimed change does not match the plan's evidence for ${sha.slice(0, 12)}: ` +
+        `claimed ${JSON.stringify(inc.divergence)}, recorded ${JSON.stringify(change)}`,
+    );
+    return;
+  }
+
+  // 2. The claimed quote against the document AS OF headCommit. Normalizing both sides collapses
+  // whitespace and line endings and NOTHING else, so a re-wrapped paragraph still matches while a
+  // paraphrase, a softened "should" for "must", or a dropped "not" does not.
+  const snapshot = probe.readFileAtCommit(headCommit, docPath);
+  if (snapshot === null) {
+    push("doc_not_at_head", `"${docPath}" does not exist at the run's headCommit; an uncommitted document cannot anchor a finding`);
+    return;
+  }
+  const snapLines = snapshot.replace(/\r\n?/g, "\n").split("\n");
+  if (docAnchor.endLine > snapLines.length) {
+    push(
+      "line_out_of_range_at_head",
+      `endLine ${docAnchor.endLine} exceeds "${docPath}" at headCommit (${snapLines.length} lines)`,
+    );
+    return;
+  }
+  const anchoredRange = normalizeExactSourceClaim(snapLines.slice(docAnchor.startLine - 1, docAnchor.endLine).join("\n"));
+  const quote = normalizeExactSourceClaim(inc.claimText);
+  if (quote.length === 0 || !anchoredRange.includes(quote)) {
+    push(
+      "claim_not_in_document",
+      `claimText is not a verbatim quote of ${docPath}#L${docAnchor.startLine}-L${docAnchor.endLine} at headCommit`,
+    );
+    return;
+  }
+  // Persist the CLI-verified span, not the model's string. They are byte-identical here (that is
+  // what the substring check just established), which is precisely why overwriting is safe and
+  // why what lands in the artifact is provably the document's own words.
+  inc.claimText = quote;
+
+  // 3. Ancestry. The doc-anchor commit is the one that last touched the quoted range; one blame
+  // call yields both it and the attribution. Failure drops this finding, never the run.
+  const blamed = probe.blameRange(headCommit, docPath, docAnchor.startLine, docAnchor.endLine);
+  if (!blamed || blamed.length === 0) {
+    push("blame_unavailable", `git could not blame ${docPath}#L${docAnchor.startLine}-L${docAnchor.endLine} at headCommit`);
+    return;
+  }
+  const distinct = [...new Set(blamed.map((l) => l.commit))];
+  if (distinct.length !== 1) {
+    // Picking one of several would mean ordering them, and the only cheap ordering is by date,
+    // which is display metadata precisely because it is rebase- and author-controlled. A narrower
+    // anchor (quote the one sentence) makes this finding provable; guessing does not.
+    push(
+      "ambiguous_claim_origin",
+      `the anchored range spans ${distinct.length} commits, so no single commit can be shown to predate the change`,
+    );
+    return;
+  }
+  const claimCommit = distinct[0];
+  if (claimCommit === NULL_SHA) {
+    push("claim_not_committed", "the anchored range is not committed, so it cannot be shown to predate anything");
+    return;
+  }
+  // `--is-ancestor X X` exits 0, so without this a single commit that wrote the rule AND made the
+  // change would "prove" it violated itself. That is not an unpropagated change, it is one commit
+  // doing two things, and it is the reader's first false positive.
+  if (claimCommit === sha) {
+    push("claim_and_change_same_commit", `the rule and the change landed in the same commit (${sha.slice(0, 12)})`);
+    return;
+  }
+  if (!probe.isAncestor(claimCommit, sha)) {
+    // Exit 1 (the rule is NOT an ancestor: it landed after the change, so the change broke
+    // nothing) and an unresolvable graph both arrive here, because both mean the same thing:
+    // the ordering was not proven.
+    push(
+      "claim_not_proven_older",
+      `${claimCommit.slice(0, 12)} (which wrote the quoted rule) is not a proven ancestor of ${sha.slice(0, 12)}`,
+    );
+    return;
+  }
+
+  // Verified. Stamp the attribution the CLI derived; the person and the time are courtesy fields
+  // and are omitted rather than guessed, which is why they sit outside the finding's identity.
+  const line = blamed[0];
+  inc.attribution = {
+    commit: claimCommit,
+    ...(line.authorName ? { authorName: line.authorName } : {}),
+    ...(isoFromEpochSeconds(line.authorTime) ? { authorTime: isoFromEpochSeconds(line.authorTime) } : {}),
+  };
+}
+
 // Verifies a single shape-valid candidate against the filesystem + commit allowlist.
 // Rejects the whole candidate if ANY anchor fails (a citation is only as trustworthy as
 // its weakest anchor). Returns all errors for reporting.
@@ -333,6 +574,12 @@ export function verifyCandidate(
     } else if (resolveAllowedCommit(allowlist, ev.commit) === null) {
       push("commit_not_in_allowlist", `commit is not in the plan's allowlist: ${ev.commit}`);
     }
+  }
+  // Only after the anchors themselves hold: the historical proof reads the document at the
+  // anchored range, so running it over a path that failed containment would be verifying a
+  // quote from a file we already refused to trust.
+  if (candidate.kind === RECONCILIATION_FINDING_KIND && errors.length === 0) {
+    verifyInconsistency(candidate, run, probe, push);
   }
   return errors;
 }
@@ -497,7 +744,13 @@ export function upsertCandidatesSidecar(home: string, incoming: OnboardingCandid
   const existing = loadCandidatesSidecar(home, incoming.workspaceId, incoming.runId);
   const byId = new Map<string, OnboardingCandidateRecord>();
   if (existing) for (const c of existing.candidates) byId.set(c.candidateId, c);
-  for (const c of incoming.candidates) byId.set(c.candidateId, c);
+  for (const c of incoming.candidates) {
+    // A later ingest must never UN-resolve a finding a human already closed. Ingest rewrites a
+    // record in place (that is how a resuming scout refreshes its landed outcome) and it has no
+    // opinion about resolution, so a prior verdict is carried across rather than silently dropped.
+    const prior = byId.get(c.candidateId);
+    byId.set(c.candidateId, prior?.resolution && !c.resolution ? { ...c, resolution: prior.resolution } : c);
+  }
   const merged: OnboardingCandidatesSidecar = {
     schemaVersion: 1,
     workspaceId: incoming.workspaceId,
@@ -592,33 +845,26 @@ export async function ingestRun(input: {
   // immutable; §6). Carry prior state forward. Keyed by runId, so a different repo's run
   // in the same workspace starts from a clean slate instead of inheriting "complete".
   const prior = loadState(env.home, env.workspaceId, runId);
-  const scoutState: Record<ScoutName, ScoutRunState> = {
-    documentation: prior?.scouts.documentation ?? emptyScoutState(),
-    history: prior?.scouts.history ?? emptyScoutState(),
-  };
+  // Built by mapping SCOUT_NAMES, not by hand: a hand-written literal here is exactly the
+  // shape that goes stale when a role is added, and the compiler only catches it because the
+  // annotation is a TOTAL Record. Deriving it removes the chance entirely.
+  const scoutState = Object.fromEntries(
+    SCOUT_NAMES.map((role) => [role, prior?.scouts[role] ?? emptyScoutState()]),
+  ) as Record<ScoutName, ScoutRunState>;
 
   const outcomes: ScoutIngestOutcome[] = [];
-  const totalCap = run.limits.maxCandidatesTotal;
-  const perScoutCap = run.limits.maxCandidatesPerScout;
 
-  // Budget consumed by scouts that completed in a PRIOR ingest (resume): they are
-  // skipped in the loop below but still count against the run's total backstop.
-  const committedPrior = SCOUT_SLOTS.reduce((n, s) => {
-    const st = scoutState[s];
-    return n + (st.status === "complete" ? (st.candidateCount ?? 0) : 0);
-  }, 0);
-
-  // Runnable scouts = every slot not already complete from a prior ingest. Each gets its
-  // own independent per-scout cap (no reallocation, verdict item 8); the cap does NOT
-  // depend on what the scout actually sent, so a low-producing scout never frees capacity
-  // for the other one.
-  const runnable = new Set<ScoutName>(SCOUT_SLOTS.filter((s) => scoutState[s].status !== "complete"));
-  const budget = allocateScoutBudgets(perScoutCap, totalCap, committedPrior, runnable);
+  // Runnable scouts = every role not already complete from a prior ingest. Each gets its own
+  // independent per-ROLE cap (no reallocation, no shared pool, no order sensitivity); the cap
+  // does NOT depend on what any scout actually sent, so a low-producing scout never frees
+  // capacity for another and an appended role can never allocate zero.
+  const runnable = new Set<ScoutName>(SCOUT_NAMES.filter((s) => scoutState[s].status !== "complete"));
+  const budget = allocateScoutBudgets(runnable);
 
   // Phase 1: validate + cap each scout, but persist NOTHING yet. A scout that completed in a
   // prior ingest, reported it did not finish, or arrived malformed is resolved in-loop (it
   // contributes no accepted candidates); every complete scout's accepted set is collected so
-  // Phase 2 can merge exact duplicates across BOTH scouts before a single POST.
+  // Phase 2 can merge exact duplicates across ALL scouts before a single POST.
   const completeBatch: Array<{
     scout: ScoutName;
     received: number;
@@ -695,7 +941,10 @@ export async function ingestRun(input: {
         reject({
           index: i,
           code: "candidate_cap_exceeded",
-          message: `per-scout candidate cap reached; this scout's cap was ${scoutBudget} (per-scout ${perScoutCap}, run total ${totalCap})`,
+          // Name only THIS role's cap. The old message also quoted a shared run total, which
+          // implied the drop might be someone else's fault; caps are now per-role and nothing
+          // another scout did can change this number.
+          message: `per-scout candidate cap reached; the ${result.scout} scout's cap is ${scoutBudget}`,
         });
         return;
       }
@@ -716,8 +965,8 @@ export async function ingestRun(input: {
   }
 
   // Phase 2: merge EXACT duplicates across this single ingest call (verdict item 9). A
-  // statement both scouts surfaced becomes ONE governed document that cites both, instead of
-  // two near-identical docs the reviewer must reconcile. Merge is anchor-insensitive (keyed
+  // statement more than one scout surfaced becomes ONE governed document citing all of them,
+  // instead of near-identical docs the reviewer must reconcile. Merge is anchor-insensitive (keyed
   // by kind + normalized statement) so it also collapses a scout that emitted the same
   // statement twice; it is scoped to THIS call only, so a resuming scout (whose candidates
   // arrive after the other is already complete) never folds across calls.
@@ -800,14 +1049,16 @@ export async function ingestRun(input: {
   const persistErrorMessage = [...new Set(persistErrors)].join("; ");
 
   // Tally each scout's landed documents by REAL server outcome: newly minted ("ingested") vs
-  // already governed and unchanged ("noop_unchanged"). A doc shared by both scouts counts
+  // already governed and unchanged ("noop_unchanged"). A doc shared by several scouts counts
   // toward each: the union truly carries each one's evidence. A doc the server reported
   // "failed" (a 200 carrying a per-document failure) landed for neither and is surfaced as an
   // error below. This split is what makes idempotency visible: a re-run of an unchanged repo
   // reports every doc as already-present, not as freshly persisted.
-  const newByScout: Record<ScoutName, number> = { documentation: 0, history: 0 };
-  const dedupedByScout: Record<ScoutName, number> = { documentation: 0, history: 0 };
-  const docFailedByScout: Record<ScoutName, number> = { documentation: 0, history: 0 };
+  const zeroPerScout = (): Record<ScoutName, number> =>
+    Object.fromEntries(SCOUT_NAMES.map((role) => [role, 0])) as Record<ScoutName, number>;
+  const newByScout = zeroPerScout();
+  const dedupedByScout = zeroPerScout();
+  const docFailedByScout = zeroPerScout();
   if (!persistFailed) {
     for (const [relPath, scouts] of scoutsByPath) {
       const outcome = outcomeByPath.get(relPath);
@@ -957,17 +1208,27 @@ export async function ingestRun(input: {
     schemaVersion: 2,
     status: allComplete ? "complete" : "partial",
     updatedAt: now,
-    scouts: { documentation: scoutState.documentation, history: scoutState.history },
+    // scoutState is already the total per-role record this run computed; re-listing the roles
+    // here would have silently dropped any role not named, so the resume state would forget a
+    // completed scout and re-run it forever.
+    scouts: scoutState,
   };
   writeState(env.home, state);
 
   return { ok: true, runId, outcomes, state };
 }
 
+// Attribute a MALFORMED envelope to a slot so it can be retried. Membership is tested against
+// SCOUT_NAMES, not a hand-written pair of literals: an `s === "documentation" || s ===
+// "history"` test compiles forever, so a third scout's malformed envelope would have been
+// unattributable, its slot would never be stamped `malformed`, and the run would report that
+// scout as never having run at all.
 function guessScoutName(raw: unknown): ScoutName | null {
   if (raw && typeof raw === "object" && "scout" in raw) {
     const s = (raw as { scout?: unknown }).scout;
-    if (s === "documentation" || s === "history") return s;
+    if (typeof s === "string" && (SCOUT_NAMES as readonly string[]).includes(s)) {
+      return s as ScoutName;
+    }
   }
   return null;
 }

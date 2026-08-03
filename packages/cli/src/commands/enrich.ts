@@ -41,6 +41,7 @@ import {
   ingestRun,
   findCompletedRunWithDigest,
   loadCandidatesSidecar,
+  upsertCandidatesSidecar,
   type Persister,
 } from "../lib/enrichment/ingest";
 import { buildScoutPrompt } from "../lib/enrichment/scout-brief";
@@ -49,6 +50,13 @@ import {
   DEFAULT_BUDGET_MS,
   SCOUT_NAMES,
   validateCandidateShape,
+  assertNever,
+  FINDING_RESOLUTIONS,
+  RECONCILIATION_FINDING_KIND,
+  findingToRuleCandidate,
+  isFindingResolution,
+  type FindingResolution,
+  type FindingResolutionRecord,
   type ScoutName,
   type ScoutIngestOutcome,
   type EnrichmentCandidate,
@@ -154,7 +162,30 @@ const USAGE = `mla enrich: agent-orchestrated onboarding enrichment.
       first (interactive Y/n, or --yes non-interactively). Re-running is safe: a rule whose
       payload is already live is skipped, never minted twice. A mint failure writes nothing.
       --dry-run previews without minting or writing. Exit: 0 done (or nothing to do), 1 mint
-      refused/failed, 2 bad input (unknown run, bad/ambiguous prefix).`;
+      refused/failed, 2 bad input (unknown run, bad/ambiguous prefix).
+
+  mla enrich resolve --run-id <id> [--finding <id-prefix> --as <code_diverged|doc_stale|carve_out>]
+                     [--team | --personal] [--yes] [--dry-run] [--json] [--workspace <id>]
+      Answer a doc/code finding: a place where a document says one thing and a commit in this
+      repository's history did another, with the document's sentence quoted verbatim out of the
+      file and the commit's own changed-file record as proof. A finding is a QUESTION, which is
+      why it never appears in \`enrich accept\`'s durable list: nothing about it is decided until
+      a human says which side was right.
+      With no --finding it is a read-only review: it prints the open findings and closes nothing.
+      --finding names one (>= 6 hex chars of its id, fail-closed on no/ambiguous match) and --as
+      answers it. The three answers:
+        code_diverged  the document was right and the change broke it. YOUR SELECTION IS THE
+                       APPROVAL: the quoted sentence is minted as a rule through the same path
+                       \`enrich accept\` mints through, and there is no second prompt.
+        doc_stale      the change was right and the document is out of date. Nothing is minted;
+                       the finding closes. Update the document yourself.
+        carve_out      both were right and this was a deliberate exception. Nothing is minted.
+      Minting requires an authenticated human (\`mla login\`). The default plane is PERSONAL;
+      --team enforces workspace-wide and confirms first (interactive Y/n, or --yes). --dry-run
+      previews without minting, writing, or closing. Answering the same way twice is a no-op;
+      answering a DIFFERENT way is refused rather than silently overwritten.
+      Exit: 0 done, 1 mint refused/failed, 2 bad input (unknown run, bad/ambiguous prefix,
+      already resolved another way).`;
 
 // The git toplevel is the enrichment repository root: `git ls-files` / `git log` must
 // run from it so the paths the scouts cite are repo-root-relative and the realpath
@@ -584,12 +615,47 @@ export function extractResults(raw: string, runId: string): unknown[] {
   throw new Error("scout results must be a JSON array, or an object with a `results` array");
 }
 
+/**
+ * What ingest knows about this run's doc/code findings, for the finding-first terminal state.
+ *
+ * `candidates` is the WHOLE sidecar, not a pre-filtered finding list: the renderer selects and
+ * filters, so no caller can hand it a list that quietly omits one. Optional at the call site
+ * only because a caller that has no sidecar (a pure unit test of the counts) must not be able to
+ * fake "this run examined the code and found nothing", which is a claim about evidence.
+ */
+export interface IngestFindingsView {
+  runId: string;
+  candidates: readonly OnboardingCandidateRecord[];
+}
+
 export function renderIngestSummary(
   outcomes: ScoutIngestOutcome[],
   status: string | undefined,
   reviewUrl: string,
+  findings?: IngestFindingsView,
 ): string {
   const lines = [`Onboarding ingest complete (state: ${status ?? "unknown"}).`, ``];
+
+  // The finding leads, ahead of every count. It is the one line in this summary that is a
+  // QUESTION rather than a tally, and a question printed under twenty numbers is a question
+  // nobody answers. Neither side is declared wrong here: the headline states the disagreement
+  // and the next line is the command that asks the human which one is right.
+  const open = (findings?.candidates ?? []).filter((c) => isFinding(c) && !c.resolution);
+  if (findings && open.length > 0) {
+    lines.push(
+      `  ${open.length} finding${open.length === 1 ? "" : "s"}: a document and a commit disagree, ` +
+        `and neither is assumed right.`,
+      ``,
+    );
+    for (const r of open) lines.push(...renderFindingRow(r));
+    lines.push(``, `  Answer ${open.length === 1 ? "it" : "them"}:  mla enrich resolve --run-id ${findings.runId}`, ``);
+  } else if (findings && outcomes.some((o) => o.scout === "reconciliation")) {
+    // Claim ONLY what was examined. The reconciliation scout saw the documents this run planned
+    // and the commits this run listed; it did not read the repository, so "no inconsistencies in
+    // this repo" would be a coverage claim the run never earned. The scope is stated in the
+    // sentence rather than left for the operator to assume.
+    lines.push(`  No inconsistencies between the documents and the commits this run examined.`, ``);
+  }
   let totalPersisted = 0;
   let totalDeduped = 0;
   for (const o of outcomes) {
@@ -790,7 +856,18 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
   if (flags.json) {
     console.log(JSON.stringify(res, null, 2));
   } else {
-    console.log(renderIngestSummary(res.outcomes, res.state?.status, consoleDeepLink(cfg, "/kb")));
+    // Read the sidecar this ingest just wrote so the summary can lead with the findings. Its
+    // absence is not an error (a run with nothing to persist writes none); it degrades to the
+    // counts-only summary rather than claiming a clean bill of health it cannot support.
+    const sidecar = res.runId ? loadCandidatesSidecar(HOME, cfg.workspaceId, res.runId) : null;
+    console.log(
+      renderIngestSummary(
+        res.outcomes,
+        res.state?.status,
+        consoleDeepLink(cfg, "/kb"),
+        sidecar ? { runId: sidecar.runId, candidates: sidecar.candidates } : undefined,
+      ),
+    );
   }
 
   // 1 when a scout needs attention (infra failure or a malformed envelope worth a retry);
@@ -1780,6 +1857,428 @@ function renderMintSummary(
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------------------
+// `mla enrich resolve`: answering a doc/code finding (§5.9)
+// ---------------------------------------------------------------------------------------
+
+interface ResolveFlags {
+  runId?: string;
+  finding?: string; // a candidate id prefix, lowercased (>= 6 hex chars)
+  as?: FindingResolution;
+  dryRun: boolean;
+  json: boolean;
+  workspace?: string;
+  team: boolean;
+  personal: boolean;
+  yes: boolean;
+}
+
+// Accepts both `--flag value` and `--flag=value`, matching what resolveOperation's argv sniff
+// looks for: a shape the capability gate recognizes but the parser rejects would resolve to the
+// mutation id and then fail as a usage error inside it, which is a lie about what ran.
+export function parseResolveArgs(argv: string[]): ResolveFlags {
+  const flags: ResolveFlags = { dryRun: false, json: false, team: false, personal: false, yes: false };
+  const valueOf = (arg: string, i: number): { value: string | undefined; next: number } => {
+    const eq = arg.indexOf("=");
+    return eq === -1 ? { value: argv[i + 1], next: i + 1 } : { value: arg.slice(eq + 1), next: i };
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const name = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+    if (name === "--team") {
+      flags.team = true;
+    } else if (name === "--personal") {
+      flags.personal = true;
+    } else if (name === "--yes") {
+      flags.yes = true;
+    } else if (name === "--dry-run") {
+      flags.dryRun = true;
+    } else if (name === "--json") {
+      flags.json = true;
+    } else if (name === "--run-id") {
+      const { value, next } = valueOf(a, i);
+      if (!value) throw new Error("--run-id requires a value");
+      flags.runId = value;
+      i = next;
+    } else if (name === "--workspace") {
+      const { value, next } = valueOf(a, i);
+      if (!value) throw new Error("--workspace requires a workspace id");
+      flags.workspace = value;
+      i = next;
+    } else if (name === "--finding") {
+      const { value, next } = valueOf(a, i);
+      if (!value) throw new Error("--finding requires a candidate id prefix");
+      const prefix = value.trim().toLowerCase();
+      if (!/^[0-9a-f]{6,}$/.test(prefix)) {
+        throw new Error(`--finding prefix "${prefix}" must be at least 6 hex characters of a candidate id`);
+      }
+      flags.finding = prefix;
+      i = next;
+    } else if (name === "--as") {
+      const { value, next } = valueOf(a, i);
+      if (!value) throw new Error(`--as requires one of: ${FINDING_RESOLUTIONS.join(", ")}`);
+      const outcome = value.trim().toLowerCase();
+      if (!isFindingResolution(outcome)) {
+        throw new Error(`--as must be one of: ${FINDING_RESOLUTIONS.join(", ")} (got "${outcome}")`);
+      }
+      flags.as = outcome;
+      i = next;
+    } else {
+      throw new Error(`Unknown flag for \`mla enrich resolve\`: ${a}`);
+    }
+  }
+  if (!flags.runId) throw new Error("--run-id is required (the id printed by `mla enrich plan`)");
+  // Half a verdict is not a verdict. Naming a finding without an outcome would silently degrade to
+  // the review (resolving nothing while looking like it did), and naming an outcome without a
+  // finding has no subject: a three-way answer is meaningless until you say what it answers.
+  if (flags.finding && !flags.as) {
+    throw new Error(`--finding also requires --as <${FINDING_RESOLUTIONS.join("|")}> (which answer this finding gets)`);
+  }
+  if (flags.as && !flags.finding) {
+    throw new Error("--as also requires --finding <id-prefix> (which finding this answers)");
+  }
+  if (flags.team && flags.personal) {
+    throw new Error("pass either --team or --personal, not both (they are the two authority planes)");
+  }
+  return flags;
+}
+
+// One finding's line in the review. The QUOTE leads, because the quote is the half the CLI proved
+// and the half the human is being asked about; the generated statement is not printed here at all.
+function renderFindingRow(record: OnboardingCandidateRecord): string[] {
+  const inc = record.inconsistency!;
+  const short = record.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN);
+  const commit = record.evidence.find((e) => e.type === "commit");
+  const lines = [
+    `  ${short}  ${inc.claimScope} says: "${inc.claimText}"`,
+    `                but ${inc.divergence.status} ${inc.divergence.path}` +
+      (inc.divergence.renamedFrom ? ` (from ${inc.divergence.renamedFrom})` : "") +
+      (commit && commit.type === "commit" ? ` in ${commit.commit.slice(0, 12)}` : ""),
+  ];
+  if (inc.attribution?.authorName) {
+    lines.push(`                the rule was last written by ${inc.attribution.authorName}`);
+  }
+  return lines;
+}
+
+// The read-only review a bare `mla enrich resolve --run-id <id>` prints. Pure (no fs) and exported
+// so a test pins the wording. Nothing is minted, written, or closed in this mode.
+export function renderResolveReview(
+  runId: string,
+  open: readonly OnboardingCandidateRecord[],
+  resolved: readonly OnboardingCandidateRecord[],
+): string {
+  if (!runId.trim()) {
+    throw new Error(
+      "renderResolveReview: runId is required to render runnable next-step commands (unresolved argument)",
+    );
+  }
+  const lines: string[] = [];
+  if (open.length === 0) {
+    lines.push(
+      resolved.length > 0
+        ? `Every finding from run ${runId} is resolved (${resolved.length} closed).`
+        : "This run found no doc/code inconsistencies.",
+    );
+  } else {
+    lines.push(
+      `${open.length} open finding${open.length === 1 ? "" : "s"} from run ${runId} ` +
+        "(a document and a commit disagree; neither is assumed right):",
+    );
+    for (const r of open) lines.push(...renderFindingRow(r));
+  }
+  if (resolved.length > 0 && open.length > 0) {
+    lines.push("");
+    lines.push(`${resolved.length} already resolved:`);
+    for (const r of resolved) {
+      lines.push(`  ${r.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN)}  ${r.resolution!.outcome}`);
+    }
+  }
+  if (open.length > 0) {
+    const first = open[0].candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN);
+    lines.push("");
+    lines.push("The document was right, the change broke it:");
+    lines.push(`  mla enrich resolve --run-id ${runId} --finding ${first} --as code_diverged`);
+    lines.push("    Mints the quoted sentence as a rule. Your choice IS the approval; there is no second prompt.");
+    lines.push("The change was right, the document is out of date:");
+    lines.push(`  mla enrich resolve --run-id ${runId} --finding ${first} --as doc_stale`);
+    lines.push("Both were right, this one was a deliberate exception:");
+    lines.push(`  mla enrich resolve --run-id ${runId} --finding ${first} --as carve_out`);
+    lines.push("Preview without minting:   add --dry-run");
+    lines.push("Enforce workspace-wide:    add --team (default is PERSONAL: it enforces for you alone)");
+  }
+  return lines.join("\n");
+}
+
+// The typed decision the review hands the agent under machine mode. One request per finding, and
+// the FIRST open one: the three options are verdicts on a specific disagreement, so a request that
+// spanned several findings would offer an answer to a question it had not asked. Returns undefined
+// when nothing is open, so the envelope carries no request.
+function buildResolveDecisionRequest(
+  runId: string,
+  open: readonly OnboardingCandidateRecord[],
+): DecisionRequest | undefined {
+  if (open.length === 0) return undefined;
+  const target = open[0];
+  const inc = target.inconsistency!;
+  const label: Record<FindingResolution, string> = {
+    code_diverged: `The document is right: mint "${inc.claimText}" as a ${inc.proposedRuleKind}`,
+    doc_stale: "The change is right: the document is out of date",
+    carve_out: "Both were right: this change was a deliberate exception",
+  };
+  const options: DecisionOption[] = FINDING_RESOLUTIONS.map((outcome) => ({
+    id: outcome,
+    label: label[outcome],
+    selection: { mode: "resolve", candidate_id: target.candidateId, resolution: outcome },
+  }));
+  options.push({ id: "none", label: "Leave this finding open", selection: { mode: "none" } });
+  return {
+    kind: "enrich.resolve",
+    subject: { run_id: runId },
+    prompt:
+      `${inc.claimScope} says "${inc.claimText}", and commit ` +
+      `${target.evidence.find((e) => e.type === "commit")?.commit.slice(0, 12) ?? "(unknown)"} ` +
+      `${inc.divergence.status} ${inc.divergence.path} anyway. Which one is right?` +
+      (open.length > 1 ? ` (${open.length - 1} more open after this one.)` : ""),
+    options,
+  };
+}
+
+const isFinding = (c: OnboardingCandidateRecord): boolean =>
+  c.kind === RECONCILIATION_FINDING_KIND && !!c.inconsistency;
+
+/**
+ * `mla enrich resolve`: close one doc/code finding with one of three answers.
+ *
+ * A finding is a QUESTION, not a rule, which is why it never appears in `enrich accept`'s durable
+ * list. `code_diverged` is the only answer that mints, and it mints through the SAME
+ * materializeRules -> mintAndDeliverRules path accept uses: findingToRuleCandidate projects the
+ * finding into an ordinary candidate carrying the CLI-VERIFIED quote as its statement and the
+ * proposed kind as its kind, and isDurableRuleKind gates it on the far side exactly as before.
+ * There is no second authority path and no second approval: the human's selection IS the approval.
+ */
+export async function runEnrichResolve(argv: string[], deps: EnrichAcceptDeps = {}): Promise<number> {
+  const command = getMachineCommand() ?? "enrich.resolve";
+
+  let flags: ResolveFlags;
+  try {
+    flags = parseResolveArgs(argv);
+  } catch (e) {
+    return failInMode(command, "usage_error", (e as Error).message, 2);
+  }
+
+  let cfg: KbCliConfig;
+  try {
+    cfg = readKbConfig(flags.workspace);
+  } catch (e) {
+    return failInMode(command, "config_error", (e as Error).message, 2);
+  }
+
+  const sidecar = loadCandidatesSidecar(HOME, cfg.workspaceId, flags.runId!);
+  if (!sidecar) {
+    return failInMode(
+      command,
+      "unknown_run",
+      `no candidates sidecar for run ${flags.runId} in workspace ${cfg.workspaceId}. ` +
+        "Run `mla enrich ingest` first, from the same workspace.",
+      2,
+    );
+  }
+
+  const findings = sidecar.candidates.filter(isFinding);
+  const open = findings.filter((c) => !c.resolution);
+  const resolved = findings.filter((c) => c.resolution);
+
+  // No verdict: read-only review. Print what is open, close nothing.
+  if (!flags.finding) {
+    const reviewPayload = {
+      runId: sidecar.runId,
+      repositoryRoot: sidecar.repositoryRoot,
+      open: open.map((c) => ({
+        candidateId: c.candidateId,
+        claimText: c.inconsistency!.claimText,
+        claimScope: c.inconsistency!.claimScope,
+        claimClass: c.inconsistency!.claimClass,
+        proposedRuleKind: c.inconsistency!.proposedRuleKind,
+        divergence: c.inconsistency!.divergence,
+        attribution: c.inconsistency!.attribution,
+      })),
+      resolved: resolved.map((c) => ({ candidateId: c.candidateId, ...c.resolution! })),
+    };
+    if (isMachineMode()) {
+      return emitEnvelope(
+        successEnvelope(command, reviewPayload, {
+          decisionRequest: buildResolveDecisionRequest(sidecar.runId, open),
+          humanSummary:
+            open.length === 0
+              ? "No open doc/code findings in this run."
+              : `${open.length} open finding${open.length === 1 ? "" : "s"}: a document and a commit ` +
+                "disagree. Nothing is decided until you answer.",
+        }),
+        0,
+      );
+    }
+    if (flags.json) {
+      console.log(JSON.stringify(reviewPayload, null, 2));
+    } else {
+      console.log(renderResolveReview(sidecar.runId, open, resolved));
+    }
+    return 0;
+  }
+
+  // A verdict. Resolve the prefix fail-closed against the FINDINGS only: a prefix that matches a
+  // durable rule is not "no match", it is the wrong verb, and saying so beats "no candidate id".
+  const matches = findings.filter((c) => c.candidateId.toLowerCase().startsWith(flags.finding!));
+  if (matches.length === 0) {
+    const elsewhere = sidecar.candidates.some((c) => c.candidateId.toLowerCase().startsWith(flags.finding!));
+    return failInMode(
+      command,
+      "invalid_selection",
+      elsewhere
+        ? `refusing to resolve: "${flags.finding}" is a candidate in this run but not a finding. ` +
+            "Durable rules are accepted with `mla enrich accept`, not resolved."
+        : `refusing to resolve: no finding id starts with "${flags.finding}" in this run`,
+      2,
+    );
+  }
+  if (matches.length > 1) {
+    return failInMode(
+      command,
+      "invalid_selection",
+      `refusing to resolve: finding id prefix "${flags.finding}" is ambiguous (matches ${matches.length}); use more characters`,
+      2,
+    );
+  }
+  const target = matches[0];
+  // Re-resolving is refused rather than overwritten: the first answer already minted (or explicitly
+  // did not), and silently replacing it would leave a rule live under a verdict that no longer says
+  // it should be. Re-running the SAME answer is a no-op, so a retried command is safe.
+  if (target.resolution && target.resolution.outcome !== flags.as) {
+    return failInMode(
+      command,
+      "already_resolved",
+      `refusing to resolve: finding ${target.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN)} is already ` +
+        `resolved as ${target.resolution.outcome}. Re-run \`mla enrich plan\` to re-surface it if the ` +
+        "repository has changed.",
+      2,
+    );
+  }
+
+  const outcome = flags.as!;
+  const authorityScope: RuleAuthorityScope = flags.team ? "TEAM" : "PERSONAL";
+  let mintOutcomes: MintOutcome[] = [];
+  let delivered = false;
+  let deliveryError: string | null = null;
+  let materialized: MaterializeResult | null = null;
+
+  // `code_diverged` is the ONLY answer that touches the authority. The other two record a verdict.
+  if (outcome === "code_diverged") {
+    const ruleCandidate = findingToRuleCandidate(target);
+    if (!ruleCandidate) {
+      return failInMode(
+        command,
+        "invalid_selection",
+        `refusing to mint: finding ${target.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN)} carries no verified claim`,
+        2,
+      );
+    }
+    const managedPath = join(sidecar.repositoryRoot, MANAGED_RULES_PATH);
+    materialized = materializeRules(readManagedFile(managedPath), [ruleCandidate]);
+
+    if (materialized.materialized.length > 0 && !flags.dryRun) {
+      const minted = await mintAndDeliverRules(
+        materialized.materialized,
+        {
+          verb: "resolve",
+          command,
+          team: flags.team,
+          yes: flags.yes,
+          workspace: flags.workspace,
+          repositoryRoot: sidecar.repositoryRoot,
+        },
+        deps,
+      );
+      if (!minted.ok) return minted.exitCode;
+      mintOutcomes = minted.outcomes;
+      delivered = minted.delivered;
+      deliveryError = minted.deliveryError;
+    }
+    if (materialized.changed && !flags.dryRun) writeManagedFile(managedPath, materialized.text);
+  }
+
+  // Stamp the verdict LAST, and never on a dry run: a finding recorded as closed while its rule
+  // never reached the authority is the one state this ordering makes unreachable.
+  if (!flags.dryRun) {
+    const resolution: FindingResolutionRecord = {
+      outcome,
+      resolvedAt: new Date().toISOString(),
+      ...(outcome === "code_diverged" && mintOutcomes.length > 0
+        ? { mintedRuleKind: target.inconsistency!.proposedRuleKind }
+        : {}),
+    };
+    upsertCandidatesSidecar(HOME, {
+      ...sidecar,
+      updatedAt: new Date().toISOString(),
+      candidates: [{ ...target, resolution }],
+    });
+  }
+
+  const minted = mintOutcomes.filter((o) => o.status === "minted");
+  const alreadyLive = mintOutcomes.filter((o) => o.status === "already_live");
+  const resolvePayload = {
+    runId: sidecar.runId,
+    repositoryRoot: sidecar.repositoryRoot,
+    findingId: target.candidateId,
+    resolution: outcome,
+    dryRun: flags.dryRun,
+    authorityScope,
+    minted: minted.map((o) => ({ ruleId: o.ruleId, hash: o.hash, statement: o.rule.statement })),
+    alreadyLive: alreadyLive.map((o) => ({ hash: o.hash, statement: o.rule.statement })),
+    delivered,
+    deliveryError,
+  };
+
+  if (isMachineMode()) return emitEnvelope(successEnvelope(command, resolvePayload), 0);
+  if (flags.json) {
+    console.log(JSON.stringify(resolvePayload, null, 2));
+    return 0;
+  }
+  console.log(renderResolveOutcome(target, outcome, flags.dryRun));
+  if (materialized) {
+    console.log(
+      renderMintSummary(minted, alreadyLive, authorityScope, materialized.materialized.length, flags.dryRun, {
+        delivered,
+        deliveryError,
+      }),
+    );
+  }
+  return 0;
+}
+
+// What resolving DID, in the operator's words. Each answer says what it changed and, just as
+// importantly, what it did not: a verdict that quietly touched nothing reads as a failed command.
+function renderResolveOutcome(
+  target: OnboardingCandidateRecord,
+  outcome: FindingResolution,
+  dryRun: boolean,
+): string {
+  const short = target.candidateId.slice(0, CANDIDATE_ID_DISPLAY_LEN);
+  const would = dryRun ? "Would resolve" : "Resolved";
+  switch (outcome) {
+    case "code_diverged":
+      return `${would} ${short} as code_diverged: the document was right, and its sentence is now a rule.`;
+    case "doc_stale":
+      return (
+        `${would} ${short} as doc_stale: the change was right and ${target.inconsistency!.claimScope} is out of date. ` +
+        "Nothing was minted. Update the document itself; this only records the verdict."
+      );
+    case "carve_out":
+      return `${would} ${short} as carve_out: a deliberate exception. Nothing was minted, and the finding is closed.`;
+    default:
+      return assertNever(outcome, "renderResolveOutcome");
+  }
+}
+
 export async function runEnrich(argv: string[]): Promise<number> {
   const sub = argv[0];
   const rest = argv.slice(1);
@@ -1798,6 +2297,8 @@ export async function runEnrich(argv: string[]): Promise<number> {
       return runEnrichMaterialize(rest);
     case "accept":
       return runEnrichAccept(rest);
+    case "resolve":
+      return runEnrichResolve(rest);
     default:
       console.error(`unknown \`mla enrich\` subcommand: ${sub}\n`);
       console.error(USAGE);

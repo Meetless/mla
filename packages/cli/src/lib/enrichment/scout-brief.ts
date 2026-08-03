@@ -13,9 +13,9 @@
 // the two surfaces cannot drift (plan §4).
 //
 // Capability boundary: SCOUT_TOOL_ALLOWLIST is the single source of truth for what
-// each scout may do. The documentation scout gets Read only; the history scout gets
-// nothing (it interprets in-prompt evidence). A static test (gate 7) asserts neither
-// allowlist contains a shell, mutation, or network tool, and the subagent .md
+// each scout may do. The documentation and reconciliation scouts get Read only; the
+// history scout gets nothing (it interprets in-prompt evidence). A static test (gate 7)
+// asserts NO allowlist contains a shell, mutation, or network tool, and the subagent .md
 // definitions' `tools:` frontmatter is cross-checked against this map.
 
 import {
@@ -25,6 +25,15 @@ import {
   DocumentationTarget,
   PreparedGitEvidence,
   MAX_STATEMENT_LENGTH,
+  MAX_CLAIM_TEXT_LENGTH,
+  MAX_CLAIM_SCOPE_LENGTH,
+  DOC_CLAIM_CLASSES,
+  MINTABLE_ENRICHMENT_KINDS,
+  RECONCILIATION_FINDING_KIND,
+  SCOUT_CANDIDATE_KINDS,
+  scoutMayEmitKind,
+  assertNever,
+  scoutCandidateCap,
 } from "./protocol";
 import { buildScoutPolicy, ScoutPolicy } from "../scanner/scout-mission";
 
@@ -36,6 +45,12 @@ import { buildScoutPolicy, ScoutPolicy } from "../scanner/scout-mission";
 export const SCOUT_TOOL_ALLOWLIST: Record<ScoutName, readonly string[]> = {
   documentation: ["Read"],
   history: [],
+  // Reads the ranked doc targets itself so it depends on NEITHER sibling scout's output and
+  // adds no serial stage. Its commit evidence is inlined by the plan, exactly as the history
+  // scout's is. Read only: it never runs git, and never gets a shell. Every git operation
+  // this finding needs (blame, ancestry, author) happens later, in the trusted CLI, against
+  // anchors ingest has already validated.
+  reconciliation: ["Read"],
 };
 
 // The Claude Code subagent `name:` each scout role dispatches as. `/mla onboard`
@@ -46,6 +61,7 @@ export const SCOUT_TOOL_ALLOWLIST: Record<ScoutName, readonly string[]> = {
 export const SCOUT_AGENT_NAME: Record<ScoutName, string> = {
   documentation: "meetless-doc-scout",
   history: "meetless-history-scout",
+  reconciliation: "meetless-reconciliation-scout",
 };
 
 function renderCategoryLines(policy: ScoutPolicy): string[] {
@@ -111,23 +127,78 @@ function toolLine(role: ScoutName): string {
   return `Your only tools are: ${tools.join(", ")}. Do not attempt any other tool.`;
 }
 
-// Each scout's INDEPENDENT hard cap (verdict item 8: no reallocation). ingest bounds every
-// scout at maxCandidatesPerScout regardless of what the other scout produced, so this is the
-// exact ceiling a scout should aim at; telling it up front stops it over-producing candidates
-// ingest would only drop. At least 1 so a scout is never told to surface nothing.
-function perScoutTarget(run: OnboardingRun): number {
-  return Math.max(1, run.limits.maxCandidatesPerScout);
+// Each scout's INDEPENDENT hard cap (verdict item 8: no reallocation). Read from
+// scoutCandidateCap, the SAME function ingest allocates from, so the number a scout is told
+// to aim at is by construction the number ingest will honor. A single persisted scalar on the
+// run's `limits` cannot express per-role caps, which is why none exists: a role capped at 3
+// would be told to aim at 10 and have 7 findings silently dropped. At least 1 so a scout is
+// never told to surface nothing.
+function perScoutTarget(role: ScoutName): number {
+  return Math.max(1, scoutCandidateCap(role));
 }
 
-function renderOutputContract(run: OnboardingRun, role: ScoutName): string[] {
-  const evidenceExample =
-    role === "documentation"
-      ? '{ "type": "file", "path": "<one of the documents above>", "startLine": 10, "endLine": 24 }'
-      : '{ "type": "commit", "commit": "<one of the commits above>", "path": "optional/historical/path" }';
-  const anchorRule =
-    role === "documentation"
-      ? "Every candidate needs at least one `file` anchor whose path is exactly one of the documents listed above; the line range must point at the text that states the claim."
-      : "Every candidate needs at least one `commit` anchor whose SHA is exactly one of the commits listed above; an optional `path` may name a historical file even if it no longer exists at HEAD.";
+// The per-role anchor contract. A switch, not a ternary: an `else` branch would have handed a
+// new role whichever contract happened to be written second, and the compiler would not have
+// said a word. Adding a ScoutName now fails the build here (see assertNever).
+function anchorContract(role: ScoutName): { evidenceExample: string; anchorRule: string } {
+  switch (role) {
+    case "documentation":
+      return {
+        evidenceExample:
+          '{ "type": "file", "path": "<one of the documents above>", "startLine": 10, "endLine": 24 }',
+        anchorRule:
+          "Every candidate needs at least one `file` anchor whose path is exactly one of the documents listed above; the line range must point at the text that states the claim.",
+      };
+    case "history":
+      return {
+        evidenceExample:
+          '{ "type": "commit", "commit": "<one of the commits above>", "path": "optional/historical/path" }',
+        anchorRule:
+          "Every candidate needs at least one `commit` anchor whose SHA is exactly one of the commits listed above; an optional `path` may name a historical file even if it no longer exists at HEAD.",
+      };
+    case "reconciliation":
+      return {
+        evidenceExample:
+          '{ "type": "file", "path": "<the document above that states the rule>", "startLine": 10, "endLine": 24 },\n' +
+          '                     { "type": "commit", "commit": "<the commit above that does the opposite>", "path": "the/file/it/touched" }',
+        anchorRule:
+          "Every candidate needs BOTH anchors: a `file` anchor whose path is exactly one of the documents above and whose line range covers the exact sentence stating the rule, AND a `commit` anchor whose SHA is exactly one of the commits above with the `path` set to the file that commit touched. One anchor alone is not a finding: without the document there is no rule, and without the commit there is no divergence.",
+      };
+    default:
+      return assertNever(role, "anchorContract");
+  }
+}
+
+// The `inconsistency` payload, rendered ONLY for the role whose kind requires it. Every field
+// here is re-derived by `enrich ingest` from the evidence the plan already froze: the quote is
+// re-read from the document at the run's head commit and must match verbatim, and the path,
+// status, and renamedFrom must match the commit's prepared file list exactly. So this block is
+// not asking the scout to summarize; it is asking it to COPY, and anything it invents is
+// rejected rather than persisted.
+function renderInconsistencyField(role: ScoutName): string[] {
+  if (!scoutMayEmitKind(role, RECONCILIATION_FINDING_KIND)) {
+    return [];
+  }
+  return [
+    '      "inconsistency": {',
+    `        "claimClass": "<one of: ${DOC_CLAIM_CLASSES.join(" | ")}>",`,
+    `        "claimText": "<the rule sentence COPIED VERBATIM from the document, ${MAX_CLAIM_TEXT_LENGTH} characters or fewer>",`,
+    `        "claimScope": "<the exact path the rule governs, or a directory prefix ending in /, ${MAX_CLAIM_SCOPE_LENGTH} characters or fewer>",`,
+    `        "proposedRuleKind": "<if a human adopted this rule, which kind it would be: ${MINTABLE_ENRICHMENT_KINDS.join(" | ")}>",`,
+    '        "divergence": {',
+    '          "path": "<the file the commit touched, copied exactly from that commit\'s files list above>",',
+    '          "status": "<that file\'s status letter, copied exactly from the same line>",',
+    '          "renamedFrom": "<ONLY for a rename/copy: the old path shown in parentheses on that line>"',
+    "        }",
+    "      },",
+  ];
+}
+
+// No longer takes the run: every number here is now a property of the ROLE (its own cap) or a
+// protocol constant. The run's `limits.maxCandidatesTotal` is derived from the per-role caps,
+// so quoting it told the scout a ceiling that could never bind it before its own cap did.
+function renderOutputContract(role: ScoutName): string[] {
+  const { evidenceExample, anchorRule } = anchorContract(role);
   return [
     "Return EXACTLY one JSON object and nothing else (no prose before or after it):",
     "",
@@ -140,6 +211,7 @@ function renderOutputContract(run: OnboardingRun, role: ScoutName): string[] {
     `      "statement": "<one specific claim, ${MAX_STATEMENT_LENGTH} characters or fewer>",`,
     `      "evidence": [ ${evidenceExample} ],`,
     `      "sourceScout": "${role}",`,
+    ...renderInconsistencyField(role),
     '      "rationale": "<optional: WHY this governs, in YOUR words. OMIT this AND rationaleSource together when the why is obvious>",',
     '      "rationaleSource": "AGENT_SUMMARY"   // PAIRED with rationale: include ONLY when you wrote a rationale above; omit it whenever rationale is omitted',
     "    }",
@@ -157,30 +229,67 @@ function renderOutputContract(run: OnboardingRun, role: ScoutName): string[] {
     `Keep each statement to ${MAX_STATEMENT_LENGTH} characters or fewer: a longer statement is ` +
       "rejected outright at ingest, not truncated, so state the claim concisely and let the " +
       "evidence anchor carry the detail.",
-    `Aim for the highest-value ${perScoutTarget(run)} candidates or fewer. That per-scout cap is ` +
-      "yours alone: it is not shared with or reallocated to the other scout, so candidates past it " +
-      `are dropped at ingest. The run keeps at most ${run.limits.maxCandidatesTotal} candidates ` +
-      "across all scouts. Pick the highest-value ones rather than padding.",
+    `Aim for the highest-value ${perScoutTarget(role)} candidates or fewer. That cap is yours ` +
+      "alone: it is not shared with, borrowed from, or reallocated to any other scout, so " +
+      "candidates past it are dropped at ingest. Scouts have different caps, and yours is the " +
+      "only number that governs you. Pick the highest-value ones rather than padding.",
     'Zero candidates with status "complete" is a valid, successful result: only record a',
     "candidate you can anchor to the evidence above.",
-    "If two sources contradict each other on a governing point, that IS a governance",
-    "signal: surface it as a `decision` or `deprecation` candidate that names which",
-    "source supersedes which, anchored to both. Do not append free prose; the JSON",
-    "object above is the entire output.",
+    ...renderContradictionRule(role),
+    "Do not append free prose; the JSON object above is the entire output.",
   ];
+}
+
+// What each role does with a contradiction. A switch, not one paragraph shown to everyone: the
+// two extraction scouts each hold half the evidence and must fold a conflict into an ordinary
+// governance candidate, while the reconciliation scout has a kind for exactly this and would be
+// rejected at ingest for emitting `decision` or `deprecation` instead (SCOUT_CANDIDATE_KINDS).
+function renderContradictionRule(role: ScoutName): string[] {
+  switch (role) {
+    case "documentation":
+    case "history":
+      return [
+        "If two sources contradict each other on a governing point, that IS a governance",
+        "signal: surface it as a `decision` or `deprecation` candidate that names which",
+        "source supersedes which, anchored to both.",
+      ];
+    case "reconciliation":
+      return [
+        "A historical commit and a current document are NOT automatically inconsistent. The",
+        "document must already have stated the rule when the commit landed; a commit that",
+        "predates the rule broke nothing. The CLI proves that ordering with git after you",
+        "return, and silently drops any finding it cannot prove, so spend your effort on the",
+        "ones where the document is visibly older than the change, and report nothing when",
+        "you are unsure.",
+        "Copy, do not paraphrase. `claimText` must be the document's own sentence, character",
+        "for character; the CLI re-reads that line range and rejects anything that is not an",
+        "exact quote. `divergence.path`, `divergence.status`, and `divergence.renamedFrom`",
+        "must be copied from the commit's files list above, and are checked the same way.",
+        "The status letter has to PROVE the claim you picked: `never_modify` needs M,",
+        "`never_add` needs A, `never_delete` needs D, `never_rename` needs R or C. A file",
+        "that was merely modified does not prove a rule about adding files, and a rule you",
+        "cannot state as one of those four classes is not a finding for this run.",
+        "`claimScope` must cover `divergence.path`: the exact path, or a directory prefix",
+        "ending in `/` that the changed file sits under. A rule about one file says nothing",
+        "about its neighbours.",
+      ];
+    default:
+      return assertNever(role, "renderContradictionRule");
+  }
 }
 
 /**
  * Render the brief for one scout role from the authoritative run record. Pure: the
  * same (run, role, deadlineAt) always yields the same string. The documentation brief
  * lists the exact ranked document targets and grants Read; the history brief inlines the
- * bounded git evidence and grants no tools. Both state the shared scout policy and
- * the JSON output contract `enrich ingest` expects.
+ * bounded git evidence and grants no tools; the reconciliation brief carries both halves,
+ * because a doc/code disagreement is invisible to anyone holding only one. Every brief
+ * states the shared scout policy and the JSON output contract `enrich ingest` expects.
  *
  * `deadlineAt` overrides the run's frozen deadline. `enrich brief` passes one, because
  * run.deadlineAt is anchored to PLAN time and the scout does not start at plan time: the
- * agent runs two `enrich brief` calls and then relays the brief verbatim into the Task
- * prompt, and the history brief is tens of kilobytes of git evidence that the orchestrator
+ * agent runs one `enrich brief` call per role and then relays each brief verbatim into the
+ * Task prompt, and the history evidence is tens of kilobytes of git that the orchestrator
  * must emit token by token. That relay alone can burn minutes. Handing the scout a deadline
  * that is already spent (or already past, at which point the brief orders it to return
  * `timed_out` having read nothing) makes the budget a trap rather than a bound. The brief is
@@ -189,7 +298,10 @@ function renderOutputContract(run: OnboardingRun, role: ScoutName): string[] {
  * for audit and lock math; only the sentence the scout reads moves.
  */
 export function buildScoutPrompt(run: OnboardingRun, role: ScoutName, deadlineAt?: string): string {
-  const policy = buildScoutPolicy();
+  // The kinds THIS role may emit, not every kind that exists. A scout produces what it is
+  // shown, and ingest rejects a kind its author's role cannot anchor, so the two lists are
+  // the same list (SCOUT_CANDIDATE_KINDS) rather than two that can drift apart.
+  const policy = buildScoutPolicy(SCOUT_CANDIDATE_KINDS[role]);
   const head = [
     `Onboarding scout: ${role} (run ${run.runId}).`,
     "",
@@ -210,29 +322,68 @@ export function buildScoutPrompt(run: OnboardingRun, role: ScoutName, deadlineAt
     "",
   ];
 
-  const body =
-    role === "documentation"
-      ? [
-          "Read ONLY these documents, in rank order. The plan already selected and ranked",
-          "them; do not search for, glob, or open any other file.",
-          "",
-          `The paths below are relative to the repository root: ${run.repositoryRoot}`,
-          "Your working directory may NOT be that root, so read each document by its",
-          "absolute path (join the root and the relative path). In every candidate's",
-          "evidence, write the path exactly as listed below (relative), not the absolute",
-          "one: ingest anchors evidence against the repository root and rejects absolute",
-          "paths.",
-          "",
-          ...renderDocumentationTargets(run.documentationTargets),
-        ]
-      : [
-          "You cannot open files or run git. The relevant history is reproduced below,",
-          "bounded to what fits this brief. Interpret it: why a current design exists, what",
-          "was reversed or superseded, which mistake keeps reappearing, which approach was",
-          "killed.",
-          "",
-          ...renderGitEvidence(run.historyEvidence),
-        ];
+  return [...head, ...renderMissionBody(run, role), "", ...renderOutputContract(role)].join("\n");
+}
 
-  return [...head, ...body, "", ...renderOutputContract(run, role)].join("\n");
+// The path-handling rule shared by every role that is granted Read. Written once so the
+// documentation and reconciliation briefs cannot drift on the one instruction that decides
+// whether a scout's evidence anchors survive ingest at all.
+function renderPathRule(run: OnboardingRun): string[] {
+  return [
+    `The paths below are relative to the repository root: ${run.repositoryRoot}`,
+    "Your working directory may NOT be that root, so read each document by its",
+    "absolute path (join the root and the relative path). In every candidate's",
+    "evidence, write the path exactly as listed below (relative), not the absolute",
+    "one: ingest anchors evidence against the repository root and rejects absolute",
+    "paths.",
+  ];
+}
+
+// The per-role mission. A switch, not `documentation ? … : …`: under a ternary the
+// reconciliation scout would have silently inherited the history brief, been told it cannot
+// open files, and produced nothing, while the build stayed green.
+function renderMissionBody(run: OnboardingRun, role: ScoutName): string[] {
+  switch (role) {
+    case "documentation":
+      return [
+        "Read ONLY these documents, in rank order. The plan already selected and ranked",
+        "them; do not search for, glob, or open any other file.",
+        "",
+        ...renderPathRule(run),
+        "",
+        ...renderDocumentationTargets(run.documentationTargets),
+      ];
+    case "history":
+      return [
+        "You cannot open files or run git. The relevant history is reproduced below,",
+        "bounded to what fits this brief. Interpret it: why a current design exists, what",
+        "was reversed or superseded, which mistake keeps reappearing, which approach was",
+        "killed.",
+        "",
+        ...renderGitEvidence(run.historyEvidence),
+      ];
+    case "reconciliation":
+      return [
+        "You hold BOTH halves of the evidence, and that is the entire point of this role.",
+        "The other scouts each see one half: one reads the documents, one reads the history,",
+        "and neither can see a disagreement that only exists BETWEEN them.",
+        "",
+        "Your job is narrow. Find places where a document states a rule and a commit in the",
+        "list below did the opposite. Report only that. Do not report rules you agree with,",
+        "do not summarize either source, and do not report a rule with no matching commit.",
+        "",
+        "Read ONLY the documents listed below, in rank order. Do not search for, glob, or",
+        "open any other file, and do not run git: the commits are reproduced for you.",
+        "",
+        ...renderPathRule(run),
+        "",
+        "DOCUMENTS",
+        ...renderDocumentationTargets(run.documentationTargets),
+        "",
+        "COMMITS",
+        ...renderGitEvidence(run.historyEvidence),
+      ];
+    default:
+      return assertNever(role, "renderMissionBody");
+  }
 }

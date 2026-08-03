@@ -35,13 +35,19 @@ import { logsDir, readLogJsonl } from "../lib/analytics/logs";
 
 // Re-export the shared join surface so prior importers (cli.ts, the parity
 // spec) keep importing from `commands/adoption` unchanged.
-export {
+// The six interfaces go through `export type`. A plain `export { SomeInterface }`
+// emits a runtime re-export of a binding that does not exist once a transpile-only
+// compiler (ts-jest with isolatedModules, esbuild, swc) is in the chain, and the
+// importer gets `undefined` with nothing raised anywhere.
+export type {
   AdoptionAggregate,
   FollowthroughRow,
   GovernedCatches,
   InjectTurn,
   McpCall,
   ReportCitation,
+};
+export {
   buildAdoption,
   computeFollowthrough,
   countGovernedCatches,

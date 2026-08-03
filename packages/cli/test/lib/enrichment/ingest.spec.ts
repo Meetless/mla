@@ -20,6 +20,8 @@ import {
 import { buildOnboardingRun, writeRunRecord, runRecordPath } from "../../../src/lib/enrichment/plan";
 import {
   defaultLimits,
+  scoutCandidateCap,
+  SCOUT_NAMES,
   candidateId,
   candidateRelPath,
   type DocumentationTarget,
@@ -30,22 +32,48 @@ import {
   type OnboardingCandidateRecord,
   type OnboardingCandidatesSidecar,
 } from "../../../src/lib/enrichment/protocol";
+import { withIdleScouts } from "../../helpers/scout-state";
 
 const NOW = "2026-06-26T12:00:00.000Z";
 const ALLOWED_SHA = "a".repeat(40);
+const HEAD_SHA = "b".repeat(40); // the run's snapshot: every quote and blame is read AS OF this
+const CLAIM_SHA = "c".repeat(40); // the commit that wrote the rule; a proven ancestor of ALLOWED_SHA
+
+// The document the fake probe serves at HEAD_SHA. Reconciliation fixtures quote it BY LINE, so
+// a claim is "verbatim" in these tests only because it really was copied from here; a fixture
+// that invents its own sentence fails the same substring check a real scout would.
+const RECON_DOC = "CLAUDE.md";
+const reconClaim = (n: number): string =>
+  `Rule ${n}: src/generated/file-${n}.ts is generated and must never be edited by hand.`;
+const RECON_DOC_LINES = Array.from({ length: 40 }, (_, i) => reconClaim(i + 1));
 
 const ALLOWLIST_HISTORY: PreparedGitEvidence[] = [
-  { commit: ALLOWED_SHA, timestamp: "2026-06-20T10:00:00+00:00", subject: "feat: x", body: "", changedFiles: [] },
+  {
+    commit: ALLOWED_SHA,
+    timestamp: "2026-06-20T10:00:00+00:00",
+    subject: "feat: x",
+    body: "",
+    // The changes a finding's `divergence` is checked against, field for field. Recorded here
+    // rather than in each fixture because that is where they live in a real run: the CLI read
+    // them out of git, and the scout only ever gets to copy them.
+    changedFiles: Array.from({ length: 40 }, (_, i) => ({ path: `src/generated/file-${i + 1}.ts`, status: "M" })),
+  },
 ];
 
-// A permissive probe: everything tracked, realpath is identity (in-repo), files are long.
-// Each test overrides only what it needs to flip a single verification check.
+// A permissive probe: everything tracked, realpath is identity (in-repo), files are long, the
+// document reads back at headCommit, one commit wrote the quoted line, and it predates the
+// change. Each test overrides only what it needs to flip a single verification check.
 function makeProbe(over: Partial<FsProbe> = {}): FsProbe {
   return {
     repoRealpath: over.repoRealpath ?? "/repo",
     isTracked: over.isTracked ?? (() => true),
     realpath: over.realpath ?? ((abs) => abs),
     lineCount: over.lineCount ?? (() => 100_000),
+    readFileAtCommit:
+      over.readFileAtCommit ?? ((_commit, relPath) => (relPath === RECON_DOC ? RECON_DOC_LINES.join("\n") : null)),
+    blameRange:
+      over.blameRange ?? (() => [{ commit: CLAIM_SHA, authorName: "Test Author", authorTime: "1750000000" }]),
+    isAncestor: over.isAncestor ?? (() => true),
   };
 }
 
@@ -58,6 +86,7 @@ function seedRun(
     documentationTargets?: DocumentationTarget[];
     historyEvidence?: PreparedGitEvidence[];
     limits?: EnrichmentLimits;
+    headCommit?: string | null;
   } = {},
 ) {
   const run = buildOnboardingRun({
@@ -68,6 +97,7 @@ function seedRun(
     limits: over.limits,
     documentationTargets: over.documentationTargets ?? [],
     historyEvidence: over.historyEvidence ?? ALLOWLIST_HISTORY,
+    headCommit: "headCommit" in over ? over.headCommit : HEAD_SHA,
   });
   writeRunRecord(home, run);
   return run;
@@ -88,6 +118,45 @@ const histCandidate = (over: Partial<EnrichmentCandidate> = {}): EnrichmentCandi
   sourceScout: "history",
   ...over,
 });
+
+// A reconciliation finding is a PAIR of anchors by construction (REQUIRED_ANCHOR_TYPES):
+// the documented claim and the commit that diverged from it. Either one alone is a different
+// scout's finding. `n` picks the line of RECON_DOC it quotes, which is also what makes two
+// fixtures distinct: identity is the verified quote plus the change, never the generated prose.
+const reconCandidate = (over: Partial<EnrichmentCandidate> = {}, n = 1): EnrichmentCandidate => ({
+  kind: "doc_code_inconsistency",
+  statement: `${RECON_DOC} says file-${n} is generated, but a commit edited it by hand.`,
+  evidence: [
+    { type: "file", path: RECON_DOC, startLine: n, endLine: n },
+    { type: "commit", commit: "aaaaaaa" }, // unambiguous prefix of ALLOWED_SHA
+  ],
+  sourceScout: "reconciliation",
+  inconsistency: {
+    claimClass: "never_modify",
+    claimText: reconClaim(n),
+    claimScope: "src/generated/",
+    proposedRuleKind: "constraint",
+    divergence: { path: `src/generated/file-${n}.ts`, status: "M" },
+  },
+  ...over,
+});
+
+// Cap tests need MORE candidates than a role's cap, and the caps are real numbers (10) rather
+// than a test-tuned 1 or 2. Statements must be distinct or dedup merges them and the count
+// under test is not the count that arrived.
+const distinct = (
+  make: (over: Partial<EnrichmentCandidate>) => EnrichmentCandidate,
+  label: string,
+) => (n: number): EnrichmentCandidate[] =>
+  Array.from({ length: n }, (_, i) => make({ statement: `Distinct ${label} statement number ${i + 1}.` }));
+
+const distinctDocs = distinct(docCandidate, "documentation");
+const distinctHists = distinct(histCandidate, "history");
+// Findings vary by the LINE they quote, not by their statement: two findings with different
+// prose over the same quote and the same change are one finding, which is the whole point of
+// hashing the verified quote instead of the generated sentence.
+const distinctRecons = (n: number): EnrichmentCandidate[] =>
+  Array.from({ length: n }, (_, i) => reconCandidate({}, i + 1));
 
 // renderCandidateDocument now takes the MERGED shape (sourceScouts plural). A single-scout
 // candidate is the degenerate merge of one wire candidate.
@@ -112,7 +181,7 @@ function ingestArgs(home: string, runId: string, results: unknown[], probe?: FsP
   };
 }
 
-describe("ingestRun — top-level rejections", () => {
+describe("ingestRun: top-level rejections", () => {
   let home: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "mla-ingest-"));
@@ -173,7 +242,7 @@ describe("ingestRun — top-level rejections", () => {
   });
 });
 
-describe("ingestRun — candidate verification", () => {
+describe("ingestRun: candidate verification", () => {
   let home: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "mla-ingest-"));
@@ -244,7 +313,7 @@ describe("ingestRun — candidate verification", () => {
   });
 });
 
-describe("ingestRun — orchestration", () => {
+describe("ingestRun: orchestration", () => {
   let home: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "mla-ingest-"));
@@ -253,12 +322,12 @@ describe("ingestRun — orchestration", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("marks status complete only when both scouts complete; writes state", async () => {
+  it("marks status complete only when EVERY scout completes; writes state", async () => {
     seedRun(home);
-    const results = [
+    const results = withIdleScouts([
       { scout: "documentation", status: "complete", candidates: [docCandidate()] },
       { scout: "history", status: "complete", candidates: [histCandidate()] },
-    ];
+    ]);
     const res = await ingestRun(ingestArgs(home, "run-1", results));
     expect(res.state?.status).toBe("complete");
     expect(res.state?.scouts.documentation.status).toBe("complete");
@@ -280,10 +349,10 @@ describe("ingestRun — orchestration", () => {
         request: {
           protocolVersion: 1,
           runId,
-          results: [
+          results: withIdleScouts([
             { scout: "documentation", status: "complete", candidates: [docCandidate()] },
             { scout: "history", status: "complete", candidates: [histCandidate()] },
-          ],
+          ]),
         },
         persist: jest.fn(async (docs: PersistDocument[]) => ({
       docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })),
@@ -312,10 +381,13 @@ describe("ingestRun — orchestration", () => {
 
   it("marks status partial when a scout reports it did not finish; persists nothing for it", async () => {
     seedRun(home);
-    const args = ingestArgs(home, "run-1", [
+    // Every other role reports complete, so the timed-out history scout is the ONLY reason
+    // the run is partial. Leaving a role silently unreported would make the assertion pass
+    // for the wrong reason.
+    const args = ingestArgs(home, "run-1", withIdleScouts([
       { scout: "documentation", status: "complete", candidates: [docCandidate()] },
       { scout: "history", status: "timed_out", candidates: [], error: "budget exceeded" },
-    ]);
+    ]));
     const res = await ingestRun(args);
     expect(res.state?.status).toBe("partial");
     expect(res.state?.scouts.history.status).toBe("timed_out");
@@ -326,18 +398,18 @@ describe("ingestRun — orchestration", () => {
   it("does not re-process a scout already complete on rerun (resume)", async () => {
     seedRun(home);
     // run 1: doc complete, history failed
-    const first = ingestArgs(home, "run-1", [
+    const first = ingestArgs(home, "run-1", withIdleScouts([
       { scout: "documentation", status: "complete", candidates: [docCandidate()] },
       { scout: "history", status: "failed", candidates: [], error: "git error" },
-    ]);
+    ]));
     await ingestRun(first);
     expect(first.persist).toHaveBeenCalledTimes(1);
 
     // run 2: doc re-reported (must be SKIPPED), history now complete
-    const second = ingestArgs(home, "run-1", [
+    const second = ingestArgs(home, "run-1", withIdleScouts([
       { scout: "documentation", status: "complete", candidates: [docCandidate()] },
       { scout: "history", status: "complete", candidates: [histCandidate()] },
-    ]);
+    ]));
     const res = await ingestRun(second);
     expect(res.state?.status).toBe("complete");
     const docOut = res.outcomes.find((o) => o.scout === "documentation")!;
@@ -358,10 +430,10 @@ describe("ingestRun — orchestration", () => {
     // the wire and landed none of them has made no progress and MUST stay retryable.
     seedRun(home);
     const bad = { ...docCandidate(), sourceScout: undefined };
-    const first = ingestArgs(home, "run-1", [
+    const first = ingestArgs(home, "run-1", withIdleScouts([
       { scout: "documentation", status: "complete", candidates: [bad, bad] },
       { scout: "history", status: "complete", candidates: [histCandidate()] },
-    ]);
+    ]));
     const firstRes = await ingestRun(first);
 
     const docFirst = firstRes.outcomes.find((o) => o.scout === "documentation")!;
@@ -371,10 +443,10 @@ describe("ingestRun — orchestration", () => {
     expect(firstRes.state?.status).not.toBe("complete");
 
     // Rerun with the corrected candidates: they must actually land, not be skipped.
-    const second = ingestArgs(home, "run-1", [
+    const second = ingestArgs(home, "run-1", withIdleScouts([
       { scout: "documentation", status: "complete", candidates: [docCandidate()] },
       { scout: "history", status: "complete", candidates: [histCandidate()] },
-    ]);
+    ]));
     const res = await ingestRun(second);
     const docOut = res.outcomes.find((o) => o.scout === "documentation")!;
     expect(docOut.errors.map((e) => e.code)).not.toContain("already_complete");
@@ -396,6 +468,9 @@ describe("ingestRun — orchestration", () => {
       schemaVersion: 1 as unknown as 2, // the stranded v1 shape, exactly as An's run has it
       status: "partial",
       updatedAt: NOW,
+      // Deliberately a hand-written two-role literal, NOT scoutStates(): a v1 file on disk
+      // predates the third scout and really does name only these two. The cast below is what
+      // lets an off-roster shape compile, which is the whole point of the test.
       scouts: {
         documentation: { status: "complete", candidateCount: 0 }, // landed nothing, skipped forever
         history: { status: "persistence_failed", error: "kb-add persistence failed" },
@@ -406,10 +481,10 @@ describe("ingestRun — orchestration", () => {
 
     // The documentation scout is therefore runnable again: its candidates actually land.
     const res = await ingestRun(
-      ingestArgs(home, "run-1", [
+      ingestArgs(home, "run-1", withIdleScouts([
         { scout: "documentation", status: "complete", candidates: [docCandidate()] },
         { scout: "history", status: "complete", candidates: [histCandidate()] },
-      ]),
+      ])),
     );
     const docOut = res.outcomes.find((o) => o.scout === "documentation")!;
     expect(docOut.errors.map((e) => e.code)).not.toContain("already_complete");
@@ -426,10 +501,10 @@ describe("ingestRun — orchestration", () => {
     // would re-run a finished onboarding forever.
     seedRun(home);
     const res = await ingestRun(
-      ingestArgs(home, "run-1", [
+      ingestArgs(home, "run-1", withIdleScouts([
         { scout: "documentation", status: "complete", candidates: [] },
         { scout: "history", status: "complete", candidates: [histCandidate()] },
-      ]),
+      ])),
     );
     const docOut = res.outcomes.find((o) => o.scout === "documentation")!;
     expect(docOut).toMatchObject({ received: 0, accepted: 0, persisted: 0 });
@@ -437,108 +512,95 @@ describe("ingestRun — orchestration", () => {
     expect(res.state?.status).toBe("complete");
   });
 
-  it("enforces the run-wide candidate cap", async () => {
+  it("has no run-wide backstop: a low recorded maxCandidatesTotal binds nothing", async () => {
+    // `limits.maxCandidatesTotal` is display and audit metadata, derived from the per-role
+    // caps. It is deliberately NOT a second enforcement point. A run-total that could be set
+    // below the sum of the caps would have to be drained in some order across scouts, and
+    // draining a shared pool in list order is precisely the bug the per-role map removed:
+    // whichever role sorted last silently allocated whatever was left, often zero.
     seedRun(home, { limits: { ...defaultLimits(), maxCandidatesTotal: 1 } });
-    const results = [
-      {
-        scout: "documentation",
-        status: "complete",
-        candidates: [docCandidate(), docCandidate({ statement: "Second distinct convention here." })],
-      },
-    ];
-    const res = await ingestRun(ingestArgs(home, "run-1", results));
-    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
-    expect(doc.accepted).toBe(1);
-    expect(doc.rejected).toBe(1);
-    expect(doc.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
-  });
-
-  it("caps each scout independently at the per-scout cap, no reallocation (verdict item 8)", async () => {
-    // Each scout gets its OWN cap, not a share of a pooled total. With a per-scout cap of 1
-    // and a non-binding run total of 20, both scouts produce 2 and each keeps exactly 1 of
-    // its own; neither can starve the other (the old fair-share pool let the first slot
-    // swallow a tiny shared total and starve the second).
-    seedRun(home, { limits: { ...defaultLimits(), maxCandidatesPerScout: 1, maxCandidatesTotal: 20 } });
-    const results = [
-      {
-        scout: "documentation",
-        status: "complete",
-        candidates: [docCandidate(), docCandidate({ statement: "Second distinct doc convention." })],
-      },
-      {
-        scout: "history",
-        status: "complete",
-        candidates: [histCandidate(), histCandidate({ statement: "Second distinct history decision." })],
-      },
-    ];
-    const res = await ingestRun(ingestArgs(home, "run-1", results));
-    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
-    const hist = res.outcomes.find((o) => o.scout === "history")!;
-    expect(doc.accepted).toBe(1);
-    expect(hist.accepted).toBe(1);
-    expect(doc.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
-    expect(hist.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
-  });
-
-  it("does NOT reallocate an under-producing scout's surplus to the other scout (verdict item 8)", async () => {
-    // Inverse of the retired fair-share behavior. Per-scout cap 2, total 20 (non-binding).
-    // documentation sends 1 (under its own cap of 2), history sends 3. The unused
-    // documentation slot must NOT flow to history: history is still bounded at its own 2,
-    // so it keeps 2 and rejects 1 (it would have kept all 3 under the old reallocation).
-    seedRun(home, { limits: { ...defaultLimits(), maxCandidatesPerScout: 2, maxCandidatesTotal: 20 } });
-    const results = [
-      { scout: "documentation", status: "complete", candidates: [docCandidate()] },
-      {
-        scout: "history",
-        status: "complete",
-        candidates: [
-          histCandidate(),
-          histCandidate({ statement: "Second distinct history decision." }),
-          histCandidate({ statement: "Third distinct history decision." }),
-        ],
-      },
-    ];
-    const res = await ingestRun(ingestArgs(home, "run-1", results));
-    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
-    const hist = res.outcomes.find((o) => o.scout === "history")!;
-    expect(doc.accepted).toBe(1);
-    expect(doc.rejected).toBe(0);
-    expect(hist.accepted).toBe(2); // <- was 3 under the old surplus-redistribution
-    expect(hist.rejected).toBe(1);
-    expect(hist.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
-  });
-
-  it("counts a prior-complete scout's candidates against the run-total backstop on resume", async () => {
-    // The run-total backstop (not the per-scout cap) still bounds resume. Run 1:
-    // documentation completes with 2 candidates. Run 2: history arrives with a per-scout
-    // cap of 2 but only 1 slot left under the run total of 3 (3 - 2 prior), so it keeps 1.
-    seedRun(home, { limits: { ...defaultLimits(), maxCandidatesPerScout: 2, maxCandidatesTotal: 3 } });
-    await ingestRun(
-      ingestArgs(home, "run-1", [
-        {
-          scout: "documentation",
-          status: "complete",
-          candidates: [docCandidate(), docCandidate({ statement: "Second distinct doc convention." })],
-        },
-      ]),
-    );
     const res = await ingestRun(
       ingestArgs(home, "run-1", [
-        {
-          scout: "history",
-          status: "complete",
-          candidates: [
-            histCandidate(),
-            histCandidate({ statement: "Second distinct history decision." }),
-            histCandidate({ statement: "Third distinct history decision." }),
-          ],
-        },
+        { scout: "documentation", status: "complete", candidates: distinctDocs(3) },
+      ]),
+    );
+    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
+    expect(doc.accepted).toBe(3); // its own cap is 10; the recorded total of 1 changes nothing
+    expect(doc.rejected).toBe(0);
+    expect(doc.errors.map((e) => e.code)).not.toContain("candidate_cap_exceeded");
+  });
+
+  it("caps each scout at its OWN cap, which differ per role (verdict item 8)", async () => {
+    // Roles do not share a number. documentation is capped at 10 and reconciliation at 3, so
+    // a single scalar could never describe both: whichever value it held, one role would be
+    // told the wrong limit and have the difference silently dropped. Each scout here sends
+    // one more than its own cap and keeps exactly its own cap.
+    const docCap = scoutCandidateCap("documentation");
+    const reconCap = scoutCandidateCap("reconciliation");
+    expect(docCap).not.toBe(reconCap); // the premise: this is a per-ROLE cap, not one number
+    seedRun(home);
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [
+        { scout: "documentation", status: "complete", candidates: distinctDocs(docCap + 1) },
+        { scout: "reconciliation", status: "complete", candidates: distinctRecons(reconCap + 1) },
+      ]),
+    );
+    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
+    const recon = res.outcomes.find((o) => o.scout === "reconciliation")!;
+    expect(doc.accepted).toBe(docCap);
+    expect(doc.rejected).toBe(1);
+    expect(recon.accepted).toBe(reconCap);
+    expect(recon.rejected).toBe(1);
+    expect(doc.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
+    expect(recon.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
+  });
+
+  it("does NOT reallocate an under-producing scout's surplus to another scout (verdict item 8)", async () => {
+    // Inverse of the retired fair-share behavior. documentation sends 1, far under its cap of
+    // 10. Those 9 unused slots must NOT flow to reconciliation: it stays bounded at its own
+    // 3 and rejects the 4th (under the old reallocation it would have kept all 4).
+    const reconCap = scoutCandidateCap("reconciliation");
+    seedRun(home);
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [
+        { scout: "documentation", status: "complete", candidates: [docCandidate()] },
+        { scout: "reconciliation", status: "complete", candidates: distinctRecons(reconCap + 1) },
+      ]),
+    );
+    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
+    const recon = res.outcomes.find((o) => o.scout === "reconciliation")!;
+    expect(doc.accepted).toBe(1);
+    expect(doc.rejected).toBe(0);
+    expect(recon.accepted).toBe(reconCap);
+    expect(recon.rejected).toBe(1);
+    expect(recon.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
+  });
+
+  it("gives a resuming scout its FULL own cap, whatever a prior scout already landed", async () => {
+    // The retired run-total backstop counted a prior-complete scout's candidates against the
+    // resuming one, so a productive first scout could starve a later one to zero on resume.
+    // A per-role cap does not depend on what any other scout produced. Run 1: documentation
+    // completes at its full cap of 10. Run 2: history still gets all 10 of its own, even
+    // though the recorded total here is a deliberately absurd 3.
+    const docCap = scoutCandidateCap("documentation");
+    const histCap = scoutCandidateCap("history");
+    seedRun(home, { limits: { ...defaultLimits(), maxCandidatesTotal: 3 } });
+    const first = await ingestRun(
+      ingestArgs(home, "run-1", [
+        { scout: "documentation", status: "complete", candidates: distinctDocs(docCap) },
+      ]),
+    );
+    expect(first.outcomes.find((o) => o.scout === "documentation")!.accepted).toBe(docCap);
+
+    const res = await ingestRun(
+      ingestArgs(home, "run-1", [
+        { scout: "history", status: "complete", candidates: distinctHists(histCap) },
       ]),
     );
     const hist = res.outcomes.find((o) => o.scout === "history")!;
-    expect(hist.accepted).toBe(1);
-    expect(hist.rejected).toBe(2);
-    expect(hist.errors.map((e) => e.code)).toContain("candidate_cap_exceeded");
+    expect(hist.accepted).toBe(histCap); // <- was 0 under the old prior-counting backstop
+    expect(hist.rejected).toBe(0);
+    expect(hist.errors.map((e) => e.code)).not.toContain("candidate_cap_exceeded");
   });
 
   it("dedups identical candidates to one persisted document", async () => {
@@ -552,6 +614,50 @@ describe("ingestRun — orchestration", () => {
     expect(doc.persisted).toBe(1); // collapsed to one unique document
     const docs = (args.persist as jest.Mock).mock.calls[0][0];
     expect(docs).toHaveLength(1);
+  });
+
+  it("collapses two findings that differ ONLY in their generated explanation (fixture 18)", async () => {
+    // The statement is prose an LLM wrote about the finding, and prose is not stable across
+    // runs or across models. Identity is the CLI-verified quote plus the change, so two
+    // sentences describing the same line and the same commit are one finding, not two.
+    seedRun(home);
+    const args = ingestArgs(home, "run-1", [
+      {
+        scout: "reconciliation",
+        status: "complete",
+        candidates: [
+          reconCandidate({ statement: "CLAUDE.md forbids editing this generated file, and a commit edited it." }),
+          reconCandidate({ statement: "A hand edit landed in a file the docs mark generated." }),
+        ],
+      },
+    ]);
+    const res = await ingestRun(args);
+    const recon = res.outcomes.find((o) => o.scout === "reconciliation")!;
+    expect(recon.accepted).toBe(2);
+    expect(recon.persisted).toBe(1);
+    expect((args.persist as jest.Mock).mock.calls[0][0]).toHaveLength(1);
+  });
+
+  it("lands the SAME finding document after an unrelated HEAD advance (fixture 17)", async () => {
+    // A later run reads the same evidence at a newer headCommit, because the repository moved
+    // for reasons that touched neither the document nor the commit. `headCommit` is deliberately
+    // outside the identity: including it would mint a fresh copy of every open finding on every
+    // commit anyone makes, which is the fastest way to make the inbox worthless.
+    seedRun(home, { runId: "run-1", headCommit: HEAD_SHA });
+    const first = ingestArgs(home, "run-1", [
+      { scout: "reconciliation", status: "complete", candidates: [reconCandidate()] },
+    ]);
+    await ingestRun(first);
+
+    seedRun(home, { runId: "run-2", headCommit: "e".repeat(40) });
+    const second = ingestArgs(home, "run-2", [
+      { scout: "reconciliation", status: "complete", candidates: [reconCandidate()] },
+    ]);
+    await ingestRun(second);
+
+    const firstDoc = (first.persist as jest.Mock).mock.calls[0][0][0];
+    const secondDoc = (second.persist as jest.Mock).mock.calls[0][0][0];
+    expect(secondDoc.relPath).toBe(firstDoc.relPath); // same document, so the KB updates in place
   });
 
   it("merges an exact cross-scout duplicate into ONE document citing both anchors (verdict item 9)", async () => {
@@ -869,30 +975,48 @@ describe("ingestRun — orchestration", () => {
 //
 // These tests pin the property that was missing: PROGRESS IS MONOTONIC. Whatever lands, stays
 // landed, and only the documents that actually failed come back on the next run.
-describe("ingestRun — batched persistence (progress must survive a failure)", () => {
+describe("ingestRun: batched persistence (progress must survive a failure)", () => {
   let home: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "ml-ingest-batch-"));
   });
   afterEach(() => rmSync(home, { recursive: true, force: true }));
 
-  // Caps default to 10 per scout / 20 total, which is exactly one batch and exactly two. Raise
-  // them so a single scout can produce a run that spans several POSTs.
-  const wideLimits: EnrichmentLimits = {
-    ...defaultLimits(),
-    maxCandidatesTotal: 40,
-    maxCandidatesPerScout: 30,
-  };
+  // Batching needs MORE documents than one POST carries, and no `limits` override can supply
+  // them: the per-role caps live in SCOUT_CANDIDATE_CAPS, so a run record cannot widen them.
+  // The largest run the product can produce is therefore every scout at its own full cap,
+  // which is several batches. Sizing the fixture from the real caps also means these tests
+  // exercise the actual maximum a user can hit rather than an invented one.
+  const CAPS = { documentation: scoutCandidateCap("documentation"), history: scoutCandidateCap("history"), reconciliation: scoutCandidateCap("reconciliation") };
 
-  // n distinct, verifiable candidates. Distinct statements mean distinct KB paths, which is
-  // what makes each document independently attributable to a batch.
-  const nDocs = (n: number): EnrichmentCandidate[] =>
-    Array.from({ length: n }, (_, i) => docCandidate({ statement: `Convention number ${i}: prefer the explicit form.` }));
+  // The full roster at full caps, plus the exact order the batcher will slice.
+  // `ordered` matters: documents are built by walking the scouts in roster order and each
+  // scout's candidates in arrival order, so a test that needs to name the document sitting in
+  // batch N reads it from here instead of guessing which scout owns that batch.
+  function roster() {
+    const doc = distinctDocs(CAPS.documentation);
+    const hist = distinctHists(CAPS.history);
+    const recon = distinctRecons(CAPS.reconciliation);
+    return {
+      results: [
+        { scout: "documentation", status: "complete", candidates: doc },
+        { scout: "history", status: "complete", candidates: hist },
+        { scout: "reconciliation", status: "complete", candidates: recon },
+      ],
+      ordered: [...doc, ...hist, ...recon],
+    };
+  }
 
-  function batchArgs(persist: Persister, candidates: EnrichmentCandidate[], runId = "run-1") {
+  const ROSTER_TOTAL = CAPS.documentation + CAPS.history + CAPS.reconciliation;
+
+  // Batch 2 must fall entirely inside the documentation scout's own run of documents, so the
+  // "one batch failed" tests can say exactly WHICH scout was hurt and which were not.
+  const SECOND_BATCH_IS_DOCUMENTATION = CAPS.documentation >= 2 * PERSIST_BATCH_SIZE;
+
+  function batchArgs(persist: Persister, results: unknown[], runId = "run-1") {
     return {
       env: { home, workspaceId: "ws_1", repositoryRoot: "/repo" },
-      request: { protocolVersion: 1, runId, results: [{ scout: "documentation", status: "complete", candidates }] },
+      request: { protocolVersion: 1, runId, results },
       persist,
       now: NOW,
       probe: makeProbe(),
@@ -900,34 +1024,37 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
   }
 
   it("splits a run across several bounded POSTs instead of one unbounded one", async () => {
-    seedRun(home, { limits: wideLimits });
+    seedRun(home);
     const sizes: number[] = [];
     const persist: Persister = jest.fn(async (docs) => {
       sizes.push(docs.length);
       return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
     });
 
-    const res = await ingestRun(batchArgs(persist, nDocs(25)));
+    const res = await ingestRun(batchArgs(persist, roster().results));
 
-    // 25 documents split into full batches plus a remainder, none larger than the cap. Derive
-    // the expected split from PERSIST_BATCH_SIZE instead of writing the batch layout out by
-    // hand: the cap is a measured number that has already moved once (10 -> 5, when the real
-    // ceiling turned out to be Cloudflare's 100s and not Cloud Run's 300s), and an assertion
-    // that hardcodes today's layout fails the next time the measurement says to move it.
+    // The run splits into full batches plus a remainder, none larger than the cap. Derive the
+    // expected split from PERSIST_BATCH_SIZE instead of writing the batch layout out by hand:
+    // the cap is a measured number that has already moved once (10 -> 5, when the real ceiling
+    // turned out to be Cloudflare's 100s and not Cloud Run's 300s), and an assertion that
+    // hardcodes today's layout fails the next time the measurement says to move it.
     const expected = [
-      ...Array(Math.floor(25 / PERSIST_BATCH_SIZE)).fill(PERSIST_BATCH_SIZE),
-      ...(25 % PERSIST_BATCH_SIZE ? [25 % PERSIST_BATCH_SIZE] : []),
+      ...Array(Math.floor(ROSTER_TOTAL / PERSIST_BATCH_SIZE)).fill(PERSIST_BATCH_SIZE),
+      ...(ROSTER_TOTAL % PERSIST_BATCH_SIZE ? [ROSTER_TOTAL % PERSIST_BATCH_SIZE] : []),
     ];
     expect(sizes).toEqual(expected);
-    expect(sizes.reduce((a, b) => a + b, 0)).toBe(25);
+    expect(sizes.reduce((a, b) => a + b, 0)).toBe(ROSTER_TOTAL);
     expect(sizes.length).toBeGreaterThan(1); // it batched at all
     expect(sizes.every((s) => s <= PERSIST_BATCH_SIZE)).toBe(true);
-    expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(25);
-    expect(res.state?.scouts.documentation.status).toBe("complete");
+    for (const role of SCOUT_NAMES) {
+      expect(res.outcomes.find((o) => o.scout === role)!.persisted).toBe(CAPS[role]);
+      expect(res.state?.scouts[role].status).toBe("complete");
+    }
   });
 
   it("keeps what landed when a later batch fails, and only the failed documents come back", async () => {
-    seedRun(home, { limits: wideLimits });
+    expect(SECOND_BATCH_IS_DOCUMENTATION).toBe(true); // the premise of the per-scout claims below
+    seedRun(home);
     let call = 0;
     const persist: Persister = jest.fn(async (docs) => {
       call += 1;
@@ -935,22 +1062,31 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
       return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
     });
 
-    const res = await ingestRun(batchArgs(persist, nDocs(15)));
+    const res = await ingestRun(batchArgs(persist, roster().results));
 
-    // THE REGRESSION. Under the single POST this was 0: a 504 anywhere erased everything. Ten
-    // documents reached the KB and ten documents are counted.
+    // THE REGRESSION. Under the single POST this was 0: a 504 anywhere erased everything. Every
+    // document outside the lost batch reached the KB and is counted.
+    const landed = res.outcomes.reduce((n, o) => n + o.persisted, 0);
+    expect(landed).toBe(ROSTER_TOTAL - PERSIST_BATCH_SIZE);
+
+    // The lost batch is documentation's, so documentation is the scout left retryable...
     const doc = res.outcomes.find((o) => o.scout === "documentation")!;
-    expect(doc.persisted).toBe(10);
-
-    // ...and the five that did not are not silently dropped. They mark the scout retryable, so
-    // resume re-attempts exactly them.
+    expect(doc.persisted).toBe(CAPS.documentation - PERSIST_BATCH_SIZE);
     expect(doc.errors.map((e) => e.code)).toContain("persistence_partial");
     expect(res.state?.scouts.documentation.status).toBe("persistence_failed");
     expect(res.state?.status).toBe("partial");
+
+    // ...and ONLY that scout. A failed batch is not collective punishment: a scout whose
+    // documents all landed is finished, and resume must not make it pay for a neighbor's 504
+    // by re-running it (and re-spending its tokens).
+    for (const role of ["history", "reconciliation"] as const) {
+      expect(res.outcomes.find((o) => o.scout === role)!.persisted).toBe(CAPS[role]);
+      expect(res.state?.scouts[role].status).toBe("complete");
+    }
   });
 
   it("carries the REAL failure cause, not a generic 'could not persist'", async () => {
-    seedRun(home, { limits: wideLimits });
+    seedRun(home);
     let call = 0;
     const persist: Persister = jest.fn(async (docs) => {
       call += 1;
@@ -958,7 +1094,7 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
       return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
     });
 
-    const res = await ingestRun(batchArgs(persist, nDocs(15)));
+    const res = await ingestRun(batchArgs(persist, roster().results));
 
     // A user who is told only "persistence failed" cannot tell a timeout from a rejected
     // payload. That silence is how a severed request stayed undiagnosed for a day.
@@ -969,60 +1105,67 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
   });
 
   it("still reports a whole-run failure when NOTHING lands", async () => {
-    seedRun(home, { limits: wideLimits });
+    seedRun(home);
     const persist: Persister = jest.fn(async () => {
       throw new Error("intel unreachable");
     });
 
-    const res = await ingestRun(batchArgs(persist, nDocs(15)));
+    const res = await ingestRun(batchArgs(persist, roster().results));
 
     // Batching must not soften a total outage into a cheerful partial. Zero landed is zero
     // progress, and every scout that offered a candidate shares that fate, exactly as before.
-    const doc = res.outcomes.find((o) => o.scout === "documentation")!;
-    expect(doc.persisted).toBe(0);
-    expect(doc.errors.map((e) => e.code)).toContain("persistence_failed");
-    expect(res.state?.scouts.documentation.status).toBe("persistence_failed");
+    for (const role of SCOUT_NAMES) {
+      const out = res.outcomes.find((o) => o.scout === role)!;
+      expect(out.persisted).toBe(0);
+      expect(out.errors.map((e) => e.code)).toContain("persistence_failed");
+      expect(res.state?.scouts[role].status).toBe("persistence_failed");
+    }
   });
 
   it("stops hammering a server that is down, and marks the unattempted documents retryable", async () => {
-    seedRun(home, { limits: wideLimits });
+    seedRun(home);
     const persist: Persister = jest.fn(async () => {
       throw new Error("intel unreachable");
     });
 
-    // 30 documents is several batches. Once two in a row have failed, the server is down, not
+    // A full roster is several batches. Once two in a row have failed, the server is down, not
     // the batch: spending another full request budget per remaining batch to rediscover that
     // would hang the CLI for many minutes before telling the operator anything.
-    await ingestRun(batchArgs(persist, nDocs(30)));
+    expect(Math.ceil(ROSTER_TOTAL / PERSIST_BATCH_SIZE)).toBeGreaterThan(2);
+    await ingestRun(batchArgs(persist, roster().results));
 
     expect(persist).toHaveBeenCalledTimes(2);
   });
 
   it("keeps trying past a SINGLE poison batch, or a bad document would strand every batch behind it", async () => {
-    seedRun(home, { limits: wideLimits });
+    seedRun(home);
     // The MIDDLE batch is poison: some document in it trips a server-side bug, forever. Derive
     // which document that is from the batch size so the poison keeps landing mid-run when the
     // size moves; a hardcoded index quietly becomes a FIRST-batch or LAST-batch test, and
     // neither of those exercises "a failure in the middle did not strand what was behind it".
-    const batchCount = Math.ceil(25 / PERSIST_BATCH_SIZE);
-    const poisonDoc = `Convention number ${Math.floor(batchCount / 2) * PERSIST_BATCH_SIZE}:`;
+    // Identify it by relPath off the known persistence order, so the test does not care which
+    // scout happens to own the middle of the run.
+    const { results, ordered } = roster();
+    const batchCount = Math.ceil(ROSTER_TOTAL / PERSIST_BATCH_SIZE);
+    const poisonPath = candidateRelPath(asMerged(ordered[Math.floor(batchCount / 2) * PERSIST_BATCH_SIZE]));
     const persist: Persister = jest.fn(async (docs) => {
-      if (docs[0].content.includes(poisonDoc)) throw new Error("kb-add 500");
+      if (docs.some((d) => d.relPath === poisonPath)) throw new Error("kb-add 500");
       return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
     });
 
-    const res = await ingestRun(batchArgs(persist, nDocs(25)));
+    const res = await ingestRun(batchArgs(persist, results));
 
     // If a failed batch aborted the run, every batch after the poison one would never be
     // attempted, and never on ANY rerun either: each run would die at the same poison batch and
     // the documents behind it would be permanently unreachable. Keep going: attempt them all,
     // and land everything except the one batch that is genuinely poison.
     expect(persist).toHaveBeenCalledTimes(batchCount);
-    expect(res.outcomes.find((o) => o.scout === "documentation")!.persisted).toBe(25 - PERSIST_BATCH_SIZE);
+    const landed = res.outcomes.reduce((n, o) => n + o.persisted, 0);
+    expect(landed).toBe(ROSTER_TOTAL - PERSIST_BATCH_SIZE);
   });
 
   it("records ONLY what landed in the accept sidecar", async () => {
-    seedRun(home, { limits: wideLimits });
+    seedRun(home);
     let call = 0;
     const persist: Persister = jest.fn(async (docs) => {
       call += 1;
@@ -1030,20 +1173,21 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
       return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
     });
 
-    await ingestRun(batchArgs(persist, nDocs(15)));
+    await ingestRun(batchArgs(persist, roster().results));
 
     // `enrich accept` materializes durable candidates out of this sidecar into .meetless/rules.md
     // and filters on KIND, not on outcome. A candidate parked here that never reached the KB
     // would become a local rule with no governed document behind it: a stale local assumption,
     // minted by the very product that exists to prevent them.
     const sidecar = loadCandidatesSidecar(home, "ws_1", "run-1")!;
-    expect(sidecar.candidates).toHaveLength(10);
+    expect(sidecar.candidates).toHaveLength(ROSTER_TOTAL - PERSIST_BATCH_SIZE);
     expect(sidecar.candidates.every((c) => c.landed === "ingested" || c.landed === "noop_unchanged")).toBe(true);
   });
 
   it("resumes: the retry re-POSTs the landed docs as no-ops and finishes the failed ones", async () => {
-    seedRun(home, { limits: wideLimits });
-    const candidates = nDocs(15);
+    expect(SECOND_BATCH_IS_DOCUMENTATION).toBe(true); // batch 2 is documentation's; see below
+    seedRun(home);
+    const { results, ordered } = roster();
 
     let call = 0;
     const flaky: Persister = jest.fn(async (docs) => {
@@ -1051,13 +1195,13 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
       if (call === 2) throw new Error("504 Gateway Timeout");
       return { docs: docs.map((d) => ({ relPath: d.relPath, outcome: "ingested" as const })) };
     });
-    const first = await ingestRun(batchArgs(flaky, candidates));
+    const first = await ingestRun(batchArgs(flaky, results));
     expect(first.state?.scouts.documentation.status).toBe("persistence_failed");
 
-    // Run 2: intel is healthy. The scout is retryable, so it re-reports, and kb-add is an
-    // idempotent upsert: the ten documents that already landed come back noop_unchanged (cheap,
-    // no re-index) and the five that were lost finally persist. THIS is what "progress is
-    // monotonic" buys, and what the single POST could never do.
+    // Run 2: intel is healthy. ONLY documentation is retryable (the other scouts finished), so
+    // only its documents are re-reported, and kb-add is an idempotent upsert: the ones that
+    // already landed come back noop_unchanged (cheap, no re-index) and the lost batch finally
+    // persists. THIS is what "progress is monotonic" buys, and what the single POST could not.
     const landed = new Set<string>();
     const healthy: Persister = jest.fn(async (docs) => ({
       docs: docs.map((d) => {
@@ -1066,20 +1210,34 @@ describe("ingestRun — batched persistence (progress must survive a failure)", 
         return { relPath: d.relPath, outcome: seen ? ("noop_unchanged" as const) : ("ingested" as const) };
       }),
     }));
-    // Seed the server's memory with what run 1 actually persisted (the first batch).
-    for (const c of candidates.slice(0, 10)) landed.add(candidateRelPath(asMerged(c)));
+    // Seed the server's memory with what run 1 actually persisted: everything except batch 2.
+    const lost = new Set(
+      ordered
+        .slice(PERSIST_BATCH_SIZE, 2 * PERSIST_BATCH_SIZE)
+        .map((c) => candidateRelPath(asMerged(c))),
+    );
+    for (const c of ordered) {
+      const relPath = candidateRelPath(asMerged(c));
+      if (!lost.has(relPath)) landed.add(relPath);
+    }
 
-    const second = await ingestRun(batchArgs(healthy, candidates));
+    const second = await ingestRun(batchArgs(healthy, results));
 
     const doc = second.outcomes.find((o) => o.scout === "documentation")!;
-    expect(doc.persisted).toBe(15); // all fifteen are now governed
-    expect(doc.deduped).toBe(10); // ten of them were already there: the run-1 survivors
+    expect(doc.persisted).toBe(CAPS.documentation); // all of documentation's are now governed
+    expect(doc.deduped).toBe(CAPS.documentation - PERSIST_BATCH_SIZE); // the run-1 survivors
     expect(second.state?.scouts.documentation.status).toBe("complete");
+    // The scouts that finished in run 1 are skipped, not re-persisted.
+    for (const role of ["history", "reconciliation"] as const) {
+      const out = second.outcomes.find((o) => o.scout === role)!;
+      expect(out.errors.map((e) => e.code)).toContain("already_complete");
+      expect(out.persisted).toBe(0);
+    }
 
-    // And the sidecar the accept half reads now holds the whole set: upsert MERGES, so the five
-    // that landed late joined the ten that landed early rather than replacing them.
+    // And the sidecar the accept half reads now holds the whole set: upsert MERGES, so the
+    // documents that landed late joined the ones that landed early rather than replacing them.
     const sidecar = loadCandidatesSidecar(home, "ws_1", "run-1")!;
-    expect(sidecar.candidates).toHaveLength(15);
+    expect(sidecar.candidates).toHaveLength(ROSTER_TOTAL);
   });
 });
 
@@ -1198,6 +1356,202 @@ describe("verifyCandidate (unit)", () => {
     });
     const errs = verifyCandidate(cand, run, makeProbe(), 0);
     expect(errs.map((e) => e.code).sort()).toEqual(["commit_not_in_allowlist", "path_traversal"]);
+  });
+});
+
+// The half of a finding no shape check can reach: is it TRUE OF THIS REPOSITORY? Every case
+// below is a way a finding can look internally perfect and still be historically meaningless,
+// which is the failure this whole verification exists to prevent.
+describe("verifyCandidate: doc_code_inconsistency (historical proof)", () => {
+  const reconRun = buildOnboardingRun({
+    runId: "r",
+    workspaceId: "ws_1",
+    repositoryRoot: "/repo",
+    now: NOW,
+    documentationTargets: [],
+    historyEvidence: ALLOWLIST_HISTORY,
+    headCommit: HEAD_SHA,
+  });
+  const codes = (cand: EnrichmentCandidate, probe = makeProbe()): string[] =>
+    verifyCandidate(cand, reconRun, probe, 0).map((e) => e.code);
+
+  it("accepts a finding whose quote, change, and ordering all check out", () => {
+    expect(codes(reconCandidate())).toEqual([]);
+  });
+
+  it("reads the quote and the blame AS OF headCommit, and orders claim-commit before change-commit", () => {
+    // Not incidental plumbing: reading the working tree instead would let an UNCOMMITTED edit
+    // to CLAUDE.md manufacture a rule, and ordering the arguments backwards would prove the
+    // opposite of the claim (that the change predates the rule, which breaks nothing).
+    const seen: string[][] = [];
+    const probe = makeProbe({
+      readFileAtCommit: (commit, relPath) => {
+        seen.push(["read", commit, relPath]);
+        return RECON_DOC_LINES.join("\n");
+      },
+      blameRange: (commit, relPath, s, e) => {
+        seen.push(["blame", commit, relPath, String(s), String(e)]);
+        return [{ commit: CLAIM_SHA, authorName: "Test Author", authorTime: "1750000000" }];
+      },
+      isAncestor: (a, b) => {
+        seen.push(["ancestor", a, b]);
+        return true;
+      },
+    });
+    expect(codes(reconCandidate({}, 7), probe)).toEqual([]);
+    expect(seen).toEqual([
+      ["read", HEAD_SHA, RECON_DOC],
+      ["blame", HEAD_SHA, RECON_DOC, "7", "7"],
+      ["ancestor", CLAIM_SHA, ALLOWED_SHA],
+    ]);
+  });
+
+  it("rejects when the run has no headCommit: there is no snapshot to verify against", () => {
+    const noHead = buildOnboardingRun({
+      runId: "r",
+      workspaceId: "ws_1",
+      repositoryRoot: "/repo",
+      now: NOW,
+      documentationTargets: [],
+      historyEvidence: ALLOWLIST_HISTORY,
+      headCommit: null, // git was unavailable at plan time
+    });
+    expect(verifyCandidate(reconCandidate(), noHead, makeProbe(), 0).map((e) => e.code)).toEqual(["no_head_commit"]);
+  });
+
+  it("rejects a change the cited commit never made", () => {
+    const cand = reconCandidate({
+      inconsistency: { ...reconCandidate().inconsistency!, divergence: { path: "src/generated/nope.ts", status: "M" } },
+    });
+    expect(codes(cand)).toEqual(["divergence_not_in_commit"]);
+  });
+
+  it("rejects a status letter the plan's own evidence does not carry", () => {
+    // The scout was SHOWN this line and asked to copy it. `A` where the CLI recorded `M` is not
+    // a near miss: it is the difference between "edited a generated file" and "created one",
+    // and the claim class is chosen from that letter.
+    const cand = reconCandidate({
+      inconsistency: {
+        ...reconCandidate().inconsistency!,
+        claimClass: "never_add",
+        divergence: { path: "src/generated/file-1.ts", status: "A" },
+      },
+    });
+    expect(codes(cand)).toEqual(["divergence_mismatch"]);
+  });
+
+  it("rejects a rename origin the plan never recorded", () => {
+    const withRename: PreparedGitEvidence[] = [
+      {
+        ...ALLOWLIST_HISTORY[0],
+        changedFiles: [{ path: "src/generated/file-1.ts", status: "R100", renamedFrom: "src/old/file-1.ts" }],
+      },
+    ];
+    const runR = buildOnboardingRun({
+      runId: "r",
+      workspaceId: "ws_1",
+      repositoryRoot: "/repo",
+      now: NOW,
+      documentationTargets: [],
+      historyEvidence: withRename,
+      headCommit: HEAD_SHA,
+    });
+    const cand = reconCandidate({
+      inconsistency: {
+        ...reconCandidate().inconsistency!,
+        claimClass: "never_rename",
+        claimScope: "src/",
+        divergence: { path: "src/generated/file-1.ts", status: "R100", renamedFrom: "src/invented/file-1.ts" },
+      },
+    });
+    expect(verifyCandidate(cand, runR, makeProbe(), 0).map((e) => e.code)).toEqual(["divergence_mismatch"]);
+  });
+
+  it("rejects a document that does not exist at headCommit (an uncommitted doc anchors nothing)", () => {
+    expect(codes(reconCandidate(), makeProbe({ readFileAtCommit: () => null }))).toEqual(["doc_not_at_head"]);
+  });
+
+  it("rejects an anchored range past the end of the document at headCommit", () => {
+    // The working-tree length check upstream passed; the SNAPSHOT is the authority here, and a
+    // document that got shorter since is exactly how a stale anchor quotes lines that are gone.
+    const oneLineDoc = makeProbe({ readFileAtCommit: () => reconClaim(1) });
+    expect(codes(reconCandidate({}, 1), oneLineDoc)).toEqual([]);
+    expect(codes(reconCandidate({}, 9), oneLineDoc)).toEqual(["line_out_of_range_at_head"]);
+  });
+
+  it("rejects a paraphrase, however plausible", () => {
+    const cand = reconCandidate({
+      inconsistency: {
+        ...reconCandidate().inconsistency!,
+        claimText: "Rule 1: src/generated/file-1.ts is generated and should not be edited by hand.",
+      },
+    });
+    expect(codes(cand)).toEqual(["claim_not_in_document"]);
+  });
+
+  it("still matches across re-wrapping and CRLF: whitespace is the ONLY thing normalized", () => {
+    const wrapped = makeProbe({
+      readFileAtCommit: () => `Rule 1: src/generated/file-1.ts is generated\r\n   and must never be edited by hand.`,
+    });
+    expect(codes(reconCandidate({ evidence: [
+      { type: "file", path: RECON_DOC, startLine: 1, endLine: 2 },
+      { type: "commit", commit: "aaaaaaa" },
+    ] }, 1), wrapped)).toEqual([]);
+  });
+
+  it("persists the CLI-verified span, not the model's string", () => {
+    const cand = reconCandidate({
+      inconsistency: { ...reconCandidate().inconsistency!, claimText: `  ${reconClaim(1)}\n\n  ` },
+    });
+    expect(codes(cand)).toEqual([]);
+    expect(cand.inconsistency!.claimText).toBe(reconClaim(1));
+  });
+
+  it("rejects when git cannot blame the anchored range", () => {
+    expect(codes(reconCandidate(), makeProbe({ blameRange: () => null }))).toEqual(["blame_unavailable"]);
+  });
+
+  it("rejects a range written by more than one commit: no single commit can be shown to be older", () => {
+    const probe = makeProbe({
+      blameRange: () => [
+        { commit: CLAIM_SHA, authorName: "An", authorTime: "1750000000" },
+        { commit: "d".repeat(40), authorName: "An", authorTime: "1750000001" },
+      ],
+    });
+    expect(codes(reconCandidate(), probe)).toEqual(["ambiguous_claim_origin"]);
+  });
+
+  it("rejects a range git reports as not committed", () => {
+    const probe = makeProbe({ blameRange: () => [{ commit: "0".repeat(40), authorName: "", authorTime: "" }] });
+    expect(codes(reconCandidate(), probe)).toEqual(["claim_not_committed"]);
+  });
+
+  it("rejects when the rule and the change landed in the SAME commit", () => {
+    // `git merge-base --is-ancestor X X` exits 0, so without an explicit guard one commit that
+    // wrote a rule and changed a file in the same breath would "prove" it violated itself.
+    const probe = makeProbe({ blameRange: () => [{ commit: ALLOWED_SHA, authorName: "An", authorTime: "1750000000" }] });
+    expect(codes(reconCandidate(), probe)).toEqual(["claim_and_change_same_commit"]);
+  });
+
+  it("rejects when the rule is not a proven ancestor of the change (it landed AFTER)", () => {
+    // The commit predates the rule, so it broke nothing. This is the false positive that would
+    // otherwise dominate: every old commit looks like it violates every new document.
+    expect(codes(reconCandidate(), makeProbe({ isAncestor: () => false }))).toEqual(["claim_not_proven_older"]);
+  });
+
+  it("stamps the attribution git proved, and omits what git could not name", () => {
+    const cand = reconCandidate();
+    expect(codes(cand)).toEqual([]);
+    expect(cand.inconsistency!.attribution).toEqual({
+      commit: CLAIM_SHA,
+      authorName: "Test Author",
+      authorTime: "2025-06-15T15:06:40.000Z",
+    });
+
+    const bare = reconCandidate();
+    expect(codes(bare, makeProbe({ blameRange: () => [{ commit: CLAIM_SHA, authorName: "", authorTime: "" }] }))).toEqual([]);
+    // A missing person is missing, never guessed: the commit is the load-bearing half.
+    expect(bare.inconsistency!.attribution).toEqual({ commit: CLAIM_SHA });
   });
 });
 

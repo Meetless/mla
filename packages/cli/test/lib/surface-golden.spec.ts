@@ -1,4 +1,5 @@
 import { buildMlaSkillBody, buildOnboardSkillBody, buildScoutAgent } from "../../src/lib/wire";
+import { SCOUT_NAMES } from "../../src/lib/enrichment/protocol";
 
 // GOLDEN LOCK. Originally captured from the pre-refactor wire.ts to prove the
 // surface.ts extraction (moving these renderers out and parameterizing them by
@@ -16,10 +17,14 @@ describe("legacy surface golden", () => {
   it("onboard skill body is unchanged", () => {
     expect(buildOnboardSkillBody()).toMatchSnapshot();
   });
-  it("doc-scout agent is unchanged", () => {
-    expect(buildScoutAgent("documentation")).toMatchSnapshot();
-  });
-  it("history-scout agent is unchanged", () => {
-    expect(buildScoutAgent("history")).toMatchSnapshot();
-  });
+  // Iterated over SCOUT_NAMES, not listed one it() per role: a hand-listed pair left the
+  // reconciliation agent body with no golden at all, so its text could drift silently while
+  // `mla rewire` kept installing it. A new role now arrives with an unwritten snapshot,
+  // which fails on CI (--ci refuses to write new snapshots) and passes locally only after
+  // someone reads the body it captured.
+  for (const role of SCOUT_NAMES) {
+    it(`${role}-scout agent is unchanged`, () => {
+      expect(buildScoutAgent(role)).toMatchSnapshot();
+    });
+  }
 });

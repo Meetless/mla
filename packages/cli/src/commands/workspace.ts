@@ -7,7 +7,7 @@ import {
   readConfig,
   type WorkspaceCliConfig,
 } from "../lib/config";
-import { get, HttpError } from "../lib/http";
+import { get, HttpError, serverMessageOrRaw } from "../lib/http";
 import {
   inviteMember,
   listMembers,
@@ -107,20 +107,7 @@ export interface WorkspaceLifecycleDeps {
 // "METHOD URL -> HTTP 409: {json}" HttpError.message. The control error body is
 // `{ statusCode, code, message, ... }` (api-exception.ts); a network error (no
 // body) or a non-JSON body falls through to the raw message.
-function serverMessage(e: unknown): string {
-  const err = e as HttpError;
-  if (err && typeof err.body === "string" && err.body) {
-    try {
-      const parsed = JSON.parse(err.body) as { message?: unknown };
-      if (typeof parsed.message === "string" && parsed.message) {
-        return err.status ? `${parsed.message} (HTTP ${err.status})` : parsed.message;
-      }
-    } catch {
-      // non-JSON body: fall through to the raw error message
-    }
-  }
-  return (e as Error).message;
-}
+const serverMessage = serverMessageOrRaw;
 
 // Loads machine credentials (controlUrl, controlToken, actor) from
 // cli-config.json. NOTE: cli-config no longer carries the workspaceId (T1.1);

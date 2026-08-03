@@ -1,7 +1,11 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { removeMeetlessSkills, removeMeetlessAgents } from "../../src/lib/unwire";
+import {
+  removeMeetlessSkills,
+  removeMeetlessAgents,
+  SCOUT_AGENT_FILES,
+} from "../../src/lib/unwire";
 
 const mkTmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "mla-unwire-"));
 
@@ -37,7 +41,10 @@ describe("removeMeetlessSkills", () => {
 describe("removeMeetlessAgents", () => {
   it("removes each scout agent file unconditionally", () => {
     const agents = mkTmp();
-    for (const f of ["meetless-doc-scout.md", "meetless-history-scout.md"]) {
+    // Seeded from the real roster: a hardcoded pair would leave a newly added scout's file
+    // untested, and readdirSync().toHaveLength(0) below would still pass because the file
+    // that was never written cannot be left behind.
+    for (const f of SCOUT_AGENT_FILES) {
       fs.writeFileSync(path.join(agents, f), "---\nname: x\n---\n");
     }
     const r = removeMeetlessAgents(agents);

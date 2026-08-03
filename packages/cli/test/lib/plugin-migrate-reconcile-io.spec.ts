@@ -9,6 +9,7 @@ import {
   type LegacyWiringInspection,
 } from "../../src/connectors/claude-code/plugin-migrate";
 import { MANAGED_HOOK_SCRIPTS, HOOKS_DIR, MCP_SERVER_KEY } from "../../src/lib/wire";
+import { MANAGED_SKILL_DIRS, SCOUT_AGENT_FILES } from "../../src/lib/unwire";
 
 // Package root so the ts-node child picks up tsconfig.json; and the absolute,
 // extensionless module path so the child's require() resolves the SAME TS source
@@ -96,17 +97,20 @@ describe("defaultReconcileIO real executor (Blocker 4)", () => {
         paths.claudeJsonPath,
         JSON.stringify({ mcpServers: { [MCP_SERVER_KEY]: { command: "mla", args: ["mcp"] } } }),
       );
-      for (const name of ["mla", "mla-onboard"]) {
+      for (const name of MANAGED_SKILL_DIRS) {
         fs.mkdirSync(path.join(paths.skillsDir, name), { recursive: true });
         fs.writeFileSync(path.join(paths.skillsDir, name, "SKILL.md"), "# skill\n");
       }
       fs.mkdirSync(paths.agentsDir, { recursive: true });
-      for (const f of ["meetless-doc-scout.md", "meetless-history-scout.md"]) {
+      // Seeded from SCOUT_AGENT_FILES, not a hardcoded pair: a roster-sized literal would
+      // leave a newly added scout's agent file unseeded, so the teardown assertion below
+      // would pass without ever proving that file gets removed.
+      for (const f of SCOUT_AGENT_FILES) {
         fs.writeFileSync(path.join(paths.agentsDir, f), "---\n");
       }
       const before = inspectLegacyWiring(paths);
-      // Both hooks, a global MCP entry, BOTH skills, and BOTH agents seeded => every
-      // *Complete flag holds; this is a full legacy surface about to be torn out.
+      // Every hook, a global MCP entry, every managed skill, and every scout agent seeded =>
+      // every *Complete flag holds; this is a full legacy surface about to be torn out.
       expect(
         before.hooksComplete &&
           before.globalMcpPresent &&

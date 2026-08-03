@@ -44,31 +44,40 @@ function pluginToLegacy(pluginBody: string): string {
 }
 
 describe("PLUGIN_SURFACE (design §3.3 scoped dispatch)", () => {
-  it("onboard skill dispatches the SCOPED mla:* subagent names", () => {
+  // Driven off SCOUT_NAMES rather than a hardcoded pair. A role listed in the surface map
+  // but absent from these assertions is a scout the plugin body could stop dispatching (or
+  // dispatch under the wrong name) with every test still green.
+  it("onboard skill dispatches the SCOPED mla:* subagent name for every role", () => {
     const body = renderOnboardSkill(PLUGIN_SURFACE);
-    expect(body).toContain("mla:doc-scout");
-    expect(body).toContain("mla:history-scout");
+    for (const role of SCOUT_NAMES) {
+      expect(PLUGIN_SURFACE.scoutDispatch[role]).toMatch(/^mla:/);
+      expect(body).toContain(PLUGIN_SURFACE.scoutDispatch[role]);
+    }
   });
 
-  it("onboard skill does NOT dispatch the bare legacy scout names", () => {
+  it("onboard skill does NOT dispatch any bare legacy scout name", () => {
     const body = renderOnboardSkill(PLUGIN_SURFACE);
-    expect(body).not.toContain("meetless-doc-scout");
-    expect(body).not.toContain("meetless-history-scout");
+    for (const role of SCOUT_NAMES) {
+      expect(body).not.toContain(LEGACY_SURFACE.scoutDispatch[role]);
+    }
   });
 
-  it("legacy onboard skill still dispatches the bare names", () => {
+  it("legacy onboard skill still dispatches the bare name for every role", () => {
     const body = renderOnboardSkill(LEGACY_SURFACE);
-    expect(body).toContain("meetless-doc-scout");
-    expect(body).toContain("meetless-history-scout");
+    for (const role of SCOUT_NAMES) {
+      expect(body).toContain(LEGACY_SURFACE.scoutDispatch[role]);
+    }
   });
 
-  it("plugin scout agent frontmatter uses the bare plugin basename", () => {
-    expect(frontmatterField(renderScoutAgent("documentation", PLUGIN_SURFACE), "name")).toBe(
-      "doc-scout",
-    );
-    expect(frontmatterField(renderScoutAgent("history", PLUGIN_SURFACE), "name")).toBe(
-      "history-scout",
-    );
+  it("plugin scout agent frontmatter uses the bare plugin basename for every role", () => {
+    for (const role of SCOUT_NAMES) {
+      expect(frontmatterField(renderScoutAgent(role, PLUGIN_SURFACE), "name")).toBe(
+        PLUGIN_SURFACE.scoutAgentName[role],
+      );
+      // The bare basename, never the scoped dispatch string: a frontmatter `name` carrying
+      // the `mla:` prefix is not a name Claude Code resolves.
+      expect(PLUGIN_SURFACE.scoutAgentName[role]).not.toContain(":");
+    }
   });
 
   it("covers every scout role", () => {

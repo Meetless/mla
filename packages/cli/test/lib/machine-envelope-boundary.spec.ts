@@ -231,6 +231,56 @@ describe("§5.1 boundary LAW: has TEETH (rejects every violation)", () => {
         next_action: { kind: "skill", ref: "onboard" },
       }),
     ],
+    [
+      "a decision_request kind outside the closed set",
+      JSON.stringify({
+        protocol: MACHINE_PROTOCOL,
+        schema_version: 1,
+        command: "x",
+        ok: true,
+        result: {},
+        decision_request: {
+          kind: "enrich.delete",
+          subject: { run_id: "r" },
+          prompt: "pick",
+          options: [{ id: "all", label: "all", selection: { mode: "all" } }],
+        },
+      }),
+    ],
+    [
+      "a resolve selection with a verdict outside FINDING_RESOLUTIONS",
+      JSON.stringify({
+        protocol: MACHINE_PROTOCOL,
+        schema_version: 1,
+        command: "x",
+        ok: true,
+        result: {},
+        decision_request: {
+          kind: "enrich.resolve",
+          subject: { run_id: "r" },
+          prompt: "which one is right?",
+          options: [
+            { id: "both_fine", label: "both fine", selection: { mode: "resolve", candidate_id: "a1b2c3", resolution: "both_fine" } },
+          ],
+        },
+      }),
+    ],
+    [
+      "a resolve selection naming a verdict but no finding (an answer to no question)",
+      JSON.stringify({
+        protocol: MACHINE_PROTOCOL,
+        schema_version: 1,
+        command: "x",
+        ok: true,
+        result: {},
+        decision_request: {
+          kind: "enrich.resolve",
+          subject: { run_id: "r" },
+          prompt: "which one is right?",
+          options: [{ id: "doc_stale", label: "doc is stale", selection: { mode: "resolve", resolution: "doc_stale" } }],
+        },
+      }),
+    ],
   ];
 
   it.each(cases)("rejects %s", (_label, raw) => {
@@ -379,6 +429,8 @@ describe("§5.1 scream-on-drift: every SUPPORTED operation has boundary coverage
     "enrich.ingest": "builder-shape (this spec)",
     "enrich.accept": "real end-to-end in enrich-accept.spec.ts via the shared law",
     "enrich.accept.apply": "real end-to-end in enrich-accept.spec.ts via the shared law",
+    "enrich.resolve": "real end-to-end in enrich-resolve.spec.ts via the shared law",
+    "enrich.resolve.apply": "real end-to-end in enrich-resolve.spec.ts via the shared law",
   };
 
   it("the set of operations with a real driver equals SUPPORTED_OPERATIONS", () => {

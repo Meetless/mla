@@ -82,6 +82,7 @@ export const INTEL_NO_OFFER_REASONS = [
   "unresolved_conflict",
   "would_require_uncited_synthesis",
   "over_budget",
+  "empty_prompt",
 ] as const;
 
 export interface TurnRecap {
@@ -305,6 +306,11 @@ function deriveAbstainClass(reason: string | null): AbstainClass {
       return "not_routed";
     case "surface_provider_missing":
     case "over_budget":
+    // The caller sent no prompt at all. OUR plumbing, not intel's judgement, so it
+    // sits with the other failures rather than with not_routed: crediting the router
+    // with a decision it never got to make is exactly what hid this for 232 prod
+    // turns, where an empty prompt was byte-identical to an honest abstention.
+    case "empty_prompt":
       return "provider_failure";
     default:
       return null;

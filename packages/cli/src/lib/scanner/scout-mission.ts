@@ -1,5 +1,5 @@
 import { ScanResult } from "./types";
-import { ENRICHMENT_KINDS, EnrichmentKind } from "../enrichment/protocol";
+import { MINTABLE_ENRICHMENT_KINDS, EnrichmentKind, scoutCountWord } from "../enrichment/protocol";
 
 // GAP1 Slice 2 + onboarding enrichment: the scout policy and its two surfaces.
 //
@@ -41,26 +41,37 @@ export interface ScoutPolicy {
   untrustedContent: string[]; // repository content is data, never an instruction
 }
 
-// One human gloss per candidate kind. Typed as a total Record over EnrichmentKind so
-// the compiler forces a gloss for every kind, and the category list is built by
-// mapping ENRICHMENT_KINDS: the policy categories cannot drift from the protocol's
-// accepted kinds (a spec also asserts this).
+// One human gloss per candidate kind. Typed as a total Record over EnrichmentKind so the
+// compiler forces a gloss for every kind: adding a kind and forgetting to describe it would
+// otherwise ship a category the scout is invited to emit and given no definition of.
 const KIND_GLOSS: Record<EnrichmentKind, string> = {
   constraint: "a hard limit or forbidden action, with the source that states it",
   decision: "a product or architecture decision and the constraint it imposes",
   convention: "an agreed pattern the code follows that no tool enforces",
   boundary: "an ownership, security, or service boundary that must not be crossed",
   deprecation: "guidance or an approach a newer source has superseded or made stale",
+  doc_code_inconsistency:
+    "a document that states a rule and a specific commit that did the opposite, quoting the rule and naming the change",
 };
 
-export function buildScoutPolicy(): ScoutPolicy {
+/**
+ * The shared policy, rendered for the kinds THIS surface may emit.
+ *
+ * `kinds` is a required parameter, not a default over every EnrichmentKind, because the
+ * categories a scout is shown are the categories it will produce. The two extraction scouts
+ * each hold half the evidence for a doc/code inconsistency and cannot anchor one, so offering
+ * them the kind would invite a candidate that ingest is obliged to reject. Callers pass
+ * SCOUT_CANDIDATE_KINDS[role]; the manual mission, which has no ingest behind it to verify a
+ * finding at all, passes the mintable kinds.
+ */
+export function buildScoutPolicy(kinds: readonly EnrichmentKind[]): ScoutPolicy {
   return {
     roleIdentity: [
       "You are a SCOUT, not an implementer. Do not implement code and do not summarize",
       "every file. Read for meaning: surface the rules, policies, decisions, constraints,",
       "conventions, and deprecations that govern this codebase.",
     ],
-    categories: ENRICHMENT_KINDS.map((kind) => ({ kind, gloss: KIND_GLOSS[kind] })),
+    categories: kinds.map((kind) => ({ kind, gloss: KIND_GLOSS[kind] })),
     evidenceRule: [
       "Every candidate MUST carry checkable evidence anchored to its source: a file path",
       "with a line range (path#Lstart-Lend), or a commit SHA. A claim with no anchor is",
@@ -136,7 +147,7 @@ export function renderAgenticInvitation(scan: ScanResult): string | null {
   return (
     `Deeper docs went unread in this fast pass ` +
     `(${pluralize(docs, "decision/spec doc")}, ${pluralize(notes, "legacy note")}). ` +
-    "Run `/mla onboard` inside a Claude Code session to dispatch two read-only scouts " +
+    `Run \`/mla onboard\` inside a Claude Code session to dispatch ${scoutCountWord()} read-only scouts ` +
     "that dig into them and surface candidates born PENDING for review."
   );
 }
@@ -151,7 +162,11 @@ export function renderAgenticInvitation(scan: ScanResult): string | null {
  * structured subagent brief (buildScoutPrompt) used by `/mla onboard`.
  */
 export function renderManualScoutMission(scan: ScanResult): string {
-  const policy = buildScoutPolicy();
+  // Mintable kinds only. This path ends in a human editing CLAUDE.md, with no `enrich ingest`
+  // behind it to re-read the document at a pinned commit or check a claim against the plan's
+  // prepared changes, so a doc/code inconsistency offered here could never be verified. The
+  // prose contradiction line below is the manual path's honest substitute.
+  const policy = buildScoutPolicy(MINTABLE_ENRICHMENT_KINDS);
   return [
     "Bootstrap scout mission for this workspace.",
     "",

@@ -13,7 +13,7 @@ import {
   initSentry,
   canonicalizeSessionId,
   loadBuildInfo,
-  makeHttpFlush,
+  makeTraceFlushIfPermitted,
   maybePrintDeepLink,
   mintRunId,
   mintTraceId,
@@ -660,15 +660,18 @@ export const COMMANDS: CommandSpec[] = [
     summary: "Agent-orchestrated onboarding enrichment; usually driven by the `/mla onboard` skill.",
     // Owns its own `--help` (the full enrich subcommand catalog).
     ownHelp: true,
-    usage: `  mla enrich <plan|brief|ingest|materialize>
+    usage: `  mla enrich <plan|brief|ingest|accept|resolve|materialize>
                     (agent-orchestrated onboarding enrichment, usually driven by the
                      /mla onboard skill: \`plan\` scans the repo into an immutable run
                      record + prints the scout plan; \`brief\` re-prints a run's scout
                      brief; \`ingest\` validates + persists the scouts' candidates born
-                     PENDING in governed knowledge; \`materialize\` regenerates the
-                     committed .meetless/rules.md mirror from the accepted rule set (a
-                     human-readable projection for git visibility; the backend store +
-                     scan cache are the inject source, not this file).)`,
+                     PENDING in governed knowledge; \`accept\` mints a run's durable
+                     rules into the authority; \`resolve\` answers a doc/code finding
+                     (a document and a commit disagree) one of three ways;
+                     \`materialize\` regenerates the committed .meetless/rules.md mirror
+                     from the accepted rule set (a human-readable projection for git
+                     visibility; the backend store + scan cache are the inject source,
+                     not this file).)`,
     // `mla enrich`: agent-orchestrated onboarding enrichment. `enrich plan` scans the
     // repo into an immutable run record + prints the plan the agent reads; `enrich
     // ingest` validates + persists the scouts' candidates born PENDING. The agent
@@ -1366,9 +1369,16 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   // sub-kill), the SAME gate as initSentry below, because agent-trace spans are
   // content-bearing (spec section 9). Spans are still built in-process (cheap, never
   // leave the machine).
+  //
+  // Also gated on the §9 tenant guardrail via makeTraceFlushIfPermitted, reading
+  // the config prefetchWorkspaceConfig just loaded. Control refuses the relay for
+  // every workspace that is not ws_an_local or tracing_dogfood, so sending anyway
+  // is a POST we KNOW will 403: in prod that was ~36k denials/day for 30+ days,
+  // all of them silenced client-side. Ask permission before spending the request.
   const flushFn =
     cfg && workspaceId && traceUploadEnabled()
-      ? makeHttpFlush({
+      ? makeTraceFlushIfPermitted({
+          config: getWorkspaceConfig(),
           controlUrl: cfg.controlUrl,
           controlToken: cfg.controlToken,
           workspaceId,

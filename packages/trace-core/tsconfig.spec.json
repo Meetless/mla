@@ -1,0 +1,20 @@
+{
+  // Jest-only TypeScript config. Nothing builds from it.
+  //
+  // `isolatedModules` is what keeps ts-jest on its cheap `transpileModule` path.
+  // Without it ts-jest builds a full TypeScript LanguageService whose program roots
+  // are EVERY file in this package's `include`, so transforming one small spec pulls
+  // in the whole package. Each jest worker process pays that once, which shows up as
+  // a per-suite floor that no amount of test-writing explains.
+  //
+  // It lives here rather than in tsconfig.json because `isolatedModules` also
+  // tightens what tsc accepts, and the build has no reason to take that on. Type
+  // checking is not lost: `pnpm build` still runs the full program.
+  //
+  // scripts/lint-jest-isolated-modules.mjs holds the full rationale and keeps every
+  // ts-jest project on this path.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "isolatedModules": true
+  }
+}

@@ -25,7 +25,13 @@ import {
 import { backfillSessionPrompts } from "../lib/transcript-prompts";
 import { runWire, type WireResult } from "../lib/wire";
 import { runLogin } from "./login";
-import { get, HttpError, post } from "../lib/http";
+import {
+  get,
+  HttpError,
+  isNoWorkspaceYet,
+  post,
+  serverMessageOrRaw,
+} from "../lib/http";
 import {
   deactivationPreflight,
   deactivateWorkspace,
@@ -41,6 +47,7 @@ import {
   renderManualScoutMission,
   renderAgenticInvitation,
 } from "../lib/scanner/scout-mission";
+import { scoutCountWord } from "../lib/enrichment/protocol";
 import { rescanAndCache } from "./scan-context";
 import { removeOwnedProjection } from "../lib/scanner/floor-projection-writer";
 import { FLOOR_PROJECTION_RELPATH } from "../lib/scanner/floor-projection";
@@ -141,7 +148,7 @@ export function parseActivateArgs(argv: string[]): ActivateFlags {
           throw new Error(
             "The `full` bootstrap tier was removed: its temporal legacy-note graph was " +
               "never built. The deep, agent-driven read now lives in `/mla onboard` " +
-              "(two read-only scouts; candidates land born PENDING for you to review). " +
+              `(${scoutCountWord()} read-only scouts; candidates land born PENDING for you to review). ` +
               "Use `--bootstrap fast` (default) or run `/mla onboard` inside a session.",
           );
         }
@@ -196,7 +203,7 @@ export function bootstrapTierIsDeprecated(tier: BootstrapTier): boolean {
 export function agenticDeprecationNote(): string {
   return [
     "`--bootstrap agentic` is deprecated. The richer, agent-driven onboarding is",
-    "`/mla onboard`: two read-only scouts read your docs and git history and surface",
+    `\`/mla onboard\`: ${scoutCountWord()} read-only scouts read your docs and git history and surface`,
     "candidates born PENDING for you to review (the static mission below is a copy/paste",
     "fallback for shells without a Claude Code session).",
   ].join("\n");
@@ -642,7 +649,7 @@ export async function runActivate(argv: string[]): Promise<number> {
     : findActivation(cwd);
 
   if (existing) {
-    return runBind(existing, cwd, resolveBootstrapTier(flags));
+    return runBind(existing, cwd, resolveBootstrapTier(flags), command);
   }
 
   const git = gitInfo(cwd);
@@ -879,13 +886,112 @@ async function runProvision(
   return finishActivate(cwd, resolveBootstrapTier(flags), resp.isNew);
 }
 
+// Ask control whether this session can actually reach the marker's workspace.
+//
+// Bind provisions nothing, so a marker is the ONLY thing standing between a
+// caller and "activated". `.meetless.json` is designed to be committed (see
+// commitGuidanceLines), which makes the team path: teammate commits the marker,
+// new hire clones, `mla login`, `mla activate` -> bind. `mla login` mints an
+// Account and no workspace by design, and nothing on the bind path ever creates
+// a WorkspaceUser, so that new hire ends up bound to a workspace they hold no
+// membership in. Every workspace-scoped call then 403s, and the two that run on
+// every command (the tracing prefetch and the trace ingest) swallow errors by
+// design, so nothing says a word. One prod account sat there for three days and
+// 178 denials while `mla activate` kept reporting success.
+//
+// Deny is the ONLY answer that may change the verdict. Offline, 5xx, timeout,
+// 404: the local binding still applies and bind stays green, which is the rule
+// `mla activate --repair` has followed since 2026-06-04. Being stricter would
+// break activate on a plane to catch a membership bug.
+type BindProbe =
+  | { verdict: "ok" }
+  | { verdict: "no-workspace" }
+  | { verdict: "not-a-member" }
+  | { verdict: "unknown" };
+
+async function probeBindMembership(
+  workspaceId: string | undefined,
+): Promise<BindProbe> {
+  if (!workspaceId) return { verdict: "unknown" };
+  if (!configExists()) return { verdict: "unknown" };
+  let cfg: CliConfig;
+  try {
+    cfg = readConfig();
+  } catch {
+    return { verdict: "unknown" };
+  }
+  try {
+    await get(
+      cfg,
+      `/internal/v1/workspaces/me?workspaceId=${encodeURIComponent(workspaceId)}`,
+      4000,
+    );
+    return { verdict: "ok" };
+  } catch (e) {
+    if (isNoWorkspaceYet(e)) return { verdict: "no-workspace" };
+    const status = (e as HttpError).status;
+    if (status === 401 || status === 403) return { verdict: "not-a-member" };
+    return { verdict: "unknown" };
+  }
+}
+
+// The lines a dead binding earns. Pure so the wording is pinned by a unit test
+// and not only by the blackbox e2e. `email` is the caller's own address when the
+// config knows it, so the invite line can be copy-pasted by whoever owns the
+// workspace.
+export function deadBindingLines(
+  verdict: "no-workspace" | "not-a-member",
+  workspaceId: string,
+  markerPath: string,
+  email?: string,
+): string[] {
+  const who = email && email.trim() ? email.trim() : "<your-email>";
+  const head =
+    verdict === "no-workspace"
+      ? `Not activated: you are signed in, but this session has no workspace yet.`
+      : `Not activated: you are not a member of the workspace this folder is bound to.`;
+  return [
+    head,
+    `  marker:      ${markerPath}`,
+    `  workspaceId: ${workspaceId}`,
+    "",
+    "  The marker binds this folder to a workspace, and binding creates no",
+    "  membership. Until you hold one, every governed command here is denied.",
+    "",
+    "  Fix it one of two ways:",
+    `    1. Join the team's workspace: ask an owner to run`,
+    `       \`mla workspace invite ${who}\``,
+    "    2. Or use your own workspace for this folder:",
+    "       `mla deactivate` then `mla activate`",
+  ];
+}
+
 // Bind to an already-resolved marker. Provisions nothing; the marker is local
 // truth for "which workspace this folder runs under".
-function runBind(
+async function runBind(
   found: FoundActivation,
   cwd: string,
   tier: BootstrapTier,
-): number {
+  command: string,
+): Promise<number> {
+  const probe = await probeBindMembership(found.workspaceId);
+  if (probe.verdict === "no-workspace" || probe.verdict === "not-a-member") {
+    const id = found.workspaceId ?? "(no workspaceId in marker)";
+    let email: string | undefined;
+    try {
+      const auth = readConfig().auth;
+      if (auth.mode === "user-token") email = auth.user.email ?? undefined;
+    } catch {
+      // Best effort: the remedy still reads fine with the <your-email> placeholder.
+    }
+    return failInMode(
+      command,
+      probe.verdict === "no-workspace" ? "no_workspace_yet" : "not_a_member",
+      deadBindingLines(probe.verdict, id, found.path, email).join("\n"),
+      1,
+    );
+  }
+
   if (!isMachineMode()) {
     const nameSuffix = found.workspaceName ? ` (${found.workspaceName})` : "";
     const id = found.workspaceId ?? "(no workspaceId in marker)";
@@ -1463,24 +1569,10 @@ function isOwnerAdmin(role: string | null | undefined): boolean {
 }
 
 // Prefer control's human-readable `message` over the raw HttpError.message when
-// the retire (E2) call fails. Mirrors workspace.ts:serverMessage; kept local so
-// activate.ts does not depend on the workspace command module.
-function retireErrorMessage(e: unknown): string {
-  const err = e as HttpError;
-  if (err && typeof err.body === "string" && err.body) {
-    try {
-      const parsed = JSON.parse(err.body) as { message?: unknown };
-      if (typeof parsed.message === "string" && parsed.message) {
-        return err.status
-          ? `${parsed.message} (HTTP ${err.status})`
-          : parsed.message;
-      }
-    } catch {
-      // non-JSON body: fall through to the raw error message
-    }
-  }
-  return (e as Error).message;
-}
+// the retire (E2) call fails. The extraction now lives in lib/http.ts, which is
+// where a transport concern belongs; this alias keeps the local call sites
+// reading as the retire path's own vocabulary.
+const retireErrorMessage = serverMessageOrRaw;
 
 // Injectable seams so the E2 (retire) matrix is unit-testable with no network,
 // no on-disk config, and no TTY. Every default resolves to the real production

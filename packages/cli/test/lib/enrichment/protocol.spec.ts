@@ -17,6 +17,9 @@ import {
   validateIngestRequestShape,
   MAX_RATIONALE_LENGTH,
   RATIONALE_SOURCES,
+  MAX_CANDIDATES_TOTAL,
+  SCOUT_NAMES,
+  scoutCandidateCap,
   type EnrichmentCandidate,
   type OnboardingRun,
 } from "../../../src/lib/enrichment/protocol";
@@ -94,6 +97,98 @@ describe("candidateId", () => {
   });
 });
 
+// A finding's identity is a different formula from the other five kinds', and every clause of
+// it is load-bearing in a way the governance-kind tests above cannot cover.
+describe("candidateId: doc_code_inconsistency", () => {
+  const claim = "src/generated/api.ts is generated and must never be edited by hand.";
+  const finding = (over: Partial<EnrichmentCandidate> = {}): EnrichmentCandidate => ({
+    kind: "doc_code_inconsistency",
+    statement: "CLAUDE.md forbids editing this file, but a commit edited it.",
+    sourceScout: "reconciliation",
+    evidence: [
+      { type: "file", path: "CLAUDE.md", startLine: 12, endLine: 12 },
+      { type: "commit", commit: "abcdef1234567890" },
+    ],
+    inconsistency: {
+      claimClass: "never_modify",
+      claimText: claim,
+      claimScope: "src/generated/",
+      proposedRuleKind: "constraint",
+      divergence: { path: "src/generated/api.ts", status: "M" },
+    },
+    ...over,
+  });
+
+  it("ignores the generated statement: the same quote and change is one finding", () => {
+    // The statement is an LLM's sentence ABOUT the finding, regenerated on every run. Hashing
+    // it would mint a fresh copy of an unchanged finding each time the wording drifted.
+    expect(candidateId(finding())).toBe(candidateId(finding({ statement: "A hand edit hit a generated file." })));
+  });
+
+  it("ignores line drift in the doc anchor", () => {
+    const moved = finding({
+      evidence: [
+        { type: "file", path: "CLAUDE.md", startLine: 400, endLine: 400 },
+        { type: "commit", commit: "abcdef1234567890" },
+      ],
+    });
+    expect(candidateId(finding())).toBe(candidateId(moved));
+  });
+
+  it("ignores whitespace and CRLF in the verified quote (a re-wrapped rule is the same rule)", () => {
+    const rewrapped = finding({
+      inconsistency: { ...finding().inconsistency!, claimText: `src/generated/api.ts is generated\r\n  and must never be edited by hand.` },
+    });
+    expect(candidateId(finding())).toBe(candidateId(rewrapped));
+  });
+
+  it("changes when the quoted rule changes", () => {
+    const other = finding({
+      inconsistency: { ...finding().inconsistency!, claimText: "src/generated/api.ts is generated and must never be deleted." },
+    });
+    expect(candidateId(finding())).not.toBe(candidateId(other));
+  });
+
+  it("changes when the commit changes: one rule broken twice is TWO findings", () => {
+    // Each has its own resolution. Collapsing them would leave one of the two commits with no
+    // record that anyone looked at it.
+    const other = finding({
+      evidence: [
+        { type: "file", path: "CLAUDE.md", startLine: 12, endLine: 12 },
+        { type: "commit", commit: "9876543210fedcba" },
+      ],
+    });
+    expect(candidateId(finding())).not.toBe(candidateId(other));
+  });
+
+  it("changes when the changed file, its status, or its rename origin changes", () => {
+    const base = candidateId(finding());
+    const inc = finding().inconsistency!;
+    expect(base).not.toBe(candidateId(finding({ inconsistency: { ...inc, divergence: { path: "src/generated/other.ts", status: "M" } } })));
+    expect(base).not.toBe(candidateId(finding({ inconsistency: { ...inc, divergence: { path: "src/generated/api.ts", status: "D" } } })));
+    expect(base).not.toBe(
+      candidateId(finding({ inconsistency: { ...inc, divergence: { path: "src/generated/api.ts", status: "M", renamedFrom: "src/old/api.ts" } } })),
+    );
+  });
+
+  it("ignores the attribution git stamped on it (courtesy metadata, not identity)", () => {
+    const attributed = finding({
+      inconsistency: {
+        ...finding().inconsistency!,
+        attribution: { commit: "c".repeat(40), authorName: "Test Author", authorTime: "2026-01-01T00:00:00.000Z" },
+      },
+    });
+    expect(candidateId(finding())).toBe(candidateId(attributed));
+  });
+
+  it("names the finding by its verified quote, not by the prose, in the persisted path", () => {
+    // Path IS the KB document identity. A slug built from the drifting sentence would write a
+    // second document for the same finding even while the hash held steady.
+    expect(candidateRelPath(finding())).toBe(candidateRelPath(finding({ statement: "Totally different wording here." })));
+    expect(candidateRelPath(finding())).toContain("-src-generated-api-ts-is-generated-and-mu.md");
+  });
+});
+
 describe("candidateSlug + candidateRelPath", () => {
   it("kebab-cases, strips punctuation, and bounds length", () => {
     expect(candidateSlug("Slack approval target is 60 seconds.")).toBe("slack-approval-target-is-60-seconds");
@@ -167,18 +262,55 @@ describe("computePlanDigest", () => {
   });
 });
 
+describe("SCOUT_CANDIDATE_CAPS", () => {
+  it("caps each role at its own number: 10 / 10 / 3", () => {
+    // Pinned literally, not derived from the map under test. A test that reads the same
+    // constant it asserts proves only that reading is deterministic; these numbers are a
+    // product decision (the reconciliation scout files few, high-cost findings) and a silent
+    // change to any of them must break a test.
+    expect(scoutCandidateCap("documentation")).toBe(10);
+    expect(scoutCandidateCap("history")).toBe(10);
+    expect(scoutCandidateCap("reconciliation")).toBe(3);
+  });
+
+  it("gives every configured scout non-zero ingest capacity", () => {
+    // The failure this guards: a new role added to SCOUT_NAMES but not to SCOUT_CANDIDATE_CAPS
+    // (or given 0) would be dispatched, burn tokens, report findings, and have every one of
+    // them dropped at the cap check. An active scout with zero capacity is worse than an
+    // absent scout, because it looks like it ran.
+    for (const role of SCOUT_NAMES) {
+      expect(scoutCandidateCap(role)).toBeGreaterThan(0);
+    }
+  });
+
+  it("derives the run total from the per-role caps, in any order", () => {
+    const sum = SCOUT_NAMES.reduce((total, role) => total + scoutCandidateCap(role), 0);
+    expect(MAX_CANDIDATES_TOTAL).toBe(sum);
+    // Order-independence is the whole point of the per-role map. The bug it replaced drained
+    // one shared pool while walking SCOUT_NAMES, so whichever role sorted last got whatever
+    // was left (often nothing). Summing a reversed roster must land on the same number.
+    const reversed = [...SCOUT_NAMES].reverse().reduce((total, role) => total + scoutCandidateCap(role), 0);
+    expect(reversed).toBe(sum);
+  });
+});
+
 describe("defaultLimits", () => {
   it("uses the default budget when none is given", () => {
     expect(defaultLimits().budgetMs).toBe(240_000);
-    expect(defaultLimits().maxCandidatesTotal).toBe(20);
   });
-  it("splits the per-scout cap from the run-total backstop, no reallocation (verdict item 8)", () => {
+  it("records the derived run total, and carries no per-scout scalar (verdict item 8)", () => {
     const limits = defaultLimits();
-    expect(limits.maxCandidatesPerScout).toBe(10);
-    expect(limits.maxCandidatesTotal).toBe(20);
-    // Per-scout caps must be able to sum to the run total so the per-scout cap is the binding
-    // limit on a fresh run (no scout is silently throttled below its own cap).
-    expect(limits.maxCandidatesPerScout * 2).toBeGreaterThanOrEqual(limits.maxCandidatesTotal);
+    expect(limits.maxCandidatesTotal).toBe(MAX_CANDIDATES_TOTAL);
+    // Display and audit only: nothing enforces it, because the per-role caps already bound
+    // the run by construction. It must equal their sum, never sit below it, or the recorded
+    // number would describe a throttle the run does not actually apply.
+    expect(limits.maxCandidatesTotal).toBe(
+      SCOUT_NAMES.reduce((total, role) => total + scoutCandidateCap(role), 0),
+    );
+    // No `maxCandidatesPerScout`. A single scalar cannot express caps that differ per role,
+    // and a persisted number that binds nothing is worse than an absent one: an operator can
+    // set it, observe no change, and conclude the cap is honored.
+    expect("maxCandidatesPerScout" in limits).toBe(false);
   });
   it("splits the history scan window from the inlined-commit cap (verdict item 7)", () => {
     const limits = defaultLimits();

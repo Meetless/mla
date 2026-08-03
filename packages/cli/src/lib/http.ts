@@ -295,6 +295,73 @@ function refreshBusyError(): HttpError {
   return e;
 }
 
+// ---------------------------------------------------------------------------
+// Server error-code classification.
+//
+// buildError folds the whole failure into ONE message string prefixed by the
+// method and URL, and every caller that renders it slices that string to keep a
+// terminal line readable. With a prod-length control URL plus a 25-char
+// workspaceId plus a 25-char actorUserId, the prefix alone is ~126 chars: a
+// 120-char slice truncates INSIDE the URL, so the response body (where the
+// server put the remedy) never reaches the human at all. Read the code off the
+// raw body instead of pattern-matching a rendered string.
+// ---------------------------------------------------------------------------
+
+// The parsed `code` an API error carries, or null when the failure never reached
+// the server / carried no JSON envelope. Never throws.
+export function errorCode(e: unknown): string | null {
+  const body = (e as HttpError | undefined)?.body;
+  if (!body) return null;
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown };
+    return typeof parsed.code === "string" ? parsed.code : null;
+  } catch {
+    return null;
+  }
+}
+
+// True when control denied this call because the caller's session holds NO
+// workspace at all: the ordinary state of a human between `mla login` (which
+// mints an Account and deliberately nothing else, INV-ACC-3) and `mla activate`.
+// Distinct from WORKSPACE_ACCESS_DENIED (they named a workspace that is not
+// theirs) and INSUFFICIENT_ROLE (they hold a role, just not a high enough one).
+export function isNoWorkspaceYet(e: unknown): boolean {
+  return (
+    (e as HttpError | undefined)?.status === 403 &&
+    errorCode(e) === "NO_WORKSPACE_YET"
+  );
+}
+
+// The server's own human-readable message for a failed call, when it sent one.
+// Falls back to null so callers can keep their existing rendering rather than
+// print an empty detail.
+export function serverMessage(e: unknown): string | null {
+  const body = (e as HttpError | undefined)?.body;
+  if (!body) return null;
+  try {
+    const parsed = JSON.parse(body) as { message?: unknown };
+    if (typeof parsed.message === "string" && parsed.message.trim()) {
+      return parsed.message.trim();
+    }
+  } catch {
+    // Not JSON: a proxy 502 page, an empty body. Nothing to surface.
+  }
+  return null;
+}
+
+// The rendering form: control's message with its status, falling back to the raw
+// HttpError.message when there is no enveloped body (a network error, a proxy
+// page). workspace.ts and activate.ts each grew a private copy of this, the
+// second one commented "kept local so activate.ts does not depend on the
+// workspace command module": a transport concern does belong here, not in a
+// command. One copy means the next fix to the extraction reaches every caller.
+export function serverMessageOrRaw(e: unknown): string {
+  const message = serverMessage(e);
+  if (!message) return (e as Error).message;
+  const status = (e as HttpError | undefined)?.status;
+  return status ? `${message} (HTTP ${status})` : message;
+}
+
 // Fail-fast guard for the intel plane (which always needs a real bearer; intel
 // validates it via control, §7). Mirrors doFetch's none-mode reject. Intel does
 // NOT auto-refresh in v1: refresh is scoped to control's doFetch (§6.5). A

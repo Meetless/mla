@@ -20,6 +20,11 @@
  */
 
 import { getRunTraceId } from "./observability";
+// Type-only, and one direction: enrichment/protocol.ts imports nothing from here, so naming its
+// closed resolution union in the envelope costs no runtime edge. Derived, never restated: the
+// envelope and the CLI must agree on what the three outcomes ARE, and a copied union is how those
+// two spellings drift apart.
+import type { FindingResolution } from "./enrichment/protocol";
 
 /** The protocol discriminator. The connector recognizes an envelope only by a
  * FULL-schema match, never by "JSON.parse succeeded" (§4.2), and this constant
@@ -49,7 +54,13 @@ export interface NextAction {
 export type DecisionSelection =
   | { mode: "all" }
   | { mode: "only"; candidate_ids: string[] }
-  | { mode: "none" };
+  | { mode: "none" }
+  // Resolving ONE doc/code finding (§5.9). Deliberately single-subject: the three outcomes are
+  // verdicts on a specific disagreement, so there is no coherent "resolve them all" and offering
+  // one would let a human close findings they never read. `resolution` is FindingResolution, the
+  // same closed union the CLI validates, imported rather than restated so the wire contract and
+  // the domain can never drift into two spellings of the same three words.
+  | { mode: "resolve"; candidate_id: string; resolution: FindingResolution };
 
 /** One option the human may pick in a `decision_request`. */
 export interface DecisionOption {
@@ -59,12 +70,21 @@ export interface DecisionOption {
 }
 
 /**
+ * The closed set of questions the CLI is allowed to ask. `enrich.accept` asks which
+ * durable rules to mint; `enrich.resolve` asks how one doc/code finding is answered.
+ * They stay separate kinds because they ask about different objects and the connector
+ * maps each to different CLI arguments. Exported as a runtime array so the boundary
+ * law checks membership against THIS list rather than a string it copied.
+ */
+export const DECISION_REQUEST_KINDS = ["enrich.accept", "enrich.resolve"] as const;
+export type DecisionRequestKind = (typeof DECISION_REQUEST_KINDS)[number];
+
+/**
  * Ephemeral control data emitted BEFORE a mutation (§4.5, §4.6). Not the
- * completed transcript (that stays hook-owned). `kind` is a closed enum; Phase 3
- * ships only enrichment acceptance.
+ * completed transcript (that stays hook-owned).
  */
 export interface DecisionRequest {
-  kind: "enrich.accept";
+  kind: DecisionRequestKind;
   subject: { run_id: string };
   prompt: string;
   options: DecisionOption[];

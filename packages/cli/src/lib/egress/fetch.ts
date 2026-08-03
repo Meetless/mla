@@ -21,7 +21,11 @@ import {
 } from "./policy";
 import { EGRESS_RULES } from "./rules";
 
-export { EgressPolicyError, EgressService };
+// EgressService is a type; re-exporting it as a value emits a runtime binding
+// that does not exist under any transpile-only compiler. Same for the six type
+// re-exports in commands/adoption.ts.
+export { EgressPolicyError };
+export type { EgressService };
 
 /** Verbs that carry a body and therefore must resolve a rule. */
 const BODY_VERBS = new Set(["POST", "PATCH", "PUT"]);

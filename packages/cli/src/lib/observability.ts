@@ -234,15 +234,31 @@ export function getWorkspaceConfig(): WorkspaceConfigForTracing | null {
   return currentWorkspaceConfig;
 }
 
-// Tenant guardrail (§9): even if workspace.tracing.sentryEnabled were flipped
-// true on a non-dogfood workspace by a config drift, the CLI still refuses to
-// send full-context captures. Only ws_an_local or workspaces explicitly flagged
-// tracing_dogfood: true clear the gate.
-export function workspaceSentryAllowed(cfg: WorkspaceConfigForTracing | null): boolean {
+// Tenant guardrail (§9), the tenant half. Only ws_an_local or a workspace
+// explicitly flagged tracing_dogfood may send observability data off the
+// machine. This is the SAME predicate control's AgentTracesService applies in
+// assertTenantTracingForbidden; both planes below compose it so a client can
+// never be looser (silent 403 storm) or stricter (silently dropped traces) than
+// the server.
+//
+// Deliberately does NOT read tracing.sentryEnabled: control's trace gate never
+// looks at it, so requiring it here would refuse relays control would accept.
+// The Sentry plane adds that condition on top; the trace plane does not.
+export function workspaceTraceRelayAllowed(
+  cfg: WorkspaceConfigForTracing | null,
+): boolean {
   if (!cfg) return false;
-  if (cfg.tracing?.sentryEnabled !== true) return false;
   if (cfg.workspaceId === "ws_an_local") return true;
   return cfg.tracingDogfood === true;
+}
+
+// Tenant guardrail (§9), Sentry plane: the tenant gate AND the workspace's own
+// sentryEnabled toggle. Even if sentryEnabled were flipped true on a non-dogfood
+// workspace by a config drift, the tenant gate still refuses full-context
+// captures.
+export function workspaceSentryAllowed(cfg: WorkspaceConfigForTracing | null): boolean {
+  if (!workspaceTraceRelayAllowed(cfg)) return false;
+  return cfg!.tracing?.sentryEnabled === true;
 }
 
 // OBS-9 allowlist. The ONLY fields permitted to ride a Sentry context: pointers
@@ -544,12 +560,26 @@ export function resetIntelEchoForTesting(): void {
 // advertising URLs that resolve to nothing.
 let traceFlushSucceeded = false;
 
+// True when this run installed NO relay at all (kill switch, or the §9 tenant
+// gate). A no-op tracer's flush() resolves, which boundedTraceFlush cannot tell
+// apart from a 200 from control, so without this flag "flushed" reads as
+// "uploaded" and the deep link advertises a Langfuse URL for a trace that was
+// never sent. Recorded at the one place that knows (createRunTracer) rather than
+// sniffed from the tracer, which carries no marker. Defaults false so a tracer
+// with a real flushFn is treated as an installed relay.
+let traceRelaySuppressed = false;
+
 export function didTraceFlushSucceed(): boolean {
-  return traceFlushSucceeded;
+  return !traceRelaySuppressed && traceFlushSucceeded;
+}
+
+export function isTraceRelaySuppressed(): boolean {
+  return traceRelaySuppressed;
 }
 
 export function resetTraceFlushOutcomeForTesting(): void {
   traceFlushSucceeded = false;
+  traceRelaySuppressed = false;
 }
 
 // HTTP-backed flush function the tracer calls inside flush(). POSTs the span
@@ -626,6 +656,36 @@ export function makeHttpFlush(opts: {
       clearTimeout(timer);
     }
   };
+}
+
+// The trace plane's §9 gate: build an HTTP flush ONLY for a workspace control
+// will actually accept a relay from, otherwise null (which createRunTracer turns
+// into a no-op tracer, so the run never touches the network).
+//
+// Without this the client sent a span batch on every command under every
+// workspace, and control refused every one of them. Measured in prod on
+// 2026-08-01: ~25 denials/min, ~36k/day, zero 2xx in 7 days, invisible for 30+
+// days because a §9 refusal is on the deliberately-silenced list. The server
+// gate was never the problem; the missing client gate was. Enforcing it here
+// also means the silenced-error path stops being load-bearing for the normal
+// case: it now only catches a workspace whose dogfood flag was revoked
+// mid-session, which is what a silenced error should be for.
+export function makeTraceFlushIfPermitted(opts: {
+  config: WorkspaceConfigForTracing | null;
+  controlUrl: string;
+  controlToken: string;
+  workspaceId: string;
+  actorUserId?: string;
+  timeoutMs?: number;
+}): FlushFn | null {
+  if (!workspaceTraceRelayAllowed(opts.config)) return null;
+  return makeHttpFlush({
+    controlUrl: opts.controlUrl,
+    controlToken: opts.controlToken,
+    workspaceId: opts.workspaceId,
+    actorUserId: opts.actorUserId,
+    timeoutMs: opts.timeoutMs,
+  });
 }
 
 // Control's §9 error code for "this workspace is not authorized to relay
@@ -770,16 +830,19 @@ export function maybePrintDeepLink(opts: DeepLinkOpts): boolean {
 }
 
 // Build the run's tracer. Returns a no-op tracer when no HTTP flush function
-// is available (mla init / no config / fully-offline command). Otherwise
-// returns a real tracer whose flush POSTs to control's relay. flush() is
-// always called once (via boundedTraceFlush in cli.ts); the no-op tracer
-// resolves immediately so the lifecycle is unconditional.
+// is available (mla init / no config / kill switch / a workspace the §9 tenant
+// gate refuses). Otherwise returns a real tracer whose flush POSTs to control's
+// relay. flush() is always called once (via boundedTraceFlush in cli.ts); the
+// no-op tracer resolves immediately so the lifecycle is unconditional, which is
+// exactly why the suppression must be recorded here: a resolved no-op flush is
+// indistinguishable downstream from a successful upload.
 export function createRunTracer(opts: {
   traceId: string;
   rootName: string;
   buildInfo: BuildInfo;
   flushFn: FlushFn | null;
 }): Tracer {
+  traceRelaySuppressed = !opts.flushFn;
   if (!opts.flushFn) {
     return makeNoopTracer({ traceId: opts.traceId });
   }

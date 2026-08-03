@@ -11,7 +11,7 @@ import {
   userHomeDir,
 } from "../lib/config";
 import { tryResolveWorkspaceId } from "../lib/workspace";
-import { get, ping } from "../lib/http";
+import { get, isNoWorkspaceYet, ping, serverMessage } from "../lib/http";
 import { queueDepth, reapQueue } from "../lib/spool";
 import { findActivation } from "../lib/activation";
 import {
@@ -1072,11 +1072,36 @@ export async function runDoctor(argv: string[]): Promise<number> {
       });
     } catch (e) {
       const err = e as Error & { status?: number };
-      checks.push({
-        ok: false,
-        label: "whoami (token + workspace + actor)",
-        detail: `HTTP ${err.status ?? "?"}: ${err.message.slice(0, 120)}`,
-      });
+      if (isNoWorkspaceYet(err)) {
+        // Not a token problem and not a role problem: this session holds no
+        // workspace membership at all, which is the ordinary state between
+        // `mla login` and a workspace. The marker still binds the folder, so the
+        // operator reads "activated" everywhere while every governed call is
+        // denied. Name the state and both ways out. See runBind in activate.ts.
+        const signedInEmail =
+          cfg.auth.mode === "user-token" && cfg.auth.user.email?.trim()
+            ? cfg.auth.user.email.trim()
+            : "<your-email>";
+        checks.push({
+          id: "workspace.membership",
+          ok: false,
+          label: "workspace membership",
+          detail:
+            `no workspace yet: signed in, but this session holds no workspace membership, ` +
+            `so every governed command in this folder is denied. The marker binds it to ` +
+            `${markerWorkspaceId}. Ask an owner to run \`mla workspace invite ${signedInEmail}\`, ` +
+            "or run `mla deactivate` then `mla activate` to use your own workspace here.",
+        });
+      } else {
+        // Render the SERVER's message when it sent one. err.message is
+        // `GET <url> -> HTTP <status>: <body>`, so any slice short enough for a
+        // terminal line lands inside the URL and drops the diagnosis entirely.
+        checks.push({
+          ok: false,
+          label: "whoami (token + workspace + actor)",
+          detail: `HTTP ${err.status ?? "?"}: ${serverMessage(err) ?? err.message.slice(0, 120)}`,
+        });
+      }
     }
   }
 

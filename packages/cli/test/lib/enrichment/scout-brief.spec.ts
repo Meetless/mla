@@ -1,5 +1,11 @@
 import { SCOUT_TOOL_ALLOWLIST, SCOUT_AGENT_NAME, buildScoutPrompt } from "../../../src/lib/enrichment/scout-brief";
-import { OnboardingRun, SCOUT_NAMES, MAX_STATEMENT_LENGTH } from "../../../src/lib/enrichment/protocol";
+import {
+  OnboardingRun,
+  SCOUT_NAMES,
+  MAX_STATEMENT_LENGTH,
+  MAX_CANDIDATES_TOTAL,
+  scoutCandidateCap,
+} from "../../../src/lib/enrichment/protocol";
 
 function run(over: Partial<OnboardingRun> = {}): OnboardingRun {
   return {
@@ -16,7 +22,6 @@ function run(over: Partial<OnboardingRun> = {}): OnboardingRun {
       maxHistorySelectedCommits: 40,
       maxPreparedInputBytes: 200_000,
       maxCandidatesTotal: 20,
-      maxCandidatesPerScout: 10,
       budgetMs: 240_000,
     },
     documentationTargets: over.documentationTargets ?? [
@@ -54,6 +59,14 @@ describe("SCOUT_TOOL_ALLOWLIST (gate 7: no shell, mutation, or network tools)", 
     expect(SCOUT_TOOL_ALLOWLIST.history).toEqual([]);
   });
 
+  it("grants the reconciliation scout Read only: it never runs git itself", () => {
+    // The reconciliation finding needs blame, ancestry, and file-change facts, and every one
+    // of those happens later in the trusted CLI against anchors ingest has already validated.
+    // Handing the scout Bash to fetch them itself would put an untrusted agent's shell output
+    // inside the evidence chain, which is the exact thing the allowlist exists to prevent.
+    expect(SCOUT_TOOL_ALLOWLIST.reconciliation).toEqual(["Read"]);
+  });
+
   it("never grants any scout a shell, mutation, network, or discovery tool", () => {
     // Shell / mutation / network would break the security claim; Glob/Grep are forbidden
     // because the deterministic plan already discovered and ranked the inputs (plan §4).
@@ -76,7 +89,9 @@ describe("SCOUT_TOOL_ALLOWLIST (gate 7: no shell, mutation, or network tools)", 
     }
   });
 
-  it("covers exactly the two known scout roles", () => {
+  it("covers every configured scout role and no others", () => {
+    // A role missing from the allowlist would be dispatched with an undefined tool list; a
+    // role present but not in SCOUT_NAMES is a permission grant nothing revoked.
     expect(Object.keys(SCOUT_TOOL_ALLOWLIST).sort()).toEqual([...SCOUT_NAMES].sort());
   });
 });
@@ -85,6 +100,7 @@ describe("SCOUT_AGENT_NAME (role -> Claude Code subagent name)", () => {
   it("maps each role to a distinct, namespaced, kebab-case agent name", () => {
     expect(SCOUT_AGENT_NAME.documentation).toBe("meetless-doc-scout");
     expect(SCOUT_AGENT_NAME.history).toBe("meetless-history-scout");
+    expect(SCOUT_AGENT_NAME.reconciliation).toBe("meetless-reconciliation-scout");
     for (const role of SCOUT_NAMES) {
       const name = SCOUT_AGENT_NAME[role];
       // Namespaced so it cannot collide with an operator's own agents.
@@ -92,18 +108,19 @@ describe("SCOUT_AGENT_NAME (role -> Claude Code subagent name)", () => {
       // Claude Code subagent names are lowercase letters, numbers, and hyphens only.
       expect(name).toMatch(/^[a-z0-9-]+$/);
     }
-    // Two roles must not collapse to one subagent.
+    // No two roles may collapse to one subagent: a shared name would silently dispatch one
+    // role's brief to another role's tool grant.
     expect(new Set(Object.values(SCOUT_AGENT_NAME)).size).toBe(SCOUT_NAMES.length);
   });
 
-  it("covers exactly the two known scout roles", () => {
+  it("covers every configured scout role and no others", () => {
     expect(Object.keys(SCOUT_AGENT_NAME).sort()).toEqual([...SCOUT_NAMES].sort());
   });
 });
 
 describe("buildScoutPrompt: the scout's deadline can be re-anchored at dispatch time", () => {
   // run.deadlineAt is frozen at PLAN time, but the scout does not start at plan time: the
-  // agent runs `enrich brief` for both roles and then relays each brief verbatim into a Task
+  // agent runs `enrich brief` for every role and then relays each brief verbatim into a Task
   // prompt (the history brief is tens of KB of git evidence, emitted token by token). Charging
   // the scout for that orchestration makes the budget a trap: on a slow relay the deadline is
   // already past when the scout starts, and the brief tells it to return `timed_out` having
@@ -123,7 +140,7 @@ describe("buildScoutPrompt: the scout's deadline can be re-anchored at dispatch 
   }
 });
 
-describe("buildScoutPrompt (shared policy atoms, both roles)", () => {
+describe("buildScoutPrompt (shared policy atoms, every role)", () => {
   for (const role of SCOUT_NAMES) {
     it(`states the scout policy for the ${role} scout`, () => {
       const out = buildScoutPrompt(run(), role);
@@ -140,13 +157,16 @@ describe("buildScoutPrompt (shared policy atoms, both roles)", () => {
       // The output contract carries the role's own sourceScout.
       expect(out).toContain(`"sourceScout": "${role}"`);
       expect(out).toContain(`"scout": "${role}"`);
-      // Each scout is told its OWN independent hard cap (10), explicitly NOT a shared or
-      // reallocated budget (verdict item 8: no reallocation). The run-wide backstop (20) is
-      // surfaced as a ceiling, but the binding instruction is the per-scout cap, so the brief
-      // must not revive the old "fair share" framing that implied surplus moves between scouts.
-      expect(out).toContain("10 candidates or fewer");
-      expect(out).toContain("20 candidates");
+      // Each scout is told its OWN independent hard cap, read from the SAME function ingest
+      // allocates from, so the number a scout aims at is the number ingest will honor
+      // (verdict item 8: no reallocation). Caps differ per role, so a brief that hardcoded
+      // one number would tell the reconciliation scout to file 10 and have 7 dropped.
+      expect(out).toContain(`${scoutCandidateCap(role)} candidates or fewer`);
       expect(out).toMatch(/yours alone|not (shared|reallocated)/i);
+      // No run-wide ceiling is quoted: MAX_CANDIDATES_TOTAL is derived from the per-role caps
+      // and binds nothing at ingest, so printing it would give the scout a second, larger
+      // number to aim at that no check enforces.
+      expect(out).not.toContain(`${MAX_CANDIDATES_TOTAL} candidates`);
       expect(out).not.toMatch(/shares that budget fairly/);
       expect(out).not.toMatch(/fair share/i);
     });
@@ -161,9 +181,17 @@ describe("buildScoutPrompt (shared policy atoms, both roles)", () => {
       expect(out).not.toMatch(/prose summary after the JSON/i);
       expect(out).toMatch(/the JSON\s*\n?\s*object above is the entire output/i);
       // Contradictions are not dropped: they are redirected into the candidate model,
-      // which is the only thing ingest persists.
-      expect(out).toMatch(/contradict/i);
-      expect(out).toMatch(/`decision` or `deprecation` candidate/);
+      // which is the only thing ingest persists. WHICH model depends on the role, because
+      // the kinds a role may emit are the kinds it may be told to file: sending every role
+      // the same closing rule is how the reconciliation scout got told to file a `decision`
+      // that ingest is now obliged to reject as kind_not_allowed_for_scout.
+      if (role === "reconciliation") {
+        expect(out).toMatch(/NOT automatically inconsistent/);
+        expect(out).not.toMatch(/`decision` or `deprecation` candidate/);
+      } else {
+        expect(out).toMatch(/contradict/i);
+        expect(out).toMatch(/`decision` or `deprecation` candidate/);
+      }
     });
 
     it(`warns the ${role} scout that an over-length statement is hard-rejected (not truncated) at ingest`, () => {

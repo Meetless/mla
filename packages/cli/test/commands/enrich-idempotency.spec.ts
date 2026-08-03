@@ -7,6 +7,7 @@ import { bindWorkspaceMarker } from "../lib/workspace-marker.helper";
 import { onboardingLockPath, releaseOnboardingLock } from "../../src/lib/enrichment/lock";
 import { runRecordPath } from "../../src/lib/enrichment/plan";
 import { writeState } from "../../src/lib/enrichment/ingest";
+import { scoutStates } from "../helpers/scout-state";
 
 // Command-boundary coverage for the plan-digest idempotency gate
 // (notes/20260627-onboarding-idempotency-plandigest-gate.md). The gate's job: a re-run of
@@ -108,10 +109,10 @@ describe("mla enrich plan: plan-digest idempotency gate", () => {
       schemaVersion: 2,
       status: "complete",
       updatedAt: "2026-06-27T00:00:00.000Z",
-      scouts: {
+      scouts: scoutStates({
         documentation: { status: "complete", candidateCount: counts.documentation },
         history: { status: "complete", candidateCount: counts.history },
-      },
+      }),
     });
     return first;
   }
@@ -176,10 +177,10 @@ describe("mla enrich plan: plan-digest idempotency gate", () => {
       schemaVersion: 2,
       status: "partial",
       updatedAt: "2026-06-27T00:00:00.000Z",
-      scouts: {
+      scouts: scoutStates({
         documentation: { status: "complete", candidateCount: 7 },
         history: { status: "timed_out" },
-      },
+      }),
     });
 
     const rc = await runEnrich(["plan", "--json"]);

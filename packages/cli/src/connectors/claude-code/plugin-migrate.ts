@@ -183,7 +183,7 @@ function countLegacySkills(skillsDir: string): { present: number; total: number 
   return { present, total };
 }
 
-// Present/total over the two SCOUT_AGENT_FILES (agentsAny vs agentsComplete).
+// Present/total over every SCOUT_AGENT_FILES entry (agentsAny vs agentsComplete).
 function countLegacyAgents(agentsDir: string): { present: number; total: number } {
   const total = SCOUT_AGENT_FILES.length;
   const present = SCOUT_AGENT_FILES.filter((file) =>
