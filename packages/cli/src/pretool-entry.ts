@@ -15,6 +15,7 @@
 // core's exit code, and fail OPEN (exit 0) on any unexpected rejection so an
 // entrypoint fault can never escalate into a blocking hook decision.
 import { runInternalPretoolObserve } from "./commands/internal-pretool-observe";
+import { installStdioEpipeGuard } from "./lib/stdio-guard";
 
 /**
  * Run the observe core with no argv (the PreToolUse payload arrives on stdin, not in
@@ -34,5 +35,11 @@ export async function runPretoolEntry(
 }
 
 if (require.main === module) {
+  // First, before anything can write. The hook harness owns this stdout pipe and may
+  // close it at any moment; Node reports that as a stream `error` event, which the
+  // try/catch above is structurally unable to see. Without the guard, a closed pipe
+  // becomes an uncaught exception and this permissive hook exits as a crash, which is
+  // the one outcome the fail-open contract exists to prevent.
+  installStdioEpipeGuard();
   void runPretoolEntry();
 }

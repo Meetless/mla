@@ -1,7 +1,16 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { resolveMeetlessHome } from "../config";
+import { assertSafeWorkspaceId } from "../path-component";
 import { ScanResult, Verdicts } from "./types";
 import { renderStaleContextXml } from "./render";
 
@@ -27,12 +36,21 @@ import { renderStaleContextXml } from "./render";
 // goes through config.resolveMeetlessHome, which validates and recovers.
 //
 // With the variable unset (every production install) this resolves exactly as before.
-function stateRoot(home?: string): string {
+//
+// EXPORTED because the state root is now also an IDENTITY, not just a path prefix: the floor
+// projection stamps the root that wrote it so a run under one state root cannot silently
+// replace a projection owned by another (floor-projection-writer.ts).
+export function resolveStateRoot(home?: string): string {
   if (home !== undefined) return join(home, ".meetless");
   return resolveMeetlessHome();
 }
+// The single choke point through which EVERY per-workspace artifact path below is built, which
+// is why the id is validated here and not at the eight callers. `join` normalizes, so an id like
+// `../../x` does not name a badly-named directory, it lands OUTSIDE the state root entirely; and
+// a shell-quoted id (observed on disk 2026-07-15) silently forks one workspace's state into two
+// directories. See path-component.ts for the full incident.
 function wsDir(home: string | undefined, workspaceId: string): string {
-  return join(stateRoot(home), "workspaces", workspaceId);
+  return join(resolveStateRoot(home), "workspaces", assertSafeWorkspaceId(workspaceId));
 }
 export function scanCachePath(workspaceId: string, home?: string): string {
   return join(wsDir(home, workspaceId), "scan-cache.json");
@@ -110,24 +128,40 @@ function readJson<T>(path: string): T | null {
 // it, which is a floor-only turn rather than a wrong-rules turn. Bounded, not clever.
 const MAX_ROOT_SLOTS = 8;
 
+// A slot whose root directory is GONE is unreachable, not merely old: `readScanCacheAtRoot` keys on
+// the live cwd's realpath, so nothing can ever address it again. Those are dropped before the cap
+// applies, because mtime order is exactly backwards for this hazard: the throwaway roots are the
+// NEWEST slots, so a pure-mtime cap evicts the real checkouts and keeps the temp dirs.
 function pruneRootSlots(workspaceId: string, home: string | undefined, keep: string): void {
   try {
     const dir = scanCacheRootsDir(workspaceId, home);
-    const entries = readdirSync(dir)
-      .filter((f) => f.startsWith("scan-cache-") && f.endsWith(".json"))
-      .map((f) => {
-        const path = join(dir, f);
-        let mtime = 0;
+    const survivors: { path: string; mtime: number }[] = [];
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith("scan-cache-") || !f.endsWith(".json")) continue;
+      const path = join(dir, f);
+      if (path === keep) continue;
+      const root = readJson<ScanResult>(path)?.scanRootPath;
+      // Only a slot that NAMES a root we can prove is gone gets dropped here. An unparseable or
+      // unstamped slot is left to the cap: it may be a partial write from a live root, and
+      // "cannot tell" must not read as "vanished".
+      if (root && !existsSync(root)) {
         try {
-          mtime = statSync(path).mtimeMs;
+          unlinkSync(path);
         } catch {
-          /* unreadable: sorts oldest, gets pruned first */
+          /* best effort */
         }
-        return { path, mtime };
-      })
-      .filter((e) => e.path !== keep)
-      .sort((a, b) => b.mtime - a.mtime);
-    for (const stale of entries.slice(MAX_ROOT_SLOTS - 1)) {
+        continue;
+      }
+      let mtime = 0;
+      try {
+        mtime = statSync(path).mtimeMs;
+      } catch {
+        /* unreadable: sorts oldest, gets pruned first */
+      }
+      survivors.push({ path, mtime });
+    }
+    survivors.sort((a, b) => b.mtime - a.mtime);
+    for (const stale of survivors.slice(MAX_ROOT_SLOTS - 1)) {
       try {
         unlinkSync(stale.path);
       } catch {
@@ -139,10 +173,76 @@ function pruneRootSlots(workspaceId: string, home: string | undefined, keep: str
   }
 }
 
+// What the workspace-global slot should hold after `incoming` is scanned.
+//
+// That slot is ONE file shared by every root bound to this workspace id, and its fields split in
+// two (see ScanResult.scanRootPath): floor content is workspace-global and identical from any
+// root, while commitSha / inventory / directives / scopedRules / staleSignals describe exactly ONE
+// checkout. Writing the whole record from any root is what let a scan inside a throwaway directory
+// serve that directory's inventory as a real checkout's governing rules, twice (2026-07-28,
+// 2026-08-02). Per-root slots fixed the READ side for roots that already own a slot; this fixes
+// the write side for every root that does not, and for the three shell readers of this file.
+//
+// So the slot gets an OWNER: the first root to stamp it. A different root refreshes the floor and
+// leaves the owner's repo-specific fields alone. Ownership transfers when the owner's directory no
+// longer exists, which is precisely the throwaway-dir case and the self-heal the 2026-07-28
+// write-up said was missing ("that directory is then deleted, so the cache can never match again
+// and nothing self-heals").
+//
+// Single-root installs, the vast majority, always take the `incoming` path and are byte-identical
+// to before this landed.
+// Does this scan actually carry a floor? Missing, empty and whitespace-only are the same absence
+// wearing different clothes: `floorRulesXml` is optional in the type, a bundle read that returns
+// nothing renders "", and a renderer given zero rules can emit an empty wrapper's worth of
+// whitespace. Guarding only `=== ""` would leave the other two roads open.
+function hasFloor(scan: ScanResult): boolean {
+  return (scan.floorRulesXml ?? "").trim().length > 0;
+}
+
+function globalSlotContent(
+  home: string | undefined,
+  workspaceId: string,
+  incoming: ScanResult,
+): ScanResult {
+  const incumbent = readScanCache(home, workspaceId);
+  // Nothing there, an unstamped pre-per-root cache (whose owner is unknowable), or an unstamped
+  // incoming scan: claim the slot outright.
+  if (!incumbent?.scanRootPath || !incoming.scanRootPath) return incoming;
+  if (incumbent.scanRootPath === incoming.scanRootPath) return incoming;
+  if (!existsSync(incumbent.scanRootPath)) return incoming;
+  // A different, still-present root owns this slot. Refresh only what is workspace-global.
+  //
+  // schemaVersion deliberately stays the INCUMBENT's: it gates how the assembler reads the record
+  // it is attached to, and every repo-specific field here is still the incumbent's. Raising it to
+  // match a newer `incoming` would claim structured arrays this record does not carry, turning a
+  // visible degradation into a silent floor-only delivery.
+  //
+  // ...and a stranger only gets to refresh the floor when it HAS one. The floor is workspace-global
+  // and principal-keyed, so every root that can read the bundle computes the same one; but a root
+  // that cannot read it (offline, no cached bundle for that principal, a throwaway dir that
+  // resolves no principal at all) still scans successfully and still carries an EMPTY floor. Taking
+  // that unconditionally writes the absence over the owner's real floor, and three shell readers in
+  // the hot-path hook read this slot directly, so the owning checkout loses its MUSTs on every
+  // prompt: the 2026-08-02 floor outage reached by a different road. A refresh must carry something.
+  // Absence never overwrites presence.
+  //
+  // The three fields move together on purpose. They come from ONE bundle read, and floorMeta is the
+  // provenance stamp (bundleId/bundleHash/freshness) that the delivery receipt attests ABOUT
+  // floorRulesXml. Taking the XML from the stranger and the stamp from the incumbent would mint a
+  // record whose receipt vouches for a body it never saw.
+  if (!hasFloor(incoming)) return incumbent;
+  return {
+    ...incumbent,
+    floorRulesXml: incoming.floorRulesXml,
+    floorRules: incoming.floorRules,
+    floorMeta: incoming.floorMeta,
+  };
+}
+
 export function writeScanCache(home: string | undefined, workspaceId: string, result: ScanResult): void {
-  // The workspace-global slot, unchanged. Three shell readers in the hot-path hook consume it
-  // directly, and its workspace-global content (floor XML, floor meta) is correct from any root.
-  writeJson(scanCachePath(workspaceId, home), result);
+  // The workspace-global slot. Three shell readers in the hot-path hook consume it directly, so it
+  // is always written; what it is allowed to overwrite is decided by globalSlotContent.
+  writeJson(scanCachePath(workspaceId, home), globalSlotContent(home, workspaceId, result));
   // The per-root slot. Only written when the scan stamped its root; a result without one is a
   // pre-stamp cache and has nothing to key by.
   if (!result.scanRootPath) return;

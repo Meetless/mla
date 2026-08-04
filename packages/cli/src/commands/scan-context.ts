@@ -7,6 +7,7 @@ import {
   readScanCache,
   readScanCacheAtRoot,
   readVerdicts,
+  resolveStateRoot,
   writeScanCache,
   writeProjectionReceipt,
   type PersistedProjectionReceipt,
@@ -174,7 +175,7 @@ function materializeAndRecordProjection(
   now: () => string,
 ): void {
   const scanRoot = resolveScanRoot(cwd);
-  const outcome = resolveProjectionOutcome(scanRoot, applied.directives, floorMeta);
+  const outcome = resolveProjectionOutcome(scanRoot, applied.directives, floorMeta, home);
   writeProjectionReceipt(home, workspaceId, {
     schemaVersion: 1,
     at: now(),
@@ -195,10 +196,16 @@ function materializeAndRecordProjection(
 // subagents until deactivation); every other case defers to the writer's own safety posture.
 // bundleId is informational provenance in the header; ownership/rewrite decisions are driven
 // purely by the body hash, so reusing the floorMeta read (vs a second read) is safe.
+//
+// `home` is this run's state root ancestor, and it is what makes the writer's cross-state-root
+// guard reachable in production: the projection's owner is the `.meetless` dir the scan's state
+// belongs to. It is passed through UNRESOLVED when absent, deliberately: resolveStateRoot()
+// throws on a malformed MEETLESS_HOME, and the writer resolves it inside its own throw-free try.
 export function resolveProjectionOutcome(
   scanRoot: string,
   directives: Directive[],
   floorMeta: FloorMeta,
+  home?: string,
 ): { projection: PersistedProjectionReceipt["projection"]; reason?: string } {
   if (directives.length === 0 && floorMeta.freshness === "fresh") {
     const r = removeOwnedProjection(scanRoot);
@@ -207,7 +214,8 @@ export function resolveProjectionOutcome(
     // the on-disk file untouched, but surface that we could not reconcile it).
     return { projection: r.reason === "absent" ? "unchanged" : "blocked", reason: r.reason };
   }
-  const receipt = materializeFloorProjection(scanRoot, directives, floorMeta.bundleId);
+  const owner = home === undefined ? undefined : resolveStateRoot(home);
+  const receipt = materializeFloorProjection(scanRoot, directives, floorMeta.bundleId, owner);
   return { projection: receipt.projection, reason: receipt.reason };
 }
 

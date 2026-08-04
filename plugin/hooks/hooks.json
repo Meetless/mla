@@ -83,7 +83,7 @@
         ]
       },
       {
-        "matcher": "mcp__meetless__",
+        "matcher": "^mcp__meetless__.*$",
         "hooks": [
           {
             "type": "command",

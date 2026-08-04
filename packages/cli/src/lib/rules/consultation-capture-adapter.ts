@@ -128,9 +128,9 @@ function extractConsultationText(
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-function extractResultPayload(response: Record<string, unknown>): Record<string, unknown> | null {
-  const content = response.content;
-  if (!Array.isArray(content) || content.length === 0) return null;
+/** Lift the JSON payload out of a normalised content-block list (either envelope). */
+function extractResultPayload(content: unknown[]): Record<string, unknown> | null {
+  if (content.length === 0) return null;
   const first = content[0];
   if (!isPlainObject(first) || typeof first.text !== "string") return null;
   try {
@@ -161,13 +161,31 @@ export function classifyRetrievalEnvelope(toolResponse: unknown): {
   execution: ConsultationExecution;
   result?: ConsultationResult;
 } {
-  if (!isPlainObject(toolResponse)) {
+  // TWO envelopes, because two clients disagree. Claude Code sends the content-block
+  // ARRAY itself as tool_response; the MCP spec's own result shape wraps it as
+  // `{content: [...]}`, which is what Codex and every fixture in this file use.
+  //
+  // This function used to open with `if (!isPlainObject(toolResponse)) return UNKNOWN`,
+  // so the real Claude Code shape short-circuited on the first line and EVERY genuine
+  // consultation was recorded as execution=UNKNOWN with a null result: a row attesting
+  // "we consulted" that cannot say whether anything came back, which is the entire
+  // measurement CE0 exists to produce. It went unseen because the matcher bug meant no
+  // real payload ever reached this code (see CE0_POST_TOOL_USE_MATCHER), and because
+  // every fixture used the wrapper. Normalising to the block list first accepts both.
+  const blocks: unknown[] | null = Array.isArray(toolResponse)
+    ? toolResponse
+    : isPlainObject(toolResponse) && Array.isArray(toolResponse.content)
+      ? toolResponse.content
+      : null;
+  if (blocks === null) {
     return { execution: "UNKNOWN" };
   }
-  if (toolResponse.isError === true) {
+  // Only the wrapper form carries an explicit error flag. A bare list that holds an
+  // error string simply fails to parse below and lands on UNKNOWN, which is honest.
+  if (isPlainObject(toolResponse) && toolResponse.isError === true) {
     return { execution: "FAILED" };
   }
-  const payload = extractResultPayload(toolResponse);
+  const payload = extractResultPayload(blocks);
   if (payload === null) {
     return { execution: "UNKNOWN" };
   }

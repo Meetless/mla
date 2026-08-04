@@ -16,6 +16,7 @@
 
 import { mkdirSync, writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { assertSafeWorkspaceId } from "../path-component";
 
 export const ONBOARDING_LOCK_SCHEMA_VERSION = 1 as const;
 
@@ -34,8 +35,12 @@ export interface OnboardingLock {
   expiresAt: string; // ISO 8601; createdAt + ttl, surfaced so a reject can say when it frees
 }
 
+// The workspaceId is a PATH COMPONENT here (see path-component.ts). Validated before the join
+// so a malformed id cannot claim a lock file outside the state root, where no other run would
+// ever look for it and the mutual exclusion this file exists to provide would silently stop
+// holding.
 export function onboardingLockPath(home: string, workspaceId: string): string {
-  return join(home, "workspaces", workspaceId, "onboarding-active.json");
+  return join(home, "workspaces", assertSafeWorkspaceId(workspaceId), "onboarding-active.json");
 }
 
 export type AcquireResult =

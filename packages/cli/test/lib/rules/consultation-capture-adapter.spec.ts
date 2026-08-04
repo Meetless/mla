@@ -112,6 +112,16 @@ function post(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
+/** The tool_response shape Claude Code ACTUALLY sends: the content-block array itself,
+ * NOT wrapped in a `{content: [...]}` envelope. Captured 2026-08-04 from a real
+ * PostToolUse payload for `mcp__meetless__meetless__retrieve_knowledge`; the hook's
+ * top-level keys were cwd, duration_ms, effort, hook_event_name, permission_mode,
+ * prompt_id, session_id, tool_input, tool_name, tool_response, tool_use_id,
+ * transcript_path, and `tool_response` was `list[1]` of `{text, type}`. */
+function bareContentList(payload: unknown): unknown {
+  return [{ type: "text", text: JSON.stringify(payload) }];
+}
+
 function rowCount(table: string): number {
   return (store.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 }
@@ -185,6 +195,59 @@ describe("captureMemoryConsultation: records an AGENT_PULL fact", () => {
     const { outcome } = captureMemoryConsultation(empty, config());
     expect(outcome).toMatchObject({ execution: "COMPLETE", result: "NO_MATCH" });
     expect(getConsultationAttempt(store, "con_1")?.result).toBe("NO_MATCH");
+  });
+
+  it("classifies the REAL Claude Code envelope: a bare content list, not a {content} wrapper", () => {
+    // The second defect behind the zero-consultation outage, and it survived the first
+    // fix. Once the matcher was corrected the hook finally fired on a real MCP call and
+    // recorded execution=UNKNOWN with a null result: a row that attests "we consulted"
+    // and cannot say whether anything came back, which is exactly the measurement the
+    // CE0 harness exists to produce.
+    //
+    // Cause: every fixture in this file wraps the blocks as `{content: [...]}`, and
+    // `classifyRetrievalEnvelope` opens with `if (!isPlainObject(toolResponse)) return
+    // UNKNOWN`. Claude Code sends the ARRAY itself, which is not a plain object, so the
+    // classifier short-circuited on the first line for every real call ever made. The
+    // whole suite agreed with the fixture instead of with the hook.
+    seedTurn();
+    const { outcome } = captureMemoryConsultation(
+      post({
+        tool_response: bareContentList({
+          tool: "meetless__retrieve_knowledge",
+          workspace: "ws_abc",
+          query: RK_QUERY,
+          count: 2,
+          candidates: [{ id: "ev_1" }, { id: "ev_2" }],
+        }),
+      }),
+      config(),
+    );
+    expect(outcome.kind).toBe("CAPTURED");
+    if (outcome.kind !== "CAPTURED") return;
+    expect(outcome.execution).toBe("COMPLETE");
+    expect(outcome.result).toBe("RESULTS_RETURNED");
+  });
+
+  it("classifies a bare content list with zero hits as COMPLETE + NO_MATCH", () => {
+    seedTurn();
+    const { outcome } = captureMemoryConsultation(
+      post({ tool_response: bareContentList({ count: 0, candidates: [] }) }),
+      config(),
+    );
+    expect(outcome.kind).toBe("CAPTURED");
+    if (outcome.kind !== "CAPTURED") return;
+    expect(outcome.execution).toBe("COMPLETE");
+    expect(outcome.result).toBe("NO_MATCH");
+  });
+
+  it("still classifies the {content:[...]} wrapper, which other MCP clients send", () => {
+    // The fix widens the accepted shapes; it must not trade one envelope for the other.
+    seedTurn();
+    const { outcome } = captureMemoryConsultation(post(), config());
+    expect(outcome.kind).toBe("CAPTURED");
+    if (outcome.kind !== "CAPTURED") return;
+    expect(outcome.execution).toBe("COMPLETE");
+    expect(outcome.result).toBe("RESULTS_RETURNED");
   });
 
   it("captures a kb_doc_detail pull, lifting the consultation subject from document_id", () => {

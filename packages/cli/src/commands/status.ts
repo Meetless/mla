@@ -3,7 +3,9 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readScanCache } from "../lib/scanner/cache";
-import { readScanCacheForRoot } from "./scan-context";
+import { type ScanResult } from "../lib/scanner/types";
+import { ageLabel } from "../lib/age";
+import { readScanCacheForRoot, resolveScanRootIdentity } from "./scan-context";
 import { resolveWorkspaceIdWithEnv } from "../lib/workspace";
 import { CliConfig, HOOKS_DIR, readConfig } from "../lib/config";
 import { get } from "../lib/http";
@@ -82,6 +84,40 @@ export function notMemberStatusMessage(e: unknown, workspaceId: string): string 
   );
 }
 
+// A scan cache exists for this workspace, but another checkout owns it.
+//
+// `readScanCacheForRoot` returns null for two structurally different reasons and status used
+// to collapse both into NOT_ACTIVATED: (a) nothing was ever scanned, where that copy is true,
+// and (b) the workspace-global slot carries ANOTHER root's stamp, where it is a lie. Case (b)
+// is the 2026-07-28 / 2026-08-02 signature, and it is the case where the operator most needs
+// the truth: `mla activate` already succeeded here and running it again changes nothing.
+//
+// `mla doctor` has named this state correctly since ruleDeliveryDoctorChecks landed; this is
+// the same classification on the surface an operator actually reaches for first.
+//
+// Deliberately precise about the blast radius. The hot-path hook reads `.floorRulesXml` out of
+// the workspace-global slot with jq and no root check (hooks-template/user-prompt-submit.sh),
+// so the floor still reaches every prompt from here; what is missing is the repo-specific half.
+// "Meetless is delivering nothing" would be its own false alarm.
+export function foreignRootStatusMessage(
+  workspaceId: string,
+  root: string,
+  globalCache: ScanResult,
+  now: Date,
+): string {
+  const owner = globalCache.scanRootPath ?? "an unstamped scan";
+  const gone = globalCache.scanRootPath && !existsSync(globalCache.scanRootPath);
+  return [
+    `Meetless is activated for workspace ${workspaceId}, but no scan belongs to this checkout.`,
+    `  this checkout: ${root}`,
+    `  cache owner:   ${owner} (${ageLabel(globalCache.generatedAt, now)}` +
+      `${gone ? ", directory no longer exists" : ""})`,
+    `  Floor rules still reach every prompt (they are workspace-global). This checkout's`,
+    `  scoped rules, inventory and review items do not.`,
+    "  Run `mla scan` from this directory to claim a slot for it.",
+  ].join("\n");
+}
+
 // Best-effort membership probe against control for the no-cache branch. Returns
 // the status-framed non-member message when control DEFINITIVELY denies access
 // to the bound workspace (403 WORKSPACE_ACCESS_DENIED), else null: a member, or
@@ -139,6 +175,15 @@ export async function runStatus(_argv: string[]): Promise<number> {
     if (denied) {
       console.error(denied);
       return 1;
+    }
+    // Before falling back to the activate hint, separate "never scanned" from "scanned, but
+    // by a sibling checkout". Only the first one is a not-activated repo.
+    const globalCache = readScanCache(home, workspaceId);
+    if (globalCache) {
+      console.log(
+        foreignRootStatusMessage(workspaceId, resolveScanRootIdentity(), globalCache, new Date()),
+      );
+      return 0;
     }
     console.log(NOT_ACTIVATED);
     return 0;

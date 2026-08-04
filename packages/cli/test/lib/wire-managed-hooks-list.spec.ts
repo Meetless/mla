@@ -1,4 +1,4 @@
-import { MANAGED_HOOK_SCRIPTS } from "../../src/lib/wire";
+import { MANAGED_HOOK_SCRIPTS, CE0_POST_TOOL_USE_MATCHER, PRE_TOOL_USE_MATCHER } from "../../src/lib/wire";
 
 describe("MANAGED_HOOK_SCRIPTS", () => {
   it("lists exactly the ten managed (event, script) pairs install can wire", () => {
@@ -38,7 +38,9 @@ describe("MANAGED_HOOK_SCRIPTS", () => {
     // hook must not fire on Bash/Read/etc., so it carries a narrow exact-match
     // matcher rather than the empty catch-all.
     const pre = MANAGED_HOOK_SCRIPTS.find((h) => h.script === "pre-tool-use.sh");
-    expect(pre?.matcher).toBe("^(Write|Edit|MultiEdit|NotebookEdit|Bash)$");
+    expect(pre?.matcher).toBe(PRE_TOOL_USE_MATCHER);
+    expect(new RegExp(`^(?:${pre?.matcher})$`).test("Write")).toBe(true);
+    expect(new RegExp(`^(?:${pre?.matcher})$`).test("Read")).toBe(false);
   });
 
   it("scopes the CE0 PostToolUse hook to the meetless MCP tools (narrow, not the catch-all)", () => {
@@ -47,7 +49,13 @@ describe("MANAGED_HOOK_SCRIPTS", () => {
     // CE0 UserPromptSubmit/Stop hooks ride every prompt/stop (no matcher).
     const ce0Ptu = MANAGED_HOOK_SCRIPTS.find((h) => h.script === "ce0-post-tool-use.sh");
     expect(ce0Ptu?.event).toBe("PostToolUse");
-    expect(ce0Ptu?.matcher).toBe("mcp__meetless__");
+    // Referenced, never re-typed. This assertion used to carry the literal
+    // "mcp__meetless__", which is a matcher that full-matches nothing, so it pinned a
+    // hook that never fired (see hook-contract.ts and wire-ce0-hooks.spec.ts). A second
+    // hand-copied literal in a second file is exactly how a wrong value survives two
+    // green test suites, so this now reads the constant and checks BEHAVIOUR beside it.
+    expect(ce0Ptu?.matcher).toBe(CE0_POST_TOOL_USE_MATCHER);
+    expect(new RegExp(`^(?:${ce0Ptu?.matcher})$`).test("mcp__meetless__meetless__retrieve_knowledge")).toBe(true);
     const ce0Ups = MANAGED_HOOK_SCRIPTS.find((h) => h.script === "ce0-user-prompt-submit.sh");
     expect(ce0Ups?.event).toBe("UserPromptSubmit");
     expect(ce0Ups?.matcher).toBeUndefined();

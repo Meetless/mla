@@ -10,6 +10,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, realpathSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { assertSafeRunId, assertSafeWorkspaceId } from "../path-component";
 import { classifyTier, isCuratedDoc, type Tier } from "../scanner/score";
 import {
   PROTOCOL_VERSION,
@@ -266,12 +267,15 @@ export function buildOnboardingRun(input: {
 
 // --- Persistence: ~/.meetless/workspaces/<ws>/onboarding-runs/<runId>.json ---------
 
+// Both ids are PATH COMPONENTS, so both are validated before they reach `join` (see
+// path-component.ts). runsDir is the choke point for every onboarding artifact, including the
+// two inline joins in ingest.ts that now route through it.
 export function runsDir(home: string, workspaceId: string): string {
-  return join(home, "workspaces", workspaceId, "onboarding-runs");
+  return join(home, "workspaces", assertSafeWorkspaceId(workspaceId), "onboarding-runs");
 }
 
 export function runRecordPath(home: string, workspaceId: string, runId: string): string {
-  return join(runsDir(home, workspaceId), `${runId}.json`);
+  return join(runsDir(home, workspaceId), `${assertSafeRunId(runId)}.json`);
 }
 
 export function writeRunRecord(home: string, run: OnboardingRun): string {

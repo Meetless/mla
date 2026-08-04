@@ -5,6 +5,7 @@ import {
   ensureClaudeSettings,
   MANAGED_HOOK_SCRIPTS,
   CE0_POST_TOOL_USE_MATCHER,
+  PRE_TOOL_USE_MATCHER,
 } from "../../src/lib/wire";
 
 // CE0 evidence-consultation measurement harness (proposal §4.1, the one remaining
@@ -57,10 +58,67 @@ describe("CE0 evidence hooks: registered as second managed entries on shared eve
     // The capture adapter filters precisely to the three governed pulls
     // (retrieve_knowledge/kb_doc_detail/query), so a meetless-prefix matcher is
     // both safe and avoids spawning mla on every unrelated tool call.
-    expect(CE0_POST_TOOL_USE_MATCHER).toBe("mcp__meetless__");
     const ce0 = MANAGED_HOOK_SCRIPTS.find((h) => h.script === "ce0-post-tool-use.sh");
     expect(ce0?.event).toBe("PostToolUse");
     expect(ce0?.matcher).toBe(CE0_POST_TOOL_USE_MATCHER);
+    // Deliberately NOT the catch-all, which would spawn mla on every tool call.
+    expect(CE0_POST_TOOL_USE_MATCHER).not.toBe("");
+  });
+
+  // The tool names Claude Code actually sends for this MCP server. The server
+  // namespaces its own tools as `meetless__*`, so the wire name carries the segment
+  // twice: `mcp__` + server (`meetless`) + `__` + tool (`meetless__retrieve_knowledge`).
+  const GOVERNED_PULL_TOOL_NAMES = [
+    "mcp__meetless__meetless__retrieve_knowledge",
+    "mcp__meetless__meetless__kb_doc_detail",
+    "mcp__meetless__meetless__query",
+  ];
+
+  /** Claude Code decides whether a hook runs by FULL-matching the matcher regex
+   * against the tool name, not by searching within it. Measured 2026-08-04 by
+   * registering three probe hooks on one real MCP call:
+   *
+   *     matcher                 fired
+   *     ""            (control)   yes
+   *     mcp__meetless__           NO
+   *     mcp__meetless__.*         yes
+   *     ^mcp__meetless__.*$       yes
+   *
+   * `^(?:M)$` is the model that reproduces all four observations. */
+  const fullMatches = (matcher: string, toolName: string) => new RegExp(`^(?:${matcher})$`).test(toolName);
+
+  it("the CE0 matcher actually fires on every governed pull's REAL tool name", () => {
+    // The regression this exists to prevent, and it was live for the whole life of
+    // the CE0 harness: the matcher shipped as the bare prefix `mcp__meetless__`, whose
+    // own comment claimed it was "an UNANCHORED substring regex" that "matches the full
+    // tool name". Claude Code full-matches, so it matched NOTHING, the hook never ran,
+    // and `evidence_consultation_completed` recorded zero events across 18 production
+    // workspaces for the entire window. The capture adapter underneath was correct and
+    // fully unit-tested the whole time; nothing tested that the hook was ever REACHED.
+    //
+    // Asserting the literal string (the previous test) can never catch this: a literal
+    // pin agrees with whatever is written, including a value that matches nothing.
+    for (const toolName of GOVERNED_PULL_TOOL_NAMES) {
+      expect(fullMatches(CE0_POST_TOOL_USE_MATCHER, toolName)).toBe(true);
+    }
+  });
+
+  it("the CE0 matcher still does NOT fire on unrelated tools", () => {
+    // The other half: scoping is the reason this matcher is not the catch-all, so a
+    // fix that just widens it to `.*` would trade one defect for another.
+    for (const toolName of ["Read", "Edit", "Bash", "mcp__other__query", "mcp__othermeetless__x"]) {
+      expect(fullMatches(CE0_POST_TOOL_USE_MATCHER, toolName)).toBe(false);
+    }
+  });
+
+  it("the PreToolUse matcher full-matches its tools too (the form that always worked)", () => {
+    // PRE_TOOL_USE_MATCHER is anchored `^(Write|Edit|...)$`, which is why that hook has
+    // always fired while the CE0 one never did. Pinned here so the two cannot drift apart
+    // again, and so the next person sees the working form beside the broken one.
+    for (const toolName of ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]) {
+      expect(fullMatches(PRE_TOOL_USE_MATCHER, toolName)).toBe(true);
+    }
+    expect(fullMatches(PRE_TOOL_USE_MATCHER, "Read")).toBe(false);
   });
 
   it("registers each CE0 hook as a SECOND managed entry beside its load-bearing sibling on a fresh file", () => {

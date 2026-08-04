@@ -51,6 +51,7 @@ import {
 import { scoutCountWord } from "../lib/enrichment/protocol";
 import { fetchOnboardingStatus } from "../lib/enrichment/onboarding-status-client";
 import { rescanAndCache } from "./scan-context";
+import { readScanCache } from "../lib/scanner/cache";
 import { removeOwnedProjection } from "../lib/scanner/floor-projection-writer";
 import { FLOOR_PROJECTION_RELPATH } from "../lib/scanner/floor-projection";
 import { tryResolveWorkspaceId } from "../lib/workspace";
@@ -1192,6 +1193,41 @@ export function reconcileWiringBackstop(
 // scout mission (fast = review bundle only; agentic/full = bundle + mission).
 // recommendOnboard is set only by the provision path, so the `/mla onboard` nudge
 // fires once per fresh workspace (see onboardRecommendation).
+// Item 4: nothing stopped a caller binding a live workspaceId to a throwaway path. The cache-side
+// guard in `globalSlotContent` now makes that harmless (a stranger cannot take the slot, and since
+// the floor-absence fix it cannot blank the floor either), but harmless is not the same as visible:
+// the two `ws_1` bundles that sat in the operator's real ~/.meetless for three weeks were found by
+// human eyes reading a directory listing, which is not a detection mechanism.
+//
+// So activate says it out loud. The condition is deliberately narrow, because a warning that fires
+// on the normal case is a warning nobody reads by the third time:
+//   - this root brought ZERO instruction files (the throwaway-dir shape), AND
+//   - some OTHER still-present root already owns this workspace's cache.
+// Two real checkouts of one workspace is a supported setup and stays silent, as does every
+// single-checkout install. Exported for the spec so the decision is testable without driving the
+// whole command.
+export function renderForeignRootWarning(args: {
+  scan: ScanResult;
+  incumbentRootPath: string | null;
+}): string | null {
+  const { scan, incumbentRootPath } = args;
+  // No incumbent, or an unstamped legacy cache: nobody to take anything from.
+  if (!incumbentRootPath || !scan.scanRootPath) return null;
+  // We ARE the owner. A rescan of your own checkout is the ordinary path.
+  if (incumbentRootPath === scan.scanRootPath) return null;
+  // A second checkout that brought its own docs is a real checkout, not a throwaway.
+  if (scan.inventory.instructionFiles > 0) return null;
+  return [
+    "WARNING: this folder has no instruction files, and another checkout already owns this workspace.",
+    `  this folder:      ${scan.scanRootPath}`,
+    `  current owner:    ${incumbentRootPath}`,
+    "",
+    "  Your scan cannot overwrite that checkout's scan or blank its governing floor; the cache",
+    "  keeps the owner's record. But if you did not mean to bind a live workspace from here (a",
+    "  temp dir, a test harness, the wrong terminal tab), run `mla deactivate` in this folder.",
+  ].join("\n");
+}
+
 async function finishActivate(
   cwd: string,
   tier: BootstrapTier,
@@ -1235,6 +1271,20 @@ async function finishActivate(
   if (scan && !isMachineMode()) {
     console.log("");
     console.log(renderBootstrapSummary(scan, { injectedNow: boot.ok }));
+
+    // Read the slot back AFTER the write: `globalSlotContent` has already decided who owns it, so
+    // whatever is on disk now is the authoritative owner. No `home` argument, matching the write
+    // path, so the cache module's MEETLESS_HOME policy stays the single place that resolves it.
+    const foreignRoot = renderForeignRootWarning({
+      scan,
+      incumbentRootPath: workspaceId
+        ? (readScanCache(undefined, workspaceId)?.scanRootPath ?? null)
+        : null,
+    });
+    if (foreignRoot) {
+      console.log("");
+      console.log(foreignRoot);
+    }
 
     // The deprecated `agentic` tier still prints the static scout mission for the
     // messy Tier-2 docs the deterministic pass could only count, but steers the

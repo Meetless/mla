@@ -74,8 +74,19 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  fs.rmSync(HOME, { recursive: true, force: true });
-  fs.rmSync(FAKE_HOME, { recursive: true, force: true });
+  // Teardown must never be able to fail a suite that passed. `force` only swallows
+  // ENOENT; the hooks these tests exercise run `mkdir -p "$QUEUE_DIR"` from a spawned
+  // shell (hooks-template/common.sh), so a writer that lands a file between rmSync's
+  // readdir and its rmdir throws ENOTEMPTY and fails the whole SUITE with every test
+  // green (CI: "6748 passed, 0 total failed", suite failed to run). Retry, then give
+  // up quietly. Same hazard and same remedy as activation-gate.spec.ts.
+  for (const dir of [HOME, FAKE_HOME]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    } catch {
+      /* best effort: os.tmpdir() litter is not what this spec asserts on */
+    }
+  }
   if (prevHomeEnv === undefined) delete process.env.HOME;
   else process.env.HOME = prevHomeEnv;
   if (prevSession === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;

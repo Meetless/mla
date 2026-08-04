@@ -14,7 +14,15 @@
 // the second half gives each root its own cache slot: a scan from B writes B's slot and cannot
 // darken A. Legacy (unstamped) caches and single-repo installs must be entirely unaffected.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+  appendFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -53,6 +61,32 @@ function makeRepo(prefix: string, adrFile: string): string {
   return repo;
 }
 
+// A minimal stamped ScanResult, for the write-side cases that need two scans differing in exactly
+// one field. Everything a real scan derives from a checkout is overridable.
+function mkScan(scanRootPath: string, over: Partial<ScanResult> = {}): ScanResult {
+  return {
+    schemaVersion: 2,
+    workspaceId: "owner-ws",
+    commitSha: "0000",
+    generatedAt: "t",
+    inventory: {
+      instructionFiles: 1,
+      decisionDocs: 0,
+      legacyNotes: 0,
+      staleSignals: 0,
+      agentMemoryRules: 0,
+    },
+    directives: [],
+    staleSignals: [],
+    confirmedRulesXml: "",
+    floorRulesXml: "",
+    staleContextXml: "",
+    advisoryDirectives: [],
+    scanRootPath,
+    ...over,
+  };
+}
+
 describe("scan-cache scan-root guard (Finding A: two checkouts, one workspace)", () => {
   let home: string;
   let repoA: string;
@@ -81,10 +115,11 @@ describe("scan-cache scan-root guard (Finding A: two checkouts, one workspace)",
     rescanAndCache({ cwd: repoA, workspaceId: WS, home, now: () => "t" });
     rescanAndCache({ cwd: repoB, workspaceId: WS, home, now: () => "t" });
 
-    // The workspace-global slot still belongs to whoever scanned last. That one shared slot IS
-    // the defect: with only this file, the stamp guard can tell A that the cache is not its own,
-    // but it cannot give A a cache, so A stays dark until someone rescans from A.
-    expect(readScanCache(home, WS)!.scanRootPath).toBe(realpathSync(repoB));
+    // The workspace-global slot keeps its OWNER, the first root to stamp it, for as long as that
+    // root exists on disk. It used to belong to whoever scanned last, and that was the defect:
+    // the stamp guard could tell A the cache was not its own, but it could not give A a cache, so
+    // A went dark. (See the ownership cases below for what a non-owner is still allowed to write.)
+    expect(readScanCache(home, WS)!.scanRootPath).toBe(realpathSync(repoA));
 
     // Per-root slots end that. Each root reads its own, so B's scan neither replaces A's nor
     // darkens it, and neither checkout can be handed the other's repo-specific scan.
@@ -140,6 +175,113 @@ describe("scan-cache scan-root guard (Finding A: two checkouts, one workspace)",
     const got = readScanCacheForRoot(home, "legacy-ws", repoB);
     expect(got).not.toBeNull();
     expect(got!.commitSha).toBe("deadbeef");
+  });
+});
+
+// The write side of the same finding, and the half that per-root slots did NOT close.
+//
+// Per-root slots fix the read for a root that already owns a slot. They do nothing for the ONE
+// workspace-global scan-cache.json, which is still written unconditionally by every scan and is
+// what the three shell readers in the hot-path hook consume. That is the file a scan inside a
+// throwaway directory stomped on 2026-07-28 (a peer's scratchpad, via `mla scan`) and again on
+// 2026-08-02 (three `mla activate` calls from /private/tmp/live-handoff-test-000{1,2,3}, since
+// deleted). Both times the poisoning root HAD instruction files, so a guard keyed on "this root
+// looks empty" would have shipped green and fired on neither.
+//
+// The rule instead is ownership: the first root to stamp the global slot keeps its repo-specific
+// fields for as long as that root exists on disk, a stranger may refresh only the workspace-global
+// floor, and the slot changes hands the moment the owner's directory is gone.
+describe("scan-cache workspace-global slot ownership (Finding A, write side)", () => {
+  let home: string;
+  let repoA: string;
+  let repoB: string;
+  const WS = "owner-ws";
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "mla-own-home-"));
+    repoA = makeRepo("mla-own-a-", "0001-a.md");
+    repoB = makeRepo("mla-own-b-", "0002-b.md");
+  });
+
+  afterEach(() => {
+    for (const d of [home, repoA, repoB]) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("a scan from a throwaway root cannot take the slot from a live checkout", () => {
+    // The 2026-08-02 shape: the real checkout is activated, then a live-exercise test runs the
+    // same command from a temp dir bound to the SAME workspace id.
+    const owner = rescanAndCache({ cwd: repoA, workspaceId: WS, home, now: () => "t" });
+    const throwaway = makeRepo("mla-own-throwaway-", "0003-t.md");
+    try {
+      rescanAndCache({ cwd: throwaway, workspaceId: WS, home, now: () => "t" });
+    } finally {
+      rmSync(throwaway, { recursive: true, force: true });
+    }
+
+    // Before this fix the slot named the temp dir, the temp dir was then deleted, and every root
+    // in the workspace read `delivery-incomplete` until a human noticed.
+    const global = readScanCache(home, WS)!;
+    expect(global.scanRootPath).toBe(realpathSync(repoA));
+    expect(global.commitSha).toBe(owner.commitSha);
+    expect(global.staleSignals.map((s) => s.source)).toEqual(["docs/adr/0001-a.md"]);
+  });
+
+  it("lets a stranger refresh the workspace-global floor without taking the repo-specific fields", () => {
+    // Hand-built so the two scans differ in exactly one field per class: floor (workspace-global,
+    // identical from any root, so the freshest wins) versus commitSha/inventory (one checkout's).
+    writeScanCache(home, WS, mkScan(realpathSync(repoA), { commitSha: "aaaa", floorRulesXml: "<old/>" }));
+    writeScanCache(home, WS, mkScan(realpathSync(repoB), { commitSha: "bbbb", floorRulesXml: "<new/>" }));
+
+    const global = readScanCache(home, WS)!;
+    expect(global.scanRootPath).toBe(realpathSync(repoA));
+    expect(global.commitSha).toBe("aaaa"); // A's, untouched
+    expect(global.floorRulesXml).toBe("<new/>"); // B's, refreshed
+  });
+
+  it("keeps the incumbent's schemaVersion, so a preserved record never over-claims", () => {
+    // schemaVersion gates how the assembler reads the record it is attached to. Raising a v1
+    // record to v2 because a v2 scan arrived would claim structured arrays it does not carry,
+    // turning a VISIBLE degraded delivery into a silent floor-only one.
+    writeScanCache(home, WS, mkScan(realpathSync(repoA), { schemaVersion: 1 }));
+    writeScanCache(home, WS, mkScan(realpathSync(repoB), { schemaVersion: 2 }));
+    expect(readScanCache(home, WS)!.schemaVersion).toBe(1);
+  });
+
+  it("hands the slot over once the owner's directory is gone (the self-heal that was missing)", () => {
+    const ghost = makeRepo("mla-own-ghost-", "0004-g.md");
+    const ghostPath = realpathSync(ghost);
+    rescanAndCache({ cwd: ghost, workspaceId: WS, home, now: () => "t" });
+    expect(readScanCache(home, WS)!.scanRootPath).toBe(ghostPath);
+
+    // The temp dir is deleted, which is exactly what left the 2026-07-28 cache unmatchable
+    // forever: "that directory is then deleted, so the cache can never match again and nothing
+    // self-heals."
+    rmSync(ghost, { recursive: true, force: true });
+    rescanAndCache({ cwd: repoA, workspaceId: WS, home, now: () => "t" });
+    expect(readScanCache(home, WS)!.scanRootPath).toBe(realpathSync(repoA));
+  });
+
+  it("a rescan from the owner itself still replaces the whole record", () => {
+    writeScanCache(home, WS, mkScan(realpathSync(repoA), { commitSha: "aaaa" }));
+    writeScanCache(home, WS, mkScan(realpathSync(repoA), { commitSha: "cccc" }));
+    expect(readScanCache(home, WS)!.commitSha).toBe("cccc");
+  });
+
+  it("drops a per-root slot whose directory has vanished before capping by mtime", () => {
+    // mtime order is backwards for this hazard: throwaway roots are the NEWEST slots, so a pure
+    // mtime cap evicts the real checkouts and keeps the temp dirs. A slot naming a root that is
+    // gone is unreachable (reads key on the live cwd's realpath), so it goes first.
+    rescanAndCache({ cwd: repoA, workspaceId: WS, home, now: () => "t" });
+    const ghost = makeRepo("mla-own-ghost2-", "0005-g.md");
+    const ghostPath = realpathSync(ghost);
+    rescanAndCache({ cwd: ghost, workspaceId: WS, home, now: () => "t" });
+    expect(existsSync(scanCachePathForRoot(WS, ghostPath, home))).toBe(true);
+
+    rmSync(ghost, { recursive: true, force: true });
+    rescanAndCache({ cwd: repoB, workspaceId: WS, home, now: () => "t" }); // any write prunes
+
+    expect(existsSync(scanCachePathForRoot(WS, ghostPath, home))).toBe(false);
+    expect(existsSync(scanCachePathForRoot(WS, realpathSync(repoA), home))).toBe(true);
   });
 });
 

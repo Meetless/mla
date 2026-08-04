@@ -406,6 +406,21 @@ describe("classifyOutcome", () => {
       outcome: "user_error",
       error_class: "marker_missing_workspace_id",
     });
+    // A malformed workspace/run id is the OPERATOR's to fix (a hand-edited or stale
+    // `.meetless.json`, or an id that picked up shell quoting), exactly like the two rows
+    // above it. Live-exercising the guard showed a poisoned marker printing "MLA hit an
+    // internal error. Send us a redacted diagnostic report", which sends the operator to
+    // the bug queue for a file they own.
+    expect(
+      classifyOutcome(1, true, { name: "UnsafePathComponentError" }),
+    ).toMatchObject({
+      outcome: "user_error",
+      error_class: "unsafe_path_component",
+      retryable: false,
+    });
+    expect(
+      isReportableFault(classifyOutcome(1, true, { name: "UnsafePathComponentError" })),
+    ).toBe(false);
     expect(classifyOutcome(1, true, { name: "RefreshBusyError" })).toMatchObject({
       outcome: "timeout",
       error_class: "refresh_busy",

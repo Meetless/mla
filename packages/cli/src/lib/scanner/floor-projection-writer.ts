@@ -24,7 +24,9 @@ import {
   projectionBodyHash,
   splitProjection,
   declaredPayloadHash,
+  declaredStateRoot,
 } from "./floor-projection";
+import { resolveStateRoot } from "./cache";
 
 export type ProjectionOutcome = "written" | "unchanged" | "blocked";
 
@@ -36,6 +38,7 @@ export interface ProjectionReceipt {
     | "path_tracked" // the target is tracked by Git; refuse to touch a versioned file
     | "foreign_file" // a non-MLA file sits at the target; never overwrite it
     | "edited" // an MLA file whose body was hand-edited; treat as user-owned
+    | "foreign_state_root" // owned by a DIFFERENT, still-live .meetless state root
     | "error"; // an unexpected IO / Git failure (fail-safe, activation still succeeds)
   path?: string; // absolute target path, for the observability receipt
 }
@@ -138,18 +141,38 @@ function atomicWrite(absTarget: string, content: string): void {
   }
 }
 
+// Do two state roots denote the same directory? Compare resolved paths first (cheap,
+// and the only thing that works when one of them no longer exists), then realpaths, so
+// /var vs /private/var on macOS and any symlinked home still read as one root.
+function sameStateRoot(a: string, b: string): boolean {
+  if (path.resolve(a) === path.resolve(b)) return true;
+  try {
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return false; // one of them is gone: not the same live root
+  }
+}
+
 /**
  * Materialize the floor projection under `scanRoot` (the activated checkout root).
  * BEST-EFFORT and THROW-FREE: every failure degrades to a `blocked`/`unchanged` receipt
  * so the caller (a scan that just wrote scan-cache.json) never breaks.
+ *
+ * `stateRoot` is the `.meetless` dir this run's state belongs to, and it becomes the
+ * projection's OWNER. It defaults to whatever MEETLESS_HOME resolves to, which is the
+ * production case; callers that already resolved a home pass it explicitly.
  */
 export function materializeFloorProjection(
   scanRoot: string,
   dirs: Directive[],
   bundleId: string,
+  stateRoot?: string,
 ): ProjectionReceipt {
   const absTarget = path.join(scanRoot, FLOOR_PROJECTION_RELPATH);
   try {
+    // Resolved INSIDE the try: resolveMeetlessHome throws on a relative MEETLESS_HOME, and
+    // this function's contract is that it never throws.
+    const owner = stateRoot ?? resolveStateRoot();
     // Nothing eligible to project. This is ALSO the bundle-unavailable case (the scanner
     // injects no floor directives), so we intentionally do NOT remove an existing owned
     // projection here: a transient empty read must not revoke the last-known floor. The
@@ -186,9 +209,29 @@ export function materializeFloorProjection(
       if (declaredPayloadHash(parts.header) === intendedHash) {
         return { projection: "unchanged", reason: "same_hash", path: absTarget };
       }
+
+      // Owned, valid, and about to be REPLACED. This is the only branch that can destroy a
+      // floor, so it is the only one that asks who owns the incumbent.
+      //
+      // 2026-08-02: a test process with MEETLESS_HOME pointed at a tmpdir, but a cwd inside the
+      // real flagship checkout, replaced that checkout's 6-rule floor with a 1-rule fixture. The
+      // sandbox covered every piece of MLA STATE and none of the projection TARGET, and the
+      // header recorded nothing about the writer, so the result validated as owned to every
+      // later reader and nothing self-healed.
+      //
+      // Two deliberate escapes, both of which would otherwise be worse than the bug:
+      //   - an UNSTAMPED header (null) is the LEGACY case, not a foreign one. Freezing every
+      //     pre-stamp projection on upgrade would be a self-inflicted outage.
+      //   - a stamp naming a root that no longer exists is abandoned. Ownership follows the
+      //     live root, exactly as the scan cache's owner stamp does (3ae06e39e); otherwise a
+      //     throwaway sandbox could freeze a real checkout forever.
+      const declaredRoot = declaredStateRoot(parts.header);
+      if (declaredRoot && !sameStateRoot(declaredRoot, owner) && fs.existsSync(declaredRoot)) {
+        return { projection: "blocked", reason: "foreign_state_root", path: absTarget };
+      }
     }
 
-    atomicWrite(absTarget, renderFloorProjection(dirs, bundleId));
+    atomicWrite(absTarget, renderFloorProjection(dirs, bundleId, owner));
     ensureGitExclude(scanRoot, absTarget);
     return { projection: "written", path: absTarget };
   } catch {

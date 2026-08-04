@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.2.34 (2026-08-04)
+
+0.2.34 is about a measurement that had never once been taken. `mla` records when an agent
+consults governed evidence before it writes code, and that number has been zero across every
+production workspace since the lane was built. It was not zero because agents were not
+consulting. It was zero because the hook that observes them was registered under the matcher
+`mcp__meetless__`, and Claude Code decides whether a hook runs by matching that pattern against
+the whole tool name, not against its beginning. A bare prefix therefore selects nothing at all.
+The capture code underneath was correct and carried twenty unit tests; nothing tested that it was
+ever reached, which is the only test that would have failed.
+
+Fixing the matcher produced the second half of the same fault. The hook fired on a real call and
+wrote `UNKNOWN` with no result: a row attesting that a consultation happened while unable to say
+whether anything came back, which is precisely the quantity the lane exists to produce. Claude
+Code sends the content-block array itself as the tool response, while the MCP shape wraps that
+array in an object, and the classifier rejected anything that was not an object on its first line.
+The twenty existing tests all constructed the wrapped form, so the suite had been agreeing with
+its own fixture rather than with the client, and the dead matcher guaranteed no real payload ever
+arrived to contradict it.
+
+Those two fixes reach a source install. They did not reach a plugin install, because the plugin
+ships a rendered copy of the hook registration and that copy still carried the original matcher.
+It is regenerated here. Without it the repair would have been invisible to exactly the
+distribution most people use.
+
+Separately, the CLI could exit fatally on a closed stdout pipe. Node reports that condition as an
+event on the stream rather than as a rejected promise, so neither the bootstrap's `.catch()` nor
+the entrypoint's `try` could observe it, and with no listener attached it became an uncaught
+exception. The site where it was caught in the wild is cosmetic, a trace URL printed at the end of
+a command, but five of the CLI's writer sites are hook entrypoints whose stdout belongs to a
+parent process that is allowed to exit first. One of those entrypoints exists specifically to fail
+open so that a fault inside it can never turn into a blocked tool call, and a closed pipe was
+defeating that guarantee from underneath.
+
+- the consultation hook now matches the tool names it was always meant to match, so evidence
+  consultation is recorded instead of silently never observed
+- a consultation is classified correctly whichever response envelope the client sends, rather
+  than recorded as `UNKNOWN`
+- the bundled plugin carries the corrected hook registration, so plugin installs get the fix and
+  not just source installs
+- a closed stdout pipe no longer terminates the CLI, and no longer breaks the fail-open contract
+  of the hook entrypoints
+- a checkout that cannot read a bundle no longer overwrites another checkout's governing floor
+  with an empty one
+
+## 0.2.33 (2026-08-03)
+
+0.2.33 is about state that several checkouts share and none of them owns. `mla` keeps a
+per-workspace scan cache and a generated governing floor, and both were keyed by workspace id
+alone. That key is right up until the same repository exists on disk twice, which on a machine
+running agents is the ordinary case rather than the exotic one: a throwaway clone, a worktree, a
+sandbox under a temp directory. The most recent scan won every time. A single scan from a
+throwaway directory would take the cache slot away from the live checkout that had been using it,
+and nothing anywhere reported the loss, because the next command simply found no cache and
+behaved as though there had never been one. Four of the eleven slots in this machine's own home
+were dark that way when the bug surfaced.
+
+Downstream of that, `mla status` told a repository it was "not activated" whenever a sibling
+checkout owned the slot. The cache read returns nothing for two structurally different reasons, a
+slot that was never written and a slot stamped by another root, and status collapsed both into the
+same sentence. The first is true. The second is false in the worst available direction: it sends
+you to re-run activation on a workspace that is already activated. The generated floor had the
+same shape with a wider blast radius, since a scan run from a sandboxed state root could overwrite
+the `.claude/rules` projection of a real checkout, swapping the rules an agent is actually governed
+by for whatever a temp directory produced.
+
+Each of those pieces of state now has an owner. The first root to stamp a cache slot keeps its
+repository-specific fields for as long as that root exists on disk, and slots whose root has
+vanished are pruned ahead of the size cap, because recency is exactly backwards for this hazard:
+throwaway roots are the newest slots. The floor projection records the state root that wrote it, so
+a writer belonging to a different but still-live root declines instead of clobbering. A stamp
+naming a root that is gone is abandoned, and a projection written before stamps existed is still
+adoptable, so neither rule can strand you.
+
+Last, a workspace id was being spliced into filesystem paths with nothing checking it was a path
+component, reaching six path builders through one seam. The evidence was already on disk: a
+directory named with the shell quotes still wrapped around the id, sitting beside the legitimate
+one. Ids that are not safe path components are now rejected rather than sanitized, because a
+sanitized id quietly addresses a different workspace than the one you asked for.
+
+- a scan from a throwaway or sandboxed checkout no longer takes the workspace cache away from a
+  live one; the first root to claim a slot keeps it until that root is gone from disk
+- `mla status` distinguishes a workspace that was never activated from one whose cache slot is
+  owned by a sibling checkout, instead of reporting both as "not activated"
+- the generated governing floor records the state root that wrote it, so a scan from a sandbox
+  cannot overwrite the rules a real checkout is governed by
+- a workspace id that is not a safe path component is rejected at the single seam where it becomes
+  a directory name, rather than being sanitized into a path for some other workspace
+
 ## 0.2.32 (2026-08-03)
 
 0.2.32 opens with the upgrade path, because it was the one command that could lie to you and still

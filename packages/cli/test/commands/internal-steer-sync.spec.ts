@@ -101,10 +101,22 @@ describe("internal steer-sync writes the active-conflict snapshot", () => {
 // $MEETLESS_HOME and re-require the command so config + bundle-cache HOME re-evaluate.
 describe("internal steer-sync job 4: rule-bundle sync", () => {
   let home: string;
+  let cwd: string;
+  let prevCwd: string;
   let prev: Record<string, string | undefined>;
 
   beforeEach(() => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), "steer-sync-bundle-"));
+    // Sandbox the CWD, not just MEETLESS_HOME. These cases trigger a real rescan, and a
+    // rescan materializes the floor projection under resolveScanRoot(process.cwd()), i.e. the
+    // nearest .meetless.json marker dir. Under jest that cwd is packages/cli, INSIDE the real
+    // flagship checkout, so on 2026-08-02 this suite replaced that checkout's six-rule floor
+    // with makeBundle()'s single "include a Mermaid diagram in design docs" rule and every
+    // subagent dispatched there inherited the fixture for a day. MEETLESS_HOME sandboxes all
+    // MLA STATE and none of the projection TARGET; only the cwd decides where the file lands.
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), "steer-sync-cwd-"));
+    prevCwd = process.cwd();
+    process.chdir(cwd);
     prev = {
       MEETLESS_HOME: process.env.MEETLESS_HOME,
       MEETLESS_STEER_SYNC_STUB_PULL: process.env.MEETLESS_STEER_SYNC_STUB_PULL,
@@ -135,6 +147,8 @@ describe("internal steer-sync job 4: rule-bundle sync", () => {
     // The tmp home IS the scan cache's root now (MEETLESS_HOME is honored end to end), so one
     // rm takes the stamp with it. Until 2026-07-13 rescanAndCache stamped the REAL ~/.meetless
     // and this teardown had to reach into the operator's own home to delete it.
+    process.chdir(prevCwd);
+    fs.rmSync(cwd, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
     jest.resetModules();
   });

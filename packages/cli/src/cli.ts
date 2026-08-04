@@ -27,6 +27,7 @@ import {
   setWorkspaceConfig,
   type WorkspaceConfigForTracing,
 } from "./lib/observability";
+import { installStdioEpipeGuard } from "./lib/stdio-guard";
 import { computeRepoFingerprint } from "./lib/git";
 import { traceUploadEnabled } from "./lib/analytics/consent";
 import { captureCommandEvent } from "./lib/analytics/capture";
@@ -1547,6 +1548,12 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
 }
 
 if (require.main === module) {
+  // First, before initSentry and before any command can write. A reader that closed the
+  // pipe (`mla ... | head`, a hook parent that exited) surfaces as a stream `error`
+  // event, not a rejection, so the .catch() below cannot see it and it lands as an
+  // uncaught exception. That is Sentry MEETLESS-CLI-2: a FATAL raised by the cosmetic
+  // deep-link printer.
+  installStdioEpipeGuard();
   const buildInfo = loadBuildInfo();
   // Sentry is the content-bearing error plane, so it is gated on the trace-upload
   // posture (opt-out, master-kill-aware), not just the bare telemetry kill switch.

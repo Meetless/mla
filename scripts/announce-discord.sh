@@ -17,8 +17,12 @@
 # release before 0.2.16), it falls back to the commit list rather than announcing an
 # empty body, capped so the embed stays readable.
 #
-# NO LINK TO THE MIRROR. github.com/Meetless/mla is still a PRIVATE repo, so a
-# "full changelog" link there is a 404 for everyone we are announcing to.
+# NO LINK TO THE MIRROR, and the reason is no longer the one written here.
+# github.com/Meetless/mla was private when this script was written, so a "full changelog"
+# link would have 404'd for everyone we announce to. An ruled it PUBLIC on 2026-07-17
+# (verified `isPrivate:false`), so that link would resolve today. The behavior stays as it
+# is anyway: adding a mirror link to the announcement is a product decision for An, not a
+# default this script gets to make. Do not restore the old rationale; it is false.
 #
 # Usage: announce-discord.sh <version> [--changelog <path>] [--dry-run]
 #
@@ -92,11 +96,36 @@ if [ -z "${BODY//[$'\n\t ']/}" ]; then
   exit 0
 fi
 
-# Discord's embed description caps at 4096. Keep margin. There is deliberately no
-# "full changelog" tail link: the public mirror is private, so it would 404.
+# Discord's embed description caps at 4096 CHARACTERS and rejects the entire POST with
+# HTTP 400 {"embeds":["0"]} when you go over. Keep margin.
+#
+# This cap was a NO-OP from the day it was written. `cut -c1-N` truncates every LINE to N
+# characters, not the stream to N characters, and a changelog body is many short lines, so
+# it handed back the body unchanged and appended an ellipsis to a string it had not cut.
+# 0.2.32's prose was 4499 characters: the guard fired, the cut did nothing, Discord refused
+# 4501, and the release announced itself to nobody while the log said the body was trimmed.
+#
+# Truncate on LINE boundaries, then fall back to the last paragraph break. That can never
+# split a word or a UTF-8 sequence (which would be a second, subtler 400), and it ends the
+# announcement at the end of a paragraph instead of mid-sentence. For a changelog shaped
+# "prose paragraphs, then a bullet list" it lands exactly where a reader would want it: the
+# whole prose, none of the severed list.
 MAXLEN=3800
 if [ "${#BODY}" -gt "$MAXLEN" ]; then
-  BODY="$(printf '%s' "$BODY" | cut -c1-"$MAXLEN")"$'\n…'
+  TRUNCATED="$(printf '%s\n' "$BODY" | awk -v max="$MAXLEN" '
+    { n = length($0) + 1
+      if (total + n > max) exit
+      total += n
+      buf[++k] = $0
+      if ($0 ~ /^[ \t]*$/) last_blank = k
+    }
+    END {
+      end = (last_blank > 0 ? last_blank - 1 : k)
+      for (i = 1; i <= end; i++) print buf[i]
+    }')"
+  # One line longer than the whole cap would leave nothing at all: hard-cut that case.
+  [ -n "${TRUNCATED//[$'\n\t ']/}" ] || TRUNCATED="${BODY:0:$MAXLEN}"
+  BODY="$TRUNCATED"$'\n…'
 fi
 
 NPM_URL="https://www.npmjs.com/package/@meetless/mla"

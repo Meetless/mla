@@ -38,6 +38,7 @@ import {
   type ScoutRunStatus,
 } from "./protocol";
 import { loadRunRecord, runsDir, defaultGitRunner, type GitRunner } from "./plan";
+import { assertSafeRunId } from "../path-component";
 import { INGEST_BATCH_SIZE } from "../intel-ingest-budget";
 
 // One inline document for the kb-add POST. relPath is vault-relative; the server prefixes
@@ -722,7 +723,7 @@ function renderSourceLabel(sourceScouts: readonly ScoutName[]): string {
 // every later repo's scouts. Named `<runId>.state.json` so it sorts next to `<runId>.json`
 // and prune can drop the pair together.
 export function statePath(home: string, workspaceId: string, runId: string): string {
-  return join(home, "workspaces", workspaceId, "onboarding-runs", `${runId}.state.json`);
+  return join(runsDir(home, workspaceId), `${assertSafeRunId(runId)}.state.json`);
 }
 
 export function loadState(home: string, workspaceId: string, runId: string): OnboardingState | null {
@@ -743,7 +744,10 @@ export function loadState(home: string, workspaceId: string, runId: string): Onb
 }
 
 export function writeState(home: string, state: OnboardingState): void {
-  const dir = join(home, "workspaces", state.workspaceId, "onboarding-runs");
+  // Through runsDir, not an inline join: the mkdir must never precede the id validation, or a
+  // malformed workspaceId would materialize a directory outside the state root before the
+  // builder below got the chance to refuse it.
+  const dir = runsDir(home, state.workspaceId);
   mkdirSync(dir, { recursive: true });
   writeFileSync(statePath(home, state.workspaceId, state.runId), JSON.stringify(state, null, 2), "utf8");
 }
@@ -758,7 +762,7 @@ export function writeState(home: string, state: OnboardingState): void {
 // rendered markdown remains in the KB, so the structured post-merge candidates would otherwise
 // be gone and accept would have nothing to materialize from without re-parsing markdown.
 export function candidatesSidecarPath(home: string, workspaceId: string, runId: string): string {
-  return join(home, "workspaces", workspaceId, "onboarding-runs", `${runId}.candidates.json`);
+  return join(runsDir(home, workspaceId), `${assertSafeRunId(runId)}.candidates.json`);
 }
 
 export function loadCandidatesSidecar(
@@ -807,7 +811,10 @@ export function upsertCandidatesSidecar(home: string, incoming: OnboardingCandid
     updatedAt: incoming.updatedAt,
     candidates: [...byId.values()],
   };
-  const dir = join(home, "workspaces", incoming.workspaceId, "onboarding-runs");
+  // Through runsDir (same reason as writeState): `incoming` is a PARSED PAYLOAD, so its
+  // workspaceId and runId are the least trustworthy ids on this path and must not reach a
+  // mkdir before they are validated.
+  const dir = runsDir(home, incoming.workspaceId);
   mkdirSync(dir, { recursive: true });
   const path = candidatesSidecarPath(home, incoming.workspaceId, incoming.runId);
   const tmp = `${path}.tmp-${process.pid}`;

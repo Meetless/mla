@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 import { bindWorkspaceMarker } from "../lib/workspace-marker.helper";
 import { onboardingLockPath, releaseOnboardingLock } from "../../src/lib/enrichment/lock";
-import { runRecordPath } from "../../src/lib/enrichment/plan";
+import { runsDir } from "../../src/lib/enrichment/plan";
 import { writeState } from "../../src/lib/enrichment/ingest";
 import type { OnboardingRun, ScoutIngestOutcome, ScoutName } from "../../src/lib/enrichment/protocol";
 import { scoutStates } from "../helpers/scout-state";
@@ -303,8 +303,12 @@ describe("mla enrich plan: workspace-marker gate wiring", () => {
     expect(hits[0].query.get("workspaceId")).toBe(WS);
 
     // A gated no-op holds no lock and persists no run record (the gate fires before persist).
+    // Asserted against the runs DIRECTORY, not against `runRecordPath(HOME, WS, gated.runId)`:
+    // a gated payload carries no runId at all, so that form asked whether a file named
+    // `undefined.json` existed and was vacuously true no matter what the gate persisted.
     expect(existsSync(onboardingLockPath(HOME, WS))).toBe(false);
-    expect(existsSync(runRecordPath(HOME, WS, gated.runId))).toBe(false);
+    const dir = runsDir(HOME, WS);
+    expect(existsSync(dir) ? readdirSync(dir) : []).toEqual([]);
   });
 
   it("the human (non-JSON) workspace-gate message cites the other clone + the --force escape", async () => {

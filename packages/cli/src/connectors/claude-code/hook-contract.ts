@@ -49,12 +49,34 @@ export const PRE_TOOL_USE_MATCHER = "^(Write|Edit|MultiEdit|NotebookEdit|Bash)$"
 // PostToolUse matcher for the CE0 evidence-consultation hook (ce0-post-tool-use.sh,
 // proposal §4.1). Unlike the load-bearing PostToolUse hook (catch-all so the F3-B
 // heartbeat fires on EVERY tool), the CE0 hook only needs to observe the governed
-// memory pulls, so it is scoped to the `mcp__meetless__*` MCP tools. The matcher is
-// an UNANCHORED substring regex (no "^"/"$"): it matches the full tool name
-// `mcp__meetless__meetless__retrieve_knowledge` (and kb_doc_detail/query). The
-// capture adapter then filters precisely to the three governed pulls, so a slightly
-// broad matcher only spawns the subcommand on meetless tools, never on every tool.
-export const CE0_POST_TOOL_USE_MATCHER = "mcp__meetless__";
+// memory pulls, so it is scoped to the `mcp__meetless__*` MCP tools. The capture
+// adapter then filters precisely to the three governed pulls, so a slightly broad
+// matcher only spawns the subcommand on meetless tools, never on every tool.
+//
+// THE `.*` IS LOAD-BEARING. This shipped as the bare prefix `mcp__meetless__`, and the
+// comment here asserted it was "an UNANCHORED substring regex" that "matches the full
+// tool name". It does not. Claude Code decides whether a hook runs by FULL-matching the
+// matcher against the tool name, so a bare prefix matches NOTHING. Measured 2026-08-04
+// by registering probe hooks on one real MCP call:
+//
+//     matcher                 fired
+//     ""            (control)   yes
+//     mcp__meetless__           NO
+//     mcp__meetless__.*         yes
+//     ^mcp__meetless__.*$       yes
+//
+// The cost of that one missing `.*`: the CE0 hook never ran, so
+// `evidence_consultation_completed` recorded ZERO events across 18 production
+// workspaces, and `consultation_attempt` was empty in every local store too. The
+// capture adapter beneath it was correct and fully unit-tested the entire time. What
+// was missing was any test that the hook is ever REACHED, which is why the guard in
+// wire-ce0-hooks.spec.ts is written against the REAL tool names rather than against
+// this literal.
+//
+// Anchored rather than bare `mcp__meetless__.*`, because the anchored form is correct
+// under BOTH full-match and substring semantics; it cannot break again if that changes.
+// Same shape as PRE_TOOL_USE_MATCHER above, which is anchored and has always worked.
+export const CE0_POST_TOOL_USE_MATCHER = "^mcp__meetless__.*$";
 
 // Single source of truth for the Claude Code hook events Meetless manages.
 // wire.ts's ensureClaudeSettings derives its wanted list from this; unwire.ts's

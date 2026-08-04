@@ -11,6 +11,7 @@ import {
   userHomeDir,
 } from "../lib/config";
 import { tryResolveWorkspaceId } from "../lib/workspace";
+import { ageLabel } from "../lib/age";
 import { get, isNoWorkspaceYet, ping, serverMessage } from "../lib/http";
 import { queueDepth, reapQueue } from "../lib/spool";
 import { findActivation } from "../lib/activation";
@@ -377,16 +378,6 @@ export interface RuleDeliveryProbe {
   // The last turn's delivery receipt, written by the bash hook. Null before any turn has run.
   receipt: PersistedDeliveryReceipt | null;
   now: Date;
-}
-
-function ageLabel(from: string | undefined, now: Date): string {
-  if (!from) return "unknown age";
-  const ms = now.getTime() - new Date(from).getTime();
-  if (!Number.isFinite(ms) || ms < 0) return "unknown age";
-  const mins = Math.floor(ms / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  return hours < 48 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
 }
 
 export function ruleDeliveryDoctorChecks(probe: RuleDeliveryProbe): Check[] {

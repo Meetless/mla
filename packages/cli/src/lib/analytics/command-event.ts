@@ -423,6 +423,13 @@ export function classifyOutcome(
   if (name === "MarkerMissingWorkspaceIdError") {
     return { outcome: "user_error", error_class: "marker_missing_workspace_id", retryable: false };
   }
+  if (name === "UnsafePathComponentError") {
+    // A workspace/run id that is not a safe path component (path-component.ts). Every route
+    // to it is the operator's own state: a hand-edited or stale `.meetless.json` marker, a
+    // MEETLESS_WORKSPACE_ID / --workspace value that picked up shell quoting. The message
+    // already says to re-run `mla activate`, so this must not also send them to the bug queue.
+    return { outcome: "user_error", error_class: "unsafe_path_component", retryable: false };
+  }
   if (name === "RefreshBusyError") {
     return { outcome: "timeout", error_class: "refresh_busy", retryable: true };
   }
