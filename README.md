@@ -10,7 +10,7 @@ acts. You review only the changes that require human judgment.**
 </p>
 
 <p align="center"><em>
-  <a href="https://youtu.be/xSeo5Ayj9aY">Full walkthrough on YouTube</a>
+  <a href="https://youtu.be/msC4_nAASiQ">Full walkthrough on YouTube</a>
 </em></p>
 
 <p align="center">
