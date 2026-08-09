@@ -211,12 +211,24 @@ The current macOS binary is ad-hoc signed and not notarized; the Homebrew cask
 removes quarantine as a temporary workaround until Developer-ID notarization is
 enabled.
 
-Then sign in and verify:
+Then sign in, bind the repo you want governed, and verify:
 
 ```bash
-mla login      # browser OAuth; audits every action as you
-mla doctor     # verify backends, auth mode, and the MCP wiring
+mla login                  # browser OAuth; audits every action as you
+cd /path/to/your/repo
+mla activate               # bind this folder to a workspace and scan it
+mla doctor                 # verify backends, auth mode, and the MCP wiring
 ```
+
+`mla activate` is the step that turns a repo into a governed workspace: it binds
+the folder, installs the capture hooks, and scans what your docs already state.
+Skip it and `mla` is installed but governing nothing. Run it once per repo, from
+the repo root.
+
+A freshly activated repo has no governed rules yet, and `mla doctor` says so as
+information rather than as a failure. Seed them with `/mla onboard` inside a
+Claude Code session, then review the candidates it surfaces; nothing is accepted
+until you approve it.
 
 ### Install integrity, stated precisely
 
