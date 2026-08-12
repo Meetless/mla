@@ -86,7 +86,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  rmSync(HOME, { recursive: true, force: true });
+  rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 function seedCliConfig(intelUrl: string): void {
@@ -189,7 +189,7 @@ describe("mla enrich ingest: per-document persist retry (blackbox against an int
     logSpy.mockRestore();
     errSpy.mockRestore();
     restoreCwd();
-    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("a per-doc failed receipt makes the scout persistence_failed and exits 1 (not a silent 0)", async () => {
@@ -406,7 +406,7 @@ describe("mla enrich ingest: the persisted finding row (design §9)", () => {
     logSpy.mockRestore();
     errSpy.mockRestore();
     restoreCwd();
-    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   async function ingest(): Promise<IngestJson> {

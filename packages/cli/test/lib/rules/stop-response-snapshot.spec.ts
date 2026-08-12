@@ -110,7 +110,7 @@ describe("readStopResponseSnapshot: the §2.3 Stage B bounded backward reader", 
   });
 
   afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function writeTranscript(name: string, records: unknown[]): string {

@@ -269,7 +269,7 @@ describe("run-record persistence", () => {
     home = mkdtempSync(join(tmpdir(), "mla-enrich-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const run = (runId: string): OnboardingRun =>
@@ -352,7 +352,7 @@ describe("createPlan", () => {
     home = mkdtempSync(join(tmpdir(), "mla-enrich-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("assembles, persists, and prunes in one shot", () => {

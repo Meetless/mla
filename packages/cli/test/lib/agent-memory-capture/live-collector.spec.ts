@@ -77,7 +77,7 @@ describe("appendLiveDecisions", () => {
     home = mkdtempSync(join(tmpdir(), "amlc-home-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function rec(outcome: LiveRecord["outcome"], rel: string): LiveRecord {
@@ -128,7 +128,7 @@ describe("runLiveCollector (gates + per-binding pass)", () => {
     mem = mkdtempSync(join(tmpdir(), "amlc-mem-"));
   });
   afterEach(() => {
-    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("Gate 1: an injected client with no actor is refused (never upload anonymously)", async () => {

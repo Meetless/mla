@@ -205,7 +205,7 @@ describe("flush.sh large-batch transport (ARG_MAX overflow regression)", () => {
       // 3. Clean drain self-cleans the emptied queue file (no re-spool, no abort).
       expect(fs.existsSync(queueFile)).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

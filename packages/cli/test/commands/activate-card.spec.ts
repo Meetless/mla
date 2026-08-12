@@ -10,7 +10,11 @@ describe("renderActivationCard", () => {
     expect(card).toContain("8 decision/spec docs");
     expect(card).toContain("71 legacy notes");
     expect(card).toContain("4 likely-stale");
-    expect(card).toContain("high-confidence project instructions");
+    // The second line used to promise Meetless "will use high-confidence project instructions".
+    // It does not use them: the delivery path carries no plain CLAUDE.md rule, and the agent
+    // already loads the file itself. It INDEXES them, which is what makes retrieval answer.
+    expect(card).not.toMatch(/will use/i);
+    expect(card).toMatch(/index/i);
   });
 
   it("uses singular nouns at count 1", () => {

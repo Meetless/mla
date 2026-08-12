@@ -287,3 +287,57 @@ describe("caps are sane bounds", () => {
     expect(ASSISTANT_OUTPUT_MAX_BYTES).toBeGreaterThan(HUNK_MAX_BYTES);
   });
 });
+
+// --- Phase A fallout: a withheld prompt is not an absent prompt ---------------
+//
+// Dropping `input.prompt` from ask-traces.jsonl (the Phase A privacy fix) took the
+// correlator's only source of user-prompt TEXT with it. Left alone, every sealed
+// turn would carry `user_prompt: ""` and `completeness.truncated: false`, which
+// tells the judge "the user said nothing this turn" when the truth is "the user's
+// words are not retained". That is a false claim, not a smaller one, and it is the
+// exact failure class the privacy fix was written to close.
+//
+// The turn's trace still records prompt_chars, so we always know a prompt EXISTED.
+// Carry that as a withheld count and fold it into the completeness signal that
+// already exists (`truncated`), so the judge reads "evidence incomplete" and can
+// return insufficient_evidence honestly. No new state, no new enum.
+describe("withheld user prompts are reported as incomplete, not as silence", () => {
+  it("marks a turn truncated when its prompt existed but its text was not retained", () => {
+    const digest = buildWorkProductDigest({
+      windowStartTurn: 1,
+      windowEndTurn: 2,
+      captureContractVersion: 1,
+      sealedAtIso: "2026-08-05T00:00:00.000Z",
+      turns: [
+        {
+          turn_index: 1,
+          user_prompts: [],
+          user_prompts_withheld: 1,
+          assistant_outputs: [{ text: "done", truncated: false, redactedSubstance: false }],
+          hunks: [],
+        },
+      ],
+    });
+    const t = digest.turns[0];
+    expect(t.user_prompt).toBe("");
+    expect(t.completeness.truncated).toBe(true);
+  });
+
+  it("leaves a genuinely promptless turn alone (absent really is absent)", () => {
+    const digest = buildWorkProductDigest({
+      windowStartTurn: 1,
+      windowEndTurn: 2,
+      captureContractVersion: 1,
+      sealedAtIso: "2026-08-05T00:00:00.000Z",
+      turns: [
+        {
+          turn_index: 1,
+          user_prompts: [],
+          assistant_outputs: [{ text: "done", truncated: false, redactedSubstance: false }],
+          hunks: [],
+        },
+      ],
+    });
+    expect(digest.turns[0].completeness.truncated).toBe(false);
+  });
+});

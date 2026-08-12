@@ -56,7 +56,7 @@ beforeEach(() => {
 afterEach(() => {
   if (savedEnv === undefined) delete process.env.MEETLESS_NOTES_ROOT;
   else process.env.MEETLESS_NOTES_ROOT = savedEnv;
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 describe("notesRootCandidates", () => {

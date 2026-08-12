@@ -231,7 +231,7 @@ describe("mintAttestedNotesLocationVersion writes the LIVE version (real ce0 sto
 
   afterEach(() => {
     closeCe0Store(store);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function admittedPilotPayload(over: Partial<ObservedRuleSpec> = {}) {

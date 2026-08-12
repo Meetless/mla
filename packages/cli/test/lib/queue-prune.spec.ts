@@ -18,7 +18,7 @@ describe("planQueuePrune", () => {
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-prune-plan-"));
   });
-  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("includes a dead session with a NON-empty stranded tail (which reapQueue would skip)", () => {
     const sid = "dead-tail";
@@ -31,10 +31,13 @@ describe("planQueuePrune", () => {
     expect(plan.candidates).toHaveLength(1);
     const c = plan.candidates[0];
     expect(c.sessionId).toBe(sid);
-    expect(c.files).toHaveLength(3);
+    // 2, not 3. `.turn` is preserved by both the reaper and the prune, so it must not be
+    // listed as something the prune will remove; the plan an operator reads is a promise.
+    expect(c.files).toHaveLength(2);
+    expect(c.files.some((f) => f.endsWith(".turn"))).toBe(false);
     expect(c.unflushedEvents).toBe(2);
     expect(plan.totalUnflushedEvents).toBe(2);
-    expect(plan.totalFiles).toBe(3);
+    expect(plan.totalFiles).toBe(2);
   });
 
   it("skips a fresh session (newest file younger than maxAgeSec)", () => {
@@ -70,7 +73,7 @@ describe("executeQueuePrune", () => {
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-prune-exec-"));
   });
-  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("deletes every file of each candidate and counts discarded events (flush disabled)", () => {
     const sid = "dead-tail";

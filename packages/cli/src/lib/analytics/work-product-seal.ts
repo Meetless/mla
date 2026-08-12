@@ -78,7 +78,7 @@ export interface BuildSealBodyArgs {
   // ALL staged captures for the inject's session (readCaptures); filtered to the window here.
   captures: CaptureRecord[];
   // Every direct user prompt for the inject's session, keyed by turn (buildPromptsBySession).
-  promptsByTurn: Map<number, string[]>;
+  promptsByTurn: Map<number, TurnPrompts>;
   // The effective correlation window (WINDOW_TURNS, or the correlator's test override).
   window: number;
   // The inject's EMIT-TIME work_product_capture_version: the contract the capture was made
@@ -119,7 +119,8 @@ export function buildSealBody(args: BuildSealBodyArgs): WorkProductCaptureBody {
     const slot = byTurn.get(turn) ?? { assistant_outputs: [], hunks: [] };
     turns.push({
       turn_index: turn,
-      user_prompts: args.promptsByTurn.get(turn) ?? [],
+      user_prompts: args.promptsByTurn.get(turn)?.texts ?? [],
+      user_prompts_withheld: args.promptsByTurn.get(turn)?.withheld ?? 0,
       assistant_outputs: slot.assistant_outputs,
       hunks: slot.hunks,
     });
@@ -163,13 +164,26 @@ export function buildSealBody(args: BuildSealBodyArgs): WorkProductCaptureBody {
   };
 }
 
-// Index ask-traces lines to (session_id -> turn_index -> prompts[]), preserving occurrence
-// order per turn. The prompt is at `input.prompt` (user-prompt-submit.sh); a line with no
-// session/turn/prompt contributes nothing.
+// One turn's user-prompt evidence: the text we still hold, plus a count of the prompts
+// we know happened and cannot show.
+export interface TurnPrompts {
+  texts: string[];
+  withheld: number;
+}
+
+// Index ask-traces lines to (session_id -> turn_index -> TurnPrompts), preserving
+// occurrence order per turn. A line with no session or no turn contributes nothing.
+//
+// `input.prompt` is GONE from lines written after the raw-prompt-at-rest fix
+// (user-prompt-submit.sh): the trace keeps a hash and a length, never the text. Lines
+// written before it still carry the text, so both shapes are read here and neither is
+// guessed at. A line whose prompt_chars says a prompt existed but carries no text counts
+// as WITHHELD, which the digest folds into completeness. Counting it as "no prompt" is
+// what would let a privacy fix quietly turn into a lying evidence bundle.
 export function buildPromptsBySession(
   asks: Record<string, unknown>[],
-): Map<string, Map<number, string[]>> {
-  const bySession = new Map<string, Map<number, string[]>>();
+): Map<string, Map<number, TurnPrompts>> {
+  const bySession = new Map<string, Map<number, TurnPrompts>>();
   for (const a of asks) {
     const sid = typeof a.session_id === "string" ? a.session_id : "";
     if (!sid) continue;
@@ -183,15 +197,18 @@ export function buildPromptsBySession(
         ? (a.input as Record<string, unknown>)
         : null;
     const prompt = input && typeof input.prompt === "string" ? input.prompt : "";
-    if (!prompt) continue;
+    const chars = input && typeof input.prompt_chars === "number" ? input.prompt_chars : 0;
+    // Neither text nor evidence a prompt existed: a not_run line, or a malformed one.
+    if (!prompt && chars <= 0) continue;
     let byTurn = bySession.get(sid);
     if (!byTurn) {
       byTurn = new Map();
       bySession.set(sid, byTurn);
     }
-    const arr = byTurn.get(turn) ?? [];
-    arr.push(prompt);
-    byTurn.set(turn, arr);
+    const slot = byTurn.get(turn) ?? { texts: [], withheld: 0 };
+    if (prompt) slot.texts.push(prompt);
+    else slot.withheld += 1;
+    byTurn.set(turn, slot);
   }
   return bySession;
 }

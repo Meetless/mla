@@ -36,7 +36,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeCe0Store(store);
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 const FORBIDDEN_ROOT = "notes";

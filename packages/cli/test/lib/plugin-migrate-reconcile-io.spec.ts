@@ -40,7 +40,7 @@ function withTempDir(fn: (tmp: string) => void) {
   try {
     fn(tmp);
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

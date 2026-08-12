@@ -168,7 +168,7 @@ describe("flush.sh fail-soft on 401/403/404 (T1.5)", () => {
         .filter((l) => l.length > 0);
       expect(lines.length).toBeGreaterThanOrEqual(2);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -199,7 +199,7 @@ describe("flush.sh fail-soft on 401/403/404 (T1.5)", () => {
       // Same fail-soft contract: events are kept for retry.
       expect(fs.existsSync(queueFile)).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -222,7 +222,7 @@ describe("flush.sh fail-soft on 401/403/404 (T1.5)", () => {
       expect(r2.status).toBe(0);
       expect(readWarnings(home)).toHaveLength(1);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -241,7 +241,7 @@ describe("flush.sh fail-soft on 401/403/404 (T1.5)", () => {
       // Clean drain leaves no zombie spool (RC1 self-clean still holds).
       expect(fs.existsSync(queueFile)).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

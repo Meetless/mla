@@ -20,6 +20,9 @@ function projectFile(body: string): string {
 function userFile(): string {
   return `---\nname: x\nmetadata:\n  type: user\n---\nbody\n`;
 }
+function typedFile(type: string, body: string): string {
+  return `---\nname: x\nmetadata:\n  type: ${type}\n---\n${body}\n`;
+}
 
 function byRel(records: DecisionRecord[], rel: string): DecisionRecord | undefined {
   return records.find((r) => r.relativePath === rel);
@@ -44,7 +47,7 @@ describe("collectOnce (§4 transition router)", () => {
     deps = { nowIso: NOW, home };
   });
   afterEach(() => {
-    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("new clean project file -> eligible, ledger records it", () => {
@@ -139,6 +142,36 @@ describe("collectOnce (§4 transition router)", () => {
     const r = byRel(sum.records, "a.md")!;
     expect(r.decision).toBe("eligible");
     expect(r.secretRuleIds).toEqual([]);
+  });
+
+  // Phase 2a (notes/20260805-did-mla-help-...md §12.6). The eligibility RULE lives
+  // in classify.isCapturable, but both pipelines used to hardcode `type !== "project"`
+  // and isCapturable had ZERO production callers. Widening the rule was therefore
+  // inert until the pipelines actually called it. These tests bind the pipeline to
+  // the rule, so the next widening cannot be silently dead again.
+  it("Phase 2a: a feedback file is ELIGIBLE, like a project file", () => {
+    writeFileSync(join(mem, "fb.md"), typedFile("feedback", "a working rule"));
+    const sum = collectOnce(binding, deps);
+    expect(byRel(sum.records, "fb.md")!.decision).toBe("eligible");
+  });
+
+  it("Phase 2b: a reference file is ELIGIBLE (the traps index lives here)", () => {
+    writeFileSync(join(mem, "ref.md"), typedFile("reference", "a measurement trap"));
+    const sum = collectOnce(binding, deps);
+    expect(byRel(sum.records, "ref.md")!.decision).toBe("eligible");
+  });
+
+  it("a user file stays skipped after the widening: that boundary is privacy, not scope", () => {
+    writeFileSync(join(mem, "u2.md"), typedFile("user", "who An is"));
+    const sum = collectOnce(binding, deps);
+    expect(byRel(sum.records, "u2.md")!.decision).toBe("skipped");
+    expect(readLedger("bind-1", home).entries["u2.md"]).toBeUndefined();
+  });
+
+  it("newly eligible types are secret-scanned exactly like project files", () => {
+    writeFileSync(join(mem, "fb2.md"), typedFile("feedback", "config: requirepass O3o7j8zX"));
+    const sum = collectOnce(binding, deps);
+    expect(byRel(sum.records, "fb2.md")!.secretRuleIds).toContain("redis_directive");
   });
 
   it("non-project file never tracked -> skipped (and not in ledger)", () => {

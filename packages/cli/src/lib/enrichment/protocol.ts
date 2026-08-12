@@ -310,13 +310,26 @@ export function scoutMayEmitKind(role: ScoutName, kind: EnrichmentKind): boolean
 //
 // Projected FROM PreparedGitFileChange rather than declared beside it, because ingest validates
 // a claim by exact field-for-field comparison against the plan's prepared change under the
-// validated commit SHA. A field added to the prepared shape lands here automatically, so the
-// comparison cannot silently stop covering it; a field the projection does not name is a
-// deliberate exclusion the compiler will point at. The two are still distinct types because the
-// provenance differs: a PreparedGitFileChange is what the CLI read out of git, a
-// DivergenceFileChange is what a model claims it read out of the brief, and the entire point of
-// the check is that those are not the same thing until they are proven equal.
+// validated commit SHA. The two are still distinct types because the provenance differs: a
+// PreparedGitFileChange is what the CLI read out of git, a DivergenceFileChange is what a model
+// claims it read out of the brief, and the entire point of the check is that those are not the
+// same thing until they are proven equal.
 export type DivergenceFileChange = Pick<PreparedGitFileChange, "path" | "status" | "renamedFrom">;
+
+// A `Pick` names its keys, so it does NOT track the shape it projects: adding a field to
+// PreparedGitFileChange leaves this projection behind, and ingest's field-for-field comparison
+// silently stops covering the new evidence. That is the failure this guard exists to make
+// impossible, and it is a compile error rather than a runtime check because there is no run in
+// which to notice it: the comparison would simply pass. Widening the prepared shape now forces a
+// decision here (project the field and compare it, or state the exclusion in the key list).
+type AssertTrue<T extends true> = T;
+export type DivergenceShapeGuard = AssertTrue<
+  [keyof PreparedGitFileChange] extends [keyof DivergenceFileChange]
+    ? [keyof DivergenceFileChange] extends [keyof PreparedGitFileChange]
+      ? true
+      : false
+    : false
+>;
 
 // The claim classes v1 can PROVE from a commit's porcelain status letter alone.
 //

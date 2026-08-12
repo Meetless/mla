@@ -88,14 +88,27 @@ export function makeMcpStaleCheck(
   };
 }
 
+// A REBUILD OF THE SAME COMMIT IS STILL A STALE SERVER, and it is the common case on a
+// shared tree: a peer runs `npm run build` and a dev build bakes in whatever uncommitted
+// working-tree edits were present, so identical shas can produce genuinely different dist
+// bytes. The probe is right to fire and the remedy is unchanged.
+//
+// What it must NOT do is render that as `an OLDER build (55fc10b9d @ ...23.270Z); a newer
+// mla build (55fc10b9d @ ...32.031Z)`, which is the literal string a live
+// `retrieve_knowledge` call produced on 2026-08-09, nine seconds apart. An operator who
+// reads one sha printed twice under "OLDER" and "newer" concludes the CHECK is broken and
+// starts discounting it, which costs exactly the credibility this warning exists to spend
+// on the day the code really did change. So the same-commit case names itself.
 function staleWarning(
   spawn: StaleBuildIdentity,
   current: StaleBuildIdentity,
 ): string {
+  const what =
+    spawn.sha === current.sha
+      ? `Meetless MCP is serving an OLDER build of the SAME COMMIT ${spawn.sha}, rebuilt since this server started (${spawn.builtAt} -> ${current.builtAt}); a dev build includes uncommitted changes, so the code on disk can differ.`
+      : `Meetless MCP is serving an OLDER build (${spawn.sha} @ ${spawn.builtAt}); a newer mla build (${current.sha} @ ${current.builtAt}) is now on disk.`;
   return (
-    `Meetless MCP is serving an OLDER build (${spawn.sha} @ ${spawn.builtAt}); ` +
-    `a newer mla build (${current.sha} @ ${current.builtAt}) is now on disk. ` +
-    `Restart your editor so the MCP server reloads; until then every result, ` +
+    `${what} Restart your editor so the MCP server reloads; until then every result, ` +
     `including this one, comes from the older code.`
   );
 }

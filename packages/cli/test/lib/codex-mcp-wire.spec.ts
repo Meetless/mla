@@ -29,7 +29,7 @@ function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 function cleanup(...dirs: string[]): void {
-  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 }
 function cfgIn(dir: string): string {
   return path.join(dir, "config.toml");

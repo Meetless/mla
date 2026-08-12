@@ -30,10 +30,10 @@ describe("scanForCredentials (pre-upload credential denylist)", () => {
     expect(scanForCredentials("k=sk-proj-AbCdEfGhIjKlMnOpQrStUv")).toEqual([
       "provider_token",
     ]);
-    expect(scanForCredentials("aws AKIAIOSFODNN7EXAMPLE here")).toEqual([
+    expect(scanForCredentials("aws AKIA" + "IOSFODNN7EXAMPLE here")).toEqual([
       "provider_token",
     ]);
-    expect(scanForCredentials("xoxb-1234567890-abcdefghij")).toEqual([
+    expect(scanForCredentials("xox" + "b-1234567890-abcdefghij")).toEqual([
       "provider_token",
     ]);
   });

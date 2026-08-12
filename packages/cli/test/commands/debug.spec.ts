@@ -68,7 +68,7 @@ describe("debug bundle: command behavior (P5-T5)", () => {
   afterEach(() => {
     logSpy.mockRestore();
     errSpy.mockRestore();
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("rejects a malformed --trace-id up front (OBS-1 guard), writing nothing", async () => {
@@ -243,7 +243,7 @@ describe("debug bundle: command behavior (P5-T5)", () => {
   it("keeps deliberately-included prompts but still scrubs embedded credentials", async () => {
     // --include-prompts re-exposes content, NOT secrets: a credential embedded
     // inside an included prompt must still be stripped by Layer 2.
-    const GHP = "ghp_embeddedINprompt1234567890ABCD";
+    const GHP = "gh" + "p_embeddedINprompt1234567890ABCD";
     const logsDir = path.join(home, "logs");
     fs.mkdirSync(logsDir, { recursive: true });
     fs.writeFileSync(
@@ -337,7 +337,7 @@ describe("debug bundle: command behavior (P5-T5)", () => {
     expect(manifest.warnings).toContain("backend unreachable");
 
     // and a successful fetch lands backend-summary.json
-    fs.rmSync(path.join(home, "debug"), { recursive: true, force: true });
+    fs.rmSync(path.join(home, "debug"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     await runDebug(["bundle", "--trace-id", VALID_ID], { home, backendFetcher: fakeBackend });
     const ok = readBundle(home, VALID_ID);
     expect(ok.byName.has("backend-summary.json")).toBe(true);

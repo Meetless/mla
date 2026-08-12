@@ -44,7 +44,7 @@ describe("resolveHooksDir (doctor install-surface-aware hooks dir)", () => {
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mla-doctor-hooks-"));
   });
-  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("prefers home-dir wiring when ~/.meetless/hooks holds the hook", () => {
     const home = path.join(tmp, "home");

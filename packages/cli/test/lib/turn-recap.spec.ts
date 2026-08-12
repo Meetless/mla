@@ -256,6 +256,48 @@ describe("computeTurnRecap: verdict", () => {
     expect(r.evidence_layer_down).toBe(true);
   });
 
+  it("NO_OFFER: a stop_guard is named, not rendered as 'nothing relevant offered'", () => {
+    // THE SAME DEFECT AS intel_down, ONE REASON LATER, IN THIS SAME FUNCTION.
+    //
+    // The hook sets FAIL_OPEN_REASON="stop_guard" / ARB_REASON="enrichment_stop_guard"
+    // (user-prompt-submit.sh, arbitrate_layer2). Neither string contains "timeout",
+    // "error", "unauthorized" or "intel_down", so every branch missed it and it fell
+    // through to null, which renders exactly like a merits abstain. 23 such rows sit in
+    // the local ledger.
+    //
+    // Found by grepping every other consumer of `fail_open_reason` after fixing the
+    // identical hole in `analyze.py`'s `no_offer_reason_for`. The intel_down branch two
+    // tests up was added for this exact reason and did not sweep its siblings.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_stop_guard", fail_open: "stop_guard" })],
+      }),
+    );
+
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.coverage_gap_type).toBe("enrich_stop_guard");
+  });
+
+  it("NO_OFFER: a stop_guard does NOT flip evidence_layer_down, because intel answered", () => {
+    // The half that must NOT change. intel is UP and its own guard fired mid-answer, so
+    // this is not a backend outage and must not be counted as one. This file already
+    // states the principle at `intelAnswered`: "a turn that failed for another reason
+    // (stop_guard, muted, unauthorized) proves nothing about the backend, and treating
+    // it as healthy is what manufactured 160 phantom recoveries". Naming the gap and
+    // flipping the outage flag are different claims.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [ask({ turn: 8, injected: true, layer2: false, offered: [], arb_reason: "enrichment_stop_guard", fail_open: "stop_guard" })],
+      }),
+    );
+
+    expect(r.evidence_layer_down).toBe(false);
+  });
+
   it("NO_OFFER: enrich timeout and enrich error both flip evidence_layer_down", () => {
     const timedOut = computeTurnRecap(
       "s1",
@@ -546,6 +588,74 @@ describe("computeTurnRecap: verdict", () => {
     expect(legacy.abstain_class).toBeNull();
   });
 
+  // F6 (2026-08-08). The mirror below was written to catch exactly this class of
+  // drift, and it had already drifted again before anyone read it: intel added
+  // `machine_envelope` (199 of 898 prod turns, 22.2%) and the mirror never grew it, so
+  // every one of those turns recapped with abstain_class null, which reads as
+  // "instrumentation absent" on the single largest NO_OFFER population there is.
+  it("the mirror carries EVERY reason intel can emit, including the two it drifted on", () => {
+    // A withheld mirror is a deliberate precision abstention: the payload was the
+    // agent's own same-session exhaust, so there was nothing to serve.
+    expect(INTEL_NO_OFFER_REASONS).toContain("self_echo_only");
+    // The harness re-invoked the agent and no human asked anything. Not router debt.
+    expect(INTEL_NO_OFFER_REASONS).toContain("machine_envelope");
+    // 2026-08-10: intel emits this the moment a session has been served everything its
+    // retrieval finds, which on a long session is routine rather than exotic.
+    expect(INTEL_NO_OFFER_REASONS).toContain("all_excluded_by_caller");
+  });
+
+  it("NO_OFFER (all_excluded_by_caller): repeat-suppression is a correct abstain, not a recall miss", () => {
+    // Session cba778a7 turn 9: ten candidates, three banded high, and all ten dropped
+    // because the session had already been handed them or had written them itself. It
+    // arrived as `all_failed_relevance`, which classifies `should_have_matched`, so the
+    // recall dashboard counted the suppression working as a miss. Same family as
+    // self_echo_only: withholding what the caller already holds is the product being
+    // right, and the counts stay non-zero so the turn is still diagnosable.
+    const r = computeTurnRecap(
+      "s1",
+      9,
+      deps({
+        traces: [
+          ask({
+            turn: 9,
+            injected: true,
+            layer2: false,
+            offered: [],
+            gkb: { retrieved_count: 10, selected_count: 0, primary_no_offer_reason: "all_excluded_by_caller" },
+          }),
+        ],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("correct_abstain");
+    expect(r.abstain_class).not.toBe("should_have_matched");
+  });
+
+  it("NO_OFFER (self_echo_only): a withheld mirror is a correct abstain, never a recall gap", () => {
+    // The counts are what make this diagnosable, and they are deliberately NOT zero:
+    // candidates existed and the provider succeeded. If this ever classified as
+    // should_have_matched, the recall dashboard would grow a permanent phantom miss
+    // for turns where mla did exactly the right thing.
+    const r = computeTurnRecap(
+      "s1",
+      8,
+      deps({
+        traces: [
+          ask({
+            turn: 8,
+            injected: true,
+            layer2: false,
+            offered: [],
+            gkb: { retrieved_count: 1, selected_count: 0, primary_no_offer_reason: "self_echo_only" },
+          }),
+        ],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    expect(r.abstain_class).toBe("correct_abstain");
+    expect(r.abstain_class).not.toBe("should_have_matched");
+  });
+
   it("NO_OFFER (empty_prompt): a caller that sent nothing is a plumbing failure, not router debt", () => {
     // intel split this out of router_low_confidence on 2026-07-31. Before the split
     // the two were byte-identical on the wire, so a client that failed to send the
@@ -704,13 +814,17 @@ const used: TurnRecap = {
   pull_count: 2,
   referenced_source_ids: ["DD:abc"],
   cited_source_ids: ["DD:abc"],
+  opened_source_ids: [],
+  path_targeted_source_ids: [],
+  echoed_source_ids: [],
+  engaged_source_ids: ["DD:abc"],
   verdict: "USED",
 };
 
 describe("renderFooter", () => {
   it("USED line matches the Section 7 format", () => {
     expect(renderFooter(used)).toBe(
-      "🔎 mla · turn 7 · evidence injected (3 src, 412ms) · pulled retrieve_knowledge ×2 · cited DD:abc · USED",
+      "🔎 mla · turn 7 · evidence injected (3 src, 412ms) · pulled retrieve_knowledge ×2 · cited DD:abc · opened 0 · explicit evidence reference observed",
     );
   });
 
@@ -753,9 +867,106 @@ describe("renderFooter", () => {
     );
   });
 
-  it("IGNORED renders pulled/cited counts", () => {
+  it("no observed engagement renders the raw counts and says exactly that", () => {
     const r: TurnRecap = { ...used, turn_index: 9, verdict: "IGNORED", enrich_latency_ms: 380, offered_source_ids: ["NT:a.md", "NT:b.md", "NT:c.md", "NT:d.md", "NT:e.md"], pull_count: 0, evidence_tools_pulled: [], referenced_source_ids: [], cited_source_ids: [] };
-    expect(renderFooter(r)).toBe("🔎 mla · turn 9 · evidence injected (5 src, 380ms) · pulled 0 · cited 0 · IGNORED");
+    // The stored verdict is still IGNORED (intel pins the literal); the RENDERING no longer
+    // asserts a mental state we never observed. All three deterministic counters are shown so
+    // a reader can see which signals were watched for.
+    expect(r.verdict).toBe("IGNORED");
+    expect(renderFooter(r)).toBe(
+      "🔎 mla · turn 9 · evidence injected (5 src, 380ms) · pulled 0 · cited 0 · opened 0 · no explicit evidence reference observed",
+    );
+  });
+
+  // D5 (session be3cbc73, turn 2). The line read:
+  //
+  //   ... cited NT:notes/20260807-mla-helpfulness-session-8779efcf-fix-proposal.md · IGNORED
+  //
+  // and that document was NOT among the three items mla delivered. The agent named it
+  // itself, out of eval-harness output it was already holding.
+  //
+  // THE METRIC IS CORRECT and this is not a metric fix. `referenced_source_ids` IS the
+  // intersection of offered against pulled+cited, and the verdict is computed from it
+  // properly. The defect is only in the RENDERING: the line printed the RAW
+  // `cited_source_ids` next to a verdict derived from the intersection, so a reader saw
+  // a governed id and the word IGNORED in one breath with no way to tell that the cited
+  // id was never on offer.
+  //
+  // The two facts are separated rather than one of them dropped. `cited-elsewhere` is
+  // arguably the most interesting number mla produces: it is the agent going to governed
+  // material mla did NOT supply, which is precisely the gap the push side exists to close.
+  it("D5: separates a citation mla OFFERED from one the agent found elsewhere", () => {
+    const r: TurnRecap = {
+      ...used,
+      turn_index: 2,
+      offered_source_ids: ["NT:notes/a.md", "NT:notes/b.md", "CC:cmexample0000000000000005"],
+      pull_count: 0,
+      evidence_tools_pulled: [],
+      // One of the two cited ids was on offer; the other the agent brought itself.
+      cited_source_ids: ["NT:notes/a.md", "NT:notes/20260807-mla-helpfulness-session-8779efcf-fix-proposal.md"],
+      referenced_source_ids: ["NT:notes/a.md"],
+      engaged_source_ids: ["NT:notes/a.md"],
+      verdict: "USED",
+    };
+    expect(renderFooter(r)).toBe(
+      "🔎 mla · turn 2 · evidence injected (3 src, 412ms) · pulled 0 · cited NT:notes/a.md (+1 elsewhere) · opened 0 · explicit evidence reference observed",
+    );
+  });
+
+  it("D5: the be3cbc73 line no longer claims a citation for something never offered", () => {
+    const r: TurnRecap = {
+      ...used,
+      turn_index: 2,
+      offered_source_ids: ["NT:notes/x.md", "NT:notes/y.md", "CC:cmexample0000000000000005"],
+      pull_count: 0,
+      evidence_tools_pulled: [],
+      cited_source_ids: ["NT:notes/20260807-mla-helpfulness-session-8779efcf-fix-proposal.md"],
+      referenced_source_ids: [],
+      engaged_source_ids: [],
+      opened_source_ids: [],
+      verdict: "IGNORED",
+    };
+    const line = renderFooter(r);
+    // The id mla never offered must not sit beside IGNORED as though it had been.
+    expect(line).not.toContain("cited NT:notes/20260807-mla-helpfulness-session-8779efcf-fix-proposal.md");
+    expect(line).toBe(
+      "🔎 mla · turn 2 · evidence injected (3 src, 412ms) · pulled 0 · cited 0 (+1 elsewhere) · opened 0 · no explicit evidence reference observed",
+    );
+  });
+
+  it("D5: a turn citing only what was offered renders exactly as before (no format churn)", () => {
+    // `used` cites DD:abc, which IS in referenced_source_ids. The suffix must not appear
+    // at all when there is nothing to disambiguate: every existing line keeps its shape.
+    expect(renderFooter(used)).not.toContain("elsewhere");
+  });
+
+  // D3, at the surface where the blindness was actually felt. On be3cbc73 turn 1 the
+  // agent called retrieve_knowledge TWICE, was refused twice ("intel is unreachable"),
+  // and the recap for that turn said `pulled 0` -- byte-identical to a turn where the
+  // agent never reached for governed memory at all. That is the strongest signal mla
+  // can collect being rendered as its own opposite.
+  it("D3: a refused pull is named, not silently folded into `pulled 0`", () => {
+    const r: TurnRecap = {
+      ...used,
+      turn_index: 1,
+      pull_count: 0,
+      pull_refused_count: 2,
+      evidence_tools_pulled: [],
+      cited_source_ids: [],
+      referenced_source_ids: [],
+      opened_source_ids: [],
+      engaged_source_ids: [],
+      verdict: "IGNORED",
+    };
+    expect(renderFooter(r)).toBe(
+      "🔎 mla · turn 1 · evidence injected (3 src, 412ms) · pulled 0 (2 refused) · cited 0 · opened 0 · no explicit evidence reference observed",
+    );
+  });
+
+  it("D3: a turn with no refusal renders exactly as before", () => {
+    expect(renderFooter({ ...used, pull_refused_count: 0 })).toBe(
+      "🔎 mla · turn 7 · evidence injected (3 src, 412ms) · pulled retrieve_knowledge ×2 · cited DD:abc · opened 0 · explicit evidence reference observed",
+    );
   });
 
   it("NOT_RUN (muted) names the reason", () => {
@@ -792,7 +1003,7 @@ describe("renderBlock", () => {
   it("expands the full recap fields with the verdict", () => {
     const out = renderBlock(used);
     expect(out).toMatch(/turn 7 recap/);
-    expect(out).toMatch(/verdict:\s+USED/);
+    expect(out).toContain("outcome:    explicit evidence reference observed");
     expect(out).toMatch(/floor \+ evidence/);
     expect(out).toContain("a".repeat(32));
   });
@@ -819,5 +1030,165 @@ describe("renderBlock", () => {
     const out = renderBlock(r);
     expect(out).toMatch(/evidence layer DOWN/);
     expect(out).toMatch(/backend outage, not a merits result/);
+  });
+});
+
+// --- F3: the decision cannot grade itself, and a pull that resolved nothing is
+// not a falsifier ------------------------------------------------------------
+//
+// `correct_abstain` is derived ENTIRELY from intel's own no_offer reason. It is a
+// DECISION class, and the recap printed it under a name that reads as a graded
+// OUTCOME. On the session that prompted this, turn 5 rendered `correct_abstain`
+// while the very same record carried `pulled: retrieve_knowledge x1`: mla declined
+// to offer, the agent went and fetched governed evidence by hand, and mla graded
+// its own non-offer correct.
+//
+// The 2026-08-10 owner correction, on top of that fix:
+//
+//   1. The label `correct_abstain (unverified: ...)` was invalid: the class still
+//      SAID correct while the suffix said it was not. The class itself becomes
+//      `unverified_abstain`, so nothing downstream can read the wrong word.
+//   2. A bare pull COUNT is not contrary evidence. A `retrieve_knowledge` that
+//      resolved NOTHING is the corpus AGREEING with the abstention, and the old
+//      rule fired on it. Only a successful pull that resolved >=1 governed source
+//      id falsifies the abstention.
+//   3. The CLI never claims `missed_offer`. That requires establishing the pulled
+//      source was ELIGIBLE for the push mechanism at that time, which needs the
+//      corpus facts the analyzer has and this process does not. Uncertainty is
+//      preserved rather than manufacturing a win or a miss.
+//
+// deriveAbstainClass (the intel-reason taxonomy) is NOT changed; the demotion is a
+// separate step applied on top of it.
+describe("an abstention is not certified by the decision that made it", () => {
+  const abstainTrace = (turn: number) =>
+    ask({ turn, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "primary_surface_no_offer" } });
+
+  it("demotes to unverified_abstain when a successful pull resolved governed evidence", () => {
+    const r = computeTurnRecap(
+      "s1",
+      9,
+      deps({
+        traces: [abstainTrace(9)],
+        mcp: [mcp("s1", 9, "retrieve_knowledge", true, ["NT:notes/20260712-x.md"])],
+      }),
+    );
+    expect(r.verdict).toBe("NO_OFFER");
+    // The word `correct` is gone from the class, not merely qualified after it.
+    expect(r.abstain_class).toBe("unverified_abstain");
+    expect(r.hand_pulled_source_ids).toEqual(["NT:notes/20260712-x.md"]);
+    const line = renderFooter(r);
+    expect(line).toContain("unverified");
+    expect(line).toMatch(/retrieve_knowledge/);
+    expect(line).not.toContain("correct_abstain");
+  });
+
+  it("never claims missed_offer, which needs eligibility this process cannot establish", () => {
+    const r = computeTurnRecap(
+      "s1",
+      9,
+      deps({
+        traces: [abstainTrace(9)],
+        mcp: [mcp("s1", 9, "kb_doc_detail", true, ["NT:notes/20260712-x.md"])],
+      }),
+    );
+    expect(r.abstain_class).not.toBe("missed_offer");
+    expect(r.abstain_class).toBe("unverified_abstain");
+  });
+
+  it("a pull that resolved nothing leaves the abstention as intel classified it", () => {
+    // The corpus was asked and returned nothing. That CONFIRMS the abstention; the
+    // old rule read it as a falsifier because it counted calls, not resolutions.
+    const r = computeTurnRecap(
+      "s1",
+      9,
+      deps({
+        traces: [abstainTrace(9)],
+        mcp: [mcp("s1", 9, "retrieve_knowledge", true, [])],
+      }),
+    );
+    expect(r.abstain_class).toBe("correct_abstain");
+    expect(r.hand_pulled_source_ids).toEqual([]);
+    expect(renderFooter(r)).not.toContain("unverified");
+  });
+
+  it("a REFUSED pull is not a falsifier: it never reached the corpus", () => {
+    const r = computeTurnRecap(
+      "s1",
+      9,
+      deps({
+        traces: [abstainTrace(9)],
+        mcp: [{ ...mcp("s1", 9, "kb_doc_detail", true, ["NT:notes/20260712-x.md"]), outcome: "error" }],
+      }),
+    );
+    expect(r.pull_refused_count).toBe(1);
+    expect(r.hand_pulled_source_ids).toEqual([]);
+    expect(r.abstain_class).toBe("correct_abstain");
+  });
+
+  it("an ACTION call is not an evidence pull", () => {
+    const r = computeTurnRecap(
+      "s1",
+      9,
+      deps({
+        traces: [abstainTrace(9)],
+        mcp: [mcp("s1", 9, "relationship_verdict", false, ["NT:notes/20260712-x.md"])],
+      }),
+    );
+    expect(r.hand_pulled_source_ids).toEqual([]);
+    expect(r.abstain_class).toBe("correct_abstain");
+  });
+
+  it("leaves an abstention with no manual pull reading as it did before", () => {
+    const r = computeTurnRecap("s1", 10, deps({ traces: [abstainTrace(10)] }));
+    expect(r.abstain_class).toBe("correct_abstain");
+    expect(renderFooter(r)).not.toContain("unverified");
+  });
+
+  it("does not touch a class that never claimed correctness", () => {
+    const r = computeTurnRecap(
+      "s1",
+      11,
+      deps({
+        traces: [ask({ turn: 11, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "router_low_confidence" } })],
+        mcp: [mcp("s1", 11, "retrieve_knowledge", true, ["NT:notes/20260712-x.md"])],
+      }),
+    );
+    expect(r.abstain_class).toBe("not_routed");
+    expect(renderFooter(r)).not.toContain("unverified");
+  });
+});
+
+// The EXPANDED block is the surface an operator actually reads (`mla turn N`), and
+// it prints `class:` on its own line, two lines below `pulled:`. Fixing only the
+// one-line footer left the original complaint fully intact there: run against the
+// real spool, `mla turn 5 --session 2c0c38b4...` still printed
+//   pulled:     retrieve_knowledge x1
+//   class:      correct_abstain
+// which is the exact pair the finding was about. Caught by exercising the built
+// binary, not by the unit test, because the unit test asserted on renderFooter.
+describe("the expanded block carries the same falsifier as the footer", () => {
+  it("marks correct_abstain unverified in `mla turn` when the agent pulled by hand", () => {
+    const r = computeTurnRecap(
+      "s1",
+      12,
+      deps({
+        traces: [ask({ turn: 12, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "primary_surface_no_offer" } })],
+        mcp: [mcp("s1", 12, "retrieve_knowledge", true, ["NT:notes/20260712-x.md"])],
+      }),
+    );
+    const block = renderBlock(r);
+    expect(block).toMatch(/pulled:\s+retrieve_knowledge/);
+    expect(block).toContain("unverified");
+  });
+
+  it("leaves the expanded block alone when nothing falsifies the abstention", () => {
+    const r = computeTurnRecap(
+      "s1",
+      13,
+      deps({
+        traces: [ask({ turn: 13, injected: true, layer2: false, offered: [], gkb: { retrieved_count: 0, selected_count: 0, primary_no_offer_reason: "primary_surface_no_offer" } })],
+      }),
+    );
+    expect(renderBlock(r)).not.toContain("unverified");
   });
 });

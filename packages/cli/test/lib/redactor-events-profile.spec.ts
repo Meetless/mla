@@ -43,8 +43,8 @@ const CREDENTIAL_FIXTURES: Array<{ name: string; input: string; secret: string }
   },
   {
     name: "github_pat",
-    input: "git remote set-url origin https://ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789@github.com/x/y",
-    secret: "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+    input: "git remote set-url origin https://gh" + "p_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789@github.com/x/y",
+    secret: "gh" + "p_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
   },
   {
     name: "github_fine_grained_pat",
@@ -53,13 +53,13 @@ const CREDENTIAL_FIXTURES: Array<{ name: string; input: string; secret: string }
   },
   {
     name: "slack_bot_token",
-    input: "SLACK_BOT_TOKEN=xoxb-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt",
-    secret: "xoxb-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt",
+    input: "SLACK_BOT_TOKEN=xox" + "b-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt",
+    secret: "xox" + "b-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt",
   },
   {
     name: "aws_access_key_id",
-    input: "aws configure set aws_access_key_id AKIAIOSFODNN7EXAMPLE",
-    secret: "AKIAIOSFODNN7EXAMPLE",
+    input: "aws configure set aws_access_key_id AKIA" + "IOSFODNN7EXAMPLE",
+    secret: "AKIA" + "IOSFODNN7EXAMPLE",
   },
   {
     name: "google_api_key",
@@ -253,7 +253,7 @@ describe("events profile, test 5: the accepted residual, written down as the pri
   it("still goes under events when a literal pattern recognizes it", () => {
     // The exemption only ever bypasses the ENTROPY sweep. Literal credential
     // patterns run first and are identical across all three profiles.
-    const literalInPathShape = "ghp_abcdefghijklmnopqrstuvwxyz0123456789/x";
+    const literalInPathShape = "gh" + "p_abcdefghijklmnopqrstuvwxyz0123456789/x";
     expect(redact(literalInPathShape, "events")).toContain(REDACTED);
   });
 });
@@ -345,7 +345,7 @@ describe("events profile, test 7: the real caller requests it on the wire", () =
         occurredAt: "2026-07-27T00:00:00.000Z",
         payload: {
           command:
-            "node scripts/measure-redaction-corpus.js && export SLACK_BOT_TOKEN=xoxb-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt",
+            "node scripts/measure-redaction-corpus.js && export SLACK_BOT_TOKEN=xox" + "b-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt",
           stdout: "wrote apps/control/src/coordination-case/coordination-case-projection",
           exitCode: 0,
           sessionId: "0199f1e0-9c1a-7c3e-b0a1-2f4d6e8a0b2c",
@@ -360,7 +360,7 @@ describe("events profile, test 7: the real caller requests it on the wire", () =
 
     expect(out.eventKey).toBe("evt-1");
     // The credential is gone.
-    expect(out.payload.command).not.toContain("xoxb-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt");
+    expect(out.payload.command).not.toContain("xox" + "b-1234567890-0987654321-AbCdEfGhIjKlMnOpQrSt");
     // The paths that make the ledger readable are NOT.
     expect(out.payload.command).toContain("scripts/measure-redaction-corpus.js");
     expect(out.payload.stdout).toContain(

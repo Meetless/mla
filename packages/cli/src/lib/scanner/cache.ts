@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { resolveMeetlessHome } from "../config";
-import { assertSafeWorkspaceId } from "../path-component";
+import { assertSafeSessionId, assertSafeWorkspaceId } from "../path-component";
 import { ScanResult, Verdicts } from "./types";
 import { renderStaleContextXml } from "./render";
 
@@ -98,8 +98,33 @@ export function reviewCardsPath(workspaceId: string, home?: string): string {
 // subcommand budgets the model-facing envelope, then records WHAT it delivered vs dropped
 // (and any overflow) here rather than in the byte-limited prompt. Diagnostic only: a failed
 // write never breaks delivery.
-export function assembleAuditPath(workspaceId: string, home?: string): string {
-  return join(wsDir(home, workspaceId), "assemble-audit.json");
+//
+// PER SESSION when the caller can name one, and that is load-bearing rather than tidy. The
+// file is also the floor delta's BASELINE: the assembler reads it immediately before
+// overwriting it, so "what did I deliver last turn" is answered from here. Keyed on the
+// workspace alone, every session on the machine wrote this one file and the delta diffed
+// against whatever stranger wrote last. Measured on session bc08eb20 (2026-08-09): 35
+// assemblies by OTHER sessions between that agent's two turns, so its receipt read
+// `removed: []` while three `[MUST]` rules had left its floor. The line's own words are
+// "since your last turn".
+//
+// A separate FILE per session, not a `{sessionId: audit}` map inside the shared one. The
+// map is one file and therefore reads tidier, but it needs a read-modify-write from 10+
+// concurrent processes with no lock, which trades the current logical race for a
+// lost-update race; the write here is a plain whole-file overwrite precisely so it cannot
+// interleave. Files that no session shares cannot clobber one another at all.
+//
+// Orphans are swept by session-start.sh alongside the other per-session state, on the same
+// `-mtime +7` sweep and for the same reason: session ids never recur, so nothing else ever
+// reclaims them.
+//
+// No session id yields the LEGACY workspace-shaped path. That is the honest fallback for a
+// caller that genuinely cannot name a session (`mla turn` outside a hook, older builds): a
+// stranger's receipt is worse than none, so the two never share a file.
+export function assembleAuditPath(workspaceId: string, home?: string, sessionId?: string): string {
+  const dir = wsDir(home, workspaceId);
+  if (sessionId === undefined) return join(dir, "assemble-audit.json");
+  return join(dir, `assemble-audit.${assertSafeSessionId(sessionId)}.json`);
 }
 // The hook's per-turn delivery receipt. The ONLY artifact written by the bash side
 // (hooks-template/user-prompt-submit.sh §emit_delivery_receipt), and the only one that covers the
@@ -121,47 +146,70 @@ function readJson<T>(path: string): T | null {
   }
 }
 
-// How many per-root slots to keep. Real installs have one to three roots; the extra headroom is
-// for the throwaway directories that create these in the first place (three `mla activate` calls
-// from `live-handoff-test-000{1,2,3}` on 2026-08-02). Beyond the cap the oldest by mtime are
-// dropped: a pruned root falls back to the workspace-global slot, whose stamp check then refuses
-// it, which is a floor-only turn rather than a wrong-rules turn. Bounded, not clever.
-const MAX_ROOT_SLOTS = 8;
+// THE INVARIANT this function exists to hold:
+//
+//   A live bound root must not silently lose repo-specific governance merely because other
+//   live roots exist.
+//
+// A dropped slot is not a cache miss that costs a re-scan. `readScanCacheForRoot` falls back to
+// the workspace-global slot, whose stamp check then refuses a foreign root, so the next turn in
+// that checkout delivers the workspace floor and NONE of the repo's own scoped rules, and says
+// nothing about it. That is indistinguishable from a healthy turn at every surface.
+//
+// So eviction keys on LIVENESS, never on count. The old rule capped slots at 8 ("real installs
+// have one to three roots") and evicted the oldest by mtime beyond it. Both halves were wrong for
+// a workspace bound by many repos, which is the whole point of `mla activate --workspace <id>`:
+// eleven repos meant the quietest one went dark, and quiet is not the same as dead.
+//
+// Three populations, three rules:
+//   1. root directory PROVABLY GONE  -> delete. `readScanCacheAtRoot` keys on the live cwd's
+//      realpath, so nothing can ever address it again; it is unreachable, not merely old.
+//   2. root PRESENT                  -> keep, however many there are and however old. This is
+//      the invariant. Twenty repos on one workspace is a supported setup, not a leak.
+//   3. UNPROVABLE (unparseable or unstamped slot, so there is no root to check) -> keep the
+//      newest UNPROVABLE_SLOT_BUDGET by mtime and drop the rest. "Cannot tell" must not read as
+//      "vanished", but it must not accumulate without bound either. Only this population is
+//      subject to a count, and dropping one of these can never darken a root we could name.
+//
+// Cost: unchanged. This already read every slot's JSON to find `scanRootPath`, and it runs on
+// scan WRITE (activate / rescan), never on the hook read path, which addresses one slot by key.
+// Measured on this machine 2026-08-10: 4 root slots in the largest workspace, 97KB the largest
+// slot, most under 5KB. Twenty live roots is well inside what a scan-time pass absorbs, so there
+// is no measured problem to build a new cache subsystem for.
+const UNPROVABLE_SLOT_BUDGET = 8;
 
-// A slot whose root directory is GONE is unreachable, not merely old: `readScanCacheAtRoot` keys on
-// the live cwd's realpath, so nothing can ever address it again. Those are dropped before the cap
-// applies, because mtime order is exactly backwards for this hazard: the throwaway roots are the
-// NEWEST slots, so a pure-mtime cap evicts the real checkouts and keeps the temp dirs.
 function pruneRootSlots(workspaceId: string, home: string | undefined, keep: string): void {
   try {
     const dir = scanCacheRootsDir(workspaceId, home);
-    const survivors: { path: string; mtime: number }[] = [];
+    const unprovable: { path: string; mtime: number }[] = [];
     for (const f of readdirSync(dir)) {
       if (!f.startsWith("scan-cache-") || !f.endsWith(".json")) continue;
       const path = join(dir, f);
       if (path === keep) continue;
       const root = readJson<ScanResult>(path)?.scanRootPath;
-      // Only a slot that NAMES a root we can prove is gone gets dropped here. An unparseable or
-      // unstamped slot is left to the cap: it may be a partial write from a live root, and
-      // "cannot tell" must not read as "vanished".
-      if (root && !existsSync(root)) {
-        try {
-          unlinkSync(path);
-        } catch {
-          /* best effort */
+      if (root) {
+        // Population 1 and 2: we can name the root, so liveness is decidable and the answer is
+        // the whole decision. A live root is kept unconditionally.
+        if (!existsSync(root)) {
+          try {
+            unlinkSync(path);
+          } catch {
+            /* best effort */
+          }
         }
         continue;
       }
+      // Population 3: no root to check (a partial write from a live root, or a pre-stamp slot).
       let mtime = 0;
       try {
         mtime = statSync(path).mtimeMs;
       } catch {
         /* unreadable: sorts oldest, gets pruned first */
       }
-      survivors.push({ path, mtime });
+      unprovable.push({ path, mtime });
     }
-    survivors.sort((a, b) => b.mtime - a.mtime);
-    for (const stale of survivors.slice(MAX_ROOT_SLOTS - 1)) {
+    unprovable.sort((a, b) => b.mtime - a.mtime);
+    for (const stale of unprovable.slice(UNPROVABLE_SLOT_BUDGET)) {
       try {
         unlinkSync(stale.path);
       } catch {
@@ -321,7 +369,24 @@ export interface PersistedAssembleAudit {
   safeTotal: number;
   overflow: boolean;
   explicitPaths: string[];
-  delivered: Array<{ ruleId: string; tier: string; versionId?: string; represents?: string[] }>;
+  // `text` is carried for FLOOR rules only (M6). Next turn's assembler diffs its floor
+  // against this array, and a rule that LEFT the floor is by definition absent from the
+  // new scan cache, so its statement can only come from here. Floor-only keeps the cost
+  // bounded: the floor is the small always-on set, and the scoped tail is not diffed.
+  //
+  // `floor` marks floor membership EXPLICITLY (G1), because `tier` cannot: a floor SHOULD
+  // that fits is delivered under "best-effort", the same tier scoped rules ride, so the
+  // tier answers "what budget carried it" and not "which set is it in". The delta needs
+  // the second question, and inferring it from `text` being present would make a rule with
+  // an empty statement silently invisible to exactly the diff meant to catch its removal.
+  delivered: Array<{
+    ruleId: string;
+    tier: string;
+    versionId?: string;
+    represents?: string[];
+    text?: string;
+    floor?: true;
+  }>;
   omitted: Array<{ ruleId: string; reason: string; versionId?: string }>;
   // The prompt-time reconciliation rehash partition (ADR §3.3 item 9). Present ONLY when the
   // scan cache carried reconciliation findings; Phase 2B populates them, so every Phase 2A cache
@@ -335,14 +400,41 @@ export interface PersistedAssembleAudit {
     kept: Array<{ path: string; reason: string }>;
     needsReevaluation: Array<{ path: string; reason: string }>;
   };
+  // M6: what moved on or off the DELIVERED floor since the previous assembly, computed
+  // against the `delivered` array of the audit this one replaces. Present only on a turn
+  // where the floor actually moved, so a reader can treat its presence as the signal.
+  // Carries each rule's existing stable `ruleId` plus its own statement; the recap quotes
+  // the statement, because the id answers "which row" and the agent needs "which
+  // obligation". See lib/scanner/floor-delta.ts.
+  floorDelta?: {
+    added: Array<{ ruleId: string; text: string }>;
+    removed: Array<{ ruleId: string; text: string }>;
+  };
 }
+/**
+ * The PREVIOUS turn's assemble audit, or null when none exists yet.
+ *
+ * Read on the hot path by the assembler immediately BEFORE it overwrites the file, so
+ * the floor delta (M6) is computed against what was actually delivered last turn
+ * without persisting any second copy of it. Tolerates a missing or malformed file the
+ * same way every other reader here does: a first turn, or an older build, is null.
+ */
+export function readAssembleAudit(
+  home: string | undefined,
+  workspaceId: string,
+  sessionId?: string,
+): PersistedAssembleAudit | null {
+  return readJson<PersistedAssembleAudit>(assembleAuditPath(workspaceId, home, sessionId));
+}
+
 export function writeAssembleAudit(
   home: string | undefined,
   workspaceId: string,
   audit: PersistedAssembleAudit,
+  sessionId?: string,
 ): void {
   try {
-    writeJson(assembleAuditPath(workspaceId, home), audit);
+    writeJson(assembleAuditPath(workspaceId, home, sessionId), audit);
   } catch {
     // The audit is observability, never a gate: a failure here must not break delivery.
   }

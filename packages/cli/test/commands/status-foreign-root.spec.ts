@@ -84,7 +84,7 @@ describe("mla status: a scan cache owned by another checkout", () => {
     else process.env.MEETLESS_HOME = prevHome;
     if (prevWs === undefined) delete process.env.MEETLESS_WORKSPACE_ID;
     else process.env.MEETLESS_WORKSPACE_ID = prevWs;
-    rmSync(tmp, { recursive: true, force: true });
+    rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     jest.resetModules();
   });
 
@@ -154,7 +154,7 @@ describe("mla status: a scan cache owned by another checkout", () => {
     const throwaway = join(tmp, "scratchpad-gone");
     mkdirSync(throwaway, { recursive: true });
     writeScanCache(tmp, "ws-foreign", scanFixture({ scanRootPath: throwaway }));
-    rmSync(throwaway, { recursive: true, force: true });
+    rmSync(throwaway, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 
     await runStatus([]);
     const text = out.join("\n");

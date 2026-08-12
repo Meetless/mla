@@ -8,7 +8,7 @@ import { writeScanCache } from "../../src/lib/scanner/cache";
 describe("renderStatus", () => {
   let home: string;
   beforeEach(() => { home = mkdtempSync(join(tmpdir(), "mla-status-")); });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("reports active state with rule and review counts from the cache", () => {
     writeScanCache(home, "ws1", {
@@ -25,11 +25,69 @@ describe("renderStatus", () => {
     });
     const out = renderStatus({ home, workspaceId: "ws1", hooksInstalled: true });
     expect(out).toContain("Meetless is active");
-    expect(out).toContain("1 confirmed rule injected");
+    // This cache predates delivery accounting (schemaVersion 1, no floorRules array). It cannot
+    // prove anything was injected, so it must not claim it: report the scan and name the fix.
+    expect(out).toContain("1 directive scanned");
+    expect(out).toContain("mla scan");
+    expect(out).not.toContain("injected on every prompt");
     expect(out).toContain("2 pending review items");
     expect(out).toContain("hooks installed");
     // No agent-memory rules here (count 0): the advisory line is omitted (no spam).
     expect(out).not.toContain("advisory");
+  });
+
+  // Finding B of notes/20260807-mla-activation-onboarding-audit.md. `status` counted scanned
+  // DIRECTIVES and printed them as rules "injected on every prompt". A live hook run on exactly
+  // this state returned zero of them, and `activate` said so in the same session.
+  it("does NOT claim delivery for file-sourced directives that are never injected", () => {
+    writeScanCache(home, "ws-fresh", {
+      schemaVersion: 2, workspaceId: "ws-fresh", commitSha: "abc", generatedAt: "t",
+      inventory: { instructionFiles: 1, decisionDocs: 0, legacyNotes: 0, staleSignals: 0, agentMemoryRules: 0 },
+      // Four human-attested directives read out of CLAUDE.md, none bundle-sourced, so the floor
+      // filter drops every one of them. This is the brand-new-workspace state.
+      directives: [
+        { id: "a", text: "w", source: "CLAUDE.md", kind: "RULE", strength: "MUST_FOLLOW", attestation: "human_attested" },
+        { id: "b", text: "x", source: "CLAUDE.md", kind: "RULE", strength: "MUST_FOLLOW", attestation: "human_attested" },
+        { id: "c", text: "y", source: "CLAUDE.md", kind: "RULE", strength: "MUST_FOLLOW", attestation: "human_attested" },
+        { id: "d", text: "z", source: "CLAUDE.md", kind: "RULE", strength: "MUST_FOLLOW", attestation: "human_attested" },
+      ],
+      staleSignals: [],
+      confirmedRulesXml: "", floorRulesXml: "", staleContextXml: "", advisoryDirectives: [],
+      floorRules: [], scopedRules: [],
+    } as Parameters<typeof writeScanCache>[2]);
+    const out = renderStatus({ home, workspaceId: "ws-fresh", hooksInstalled: true });
+    expect(out).toContain("No governed rules injected yet");
+    expect(out).toContain("4 directives scanned");
+    expect(out).toContain("/mla onboard");
+    expect(out).not.toContain("4 confirmed rules injected");
+  });
+
+  // Wording tightened deliberately (2026-08-08 review of the 08-07 audit). 9f18551e8
+  // moved this line off the scanned-directive count and onto the floor, which killed the
+  // outright lie. The floor count is still only a fact about a cache on disk, though, so
+  // "injected on every prompt" was the same promotion of configuration into delivery one
+  // field further along: it reads identically whether the hook is delivering, firing from
+  // a sibling checkout, or never installed. Configured and observed are now two lines,
+  // and the observed one comes from the hook receipt
+  // (see status-observed-delivery.spec.ts).
+  it("reports the floor as CONFIGURED, and scoped rules as conditional", () => {
+    writeScanCache(home, "ws-gov", {
+      schemaVersion: 2, workspaceId: "ws-gov", commitSha: "abc", generatedAt: "t",
+      inventory: { instructionFiles: 1, decisionDocs: 0, legacyNotes: 0, staleSignals: 0, agentMemoryRules: 0 },
+      directives: [
+        { id: "a", text: "w", source: "CLAUDE.md", kind: "RULE", strength: "MUST_FOLLOW", attestation: "human_attested" },
+      ],
+      staleSignals: [],
+      confirmedRulesXml: "", floorRulesXml: "", staleContextXml: "", advisoryDirectives: [],
+      floorRules: [{ ruleId: "r1" }, { ruleId: "r2" }],
+      scopedRules: [{ ruleId: "r3" }],
+    } as Parameters<typeof writeScanCache>[2]);
+    const out = renderStatus({ home, workspaceId: "ws-gov", hooksInstalled: true });
+    expect(out).toContain("2 governed floor rules configured for injection");
+    expect(out).toContain("1 scoped rule when the turn matches");
+    // The claim this suite exists to prevent, in its subtler form: a cache read must
+    // never assert that a turn happened.
+    expect(out).not.toContain("injected on every prompt");
   });
 
   it("surfaces advisory agent-memory rules when the cache has them", () => {

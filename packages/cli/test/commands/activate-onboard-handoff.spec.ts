@@ -135,7 +135,7 @@ async function activateBoundFolder(): Promise<{ code: number; out: string }> {
     errSpy.mockRestore();
     warnSpy.mockRestore();
     process.chdir(prevCwd);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

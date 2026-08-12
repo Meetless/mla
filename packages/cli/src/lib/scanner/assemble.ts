@@ -190,7 +190,20 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
   const floorMust = floorRules.filter((f) => f.strength === "MUST");
   const floorShould = floorRules.filter((f) => f.strength === "SHOULD");
 
-  const floorBlock = renderFloorBlock(floorMust);
+  // H3. Sized as the block that would be emitted if NO best-effort SHOULD is accepted,
+  // which is both the required-content worst case and the state the partial precedence
+  // sentence describes. Sizing it with the shorter "complete" sentence while the final
+  // block carried the longer partial one would let `text` exceed `budget` by the
+  // difference, which is the one guarantee this function makes.
+  //
+  // A CONSEQUENCE, stated here because it surprised a test the day it shipped
+  // (155be164a): the trial that accepts the LAST global SHOULD swaps the partial
+  // sentence for the shorter complete one and so REFUNDS ~40 bytes to itself. Every
+  // trial measures the block that would actually be emitted at that point, so this is
+  // exact accounting, not slack: `text` still fits `budget`, and the effect is that a
+  // final SHOULD may now fit where it previously did not. Only a fixture whose verdict
+  // turned on those 40 bytes can notice.
+  const floorBlock = renderFloorBlock(floorMust, [], floorShould);
 
   // MANDATORY: every scoped MUST that is applicable this turn, by ANY signal (§7.1/§7.2). The
   // ratified contract inverts the old droppable-MUST behavior: an applicable MUST matched by a
@@ -312,7 +325,7 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
       c.channel === "scoped" ? [...acceptedScopedLines, c.line] : acceptedScopedLines;
     const trial = joinSegments([
       base,
-      renderFloorBlock(floorMust, trialFloorShould),
+      renderFloorBlock(floorMust, trialFloorShould, floorShould),
       renderScopedBlock(trialScoped),
     ]);
     if (byteLength(trial) <= budget) {
@@ -324,7 +337,7 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
     }
   }
 
-  const finalFloorBlock = renderFloorBlock(floorMust, acceptedFloorShould);
+  const finalFloorBlock = renderFloorBlock(floorMust, acceptedFloorShould, floorShould);
   const finalScopedBlock = renderScopedBlock(acceptedScopedLines);
   const text = joinSegments([base, finalFloorBlock, finalScopedBlock]);
   const scopedBytes = byteLength(finalScopedBlock);

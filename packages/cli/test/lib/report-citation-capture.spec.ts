@@ -92,7 +92,7 @@ function mkHarness(activate = true): { h: Harness; cleanup: () => void } {
       return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
     },
   };
-  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }) };
+  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }) };
 }
 
 // A minimal modern-transcript assistant entry with one text block.
@@ -235,6 +235,23 @@ describe("common.sh extract_source_ids (P3 shared grammar)", () => {
 
   it("accepts dotted / hyphenated ids and bare (unbracketed) tokens", () => {
     expect(extract("NT:20260603-mla-kb.v2")).toEqual(["NT:20260603-mla-kb.v2"]);
+  });
+
+  // POSITION IN THIS ARRAY IS NOT RANK, and a real audit read one out of it.
+  //
+  // `mcp-calls.jsonl` stores this array as `source_ids`, and the 2026-08-09 helpfulness
+  // audit reported "the answering document ranked LAST of twelve on the pull path" by
+  // counting positions in exactly such a row. The extractor `sort -u`s, so the only fact
+  // a position carries is where the id sorts alphabetically: the finding was an artifact
+  // of the instrument, and re-running both paths on the identical query later showed the
+  // push and pull orders agreeing on their entire prefix.
+  //
+  // The sortedness was already pinned above as a nice property. This pins it as a
+  // WARNING, keyed on the misreading, so the next reader meets the trap by name.
+  it("is a SORTED SET: the retrieval order is destroyed, so a position is never a rank", () => {
+    // Fed in descending retrieval order; comes back in ascending filename order.
+    const out = extract("[NT:zzz-ranked-first] [NT:mmm-ranked-second] [NT:aaa-ranked-last]");
+    expect(out).toEqual(["NT:aaa-ranked-last", "NT:mmm-ranked-second", "NT:zzz-ranked-first"]);
   });
 
   it("drift guard: extract_source_ids is defined in common.sh", () => {

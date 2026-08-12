@@ -358,7 +358,7 @@ async function withHome(
     else process.env.MEETLESS_HOME = prevHome;
     if (prevSession === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
     else process.env.CLAUDE_CODE_SESSION_ID = prevSession;
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

@@ -60,7 +60,7 @@ afterEach(() => {
         /* best effort */
       }
     }
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   } catch {
     /* best effort */
   }
@@ -242,7 +242,7 @@ describe("classifyTargetPath - external paths and different subtrees", () => {
       const target = path.join(otherRoot, "notes", "x.md");
       expect(await classifyTargetPath(target, scope())).toBe("OUTSIDE_FORBIDDEN_ROOT");
     } finally {
-      fs.rmSync(otherRoot, { recursive: true, force: true });
+      fs.rmSync(otherRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -318,7 +318,7 @@ describe("classifyRuntimeTarget - runtime-relative target union", () => {
   });
 
   afterEach(() => {
-    fs.rmSync(externalDir, { recursive: true, force: true });
+    fs.rmSync(externalDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("classifies a file under the project root as RUNTIME_RELATIVE with a posix relative path", async () => {

@@ -203,7 +203,7 @@ describe("scout agent files: install the roster, remove everything any version i
     } finally {
       if (prevHome === undefined) delete process.env.MEETLESS_HOME;
       else process.env.MEETLESS_HOME = prevHome;
-      rmSync(home, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -256,7 +256,7 @@ describe("ingestRun under a reduced dispatch roster", () => {
     home = mkdtempSync(join(tmpdir(), "mla-roster-ingest-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const seed = (): void => {

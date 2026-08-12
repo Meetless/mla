@@ -129,7 +129,7 @@ describe("flush.sh self-clean (RC1 stale-session reaper)", () => {
       const leftover = fs.readdirSync(queueDir).filter((f) => f.startsWith(`${sessionId}.jsonl`));
       expect(leftover).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -178,7 +178,7 @@ describe("flush.sh self-clean (RC1 stale-session reaper)", () => {
       const lines = fs.readFileSync(queueFile, "utf8").split("\n").filter((l) => l.length > 0);
       expect(lines.length).toBeGreaterThanOrEqual(2);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

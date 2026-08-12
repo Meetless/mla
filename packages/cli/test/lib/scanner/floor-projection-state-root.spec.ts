@@ -83,7 +83,7 @@ describe("floor projection: cross-state-root ownership", () => {
   });
 
   afterEach(() => {
-    rmSync(tmp, { recursive: true, force: true });
+    rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // THE INCIDENT, reduced to one assertion.
@@ -125,7 +125,7 @@ describe("floor projection: cross-state-root ownership", () => {
   // be owned by a root that can never run again. Ownership must follow the live root.
   it("ownership TRANSFERS once the stamping state root no longer exists on disk", () => {
     materializeFloorProjection(checkout, TEST_FIXTURE_FLOOR, "rev-5", sandboxHome);
-    rmSync(join(tmp, "sandbox"), { recursive: true, force: true });
+    rmSync(join(tmp, "sandbox"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 
     const r = materializeFloorProjection(checkout, REAL_FLOOR, "rev-106", realHome);
 
@@ -187,7 +187,7 @@ describe("floor projection: MEETLESS_HOME reaches the projection writer", () => 
   afterEach(() => {
     if (prevHome === undefined) delete process.env.MEETLESS_HOME;
     else process.env.MEETLESS_HOME = prevHome;
-    rmSync(tmp, { recursive: true, force: true });
+    rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("a scan under a sandboxed MEETLESS_HOME cannot rewrite another home's projection", () => {

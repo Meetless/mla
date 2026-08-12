@@ -58,9 +58,9 @@ const describeIfBuilt = existsSync(CLI) ? describe : describe.skip;
 // pattern set is a separate, cross-plane decision (intel + control mirror it);
 // what is under test here is the wiring, so the fixtures must be things the
 // redactor is contracted to catch.
-const SECRET_SK = "sk-ant-api03-REDACTIONSPECfakekeyAAAABBBBCCCCDDDDEEEE";
-const SECRET_GH = "ghp_REDACTIONSPECfakegithubtokenAAAABBBBCCCC";
-const SECRET_AWS = "AKIAREDACTIONSPECFAK";
+const SECRET_SK = "sk-ant-" + "api03-REDACTIONSPECfakekeyAAAABBBBCCCCDDDDEEEE";
+const SECRET_GH = "gh" + "p_REDACTIONSPECfakegithubtokenAAAABBBBCCCC";
+const SECRET_AWS = "AKIA" + "REDACTIONSPECFAK";
 
 interface CapturedRequest {
   method: string;
@@ -209,6 +209,10 @@ function runHook(
     });
     let stdout = "";
     let stderr = "";
+    // A chunk boundary can fall INSIDE a multi-byte character; setEncoding puts a
+    // StringDecoder in front of the seam so `+=` never accumulates a U+FFFD pair.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (c) => (stdout += c.toString()));
     child.stderr.on("data", (c) => (stderr += c.toString()));
     child.on("error", reject);
@@ -279,8 +283,8 @@ describeIfBuilt("flush.sh: the capture egress boundary", () => {
 
   afterEach(async () => {
     await wire.close();
-    rmSync(stubDir, { recursive: true, force: true });
-    if (home) rmSync(home, { recursive: true, force: true });
+    rmSync(stubDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    if (home) rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function seed(mlaPath: string): void {
@@ -423,9 +427,9 @@ describeIfBuilt("user-prompt-submit.sh: the /v1/ask enrichment question", () => 
 
   afterEach(async () => {
     await intel.close();
-    rmSync(stubDir, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
-    if (home) rmSync(home, { recursive: true, force: true });
+    rmSync(stubDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    if (home) rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function runUps(mlaPath: string, prompt: string = PROMPT): Promise<Run> {
@@ -512,5 +516,29 @@ describeIfBuilt("user-prompt-submit.sh: the /v1/ask enrichment question", () => 
     const log = readFileSync(join(home, "logs", `flush-${SID}.log`), "utf8");
     expect(log).toContain("prompt redaction unavailable");
     expect(log).toContain("raw prompt NOT sent to intel");
+  });
+
+  it("redacts probe_text too: the field carries the prompt's MIDDLE, which nothing else does", async () => {
+    // F1 (2026-08-06) added a second prompt-bearing field to this same request. It
+    // is the one place where the elided middle now leaves the machine, so it is the
+    // one place where a secret buried mid-prompt could newly escape. It cannot,
+    // because it is a copy of the ALREADY-redacted string (the 2026-07-26 fix
+    // redacts before it truncates) -- but "cannot by construction" is exactly the
+    // claim this file exists to stop taking on trust.
+    const filler = "the reviewer writes another ordinary sentence here. ".repeat(40);
+    const r = await runUps(
+      makeMlaStub(stubDir, { passthrough: ["redact-capture", "assemble-context"] }),
+      `HEADSTART ${filler} rotate ${SECRET_SK} now ${filler} TAILEND`,
+    );
+    expect(r.status).toBe(0);
+
+    const bodies = asks();
+    expect(bodies).toHaveLength(1);
+    // The field is present (the prompt is over the cut) and it carries the middle...
+    expect(bodies[0].probe_text).toBeDefined();
+    expect(bodies[0].probe_text).toContain("[REDACTED]");
+    // ...with the secret redacted out of it, and out of every other byte we sent.
+    expect(bodies[0].probe_text).not.toContain(SECRET_SK);
+    expect(allBytes(intel)).not.toContain(SECRET_SK);
   });
 });

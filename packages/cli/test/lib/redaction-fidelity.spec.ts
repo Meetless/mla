@@ -167,18 +167,18 @@ interface SecretCase {
 const SECRETS: SecretCase[] = [
   {
     name: "anthropic api key",
-    question: "rotate sk-ant-api03-BENCHfakekeyAAAABBBBCCCCDDDDEEEEFFFF for me",
-    secret: "sk-ant-api03-BENCHfakekeyAAAABBBBCCCCDDDDEEEEFFFF",
+    question: "rotate sk-ant-" + "api03-BENCHfakekeyAAAABBBBCCCCDDDDEEEEFFFF for me",
+    secret: "sk-ant-" + "api03-BENCHfakekeyAAAABBBBCCCCDDDDEEEEFFFF",
   },
   {
     name: "github pat",
-    question: "is ghp_BENCHfakegithubtokenAAAABBBBCCCC still valid",
-    secret: "ghp_BENCHfakegithubtokenAAAABBBBCCCC",
+    question: "is gh" + "p_BENCHfakegithubtokenAAAABBBBCCCC still valid",
+    secret: "gh" + "p_BENCHfakegithubtokenAAAABBBBCCCC",
   },
   {
     name: "aws access key id",
-    question: "revoke AKIABENCHFAKEKEYIDXX now",
-    secret: "AKIABENCHFAKEKEYIDXX",
+    question: "revoke AKIA" + "BENCHFAKEKEYIDXX now",
+    secret: "AKIA" + "BENCHFAKEKEYIDXX",
   },
   {
     name: "google api key",
@@ -190,8 +190,8 @@ const SECRETS: SecretCase[] = [
   },
   {
     name: "slack bot token",
-    question: "xoxb-1234567890-abcdefghij leaked in the log",
-    secret: "xoxb-1234567890-abcdefghij",
+    question: "xox" + "b-1234567890-abcdefghij leaked in the log",
+    secret: "xox" + "b-1234567890-abcdefghij",
   },
   {
     name: "env assignment",

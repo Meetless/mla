@@ -53,7 +53,7 @@ describe("resolveScanTarget", () => {
     repo = mkdtempSync(join(tmpdir(), "mla-sct-"));
     writeFileSync(join(repo, ".meetless.json"), JSON.stringify({ workspaceId: "ws-marker" }));
   });
-  afterEach(() => { rmSync(repo, { recursive: true, force: true }); });
+  afterEach(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); });
 
   it("resolves id + root from the marker when invoked from a subdir (no env/flag)", () => {
     const sub = join(repo, "apps", "control");
@@ -82,7 +82,7 @@ describe("resolveScanTarget", () => {
         scanRoot: resolve(bare),
       });
     } finally {
-      rmSync(bare, { recursive: true, force: true });
+      rmSync(bare, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -92,7 +92,7 @@ describe("resolveScanTarget", () => {
       const t = resolveScanTarget({ startDir: bare, env: {}, argv: [] });
       expect("error" in t).toBe(true);
     } finally {
-      rmSync(bare, { recursive: true, force: true });
+      rmSync(bare, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -103,7 +103,7 @@ describe("resolveScanRoot", () => {
     repo = mkdtempSync(join(tmpdir(), "mla-scanroot-"));
     writeFileSync(join(repo, ".meetless.json"), JSON.stringify({ workspaceId: "ws-marker" }));
   });
-  afterEach(() => { rmSync(repo, { recursive: true, force: true }); });
+  afterEach(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); });
 
   it("returns the marker dir when invoked from a subdir", () => {
     const sub = join(repo, "apps", "control");
@@ -116,7 +116,7 @@ describe("resolveScanRoot", () => {
     try {
       expect(resolveScanRoot(bare)).toBe(resolve(bare));
     } finally {
-      rmSync(bare, { recursive: true, force: true });
+      rmSync(bare, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -131,7 +131,7 @@ describe("rescanAndCache", () => {
     writeFileSync(join(repo, "notes-old.md"), "---\nstatus: deprecated\n---\nold\n");
     git(repo, ["add", "."]); git(repo, ["commit", "-m", "i"]);
   });
-  afterEach(() => { rmSync(repo, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); });
+  afterEach(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); });
 
   // ISSUE #4: a verdict (accept/dismiss) from a package subdir must rescan the
   // WHOLE workspace, not just that subtree. The cwd-rooted rescan silently drops
@@ -269,8 +269,8 @@ describe("runScanContext", () => {
   });
   afterEach(() => {
     process.chdir(cwd);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(home, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function sink() {
@@ -478,7 +478,7 @@ describe("runScanContext", () => {
       expect(captured!.observedPaths).toBeUndefined();
     } finally {
       process.chdir(repo);
-      rmSync(nongit, { recursive: true, force: true });
+      rmSync(nongit, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -553,7 +553,7 @@ describe("runScanContext", () => {
     } finally {
       process.chdir(repo);
       if (prevWs !== undefined) process.env.MEETLESS_WORKSPACE_ID = prevWs;
-      rmSync(bare, { recursive: true, force: true });
+      rmSync(bare, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

@@ -90,7 +90,7 @@ describe("resolveForgetHandle", () => {
     } finally {
       if (prev === undefined) delete process.env.MEETLESS_NOTES_ROOT;
       else process.env.MEETLESS_NOTES_ROOT = prev;
-      fs.rmSync(vault, { recursive: true, force: true });
+      fs.rmSync(vault, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

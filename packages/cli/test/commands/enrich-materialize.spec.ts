@@ -166,7 +166,7 @@ describe("mla enrich materialize (end to end, real file + mint + write)", () => 
   }
 
   afterAll(() => {
-    rmSync(HOME, { recursive: true, force: true });
+    rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   beforeEach(() => {
@@ -189,7 +189,7 @@ describe("mla enrich materialize (end to end, real file + mint + write)", () => 
     logSpy.mockRestore();
     errSpy.mockRestore();
     process.chdir(cwd0);
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // The P0 itself: the file was the ONLY sink, and `scan` never reads it. Materializing must reach

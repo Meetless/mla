@@ -40,7 +40,7 @@ const NOW = "2026-07-27T00:00:00.000Z";
 
 // A real credential FORMAT with a fake value. scanForCredentials matches on shape,
 // so the shape has to be right; nothing here is or ever was a live secret.
-const PAT = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+const PAT = "gh" + "p_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
 
 const cfg = {
   controlUrl: "https://control.invalid",
@@ -193,7 +193,7 @@ describe("KB block-on-detect at the transport boundary", () => {
       // as uploaded.
       expect(rec.revisionId).toBeUndefined();
     } finally {
-      for (const d of [home, mem]) rmSync(d, { recursive: true, force: true });
+      for (const d of [home, mem]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -230,7 +230,7 @@ describe("KB block-on-detect at the transport boundary", () => {
       expect(calls[0].url).toContain("/internal/v1/kb/add");
       expect(calls[0].body).toContain("a durable claim");
     } finally {
-      for (const d of [home, mem]) rmSync(d, { recursive: true, force: true });
+      for (const d of [home, mem]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

@@ -26,6 +26,7 @@ import { describeEgressRefusal } from "../lib/egress/policy";
 import {
   buildCoverageGapPayload,
   coerceRetrievalConfidence,
+  coerceTopicCategory,
   coverageGapNotUsedEventId,
 } from "../lib/analytics/coverage-gap";
 import {
@@ -40,6 +41,7 @@ import { readCaptures, reapLocalCaptures } from "../lib/analytics/work-product-c
 import {
   WorkProductCaptureBody,
   buildPromptsBySession,
+  TurnPrompts,
   buildSealBody,
   postWorkProductCapture,
 } from "../lib/analytics/work-product-seal";
@@ -340,9 +342,18 @@ export async function runInternalEvidenceCorrelate(
             payload: buildCoverageGapPayload({
               injectId,
               coverageGapType: "candidates_found_not_used",
-              // The correlator cannot recover the original query topic; the
-              // inject-time gap carries it when known. Default to unknown here.
-              queryTopicCategory: "unknown",
+              // The topic the hook classified when this inject was minted, read back
+              // off the inject event. This used to be hardcoded "unknown" with the
+              // note "the correlator cannot recover the original query topic" -- true
+              // when written, and false once the topic started riding on the inject.
+              // Measured 2026-08-07: every gap of THIS type ever minted was unknown
+              // while the inject-time class carried real labels, so the ranking-failure
+              // half of the roadmap was the unlabelled half. Coerced at the point of
+              // use, so a null on the event (nothing classified it) stays honestly
+              // distinct from a classifier that ran and said unknown.
+              queryTopicCategory: coerceTopicCategory(
+                typeof ev.query_topic_category === "string" ? ev.query_topic_category : null,
+              ),
               retrievalConfidence: coerceRetrievalConfidence(
                 typeof ev.retrieval_confidence === "string"
                   ? ev.retrieval_confidence
@@ -431,7 +442,7 @@ export async function runInternalEvidenceCorrelate(
               },
               captures: readCaps(task.sessionId, env),
               promptsByTurn:
-                promptsBySession.get(task.sessionId) ?? new Map<number, string[]>(),
+                promptsBySession.get(task.sessionId) ?? new Map<number, TurnPrompts>(),
               window: effectiveWindow,
               captureContractVersion: task.captureContractVersion,
               sealedAtIso: nowIso,

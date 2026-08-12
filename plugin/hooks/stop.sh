@@ -199,6 +199,33 @@ REPORT_LINE="$(jq -c -n \
   ml_unlock 9 "$LOG_DIR/report-citations.lock"
 )
 
+# ---- F1b echo scan ---------------------------------------------------------
+# notes/20260808-mla-in-this-session-measured-and-a-fix-proposal.md §4 (F1b).
+# The citation capture above answers "did the report CITE an id we injected". It cannot see
+# the push path's actual success mode, which is the agent reading the injected snippet inline
+# and acting on it with no pull and no marker: that is what turns 7 and 8 of session
+# 85d97591 did, and both scored as if nothing had been offered.
+#
+# So scan the turn's own prose for a verbatim quotation of an injected snippet. HEURISTIC,
+# and the recap keeps it out of the engaged set for exactly that reason: text reappearing
+# proves the text reached the output, not that it helped.
+#
+# It runs HERE because this is the only moment the turn's text exists (the recap runs at the
+# next prompt, long after). Both halves are piped in: the closing message and the intra-turn
+# narration, because an agent that changes course mid-turn says so between tool calls, not in
+# its summary. Only source IDS are written; no turn text is stored anywhere. Best-effort,
+# byte-capped by the scanner, fail-soft: any failure costs this turn's echo signal and
+# nothing else.
+if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
+  _echo_to="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  (
+    printf '%s\n%s' "$FINAL_MSG" "$NARRATION" \
+      | ${_echo_to:+"$_echo_to" 5} "$MLA_PATH" _internal echo-scan \
+          --session "$SESSION_ID" --turn "$REPORT_TURN" \
+          >/dev/null 2>&1 || true
+  ) || true
+fi
+
 # ---- Evidence material-incorporation P1: stage the closing assistant output ----
 # notes/20260716-evidence-material-incorporation-correlator.md (§5, §8, §10.6, §11).
 # The agent's CLOSING message (FINAL_MSG above, already end_turn-extracted and
@@ -279,6 +306,32 @@ if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "${MLA_PATH:-}" && -x "$MLA_PAT
     [[ -z "$DECISION_LINE" ]] && continue
     spool_append "$SESSION_ID" "$DECISION_LINE"
   done <<< "$DECISION_LINES"
+fi
+
+# ---- D3: refused-pull backstop (stop transcript scan) --------------------
+# A meetless MCP pull that intel REFUSED (unreachable, a billing denial, an auth
+# failure) leaves NO row in mcp-calls.jsonl, because Claude Code does not fire
+# PostToolUse at all when a tool result carries is_error:true. Measured 2026-08-09:
+# the ledger held 1773 rows, a refused retrieve_knowledge was issued, and it still
+# held 1773. So the strongest signal mla can collect -- the agent reaching for
+# governed memory and being told no -- read to every downstream counter as "the agent
+# had no need", and three consecutive helpfulness audits were written on top of it.
+#
+# The transcript is the ground truth and is already in hand here. This is the same
+# backstop shape as the AskUserQuestion scan above and the enforcement correlator
+# below: what the live hook could not observe, Stop reconstructs. The subcommand is
+# turn-bounded and dedups on tool_use_id, so a re-fired Stop is a no-op.
+#
+# A fast `grep -q` gate skips the cost entirely on the common session that never
+# called a meetless tool. Fail-soft and time-boxed: a missing binary, an unreadable
+# transcript, or a slow scan is swallowed and never delays Stop (<1s budget).
+if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "${MLA_PATH:-}" && -x "$MLA_PATH" \
+      && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" && "$REPORT_TURN" -ge 1 ]] \
+  && grep -q "mcp__meetless__meetless__" "$TRANSCRIPT" 2>/dev/null; then
+  MCPF_TIMEOUT="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  ${MCPF_TIMEOUT:+"$MCPF_TIMEOUT" 5} "$MLA_PATH" _internal capture-mcp-failures \
+    --session "$SESSION_ID" --turn "$REPORT_TURN" --transcript "$TRANSCRIPT" \
+    >/dev/null 2>&1 || true
 fi
 
 spawn_flush "$SESSION_ID"

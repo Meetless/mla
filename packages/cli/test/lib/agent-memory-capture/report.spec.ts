@@ -18,7 +18,7 @@ describe("analyzeCorpus (Phase 0A static value gate)", () => {
     mem = mkdtempSync(join(tmpdir(), "amrep-"));
   });
   afterEach(() => {
-    rmSync(mem, { recursive: true, force: true });
+    rmSync(mem, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("counts files by type and reports a size distribution", () => {
@@ -62,5 +62,69 @@ describe("analyzeCorpus (Phase 0A static value gate)", () => {
     expect(rep.exists).toBe(false);
     expect(rep.totalMdFiles).toBe(0);
     expect(rep.credentialProbePass).toBe(true);
+  });
+});
+
+// --- The "453 files" line was noise, and noise is not a control ----------------
+//
+// `mla agent-memory report` printed one undifferentiated count: "Project files with
+// a secret signal (observe-only): 453". Measured over the real 876-file corpus it
+// was 866 files, 98.9%, and 856 of those matched ONLY `high_entropy_token`. An
+// operator who reads that number twice learns to stop reading it.
+//
+// The scanner's precision fix (document identifiers no longer clear the generic
+// entropy bar) took the real corpus from 98.9% to 92.8%. It cannot go further
+// without exempting bare lowercase word-joins, which is the PHRASE relaxation this
+// repo already measured and rejected in redactor.ts, so the rest is fixed HERE,
+// where it is a presentation problem rather than a detection one.
+//
+// An EXPLICIT hit (a provider prefix, a JWT, a Redis directive, a credential-named
+// env assignment) names the credential family it found and is worth a human's time.
+// A generic entropy-only hit says "this file contains a long opaque string", which
+// in a corpus of governed notes is almost always a document identifier. They are
+// different claims and they are now counted separately.
+describe("the secret-signal report separates a named finding from a shrug", () => {
+  let mem: string;
+  beforeEach(() => {
+    mem = mkdtempSync(join(tmpdir(), "amrep-split-"));
+  });
+  afterEach(() => {
+    rmSync(mem, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  });
+
+  it("splits explicit-rule hits from entropy-only hits", () => {
+    writeFileSync(join(mem, "named.md"), projectFile("redis: requirepass O3o7j8zX"));
+    writeFileSync(
+      join(mem, "opaque.md"),
+      projectFile("see AbCdEf0123456789AbCdEf0123456789AbCdEfGh for context"),
+    );
+    writeFileSync(join(mem, "clean.md"), projectFile("nothing notable"));
+
+    const rep = analyzeCorpus(mem);
+
+    const explicit = rep.secretSignalFiles.filter((f) => f.ruleIds.some((r) => r !== "high_entropy_token"));
+    const entropyOnly = rep.secretSignalFiles.filter((f) => f.ruleIds.every((r) => r === "high_entropy_token"));
+
+    expect(explicit.map((f) => f.file)).toEqual(["named.md"]);
+    expect(entropyOnly.map((f) => f.file)).toEqual(["opaque.md"]);
+    // Both are still reported. Nothing is hidden; they are just no longer one number.
+    expect(rep.secretSignalFiles).toHaveLength(2);
+    expect(rep.namedSecretSignalFiles.map((f) => f.file)).toEqual(["named.md"]);
+    expect(rep.entropyOnlySignalFiles.map((f) => f.file)).toEqual(["opaque.md"]);
+  });
+
+  it("does not flag a corpus of ordinary governed notes at all", () => {
+    // The exact shapes that produced the 98.9%: wiki links, dated note paths and
+    // long snake_case slugs carrying an extension.
+    writeFileSync(
+      join(mem, "typical.md"),
+      projectFile(
+        "See [[reference_a_ttl_column_and_a_cleanup_method_are_claims_not_enforcement]] and\n" +
+          "notes/20260805-mla-router-abstention-and-raw-prompt-at-rest.md and\n" +
+          "[trap](reference_identifier_boost_ranks_the_doc_that_names_the_thing.md).",
+      ),
+    );
+    const rep = analyzeCorpus(mem);
+    expect(rep.secretSignalFiles).toEqual([]);
   });
 });

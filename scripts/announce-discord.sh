@@ -8,14 +8,19 @@
 # Phase 7. A release step that only happens when someone remembers it is not a step.
 # CI runs it now; the skill's copy is the manual fallback.
 #
-# THE BODY IS THE CHANGELOG PROSE, NOT THE COMMIT LIST.
-# meetless-cli/CHANGELOG.md leads each version with a paragraph of prose and then lists
-# the conventional-commit subjects. The prose is written for a human; the commit list is
-# written for us ("fix(cli): activate told you to restart and not to restart, in one
-# breath" is a great commit subject and a terrible announcement). So this strips the
-# conventional-commit bullets and posts the prose. If a version has no prose (every
-# release before 0.2.16), it falls back to the commit list rather than announcing an
-# empty body, capped so the embed stays readable.
+# THE BODY IS THE `## <version>` CHANGELOG SECTION, POSTED NEARLY VERBATIM.
+# That section is written for a user, not for us: one or two plain sentences saying what this
+# release gives you, then **New** / **Fixed** bullets naming the commands, under 150 words, with
+# no commit subjects, no internal file/env/function names, and no em dashes.
+#
+# There is no second place to write a nicer announcement. Whatever went into the changelog is
+# what the public reads, so the quality of this post was decided when the changelog was written.
+#
+# The conventional-commit strip below is a LEGACY SAFETY NET, not the design. Releases through
+# 0.2.34 pasted the raw commit list under the prose ("fix(cli): activate told you to restart and
+# not to restart, in one breath" is a great commit subject and a terrible announcement), so this
+# drops those bullets. The current format never emits them. If a version somehow has nothing but
+# commits, it falls back to a capped list rather than announcing an empty body.
 #
 # NO LINK TO THE MIRROR, and the reason is no longer the one written here.
 # github.com/Meetless/mla was private when this script was written, so a "full changelog"

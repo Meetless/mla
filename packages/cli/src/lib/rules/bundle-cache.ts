@@ -138,6 +138,16 @@ function verifyEntryIntegrity(entry: RuleBundleEntry): boolean {
   }
 }
 
+/**
+ * The bundle has never been pulled onto this machine for this principal+workspace+project. An
+ * expected, benign state right after `mla activate`, which binds the folder but does not fetch.
+ * Exported so a consumer can branch on it without string-matching prose that may be reworded.
+ */
+export const BUNDLE_CACHE_NEVER_FETCHED = "no rule bundle cached yet";
+
+/** The cache file exists but does not parse. A corrupt local cache, not a fresh install. */
+export const BUNDLE_CACHE_UNREADABLE = "rule bundle cache unreadable";
+
 function unavailable(reason: string): BundleCacheRead {
   return { status: "unavailable", bundle: null, ageMs: null, droppedForIntegrity: 0, reason };
 }
@@ -176,7 +186,14 @@ export function readRuleBundleCache(
   try {
     envelope = JSON.parse(fs.readFileSync(file, "utf8")) as RuleBundleCacheEnvelope;
   } catch {
-    return unavailable("no cached rule bundle");
+    // Two very different states used to share this one reason string, and a health surface cannot
+    // give correct advice while they are pooled. A file that was NEVER WRITTEN is the ordinary
+    // condition of a workspace nobody has pulled rules for yet (`mla activate` does not fetch the
+    // bundle; `mla scan` is the documented pull). A file that EXISTS and will not parse is a
+    // corrupt local cache. The first wants "run mla scan", the second wants to be loud.
+    return unavailable(
+      fs.existsSync(file) ? BUNDLE_CACHE_UNREADABLE : BUNDLE_CACHE_NEVER_FETCHED,
+    );
   }
 
   if (!envelope || typeof envelope !== "object" || envelope.cacheSchemaVersion !== RULE_BUNDLE_CACHE_SCHEMA_VERSION) {

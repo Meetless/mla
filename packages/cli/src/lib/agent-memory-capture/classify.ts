@@ -72,7 +72,28 @@ export function classifyMemory(text: string): MemoryClassification {
   return { type, hasFrontmatter: true, malformed: false };
 }
 
-// MVP captures `project` only.
+// Capturable memory types. `user` is absent and stays absent: that exclusion is a
+// PRIVACY boundary, not an MVP scope decision, and widening this set must never
+// reach for it.
+//
+// `feedback` joins `project` (Phase 2a,
+// notes/20260805-did-mla-help-this-session-measured-and-a-fix-proposal.md §12.6).
+// The original MVP deferred it on the theory that widening intake would deepen an
+// unreviewable queue. That theory was falsified: a minted claim serves
+// provisionally on arrival and acceptance is a trust gate, not a serving gate, so
+// capture width pays immediately. `feedback` is the smallest set (70 files) and the
+// most rule-shaped, which is why it lands first.
+//
+// `reference` joins them (Phase 2b, same section). It is the largest excluded set
+// (355 files) and holds the traps indexes, the environment lessons and the
+// platform notes, which are the single most reusable artifacts this agent
+// produces and had never once been retrievable. It lands SECOND, not because its
+// content is worth less, but because it is 5x the review surface of `feedback`.
+//
+// Nothing here grants trust. Captured files still land PENDING, still pass the
+// credential scanner, and still never publish raw text.
+const CAPTURABLE_TYPES: ReadonlySet<string> = new Set(["project", "feedback", "reference"]);
+
 export function isCapturable(c: MemoryClassification): boolean {
-  return c.type === "project";
+  return c.type !== null && CAPTURABLE_TYPES.has(c.type);
 }

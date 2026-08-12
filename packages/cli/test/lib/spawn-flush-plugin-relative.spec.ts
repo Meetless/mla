@@ -39,7 +39,7 @@ echo "$MEETLESS_HOOK_SCRIPT_DIR"
       expect(fs.realpathSync(resolved)).toBe(fs.realpathSync(pluginHooks));
       expect(fs.realpathSync(resolved)).not.toBe(fs.realpathSync(path.join(home, "hooks")));
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

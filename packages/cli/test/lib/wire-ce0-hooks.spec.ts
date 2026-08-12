@@ -143,7 +143,7 @@ describe("CE0 evidence hooks: registered as second managed entries on shared eve
       expect(entryForScript(p, "SessionStart", "session-start.sh")).toBeDefined();
       expect(entryForScript(p, "SessionStart", "ce0-session-start.sh")).toBeDefined();
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -158,7 +158,7 @@ describe("CE0 evidence hooks: registered as second managed entries on shared eve
       expect(entryForScript(p, "UserPromptSubmit", "ce0-user-prompt-submit.sh")).toBeDefined();
       expect(entryForScript(p, "Stop", "ce0-stop.sh")).toBeDefined();
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

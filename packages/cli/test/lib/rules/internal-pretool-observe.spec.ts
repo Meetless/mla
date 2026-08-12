@@ -592,7 +592,16 @@ describe("runInternalPretoolObserve: the deny tile enforcement-incident emission
     expect(emitIncident).not.toHaveBeenCalled();
   });
 
-  it("is fail-soft: a throwing emitter still renders the deny on the wire, exit 0", async () => {
+  it("a throwing emitter WITHHOLDS the deny and degrades to the advisory, still exit 0", async () => {
+    // CONTRACT CHANGE 2026-08-05 (INV-8 Phase A). This used to assert that a throwing emitter still
+    // rendered the deny, on the reasoning that telemetry must never disturb enforcement. That had it
+    // backwards for a HARD block: INV-8 makes a complete audit record a PRECONDITION of blocking, so a
+    // deny whose durable row did not land is an authority we cannot evidence. We now withhold the
+    // block and fall back to the non-blocking advisory.
+    //
+    // The invariant this test actually protected is unchanged and still asserted: the hook never
+    // crashes and never exits non-zero on a telemetry fault. Only the wire decision changed, and it
+    // changed in the SAFER direction (the user's action is permitted rather than blocked).
     const { deps, written } = bundleDeps(freshRead([bundleEntry()]), {
       emitIncident: () => {
         throw new Error("telemetry spool down");
@@ -601,7 +610,10 @@ describe("runInternalPretoolObserve: the deny tile enforcement-incident emission
     const code = await runInternalPretoolObserve([], deps);
     expect(code).toBe(0);
     const parsed = JSON.parse(written());
-    expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(parsed.hookSpecificOutput?.permissionDecision).toBeUndefined();
+    // The concern still reaches the operator and the model; only the enforcement is withheld.
+    expect(parsed.systemMessage).toContain("Meetless");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("Meetless");
   });
 });
 
@@ -659,12 +671,25 @@ describe("runInternalPretoolObserve: faces the backend bundle (P1G / G4)", () =>
     expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("rn_notes");
   });
 
-  it("does NOT emit a deny tile on a degraded ASK (an ASK is not a deny)", async () => {
+  it("does NOT emit a DENY tile on a degraded ASK (an ASK is not a deny)", async () => {
+    // CONTRACT CHANGE 2026-08-05 (ASK observability). This used to assert that a degraded ASK
+    // emitted NOTHING, which achieved "not counted as a deny" by making the interruption invisible
+    // to every surface. The invariant it protects is unchanged and still asserted below: an ASK must
+    // never be counted as a block. What changed is that it now records itself, as decision "ask".
     const emitIncident = jest.fn();
     const { deps } = bundleDeps(staleRead([bundleEntry()]), { emitIncident });
     const code = await runInternalPretoolObserve([], deps);
     expect(code).toBe(0);
-    expect(emitIncident).not.toHaveBeenCalled();
+    expect(emitIncident).toHaveBeenCalledTimes(1);
+    const input = emitIncident.mock.calls[0][0];
+    // The load-bearing assertion, preserved verbatim in meaning: not a deny.
+    expect(input.decision).toBe("ask");
+    expect(input.decision).not.toBe("deny");
+    // The rule was still ATTESTED at DENY; only the stale lease degraded it. Keeping those apart is
+    // what preserves why the human was interrupted.
+    expect(input.enforcementCeiling).toBe("DENY");
+    // And no approval is claimed: the host never reports the answer.
+    expect(input.askOutcome).toBe("unknown");
   });
 
   it("surfaces a natively-attested ASK ceiling as an ASK even on a FRESH bundle, exit 0", async () => {

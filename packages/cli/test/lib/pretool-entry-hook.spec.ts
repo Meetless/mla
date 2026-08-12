@@ -93,6 +93,9 @@ async function runHook(opts: {
     const { stdout, status } = await new Promise<{ stdout: string; status: number }>((resolve, reject) => {
       const child = spawn("bash", [hookPath], { cwd: tmp, env: { ...process.env, MEETLESS_HOME: home } });
       let out = "";
+      // A chunk boundary can fall INSIDE a multi-byte character; setEncoding puts a
+      // StringDecoder in front of the seam so `+=` never accumulates a U+FFFD pair.
+      child.stdout.setEncoding("utf8");
       child.stdout.on("data", (d) => (out += d));
       child.stderr.on("data", () => {});
       child.on("error", reject);
@@ -104,7 +107,7 @@ async function runHook(opts: {
     const rec = fs.existsSync(record) ? fs.readFileSync(record, "utf8") : "";
     return { stdout, status, record: rec };
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

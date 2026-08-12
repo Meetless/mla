@@ -102,6 +102,28 @@ export async function postTurnRecapToIntel(
       pull_count: recap.pull_count,
       referenced_source_ids: recap.referenced_source_ids,
       cited_source_ids: recap.cited_source_ids,
+      // The push-path signals ride DELIBERATELY (this projection is a decision list, not a
+      // spread). They are the same data class as the two ids above: source ids WE sent this
+      // turn, no turn content and no file content. Shipping them is the entire point of the
+      // change, because the question they answer -- has the push path been undervalued in
+      // every review we have run? -- is a fleet question, and a signal that stops at one
+      // laptop's local spool cannot answer it. `recap` is `dict[str, Any]` on intel's route,
+      // so this needs no coordinated deploy.
+      opened_source_ids: recap.opened_source_ids,
+      // Ships DELIBERATELY, and it ships because `engaged_source_ids` ships. From
+      // 2026-08-11 the union has a fourth input, so without this column a fleet reader sees
+      // ids in `engaged` that appear in neither `referenced` nor `opened` and cannot explain
+      // them. A derived union that travels without the column explaining it is how a metric
+      // starts producing findings nobody can trace back to a signal.
+      path_targeted_source_ids: recap.path_targeted_source_ids,
+      echoed_source_ids: recap.echoed_source_ids,
+      engaged_source_ids: recap.engaged_source_ids,
+      // The falsifier behind an `unverified_abstain`, shipped DELIBERATELY (same
+      // decision list, same data class: governed source ids, no turn content). Without
+      // it a fleet reader can see that an abstention was demoted but not what demoted
+      // it, and "which documents does the push path keep missing?" is exactly the
+      // question the abstention population exists to answer.
+      hand_pulled_source_ids: recap.hand_pulled_source_ids,
       verdict: recap.verdict,
     },
   };

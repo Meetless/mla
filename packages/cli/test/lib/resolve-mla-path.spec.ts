@@ -34,7 +34,7 @@ describe("resolveMlaPath (packaged binary)", () => {
     else delete proc.pkg;
     process.argv[1] = prevArgv1;
     process.execPath = prevExecPath;
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("resolves process.execPath, not the /snapshot argv entry, in a pkg binary", () => {

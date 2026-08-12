@@ -77,7 +77,7 @@ function managedEntryCount(doc: any, event: string): number {
   ).length;
 }
 function cleanup(...dirs: string[]): void {
-  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 }
 
 describe("Codex connector: Phase-1 gate (§7)", () => {

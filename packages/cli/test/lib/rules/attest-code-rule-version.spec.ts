@@ -44,7 +44,7 @@ describe("mintAttestedCodeRuleVersion mints a code-defined rule onto a durable L
 
   afterEach(() => {
     closeCe0Store(store);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("NEW_RULE mints a fresh LIVE version storing the frozen bytes + plain hash verbatim", () => {

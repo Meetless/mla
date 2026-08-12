@@ -476,6 +476,27 @@ export const EGRESS_RULES: readonly EgressRule[] = [
   // object the classifier reads), so EVERY invocation was refused with
   // `unknown_field`. The caller-body witness that exists to catch precisely this
   // named kb_add.ts and had been written from the rule instead of read from it.
+  // The withdraw sibling of kb/add. It had NO row until 2026-08-06, so every
+  // withdraw the agent-memory pipeline attempted was refused here with
+  // `no egress rule`, on every pass, forever: a memory file deleted locally or
+  // reclassified to a non-capturable type could never leave the governed KB.
+  // Found by exercising the live capture push, not by any test, because the
+  // pipeline treats a failed withdraw as retryable and simply tried again next
+  // pass. The body is read from upsert-client.ts:withdraw.
+  //
+  // No `documents` key: withdraw carries no content, so there is nothing to
+  // redact and nothing that could be silently rewritten. It still runs the
+  // credential scan (`relPath` and `reason` are the only free text) and refuses
+  // rather than rewrites, matching its kb/add sibling.
+  {
+    service: "intel",
+    method: "POST",
+    match: /^\/internal\/v1\/kb\/withdraw$/,
+    note: "KB withdraw-by-path (intel)",
+    mode: "block_on_detect",
+    why: "withdraw carries no document body; a credential in a path or reason is refused rather than rewritten, so the withdraw target can never be silently altered",
+    fields: ["workspaceId", "actor", "captureMethod", "relPath", "reason"],
+  },
   {
     service: "intel",
     method: "POST",

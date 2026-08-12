@@ -13,7 +13,9 @@
 // error exits 2; any other failure prints nothing and exits 0 so it can never
 // disturb the hook that spawned it.
 
-import { CliConfig, readConfig } from "../lib/config";
+import * as fs from "fs";
+import * as path from "path";
+import { CliConfig, readConfig, resolveMeetlessHome } from "../lib/config";
 import { describeEgressRefusal } from "../lib/egress/policy";
 import { postTurnRecapToIntel } from "../lib/turn-recap-emit";
 import {
@@ -78,14 +80,44 @@ export function parseTurnRecapArgs(argv: string[]): TurnRecapArgs {
   return out;
 }
 
-export function renderStyle(recap: TurnRecap, style: RecapStyle): string {
+export function renderStyle(recap: TurnRecap, style: RecapStyle, inviteLabel = false): string {
   switch (style) {
     case "block":
       return renderBlock(recap);
     case "block-context":
       return renderBlockContext(recap);
     default:
-      return renderFooter(recap);
+      return renderFooter(recap, { inviteLabel });
+  }
+}
+
+/**
+ * B.6's once-per-session gate.
+ *
+ * Claims the right to ask for a label in this session, exactly once, by creating a stamp file with
+ * the exclusive-create flag. `wx` makes the claim atomic: two hooks racing on the same session
+ * cannot both win, so a concurrent turn cannot produce a second invitation.
+ *
+ * Fail-CLOSED on any filesystem fault, which is the opposite of most seams here. Everywhere else
+ * failing open costs a lost measurement; here it would cost repeated nagging, and §3.12 of the value
+ * program rejected the count-keyed nag precisely because teaching a user to dismiss us is not
+ * reversible. A missed ask is recoverable; an unbounded one is not.
+ *
+ * Uses no new flag and no new config: the stamp lives beside the state that already exists in
+ * ~/.meetless, keyed by session, and the whole directory is disposable.
+ */
+export function claimLabelInvitation(sessionId: string, home: string): boolean {
+  if (!sessionId) return false;
+  try {
+    const dir = path.join(home, "label-asks");
+    fs.mkdirSync(dir, { recursive: true });
+    // Session ids are opaque; keep the filename filesystem-safe rather than trusting the shape.
+    const safe = sessionId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
+    fs.writeFileSync(path.join(dir, `${safe}.asked`), "", { flag: "wx" });
+    return true;
+  } catch {
+    // EEXIST (already asked this session) or any other fault: do not ask.
+    return false;
   }
 }
 
@@ -105,6 +137,9 @@ export interface TurnRecapCmdDeps {
   postTurnRecap?: (cfg: CliConfig, recap: TurnRecap) => Promise<void>;
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
+  /** B.6 test seams: the once-per-session claim and the state root it writes under. */
+  claimInvitation?: (sessionId: string, home: string) => boolean;
+  home?: string;
 }
 
 export async function runInternalTurnRecap(argv: string[], deps: TurnRecapCmdDeps = {}): Promise<number> {
@@ -133,7 +168,16 @@ export async function runInternalTurnRecap(argv: string[], deps: TurnRecapCmdDep
     } else if (args.style === "block-context" && isEmptyRecap(recap)) {
       // C-lite: inject nothing when there is genuinely nothing to say.
     } else {
-      log(renderStyle(recap, args.style));
+      // B.6: ask at most once per session, and only on a turn that actually delivered a governed
+      // item. The delivery test is the verdict, not the offered count: NOT_RUN and NO_OFFER are the
+      // two arms with nothing to have an opinion about. The claim is only ATTEMPTED on a qualifying
+      // turn, so a session full of NO_OFFERs never burns the one ask it gets.
+      const delivered = recap.verdict !== "NOT_RUN" && recap.verdict !== "NO_OFFER";
+      const inviteLabel =
+        delivered && recap.trace_id
+          ? (deps.claimInvitation ?? claimLabelInvitation)(session, deps.home ?? resolveMeetlessHome())
+          : false;
+      log(renderStyle(recap, args.style, inviteLabel));
     }
 
     // Layer D emission: detached, best-effort, never blocks the agent.

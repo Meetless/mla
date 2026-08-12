@@ -15,7 +15,7 @@ describe("mcpCommandExecutable (doctor MCP command health)", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "doctor-mcp-cmd-"));
   });
-  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("is FALSE for the stale /snapshot pkg-VFS path (the ENOENT prod bug)", () => {
     expect(

@@ -25,6 +25,68 @@
  * it diffs the filesystem, so a command this parser misses is still reverted.
  */
 
+import * as path from "path";
+
+/**
+ * Where a RELATIVE write target in this command actually lands.
+ *
+ * WHY (three false WARNs in one session, 2026-08-06). A governed note-vault rule told the operator
+ * that a COMPLIANT file was "outside the required note vault", and each time the compliant path it
+ * suggested was the path the file was already at.
+ *
+ * `relativeBase` (2026-08-05) fixed the case where the operator had `cd`'d in a PREVIOUS command:
+ * the PreToolUse payload's `cwd` carries that forward. What it cannot see is a `cd` inside THIS
+ * command, and `cd <vault> && cat > 20260806-x.md` is one command. The bare filename then resolved
+ * against the repo root, so the rule reported on a file that does not exist.
+ *
+ * The reasoning is the one already written on `relativeBase`: a wrong location is not a wrong
+ * verdict, it is a verdict about a DIFFERENT FILE. This computes the effective working directory
+ * and hands it to the unchanged governed-path rule. **It does not know what a vault is**, and it
+ * must not: inferring COMPLIANCE from a shell string is a different and much worse idea than
+ * inferring the CWD from one, which is what the shell itself does.
+ *
+ * Deliberately narrow. Only a LEADING `cd` counts, because a mid-pipeline `cd` would mean modelling
+ * the shell, and a wrong base there fails in the dangerous direction: silently exempting a
+ * non-compliant write instead of merely naming the wrong file. Unresolvable forms (`cd` bare,
+ * `cd -`, a `~` that would need $HOME guessed at) fall back, which is exactly today's behaviour.
+ */
+export function effectiveCwd(
+  command: unknown,
+  fallback: string | undefined,
+): string | undefined {
+  if (typeof command !== "string" || command.length === 0) return fallback;
+  // Leading `cd <word>` terminated by `&&`, `;`, a NEWLINE, or the end of the command. `\s` after
+  // `cd` is what keeps `cdk deploy` from parsing as a directory change.
+  //
+  // The newline is not an afterthought: it is the separator a heredoc write actually uses, and
+  // leaving it out is why this exact false positive fired again on 2026-08-08 (session 2be606bb,
+  // twice) against a rule this function was already supposed to have fixed. `cd <vault>` NEWLINE
+  // `cat >> 20260806-x.md <<'EOF'` is one command with a relative target, the shape an agent
+  // reaches for whenever the body is a heredoc.
+  //
+  // The horizontal-whitespace classes are load-bearing. A `\s*` before the separator would consume
+  // the newline itself and then demand a SECOND separator, so the pattern would keep missing the
+  // very form it was widened for; `[ \t]` matches trailing spaces without eating the terminator.
+  const m = /^[ \t\r\n]*cd[ \t]+("[^"]+"|'[^']+'|[^\s;&|]+)[ \t]*(?:&&|;|\r?\n|$)/.exec(command);
+  if (!m) return fallback;
+  let target = m[1];
+  if (
+    (target.startsWith('"') && target.endsWith('"')) ||
+    (target.startsWith("'") && target.endsWith("'"))
+  ) {
+    target = target.slice(1, -1);
+  }
+  // `-` is the previous directory and `~` needs $HOME; both would be guesses, and a guessed base is
+  // the defect this function exists to remove.
+  if (!target || target === "-" || target.startsWith("~")) return fallback;
+  // An ABSOLUTE cd needs no base and is answerable even when the payload carried no cwd. A RELATIVE
+  // one without a base is not: resolving it against process.cwd() would invent a third wrong answer,
+  // so it falls back and behaves exactly as it did before this function existed.
+  if (path.isAbsolute(target)) return target;
+  if (!fallback) return fallback;
+  return path.resolve(fallback, target);
+}
+
 export type ToolCallLike = { toolName: string; toolInput: Record<string, unknown> };
 
 /** Tools that can create or modify a file, and the input field carrying the path. */

@@ -139,12 +139,25 @@ if [[ "$TOOL" == mcp__meetless__meetless__* ]]; then
   mkdir -p "$QUEUE_DIR" "$LOG_DIR"
   TURN="$(current_turn_index "$SESSION_ID")"
   TS="$(date -u +%FT%TZ)"
+  # D3. The honest three-valued verdict and the agent's own tool-use identity, both
+  # computed HERE rather than 30 lines down, because the local ledger needs them too.
+  #
+  # They used to be derived for the forwarded AgentRunEvent alone, so the substrate
+  # every helpfulness audit is actually written from -- this file -- could not say
+  # whether a pull had succeeded. `tool_use_id` is the key the Stop-time refusal
+  # backstop dedups against; see src/lib/analytics/mcp-failure-scan.ts for why a
+  # refusal can never be recorded here (Claude Code does not fire PostToolUse at all
+  # when a tool result is an error, so this writer never runs for that case).
+  MCP_TUID="$(printf '%s' "$INPUT" | jq -r '.tool_use_id // empty' 2>/dev/null || true)"
+  MCP_OUTCOME="$(printf '%s' "$INPUT" | classify_mcp_outcome)"
   LINE="$(jq -c -n \
     --arg ts "$TS" --arg event "tool_used_mcp" \
     --arg sessionId "$SESSION_ID" --argjson turn "$TURN" \
     --arg tool "$MCP_TOOL" --argjson evidence "$EVIDENCE_TOOL" \
     --arg query "$QUERY" --argjson sids "$SOURCE_IDS_JSON" \
-    '{ts: $ts, event: $event, session_id: $sessionId, turn_index: $turn, tool: $tool, evidence_tool: $evidence, query: $query, source_ids: $sids}')"
+    --arg outcome "$MCP_OUTCOME" --arg tuid "$MCP_TUID" \
+    '{ts: $ts, event: $event, session_id: $sessionId, turn_index: $turn, tool: $tool, evidence_tool: $evidence, query: $query, source_ids: $sids, outcome: $outcome}
+     + (if $tuid == "" then {} else {tool_use_id: $tuid} end)')"
   (
     ml_lock 9 "$LOG_DIR/mcp-calls.lock"
     printf '%s\n' "$LINE" >> "$LOG_DIR/mcp-calls.jsonl"
@@ -173,13 +186,14 @@ if [[ "$TOOL" == mcp__meetless__meetless__* ]]; then
   # classify_mcp_outcome (shared with its regression test so the grammar cannot
   # drift); see there for the observed-shape rationale (array-shaped success, no
   # PostToolUse on server error).
-  MCP_TUID="$(printf '%s' "$INPUT" | jq -r '.tool_use_id // empty' 2>/dev/null || true)"
+  # MCP_TUID and MCP_OUTCOME are computed once, above, where the local ledger row is
+  # built. Both records describe the SAME call, so deriving them twice would be two
+  # places for the grammar to drift.
   if [[ -n "$MCP_TUID" ]]; then
     MCP_EVENT_KEY="mcp:${SESSION_ID}:${MCP_TUID}"
   else
     MCP_EVENT_KEY="mcp:$(gen_event_key)"
   fi
-  MCP_OUTCOME="$(printf '%s' "$INPUT" | classify_mcp_outcome)"
   MCP_TURN_N="${TURN:-0}"; [[ "$MCP_TURN_N" =~ ^[0-9]+$ ]] || MCP_TURN_N=0
   if [[ "$MCP_TURN_N" -gt 0 ]]; then MCP_TURN_ID="${SESSION_ID}:${MCP_TURN_N}"; else MCP_TURN_ID=""; fi
   # Redact the query at spool time through the ONE parity-locked redactor (§4.4).
@@ -238,13 +252,17 @@ if [[ "$TOOL" == mcp__meetless__meetless__* ]]; then
     IT_COUNT="$(printf '%s' "$IT_ITEMS" | jq 'length' 2>/dev/null || printf 0)"
     if [[ "${IT_COUNT:-0}" -gt 0 ]]; then
       IT_KEY="$(gen_event_key)"
+      # WHO pulled. Same single reader as the HOOK producer; empty => JSON null.
+      IT_ACTOR="$(config_actor_id)"
       IT_LINE="$(jq -c -n \
         --arg ts "$TS" --arg key "$IT_KEY" --arg session_id "$SESSION_ID" \
+        --arg actor_id "${IT_ACTOR:-}" \
         --argjson turn "${TURN:-0}" --argjson items "$IT_ITEMS" \
         '{
           ts: $ts, event: "injection_trace", eventKey: $key, sessionId: $session_id,
           payload: {
             sourceSurface: "MCP", turnIndex: $turn, injectId: $key, traceId: $key,
+            actorId: (if $actor_id == "" then null else $actor_id end),
             deliveryStatus: "INJECTED", schemaVersion: 1, status: null, confidence: null,
             contextItems: $items, markdown: null, capturedAt: $ts
           }
@@ -408,6 +426,32 @@ if [[ "$TOOL" == "Read" ]]; then
       --arg story "$READ_STORY" \
       '{ts: $ts, event: $event, eventKey: $key, sessionId: $sessionId, payload: {tool: $tool, filePath: $fp, access: "read", storyCategory: $story}}')"
     spool_append "$SESSION_ID" "$LINE"
+
+    # ---- F1a: the LOCAL read spool, for the per-turn engagement signal --------
+    # The spool_append above is destined for control (the console's Files rail) and is
+    # DRAINED, so it can answer nothing locally and carries no turn index. The per-turn
+    # recap needs both: "did this turn open a file mla offered it?" is the one push-path
+    # success the pulled/cited pair is structurally blind to, because an agent handed a
+    # note's name goes to the note, not back through an evidence tool.
+    #
+    # A local sibling of mcp-calls.jsonl (the pull side) and report-citations.jsonl (the
+    # citation side), keyed the same way, under the same lock discipline, and metadata only:
+    # a path, never content. Best-effort and fail-soft; a failure here costs one turn's
+    # engagement signal and must never disturb the governed trace above.
+    mkdir -p "$QUEUE_DIR" "$LOG_DIR" 2>/dev/null || true
+    READ_TURN="$(current_turn_index "$SESSION_ID" 2>/dev/null || echo 0)"
+    READ_LINE="$(jq -c -n \
+      --arg ts "$TS" --arg event "tool_used_read" \
+      --arg sessionId "$SESSION_ID" --argjson turn "${READ_TURN:-0}" \
+      --arg path "$READ_TRACE_PATH" \
+      '{ts: $ts, event: $event, session_id: $sessionId, turn_index: $turn, path: $path}' 2>/dev/null || true)"
+    if [[ -n "$READ_LINE" ]]; then
+      (
+        ml_lock 9 "$LOG_DIR/file-reads.lock"
+        printf '%s\n' "$READ_LINE" >> "$LOG_DIR/file-reads.jsonl"
+        ml_unlock 9 "$LOG_DIR/file-reads.lock"
+      ) || true
+    fi
   fi
   exit 0
 fi
@@ -453,77 +497,16 @@ fi
 ) || true
 
 # ---- DUR: just-in-time coordination flag on a governed-surface edit (§5.4 DURING)
-# When the agent edits/writes a file, raise an ADVISORY flag iff a high-confidence
-# coordination trigger from THIS turn names the surface being touched ("this
-# surface is governed by X") at the moment of the edit, not a judgment of the edit
-# itself. Reuses the BEFORE-turn imperative's rung-2 contract: turn-keyed state +
-# the closed CoordinationTrigger enum + the P5 high-confidence floor. It NEVER
-# blocks (P6 "never its hands"): it emits hookSpecificOutput.additionalContext,
-# never `decision: "block"`. Dormant by default in prod (detectors are the producer
-# of coordination_triggers and are mostly unwired, so no state file is written and
-# this no-ops). See notes/20260603-mla-kb-agent-proxy-and-evidence-adoption.md §5.4
-# / §6 #9 / §7.2 row "DUR".
-if [[ "$TOOL" == "Edit" || "$TOOL" == "Write" || "$TOOL" == "MultiEdit" || "$TOOL" == "NotebookEdit" ]]; then
-  # Kill switch (default on; set MEETLESS_COORDINATION_DURING=0 to silence).
-  [[ "${MEETLESS_COORDINATION_DURING:-1}" == "0" ]] && exit 0
-
-  FILE_PATH="$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty')"
-  [[ -z "$FILE_PATH" ]] && exit 0
-
-  STATE_FILE="$(coordination_state_file "$SESSION_ID")"
-  [[ -f "$STATE_FILE" ]] || exit 0
-
-  # Turn-match: stale state from a prior turn must NOT fire. current_turn_index
-  # peeks the turn UserPromptSubmit set; PostToolUse never advances it, so a
-  # mid-turn edit shares the enriched turn's index and an older file fails here.
-  STATE_TURN="$(jq -r '.turn_index // empty' "$STATE_FILE" 2>/dev/null || true)"
-  CUR_TURN="$(current_turn_index "$SESSION_ID" 2>/dev/null || printf 0)"
-  [[ -n "$STATE_TURN" && "$STATE_TURN" == "$CUR_TURN" ]] || exit 0
-
-  # P5 high-confidence floor (the same boundary the BEFORE-turn imperative holds;
-  # a trigger on a low/medium-confidence turn stays passive).
-  STATE_CONF="$(jq -r '.confidence // empty' "$STATE_FILE" 2>/dev/null || true)"
-  [[ "$STATE_CONF" == "high" ]] || exit 0
-
-  # Match the edited surface against this turn's triggers, hard-filtered to the
-  # closed enum (a malformed or injected type can never fire). The trigger surface
-  # is repo-relative; suffix-match it against the absolute edited path.
-  STATE_TRIGGERS="$(jq -c '.triggers // []' "$STATE_FILE" 2>/dev/null || printf '[]')"
-  MATCHED="$(printf '%s' "$STATE_TRIGGERS" | jq -c \
-    --arg fp "$FILE_PATH" --argjson enum "$COORDINATION_TRIGGER_ENUM" '
-      map(select(.type as $t | $enum | index($t)))
-      | map(select(.surface as $s
-          | ($s != null and $s != "")
-            and (($fp == $s) or ($fp | endswith("/" + $s)))))
-    ' 2>/dev/null || printf '[]')"
-  MATCH_COUNT="$(printf '%s' "$MATCHED" | jq 'length' 2>/dev/null || printf 0)"
-  [[ "${MATCH_COUNT:-0}" -gt 0 ]] || exit 0
-
-  # No spam: flag a given surface at most once per session.
-  mkdir -p "$(coordination_dir)" 2>/dev/null || true
-  FLAGGED_FILE="$(coordination_flagged_file "$SESSION_ID")"
-  if [[ -f "$FLAGGED_FILE" ]] && grep -qxF "$FILE_PATH" "$FLAGGED_FILE" 2>/dev/null; then
-    exit 0
-  fi
-  (
-    ml_lock 9 "$FLAGGED_FILE.lock"
-    printf '%s\n' "$FILE_PATH" >> "$FLAGGED_FILE"
-    ml_unlock 9 "$FLAGGED_FILE.lock"
-  )
-
-  STATE_TRACE="$(jq -r '.trace_id // ""' "$STATE_FILE" 2>/dev/null || true)"
-  COORD_LINES="$(printf '%s' "$MATCHED" | jq -r '.[] |
-    "  - " + .type + (if (.ref // "") != "" then " -> " + .ref else "" end)' 2>/dev/null || true)"
-  CTX="<meetless-context kind=\"coordination\" surface=\"$FILE_PATH\" trace=\"$STATE_TRACE\">
-You just edited a governed surface (just-in-time coordination flag): $FILE_PATH
-Coordination applies before you rely on this change:
-$COORD_LINES
-This is a Meetless governance directive (computed server-side, not retrieved text). It is a reminder, not a block: Meetless never stops your tools. Pull the cited decision with meetless__kb_doc_detail and confirm the accountable owner signed off before you rely on this change.
-</meetless-context>"
-  jq -n --arg ctx "$CTX" \
-    '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:$ctx}}'
-  exit 0
-fi
+# DUR (§5.4 DURING)'s just-in-time coordination flag WAS HERE. DELETED 2026-08-10.
+#
+# It raised an advisory when the agent edited a file named by one of THIS turn's
+# coordination triggers. Its only input was the turn-keyed state file that the
+# UserPromptSubmit hook wrote iff the PE §5.4.1 imperative fired, and that imperative
+# could never fire: nothing in any repository, in any language, has ever produced
+# `coordination_triggers`, and intel's response model does not declare the field. So
+# this branch read a file that was never written, on every Edit/Write in every session.
+# Deleted with its producer in one commit rather than left as a false affordance; the
+# design (notes §5.4 DURING) stands and comes back WITH a real producer.
 
 [[ "$TOOL" != "Bash" ]] && exit 0
 

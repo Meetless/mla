@@ -28,7 +28,7 @@ describe("runDryRunCollector", () => {
     mem = mkdtempSync(join(tmpdir(), "amcol-mem-"));
   });
   afterEach(() => {
-    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("returns empty when no bindings are enabled", () => {
@@ -93,7 +93,7 @@ describe("runDryRunCollector", () => {
       const results = runDryRunCollector({ nowIso: NOW, home });
       expect(results).toHaveLength(1); // only the enabled binding
     } finally {
-      rmSync(mem2, { recursive: true, force: true });
+      rmSync(mem2, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

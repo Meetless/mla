@@ -83,8 +83,8 @@ describe("mla rewire is decoupled from Project rules (init's job, not rewire's)"
     if (prevMlHome === undefined) delete process.env.MEETLESS_HOME;
     else process.env.MEETLESS_HOME = prevMlHome;
     mockHomedir = null;
-    fs.rmSync(tmpHome, { recursive: true, force: true });
-    fs.rmSync(tmpRepo, { recursive: true, force: true });
+    fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    fs.rmSync(tmpRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     jest.resetModules();
   });
 

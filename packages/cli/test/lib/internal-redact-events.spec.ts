@@ -15,7 +15,7 @@ import { REDACTED } from "../../src/lib/redactor";
 // `redact-events` is the mandatory boundary at flush.sh Pass 2. Each `it` below
 // pins one previously-leaking field.
 
-const SECRET = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+const SECRET = "sk-ant-" + "api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
 
 function payloadOf(events: unknown[], i = 0): Record<string, unknown> {
   return (events[i] as Record<string, unknown>).payload as Record<string, unknown>;

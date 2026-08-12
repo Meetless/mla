@@ -115,6 +115,10 @@ function maskRetrievalError(err) {
 /** The corpus states this client has a message for. See `explainEmptyPull`. */
 const CORPUS_STATES = new Set(["empty", "captured_not_indexed", "populated"]);
 
+// Allow-listed for the same reason CORPUS_STATES is: an unrecognised band must not
+// reach the agent looking like a product word we have a meaning for.
+const SERVED_RELEVANCE_BANDS = new Set(["high", "medium", "low", "unmeasured"]);
+
 /**
  * Say WHICH empty a zero-candidate pull is, or null when there is nothing to say.
  *
@@ -157,6 +161,25 @@ const CORPUS_STATES = new Set(["empty", "captured_not_indexed", "populated"]);
  * No message carries a count. The pull crosses an ACL boundary, so corpus size is
  * not ours to disclose; intel deliberately sends no number and we do not invent one.
  */
+/**
+ * Is this empty pull an ONBOARDING GAP, i.e. the one branch below whose remedy is "index this
+ * repository"? Defined once and consumed by both the message and the telemetry sink, so the two
+ * can never drift into disagreeing about which state the user is in.
+ *
+ * True for exactly one of the four branches:
+ *   captured_not_indexed -> false. The workspace DID onboard; its documents went down a
+ *                           non-grounding capture lane. Telling it to onboard again is the
+ *                           false remedy the three-way split exists to stop.
+ *   corpus_empty === true -> TRUE. Nothing indexed, no rewording will ever help, and the offer
+ *                           is actionable.
+ *   corpus_empty === false -> false. A real corpus and a retriever miss.
+ *   undefined             -> false. An intel that predates the field; we say "if", and we do not
+ *                           count a hedge as an established gap.
+ */
+export function isOnboardingGapPull(corpusEmpty, corpusState) {
+  return corpusState !== "captured_not_indexed" && corpusEmpty === true;
+}
+
 function explainEmptyPull(corpusEmpty, corpusState) {
   if (corpusState === "captured_not_indexed") {
     return (
@@ -168,7 +191,7 @@ function explainEmptyPull(corpusEmpty, corpusState) {
       "report the absence of evidence as an absence of the fact."
     );
   }
-  if (corpusEmpty === true) {
+  if (isOnboardingGapPull(corpusEmpty, corpusState)) {
     return (
       "This workspace has no indexed documents, so retrieval returns nothing for EVERY " +
       "query, not just this one. That is an onboarding gap, not a bad query: run the " +
@@ -267,6 +290,17 @@ export async function runRetrieveKnowledge(args, deps) {
     candidates,
   };
 
+  // A SERVED pull can be as empty as an empty one, and `count` cannot say so: a page
+  // of twelve irrelevant rows and a page of twelve on-point ones are the same shape.
+  // Measured on the dogfood workspace 2026-08-08, twelve candidates on every probe:
+  // all three real queries returned at least one `high` band, none of the three
+  // nonsense ones did, and `low` appeared only in the nonsense ones. Carried through
+  // verbatim (allow-listed), never rendered into a warning: this reports, the agent
+  // decides. Nothing is filtered here or upstream.
+  if (candidates.length > 0 && SERVED_RELEVANCE_BANDS.has(response.served_relevance)) {
+    result.served_relevance = response.served_relevance;
+  }
+
   // An empty pull is a finding, not a non-answer. Carry intel's verdict verbatim
   // (a boolean about the caller's OWN workspace, no substrate) plus the one line
   // that tells the agent what to do about it.
@@ -281,6 +315,18 @@ export async function runRetrieveKnowledge(args, deps) {
     if (corpusEmpty !== undefined) result.corpus_empty = corpusEmpty;
     if (corpusState !== undefined) result.corpus_state = corpusState;
     result.warnings = [explainEmptyPull(corpusEmpty, corpusState)];
+    // P0-2: the offer, at the moment the miss actually happened. Fires only on the
+    // onboarding-gap branch, so a retriever miss and an already-onboarded workspace whose
+    // capture lane does not ground are both silent here. Optional and swallowed: this server
+    // owns no fs and no env, the sink is injected by `mla mcp`, and a telemetry fault must
+    // never turn a working pull into a failed tool call.
+    if (isOnboardingGapPull(corpusEmpty, corpusState) && typeof deps.recordOnboardingGap === "function") {
+      try {
+        deps.recordOnboardingGap();
+      } catch {
+        /* never break the pull that observed it */
+      }
+    }
   }
 
   return result;

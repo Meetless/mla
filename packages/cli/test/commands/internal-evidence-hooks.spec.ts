@@ -143,7 +143,7 @@ describe("runInternalEvidenceTurnOpen: UserPromptSubmit durable path", () => {
 
   it("is dormant with no resolved workspace: writes nothing, still emits {} exit 0", async () => {
     const dbPath = tmpStorePath();
-    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     const written: string[] = [];
     const code = await runInternalEvidenceTurnOpen([], {
       readStdin: async () => JSON.stringify({ session_id: "sess-C", prompt: "what did we decide" }),

@@ -97,8 +97,16 @@ import {
 // clone), and `.gitignore` is the user's file, not ours. We only READ the
 // repo's answer (via `git check-ignore`) and tell the truth about it.
 //
+// `--workspace <id>` (D2, 2026-08-10) is the THIRD path and the only one that
+// binds a workspace the caller names: several repos in one company share one
+// workspace by running it in each. It provisions nothing, it never repoints a
+// folder already bound to a different id, and it does not fold the checkouts
+// together (each keeps its own scan root, so one repo's instruction files are
+// never served as another's). See runBindExisting.
+//
 // Usage:
 //   mla activate [--name <name>] [--note <text>]   (provision-or-bind)
+//   mla activate --workspace <id>                  (bind an EXISTING workspace)
 //   mla activate --here                            (in-Git subdir override)
 //   mla activate --create                          (non-Git override)
 //   mla activate --repair                          (re-check binding health)
@@ -127,9 +135,10 @@ interface ActivateFlags {
   create?: boolean;
   repair?: boolean;
   bootstrap?: BootstrapTier;
+  workspace?: string;
 }
 
-const VALUE_FLAGS = new Set(["--name", "--note", "--bootstrap"]);
+const VALUE_FLAGS = new Set(["--name", "--note", "--bootstrap", "--workspace"]);
 const BOOLEAN_FLAGS = new Set(["--here", "--create", "--repair"]);
 
 export function parseActivateArgs(argv: string[]): ActivateFlags {
@@ -143,6 +152,7 @@ export function parseActivateArgs(argv: string[]): ActivateFlags {
       }
       if (a === "--name") out.name = v;
       else if (a === "--note") out.note = v;
+      else if (a === "--workspace") out.workspace = v;
       else if (a === "--bootstrap") {
         // The removed `full` tier gets a migration message, never a silent fallback
         // to a shallower tier (Phase 2: "never silently fall back from a named-but-
@@ -620,6 +630,26 @@ export async function runActivate(argv: string[]): Promise<number> {
   // helper; a decline or failure never blocks activate.
   await maybeOfferLogin();
 
+  // `--workspace <id>` is the THIRD path, and it is checked before every other
+  // branch because it changes what the command is: not provision-or-bind keyed
+  // on marker presence, but "bind THIS folder to the workspace I named". See
+  // runBindExisting for the semantics.
+  if (flags.workspace !== undefined) {
+    const conflict = workspaceFlagConflict(flags);
+    if (conflict) return failInMode(command, "usage_error", conflict, 2);
+    const id = flags.workspace.trim();
+    if (!id) {
+      return failInMode(
+        command,
+        "usage_error",
+        "`--workspace` needs a workspace id. Run `mla workspace list` to see the " +
+          "workspaces you belong to.",
+        2,
+      );
+    }
+    return runBindExisting(cwd, id, flags, command);
+  }
+
   // `--repair` re-checks an existing binding's membership/connectivity ONLY. It
   // never mints a new id (An, 2026-06-04): re-creation is an explicit
   // `mla deactivate` then `mla activate`.
@@ -660,6 +690,147 @@ export async function runActivate(argv: string[]): Promise<number> {
   if (guard !== 0) return guard;
 
   return runProvision(cwd, flags);
+}
+
+// Which flags are a category error alongside `--workspace`, and why. Each of
+// these describes the PROVISION path, and `--workspace` provisions nothing:
+//   --name      names a workspace being created; this one already has a name.
+//   --here      the in-Git subdir override for auto-create (INV-FLAGS-1).
+//   --create    the non-Git override for auto-create.
+//   --repair    re-checks an EXISTING binding; it never writes one.
+// `--note` and `--bootstrap` are not here: the note is marker provenance and the
+// tier is the activation tail, and both mean the same thing on this path.
+// Returns the refusal text, or null when the combination is fine.
+export function workspaceFlagConflict(flags: ActivateFlags): string | null {
+  const clashes: string[] = [];
+  if (flags.name !== undefined) clashes.push("--name");
+  if (flags.here) clashes.push("--here");
+  if (flags.create) clashes.push("--create");
+  if (flags.repair) clashes.push("--repair");
+  if (clashes.length === 0) return null;
+  return (
+    `\`--workspace\` cannot be combined with ${clashes.join(", ")}: ` +
+    "--workspace binds this folder to a workspace that already exists, and " +
+    `${clashes.length === 1 ? "that flag belongs" : "those flags belong"} to the ` +
+    "create path (or, for --repair, to re-checking a binding that is already here)."
+  );
+}
+
+// The lines a refused repoint earns. Pure so the wording is pinned by a unit
+// test rather than only by the blackbox run.
+export function conflictingMarkerLines(
+  markerPath: string,
+  current: string,
+  requested: string,
+): string[] {
+  return [
+    "This folder is already bound to a different workspace.",
+    `  marker:    ${markerPath}`,
+    `  bound to:  ${current}`,
+    `  requested: ${requested}`,
+    "",
+    "  `--workspace` never repoints an existing binding in place. Silently",
+    "  re-pointing one is the defect that retired `mla workspace use`: the",
+    "  captured history, scan cache and review items under the old id do not",
+    "  move, so the folder would read as empty rather than as switched.",
+    "",
+    "  To move this folder deliberately:",
+    "    `mla deactivate` here, then `mla activate --workspace <id>`",
+  ];
+}
+
+// `mla activate --workspace <id>`: bind THIS folder to an EXISTING workspace.
+//
+// D2. Before this, a company with several repos had no way to share one
+// workspace: activate is provision-or-bind keyed on marker PRESENCE, so repo two
+// minted a second workspace, and the removal of `mla workspace use` (T3.2) left
+// no replacement. The umbrella-marker workaround is worse than it looks, because
+// resolveScanRoot takes the MARKER dir as the scan root, so every repo under one
+// umbrella marker collapses into a single scan root and repo B's session gets
+// repo A's repo-specific rules.
+//
+// Semantics, all keyed on the marker AT this folder (never an ancestor), which
+// mirrors how `--here` narrows resolution (INV-ACTIVATE-1):
+//   - already bound HERE to the requested id  -> idempotent no-op, exit 0.
+//   - bound HERE to a different id            -> refuse; never repoint in place.
+//   - only an ANCESTOR marker resolves        -> write the nearer marker. That is
+//     deliberate operator intent and it is exactly how a monorepo sub-project or
+//     a repo under an umbrella gets its own scan root; nearest-wins does the rest.
+//   - nothing here                            -> write it.
+//
+// The repo-root guard (checkCreateGuard) is deliberately NOT applied: it exists
+// to stop accidental workspace FRAGMENTS from auto-creation, and nothing is
+// created here. Requiring `--create` in a non-Git folder would block the umbrella
+// case this flag exists to serve.
+//
+// Membership is probed with the SAME machinery and the SAME verdict rule as the
+// bind path (probeBindMembership): only a definite DENY refuses; offline, 5xx and
+// timeouts still bind, because a local binding is local truth and being stricter
+// would break activation on a plane. The difference from bind is what a DENY
+// costs: bind is reporting on a marker that already exists, while this one is
+// about to WRITE one, so a denial here must leave the folder untouched.
+async function runBindExisting(
+  cwd: string,
+  workspaceId: string,
+  flags: ActivateFlags,
+  command: string,
+): Promise<number> {
+  const markerHere = path.join(cwd, ACTIVATION_FILENAME);
+  if (fs.existsSync(markerHere)) {
+    const current = readMarkerWorkspaceId(markerHere);
+    if (current === workspaceId) {
+      if (!isMachineMode()) {
+        console.log(`Already activated: ${markerHere} -> ${workspaceId}`);
+        console.log("  Marker unchanged; this folder is already bound to that workspace.");
+      }
+      return finishActivate(cwd, resolveBootstrapTier(flags));
+    }
+    return failInMode(
+      command,
+      "workspace_conflict",
+      conflictingMarkerLines(markerHere, current ?? "(no workspaceId in marker)", workspaceId).join("\n"),
+      1,
+    );
+  }
+
+  const probe = await probeBindMembership(workspaceId);
+  if (probe.verdict === "no-workspace" || probe.verdict === "not-a-member") {
+    let email: string | undefined;
+    try {
+      const auth = readConfig().auth;
+      if (auth.mode === "user-token") email = auth.user.email ?? undefined;
+    } catch {
+      // Best effort: the remedy still reads fine with the <your-email> placeholder.
+    }
+    return failInMode(
+      command,
+      probe.verdict === "no-workspace" ? "no_workspace_yet" : "not_a_member",
+      deadBindingLines(probe.verdict, workspaceId, markerHere, email).join("\n"),
+      1,
+    );
+  }
+
+  const { markerPath } = writeActivationMarker(cwd, workspaceId, { note: flags.note });
+
+  if (!isMachineMode()) {
+    console.log(`Bound this folder to workspace ${workspaceId}.`);
+    console.log(`  marker:      ${markerPath}`);
+    console.log(`  workspaceId: ${workspaceId}`);
+    console.log("");
+    console.log("This folder now shares that workspace's governed memory: its decisions,");
+    console.log("rules and constraints are the same ones every other folder bound to it");
+    console.log("reads. This checkout keeps its own scan root, so its own instruction");
+    console.log("files stay local to it and are never served as another repo's rules.");
+    console.log("");
+    for (const line of commitGuidanceLines(cwd)) console.log(line);
+  }
+
+  // recommendOnboard stays FALSE: nothing was provisioned. The `/mla onboard`
+  // nudge is not suppressed though, because finishActivate keys it on whether the
+  // WORKSPACE has ever been onboarded, not on how this folder got bound. An
+  // already-onboarded company workspace is silent; one that was never seeded
+  // still earns the nudge, and that is correct rather than noise.
+  return finishActivate(cwd, resolveBootstrapTier(flags));
 }
 
 // Repo-root guard (INV-FLAGS-1). Returns 0 to allow provisioning, or a non-zero
@@ -836,7 +1007,21 @@ async function runProvision(
   } catch (e) {
     const err = e as HttpError;
     let msg: string;
-    if (err.status === 401 || err.status === 403) {
+    // Logged out is an AUTH failure, and it has to be caught before the status
+    // taxonomy below. `doFetch` fails fast on `auth.mode === 'none'` by throwing
+    // notLoggedInError() before a socket is opened, so this error carries no
+    // `.status` and would otherwise fall into the connectivity `else`. That told
+    // every brand-new user (install.sh writes auth.mode none) that control might be
+    // down, and sent them to `mla doctor`, which answers `✓ control reachable`.
+    // A remedy that contradicts its own diagnosis is worse than none, so this
+    // branch names the credential and stops there. An EXPIRED session is a
+    // different state and needs no branch: authExpiredError carries status 401 and
+    // is already served below.
+    if (err.name === "NotLoggedInError") {
+      msg =
+        "You are not signed in, so there is no identity to provision a workspace under. " +
+        "Run `mla login` first, then `mla activate` again.";
+    } else if (err.status === 401 || err.status === 403) {
       msg =
         "Control rejected the provision request (not authorized). Check `mla doctor` and your token.";
     } else if (err.status !== undefined) {
@@ -1209,14 +1394,37 @@ export function reconcileWiringBackstop(
 export function renderForeignRootWarning(args: {
   scan: ScanResult;
   incumbentRootPath: string | null;
+  /**
+   * Does this folder carry a `.meetless.json` of its OWN (as opposed to
+   * resolving one from an ancestor)? Read from the live filesystem by the
+   * caller; nothing about it is persisted.
+   */
+  markerAtThisFolder: boolean;
 }): string | null {
-  const { scan, incumbentRootPath } = args;
+  const { scan, incumbentRootPath, markerAtThisFolder } = args;
   // No incumbent, or an unstamped legacy cache: nobody to take anything from.
   if (!incumbentRootPath || !scan.scanRootPath) return null;
   // We ARE the owner. A rescan of your own checkout is the ordinary path.
   if (incumbentRootPath === scan.scanRootPath) return null;
   // A second checkout that brought its own docs is a real checkout, not a throwaway.
   if (scan.inventory.instructionFiles > 0) return null;
+  // A folder holding its OWN marker was bound on purpose: someone ran
+  // `mla activate --workspace <id>` here, or the team committed the marker into
+  // this repo. Neither is the accident this warning was built for.
+  //
+  // The accident (2026-08-02) is the opposite shape: a throwaway directory that
+  // never asked for a workspace INHERITS one because an ancestor marker reaches
+  // down into it, which is how three `live-handoff-test-000N` dirs took a live
+  // workspace's cache slot. That is the only case where "did you mean to bind a
+  // live workspace from here" is a question worth asking.
+  //
+  // Without this, the D2 multi-repo shape trips a warning written for temp dirs:
+  // a small company repo with no CLAUDE.md of its own, deliberately bound to the
+  // shared workspace, would be told it might be a mistake on every activate.
+  // Derived from current filesystem state on purpose. An `explicitBind` field in
+  // the marker would answer the same question by remembering an intention rather
+  // than by observing one, and it would then have to stay true forever.
+  if (markerAtThisFolder) return null;
   return [
     "WARNING: this folder has no instruction files, and another checkout already owns this workspace.",
     `  this folder:      ${scan.scanRootPath}`,
@@ -1270,7 +1478,7 @@ async function finishActivate(
 
   if (scan && !isMachineMode()) {
     console.log("");
-    console.log(renderBootstrapSummary(scan, { injectedNow: boot.ok }));
+    console.log(renderBootstrapSummary(scan));
 
     // Read the slot back AFTER the write: `globalSlotContent` has already decided who owns it, so
     // whatever is on disk now is the authoritative owner. No `home` argument, matching the write
@@ -1280,6 +1488,7 @@ async function finishActivate(
       incumbentRootPath: workspaceId
         ? (readScanCache(undefined, workspaceId)?.scanRootPath ?? null)
         : null,
+      markerAtThisFolder: fs.existsSync(path.join(cwd, ACTIVATION_FILENAME)),
     });
     if (foreignRoot) {
       console.log("");
@@ -1750,6 +1959,35 @@ export async function runDeactivate(
         "Nothing to deactivate: no .meetless.json binding resolves from here.",
       );
       console.error("  (Use `mla mute` to silence just the current session.)");
+      return 1;
+    }
+    // D1 worktree safety, checked BEFORE the ancestor guard because
+    // `--from-root` must not open this door. An inherited binding lives in a
+    // DIFFERENT checkout, not in an ancestor of cwd, so "remove the resolved
+    // ancestor" is not a description of what deleting it would do: it would
+    // unbind the origin checkout and every other worktree of that repository,
+    // from a directory that never carried a marker. There is no opt-in flag for
+    // that; the operator names the marker explicitly or runs it over there.
+    if (found.via === "worktree") {
+      console.error(
+        "Nothing to deactivate here: this linked worktree has no binding of its own.",
+      );
+      console.error(`  inherited marker: ${found.path}`);
+      console.error(`  cwd:              ${cwd}`);
+      console.error("");
+      console.error(
+        "Removing that marker would unbind the origin checkout and every other",
+      );
+      console.error("worktree of this repository, none of which is this directory.");
+      console.error("");
+      console.error("If that is what you want, run `mla deactivate` in the origin");
+      console.error(
+        `checkout, or target it explicitly with \`mla deactivate --marker ${found.path}\`.`,
+      );
+      console.error(
+        "(Use `mla mute` to silence just the current session, or write a",
+      );
+      console.error(" .meetless.json here to bind this worktree somewhere else.)");
       return 1;
     }
     // Nested-dir safety: an ancestor marker is not removed from a subdir without

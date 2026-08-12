@@ -78,7 +78,7 @@ describe("captureCommandEvent", () => {
     delete process.env.MEETLESS_LOCAL_STATS;
     delete process.env.MEETLESS_TELEMETRY;
     delete process.env.MEETLESS_NO_TELEMETRY;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("buildCommandPayload is pure and emits the normalized shape", () => {

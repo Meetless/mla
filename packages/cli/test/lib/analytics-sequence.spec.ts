@@ -43,7 +43,7 @@ describe("computeSequence", () => {
   afterEach(() => {
     delete process.env.MEETLESS_HOME;
     delete process.env.MEETLESS_LOCAL_STATS;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("returns all-null for an unbound run (no session)", () => {

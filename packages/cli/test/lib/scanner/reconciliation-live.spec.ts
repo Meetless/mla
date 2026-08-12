@@ -67,7 +67,7 @@ describe("makeArtifactByteReader", () => {
     root = mkdtempSync(join(tmpdir(), "mla-recon-live-"));
     writeFileSync(join(root, "CLAUDE.md"), BODY);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("reads a repo-relative path and refuses to escape the repo", () => {
     const read = makeArtifactByteReader(root);

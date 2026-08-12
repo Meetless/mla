@@ -24,7 +24,7 @@ function fakeResult(over: Partial<ScanResult> = {}): ScanResult {
 describe("cache + verdicts", () => {
   let home: string;
   beforeEach(() => { home = mkdtempSync(join(tmpdir(), "mla-cache-")); });
-  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+  afterEach(() => { rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); });
 
   it("round-trips a scan cache under the workspace dir", () => {
     writeScanCache(home, "ws1", fakeResult());

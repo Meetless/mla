@@ -98,7 +98,7 @@ describe("classify_mcp_outcome bash twin (governed MCP outcome, §3.3)", () => {
   });
 
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function classify(input: unknown): string {

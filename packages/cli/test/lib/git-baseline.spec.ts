@@ -72,7 +72,7 @@ describe("captureGitEvidence baseline subtraction (ambient-attribution fix)", ()
       // diffStat reflects ONLY the mission file, not the ambient deletion.
       expect(ev.diffStat.filesChanged).toBe(1);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -94,7 +94,7 @@ describe("captureGitEvidence baseline subtraction (ambient-attribution fix)", ()
       // Status changed from " M" to "M " -> mission touched it -> kept.
       expect(ev.staged).toContain("f.ts");
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -115,7 +115,7 @@ describe("captureGitEvidence baseline subtraction (ambient-attribution fix)", ()
       expect(ev.deleted).toContain("victim.lock");
       expect(ev.diffStat.filesChanged).toBe(2);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -131,7 +131,7 @@ describe("captureGitEvidence baseline subtraction (ambient-attribution fix)", ()
       expect(ev.trackedModified).toContain("keep.ts");
       expect(ev.diffStat.filesChanged).toBe(1);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -246,8 +246,8 @@ describe("session-start.sh baseline is captured ONCE per session (continue/compa
       expect(ev.trackedModified).toContain("keep.ts");
       expect(ev.diffStat.filesChanged).toBe(1);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -280,8 +280,8 @@ describe("session-start.sh baseline is captured ONCE per session (continue/compa
       // as the new segment's baseline.
       expect(b2).toContain("keep.ts");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

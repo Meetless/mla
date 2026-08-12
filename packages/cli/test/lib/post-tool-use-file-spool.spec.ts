@@ -99,7 +99,7 @@ function mkHarness(): { h: Harness; cleanup: () => void } {
         .map((l) => JSON.parse(l) as Record<string, unknown>);
     },
   };
-  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }) };
+  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }) };
 }
 
 function fileToolInput(opts: {

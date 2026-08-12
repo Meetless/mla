@@ -20,7 +20,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 function writeSettings(settings: unknown): void {
@@ -35,7 +35,7 @@ it("resolves MLA_SOLE_AUTHORITY when the managed hook is the only Write/Edit Pre
 });
 
 it("reports MLA_HOOK_ABSENT (UNAVAILABLE) when settings.json does not exist", () => {
-  fs.rmSync(path.join(home, ".claude"), { recursive: true, force: true });
+  fs.rmSync(path.join(home, ".claude"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   const res = resolveLiveInputAuthority({ homeDir: home, mlaHooksDir });
   expect(res.kind).toBe("UNAVAILABLE");
   if (res.kind !== "UNAVAILABLE") throw new Error("unreachable");

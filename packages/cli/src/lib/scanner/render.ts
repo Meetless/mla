@@ -5,6 +5,7 @@ import {
   StaleSignal,
   directiveId,
 } from "./types";
+import { FloorRuleRef, sampleWithCount } from "./floor-delta";
 
 const STOP_CARD_CAP = 5;
 
@@ -180,9 +181,78 @@ export function isScopedRule(d: Directive): boolean {
 // the model the hook block is authoritative and outranks the static `.claude/rules`
 // projection a subagent-capable session may also be holding. "Complete" means a rule
 // omitted from this block is no longer part of the current floor.
+//
+// H3 (notes/20260809-mla-helpfulness-session-a4a779b2-the-budgeter-miscounts-its-own-items.md).
+// That claim was not always true, and the premise check found the path, not a wording
+// preference. Measured against the live 20-rule bundle on 2026-08-09:
+//
+//   13 ambient MUST     always delivered. `budget = max(SAFE_TOTAL, requiredBytes)`, so
+//                       a required MUST is never withheld for size (assemble.ts).
+//    2 ambient SHOULD    the BEST-EFFORT tail. They fill capacity above the required
+//                       floor, and when the required set alone meets SAFE_TOTAL (6000)
+//                       there is no slack and every one of them is dropped. With the
+//                       real static base the assembler reports `omitted_rules: 2` and
+//                       both `[SHOULD]` lines are gone, and this sentence still said
+//                       "complete". A dropped SHOULD is STILL part of the current
+//                       floor; it simply did not fit.
+//    2 turn-trigger MUST scoped, and they render in the separate `scoped-rules` block,
+//                       which makes no completeness claim. Not an omission from here.
+//    3 action-mode MUST  never injected on any path (`injectionTupleOK` rejects them);
+//                       they are tool-boundary enforcement, not prompt context.
+//
+// So NO floor rule is ever omitted from this block by scope, and exactly one class can
+// be omitted for size. That is a cheap, decided distinction, which is why this does not
+// emit an ambiguous "N withheld (scope / size)": the system knows the reason.
+//
+// The completeness claim is therefore CONDITIONAL rather than dropped. Deleting the word
+// on every turn would weaken a statement that is true on most of them to avoid one that
+// is false on some, and it is the word that tells a reader "a rule missing here is
+// retired". The partial form costs ~40 bytes and only on the turns where it is earned.
 export const FLOOR_PRECEDENCE_SENTENCE =
   "This block is the complete current MLA floor snapshot and supersedes all earlier " +
   "MLA floor snapshots and generated projections.";
+
+// The same contract when a best-effort global rule was withheld. It names the ONE thing
+// that can go missing and says the reason, so "absent" stops meaning both "retired" and
+// "did not fit" at once. The supersession half is preserved verbatim: it is load-bearing
+// against the static `.claude/rules` projection and is true either way.
+export const FLOOR_PRECEDENCE_SENTENCE_PARTIAL =
+  "This block is the current MLA floor snapshot except best-effort [SHOULD] rules that " +
+  "did not fit this turn, and supersedes all earlier MLA floor snapshots and generated " +
+  "projections.";
+
+// M1 (session d779aeaa, 2026-08-09). The sentence above says SOMETHING may be missing
+// and never says WHAT, so three states read identically to the only party that has to
+// obey them: dropped for budget this turn, retired by a human, never existed. The first
+// still governs and rides again on a shorter prompt; the second must be stopped; the
+// third is nothing. An agent cannot miss what it was never shown, and until 2026-08-08
+// the difference was visible only to `analyze.py`, which diffs snapshots ACROSS turns
+// after the session is over.
+//
+// NO NEW IDENTITY PRIMITIVE. The proposal priced this as needing stable rule ids the
+// floor "does not currently mint"; it has minted them all along (`FloorRuleEntry.ruleId`,
+// and `assembleContext` already logs every drop as `best-effort:did-not-fit`). The
+// renderer is handed the entries it was previously handed only a count of.
+//
+// TEXT, NOT THAT ID, and `floor-delta.ts` settled the question once already for the
+// sibling surface: "the id answers 'which row changed' and the agent needs 'which
+// obligation changed'". Nothing in reach of this agent resolves a rule id back to its
+// statement, so an id here would be a dead handle. Same helper, same 120-character
+// measurement, one sample and an exact count, so the line stays one line.
+//
+// IT COSTS BYTES ON EXACTLY THE TURNS ALREADY OVER BUDGET, which is the honest objection
+// and is answered by where it is rendered rather than by argument: this is part of
+// `renderFloorBlock`, so every greedy trial in the assembler measures the block that
+// would actually be emitted, including this line. An omission report appended AFTER the
+// fill would silently overrun the budget the fill exists to enforce.
+// REASON-NEUTRAL, deliberately. Two paths render this block and they withhold for
+// different reasons: the assembler loses a byte contest and the rule rides again on a
+// shorter prompt, while the bash fallback is structurally unable to carry the tail at all
+// until the cache is upgraded. Naming "budget" would be false on the second. What is true
+// on both, and is the whole distinction M1 needs, is that the rule is WITHHELD and not
+// WITHDRAWN; the reason, where the system knows it, is already carried by the precedence
+// sentence directly above.
+const FLOOR_WITHHELD_PREFIX = "Withheld from this block, still governing, NOT retired:";
 
 // The compact floor block (targeted-rule-injection §4.8 wire format). Block-level
 // `trust="must-follow"` carries the authority, so per-rule attributes are dropped and
@@ -190,34 +260,90 @@ export const FLOOR_PRECEDENCE_SENTENCE =
 // tail, best-effort) self-downgrade with an explicit `[SHOULD]` label; unlabeled lines
 // inherit the block's must-follow trust. Text is XML-escaped so a rule payload cannot
 // close the envelope early. Returns "" when there is nothing to render.
-function floorContextBlock(mustTexts: string[], shouldTexts: string[]): string {
+// `withheld` are the global SHOULD rules that exist in the governed set and are NOT in
+// this block, which is the only way this block can be incomplete. A non-empty list both
+// selects the partial precedence sentence and names what is missing (M1); an empty one
+// costs zero bytes, which is the common case.
+function floorContextBlock(
+  mustTexts: string[],
+  shouldTexts: string[],
+  withheld: readonly FloorRuleRef[],
+): string {
   const lines = [
     ...mustTexts.map((t) => `- ${esc(oneLine(t))}`),
     ...shouldTexts.map((t) => `- [SHOULD] ${esc(oneLine(t))}`),
   ];
   if (!lines.length) return "";
-  return `<meetless-context kind="floor-rules" trust="must-follow">\n${FLOOR_PRECEDENCE_SENTENCE}\n${lines.join("\n")}\n</meetless-context>`;
+  const precedence = withheld.length ? FLOOR_PRECEDENCE_SENTENCE_PARTIAL : FLOOR_PRECEDENCE_SENTENCE;
+  // Escaped like any other rule payload: a withheld rule's own text rides this line, so
+  // it can close the envelope early for exactly the same reason a delivered one can.
+  const omission = withheld.length
+    ? `\n${FLOOR_WITHHELD_PREFIX} ${withheld.length} [SHOULD] rule(s): ` +
+      `${esc(oneLine(sampleWithCount(withheld)))}`
+    : "";
+  return `<meetless-context kind="floor-rules" trust="must-follow">\n${precedence}${omission}\n${lines.join("\n")}\n</meetless-context>`;
 }
 
 // Entry-based floor renderer for the byte-budgeted assembler. `must` are the always-on
 // global MUST rules (Tier 0, required); `should` are the global SHOULD tail (best-effort,
 // re-rendered as the assembler greedily fits them). Rule identities are cache/audit-only
 // and never reach the wire, so only the text is rendered.
-export function renderFloorBlock(must: FloorRuleEntry[], should: FloorRuleEntry[] = []): string {
+//
+// `configuredShould` is the global SHOULD rules the cache HOLDS, which the caller knows
+// and this function cannot infer: anything in it that is not in `should` is exactly the
+// "withheld for size" state the partial sentence exists for. It defaults to `should` so
+// an older caller keeps today's wording rather than silently claiming completeness it
+// cannot vouch for.
+//
+// M1: it takes ENTRIES rather than the count it used to take. A count can say that an
+// obligation is missing; only the entry can say which one, and the renderer cannot name
+// what it was not given. `ruleId` is the identity for the set difference (stable across
+// re-attest, so a reworded rule is the same rule); the TEXT is what gets quoted.
+export function renderFloorBlock(
+  must: FloorRuleEntry[],
+  should: FloorRuleEntry[] = [],
+  configuredShould: readonly FloorRuleEntry[] = should,
+): string {
+  const delivered = new Set(should.map((e) => e.ruleId));
   return floorContextBlock(
     must.map((e) => e.text),
     should.map((e) => e.text),
+    configuredShould.filter((e) => !delivered.has(e.ruleId)),
   );
 }
 
 // The compact floor block the bash-fallback hot path emits (schemaVersion-1 caches, or
-// when the assembler subcommand is unavailable). MUST-only by construction: `isFloorRule`
-// admits only human-attested MUST bundle rules, so the fallback never carries a SHOULD tail.
+// when the assembler subcommand is unavailable). MUST-only BY CONSTRUCTION: `isFloorRule`
+// admits only human-attested MUST bundle rules, so this path cannot carry a SHOULD tail
+// at all.
+//
+// H3: that makes it the SECOND omission path, and until now it printed the completeness
+// sentence while structurally unable to be complete on any workspace whose bundle holds
+// a global SHOULD. It cannot fix that (the tail has nowhere to go here), so it says so.
+//
+// M1: and it names them, for the same reason and by the same rule as the assembler path.
+// Consistency here is not tidiness, it is correctness: if this path printed the caveat
+// with no names while the other printed names, "no names" would read as "nothing
+// withheld" on exactly the degraded path where the most is. The identity mirrors
+// scan.ts `ruleIdOf` (governed rule-node id, else the content hash), the same pairing
+// `versionOf` above already makes for `versionIdOf`.
 export function renderFloorRulesXml(dirs: Directive[]): string {
   return floorContextBlock(
     dirs.filter(isFloorRule).map((d) => d.text),
     [],
+    dirs.filter(isGlobalShouldRule).map((d) => ({ ruleId: d.ruleNodeId ?? d.id, text: d.text })),
   );
+}
+
+// The global SHOULD tail: the same partition as `isFloorRule` on every axis except
+// strength. Exported so the "was anything withheld?" question has one definition.
+export function isGlobalShouldRule(d: Directive): boolean {
+  if (d.attestation !== "human_attested" || d.strength === "MUST_FOLLOW") return false;
+  const global = d.source
+    .split(",")
+    .map((s) => s.trim())
+    .includes("rule-bundle");
+  return global && !isScopedRule(d);
 }
 
 // One rendered scoped line: the imperative plus its explicit strength label. Scoped rules

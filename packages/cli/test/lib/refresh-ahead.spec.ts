@@ -100,7 +100,7 @@ describe("iso_to_epoch (Part 3 bash date helper)", () => {
     home = path.join(tmp, "home");
     fs.mkdirSync(home, { recursive: true });
   });
-  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("parses a Z-form ISO8601 timestamp to a plausible epoch", () => {
     // 2030-01-01T00:00:00Z == 1893456000 (UTC). Allow either branch (GNU/BSD).
@@ -125,7 +125,7 @@ describe("maybe_refresh_ahead (Part 3 proactive gate)", () => {
     home = path.join(tmp, "home");
     fs.mkdirSync(home, { recursive: true });
   });
-  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("comfortably-fresh token: does NOT spawn the CLI (hot path stays clean)", () => {
     const { rc, stubArgs } = runAhead({ home, expiresAt: "2999-01-01T00:00:00Z" });

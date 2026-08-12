@@ -18,7 +18,7 @@ describe("queue sidecar classification", () => {
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-classify-"));
   });
-  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("reaps lifecycle sidecars under the SAME session as .lock", () => {
     const sid = "sess-cuid-xyz";
@@ -36,8 +36,10 @@ describe("queue sidecar classification", () => {
     // One session reaped (not three phantom ".hb" / ".narration-cursor" sessions),
     // all eight files gone.
     expect(r.reaped).toEqual([sid]);
-    expect(r.removedFiles).toBe(8);
-    expect(fs.readdirSync(dir)).toEqual([]);
+    // `.turn` is deliberately NOT removed: it is the cross-hook join key and a resumed
+    // session must not restart its numbering. See the skip in reapQueue.
+    expect(r.removedFiles).toBe(7);
+    expect(fs.readdirSync(dir)).toEqual([`${sid}.turn`]);
   });
 
   it("leaves .workspaceId.bak.* backups untouched (unrecognized)", () => {

@@ -42,7 +42,7 @@ describe("writeProjectRules IN (foreign-repo onboarding rules)", () => {
     root = mkTmpRepo();
   });
   afterEach(() => {
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("creates CLAUDE.md with the Meetless rules block when none exists", () => {
@@ -65,8 +65,18 @@ describe("writeProjectRules IN (foreign-repo onboarding rules)", () => {
     expect(body.indexOf("meetless__retrieve_knowledge")).toBeLessThan(
       body.indexOf("meetless__query"),
     );
-    // The expectation: consult governed memory before grepping for concepts.
-    expect(body).toMatch(/before you (grep|search)/);
+    // The expectation, SCOPED BY QUESTION CLASS (2026-08-06). This used to assert
+    // /before you (grep|search)/, i.e. an absolute retrieve-before-grep order.
+    // Measured against a real session's actual work that order was wrong for most
+    // of it -- the questions were "which functions call X", "what does this regex
+    // do", "is this field ever written", where grep is the correct tool and the MCP
+    // has nothing better to say. A rule that is wrong most of the time is not
+    // obeyed the rest of the time either. Both halves must be stated, plus the
+    // escalation edge back to retrieval, so the rule stays followable.
+    expect(body).toMatch(/project-history, decision, constraint, or rationale/);
+    expect(body).toMatch(/code-shape questions/);
+    expect(body).toMatch(/inspect the code first/);
+    expect(body).toMatch(/then call `?retrieve_knowledge`?/);
     expect(body).toContain("mcp");
   });
 

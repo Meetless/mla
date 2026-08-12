@@ -31,7 +31,7 @@
 // command is still useful from a plain terminal.
 
 import * as fs from "fs";
-import { loadWorkspaceConfig, consoleDeepLink, WorkspaceCliConfig } from "../lib/config";
+import { loadWorkspaceConfig, consoleDeepLink, HOME, WorkspaceCliConfig } from "../lib/config";
 import { get, post, HttpError } from "../lib/http";
 
 // The two verdicts control accepts (ADJUDICATION_VERDICTS in
@@ -55,6 +55,16 @@ export interface EnforcementIncidentView {
   rule_name?: string | null;
   rule_node_id?: string | null;
   adjudication_note?: string | null;
+  /** "deny" | "warn". Optional because an older control omits it. `mla enforcement allow` reads it
+   * to refuse overriding a warn, which was never blocked and so has nothing to override. */
+  decision?: string | null;
+  /** The ceiling the rule was ATTESTED at (D.4), independent of `decision`. */
+  enforcement_ceiling?: string | null;
+  /** INV-8 consent: "overridden" when a human grant withheld the block. */
+  consent_state?: string | null;
+  /** The user's answer to an ASK prompt: "unknown" on every ask, because the host exposes no
+   * permission outcome to a hook. Null on warn and deny rows. */
+  ask_outcome?: string | null;
 }
 
 interface EnforcementListResponse {
@@ -257,6 +267,13 @@ export async function runEnforcement(
   const out = deps.out ?? ((l: string) => console.log(l));
   const err = deps.err ?? ((l: string) => console.error(l));
 
+  // INV-8's override verb. Dispatched before the verdict parser because it is not an adjudication:
+  // `confirm`/`dismiss` record what a human thought of a block AFTER the fact, `allow` records that
+  // a human accepted ONE blocked action so it can proceed now.
+  if (argv[0] === "allow") {
+    return runEnforcementAllow(argv.slice(1), { log: out });
+  }
+
   let parsed: ParsedEnforcementArgs;
   try {
     parsed = parseEnforcementArgs(argv);
@@ -410,4 +427,90 @@ function reportListError(e: unknown, err: (l: string) => void): number {
   }
   err(`Could not list enforcement blocks: HTTP ${status}`);
   return 1;
+}
+
+// --- INV-8: the immediate, action-scoped override -----------------------------------------------
+
+/**
+ * `mla enforcement allow <incident-id>` -- record consent for exactly one blocked action.
+ *
+ * This is INV-8's "immediate override mechanism" and it is deliberately the smallest thing that can
+ * be one. It is NOT a `--force`, NOT a "disable enforcement" switch, and NOT a ceiling change: the
+ * rule keeps its attested authority, and this records that a human accepted ONE action under it.
+ *
+ * The grant it writes is single-use and keyed to the incident, its rule version, the normalized
+ * action, and the session, so approving one blocked write approves that write and nothing else. The
+ * retry is immediate and local: no control round trip, so an operator offline behind their own block
+ * is never stuck.
+ */
+export async function runEnforcementAllow(
+  argv: string[],
+  deps: {
+    home?: string;
+    env?: NodeJS.ProcessEnv;
+    now?: () => number;
+    log?: (s: string) => void;
+    listIncidents?: (cfg: WorkspaceCliConfig) => Promise<EnforcementListResponse>;
+  } = {},
+): Promise<number> {
+  const log = deps.log ?? ((s: string) => console.log(s));
+  const env = deps.env ?? process.env;
+  const incidentId = (argv[0] ?? "").trim();
+  if (!incidentId || incidentId.startsWith("-")) {
+    console.error(
+      "usage: mla enforcement allow <incident-id>\n" +
+        "Records a SINGLE-USE override for the exact action that incident blocked.\n" +
+        "Run `mla enforcement --all` to see incident ids.",
+    );
+    return 2;
+  }
+  const sessionId = (env.CLAUDE_CODE_SESSION_ID ?? "").trim();
+  if (!sessionId) {
+    console.error(
+      "No current session (CLAUDE_CODE_SESSION_ID unset). An override is scoped to the session that\n" +
+        "hit the block, so it must be granted from inside that session.",
+    );
+    return 2;
+  }
+
+  const cfg = loadWorkspaceConfig();
+  const list = await (deps.listIncidents ?? defaultListIncidents)(cfg);
+  const incident = list.incidents.find((i) => i.incident_id === incidentId);
+  if (!incident) {
+    console.error(`No incident ${incidentId} in the last ${list.window_days} days.`);
+    return 1;
+  }
+  if (incident.decision !== "deny") {
+    // A warn was never blocked, so there is nothing to override. Refusing here keeps the grant
+    // population equal to the blocked population rather than letting consent accrue against
+    // advisories.
+    console.error(
+      `Incident ${incidentId} was a ${incident.decision}, not a block. There is nothing to override.`,
+    );
+    return 1;
+  }
+  if (!incident.blocked_path || !incident.rule_version_id) {
+    console.error(
+      `Incident ${incidentId} does not record the action it blocked, so an override cannot be scoped to it.`,
+    );
+    return 1;
+  }
+
+  const { actionKey, grantConsent } = await import("../lib/rules/enforcement-consent");
+  const ok = grantConsent(deps.home ?? HOME, {
+    incidentId,
+    ruleVersionId: incident.rule_version_id,
+    actionKey: actionKey(incident.enforced_tool ?? "", incident.blocked_path),
+    sessionId,
+    grantedAtMs: (deps.now ?? Date.now)(),
+  });
+  if (!ok) {
+    console.error("Could not record the override. The record IS the override, so nothing was granted.");
+    return 1;
+  }
+  log(
+    `Override recorded for ${incidentId}: ${incident.enforced_tool} ${incident.blocked_path}.\n` +
+      "Single use, this session only, this rule version only. Retry the exact action once.",
+  );
+  return 0;
 }

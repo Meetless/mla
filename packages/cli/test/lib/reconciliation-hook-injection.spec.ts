@@ -5,6 +5,7 @@ import * as path from "path";
 import { SCAN_SCHEMA_VERSION } from "../../src/lib/scanner/types";
 import type { ReconciliationFinding } from "../../src/lib/scanner/types";
 import { normalizedContentHash } from "../../src/lib/scanner/content-normalization";
+import { assembleAuditPath } from "../../src/lib/scanner/cache";
 
 // ADR §3.5 / §8 tests 18-21, at the PROCESS boundary: the real user-prompt-submit.sh bash hook
 // driving the real built `mla _internal assemble-context` binary, with a real file on disk for the
@@ -165,8 +166,22 @@ async function runHook(args: {
   const status = await new Promise<number>((resolve, reject) => {
     const child = spawn("bash", [path.join(args.root, HOOK)], {
       cwd: workdir,
-      env: { ...process.env, HOME: args.root, MEETLESS_HOME: args.home, MEETLESS_DEBUG: "0" },
+      env: {
+        ...process.env,
+        HOME: args.root,
+        MEETLESS_HOME: args.home,
+        MEETLESS_DEBUG: "0",
+        // This suite's subject is the reconciliation block, not governance. These
+        // sandboxes have no pending-count cache, and since P13 that legitimately emits
+        // a once-per-session "review status UNAVAILABLE" notice, which would append to
+        // the context these tests assert byte-for-byte. Muting the unrelated surface
+        // isolates the unit under test; governance has its own suites.
+        MEETLESS_GOVERNANCE_HINT: "0",
+      },
     });
+    // A chunk boundary can fall INSIDE a multi-byte character; setEncoding puts a
+    // StringDecoder in front of the seam so `+=` never accumulates a U+FFFD pair.
+    child.stdout.setEncoding("utf8");
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", () => {});
     child.on("error", reject);
@@ -183,7 +198,15 @@ async function runHook(args: {
       additionalContext = null;
     }
   }
-  const auditFile = path.join(args.home, "workspaces", WS, "assemble-audit.json");
+  // PER SESSION since 6b86b437e: the assemble audit is also the floor delta's baseline, so
+  // keying it on the workspace alone made every session on the machine diff against
+  // whatever stranger wrote last. Read through `assembleAuditPath` rather than re-spelling
+  // the filename, so the next re-key moves this harness with the code.
+  //
+  // `args.root`, NOT `args.home`. `resolveStateRoot` appends `.meetless` to what it is
+  // given and `args.home` already ends in it; the sandbox sets HOME=<root> and
+  // MEETLESS_HOME=<root>/.meetless, two conventions reaching one directory.
+  const auditFile = assembleAuditPath(WS, args.root, args.sessionId);
   let audit: PersistedAudit | null = null;
   if (fs.existsSync(auditFile)) {
     try {
@@ -209,7 +232,7 @@ describe("ADR §3.5 reconciliation block: real hook + real binary", () => {
   }, 180000);
 
   afterAll(() => {
-    for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
+    for (const r of roots) fs.rmSync(r, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function sandbox(cache: CacheSeed) {

@@ -344,6 +344,12 @@ describe("the real registry", () => {
     //      nobody has heard of" and tombstones the whole real corpus. Nothing is
     //      lost by redacting these bytes; the MEANING inverts.
     //
+    // kb/withdraw joins under reason 3, in its sharpest form: its `relPath` is
+    // not content, it is the TARGET IDENTITY of a destructive action. A rewritten
+    // path does not withdraw a little less, it withdraws a DIFFERENT document or
+    // none at all, while reporting success. Refusing the send is the only outcome
+    // that leaves the KB in a state the operator can reason about.
+    //
     // The pin is a list, not a rule, because "cannot be rewritten" is a
     // judgement. A future row reaching for this mode to dodge classifying its
     // fields fails here and has to argue for itself in a diff.
@@ -351,6 +357,7 @@ describe("the real registry", () => {
     expect(rows.map((r) => r.note).sort()).toEqual([
       "KB ingest (intel)",
       "KB reingest: re-deliver an existing document's CURRENT on-disk bytes",
+      "KB withdraw-by-path (intel)",
       "amend governing rule (mint-next)",
       "bulk rule import (G2 one-time importer)",
       "mint governing rule v1",

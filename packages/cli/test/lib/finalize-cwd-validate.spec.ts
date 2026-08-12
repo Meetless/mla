@@ -93,7 +93,7 @@ describe("`mla _internal finalize-session` always POSTs (Decision 7)", () => {
     if (originalHomeEnv === undefined) delete process.env.MEETLESS_HOME;
     else process.env.MEETLESS_HOME = originalHomeEnv;
     global.fetch = fetchOriginal;
-    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("POSTs the empty-shell git evidence when cwd is non-repo AND MEETLESS_REPO_PATH unset", async () => {
@@ -131,7 +131,7 @@ describe("`mla _internal finalize-session` always POSTs (Decision 7)", () => {
       expect(body.gitEvidence.errors.length).toBeGreaterThan(0);
     } finally {
       okSpy.mockRestore();
-      fs.rmSync(nonRepo, { recursive: true, force: true });
+      fs.rmSync(nonRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -175,8 +175,8 @@ describe("`mla _internal finalize-session` always POSTs (Decision 7)", () => {
     } finally {
       errSpy.mockRestore();
       okSpy.mockRestore();
-      fs.rmSync(nonRepo, { recursive: true, force: true });
-      fs.rmSync(knownRepo, { recursive: true, force: true });
+      fs.rmSync(nonRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(knownRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -271,9 +271,9 @@ describe("on-demand finalize recovers the repo from the <sid>.repoPath sidecar (
     if (originalHomeEnv === undefined) delete process.env.MEETLESS_HOME;
     else process.env.MEETLESS_HOME = originalHomeEnv;
     global.fetch = fetchOriginal;
-    fs.rmSync(tmpHome, { recursive: true, force: true });
-    fs.rmSync(nonRepo, { recursive: true, force: true });
-    fs.rmSync(knownRepo, { recursive: true, force: true });
+    fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    fs.rmSync(nonRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    fs.rmSync(knownRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("reads the <sid>.repoPath sidecar to locate the repo, NOT the invocation cwd", async () => {

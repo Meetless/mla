@@ -54,7 +54,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  rmSync(HOME, { recursive: true, force: true });
+  rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 function seedCliConfig(intelUrl: string): void {
@@ -239,7 +239,7 @@ describe("mla enrich plan: workspace-marker gate wiring", () => {
 
   beforeEach(() => {
     seedCliConfig(`http://127.0.0.1:${port}`);
-    rmSync(join(HOME, "workspaces"), { recursive: true, force: true });
+    rmSync(join(HOME, "workspaces"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     hits = [];
     statusResponse = { status: 200, body: { onboarded: false } };
     repoDir = mkdtempSync(join(tmpdir(), "mla-enrich-wsgate-repo-"));
@@ -254,7 +254,7 @@ describe("mla enrich plan: workspace-marker gate wiring", () => {
     logSpy.mockRestore();
     errSpy.mockRestore();
     restoreCwd();
-    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // Simulate a COMPLETED local run of the current repo (as `enrich ingest` would leave it):

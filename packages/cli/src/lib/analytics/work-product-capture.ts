@@ -357,6 +357,14 @@ export interface WorkProductDigest {
 export interface DigestTurnInput {
   turn_index: number;
   user_prompts: string[];
+  // How many prompts this turn HAD whose text is not retained. ask-traces.jsonl stops
+  // persisting `input.prompt` (the raw-prompt-at-rest fix) but still records
+  // prompt_chars, so "a prompt existed" survives even though its words do not.
+  // Without this the digest reports a withheld prompt and an absent prompt
+  // identically, and the judge reads "the user said nothing" off a turn where the
+  // user spoke. Folded into `truncated` below rather than given its own field: the
+  // completeness contract already means "what you are reading is not the whole thing".
+  user_prompts_withheld?: number;
   assistant_outputs: PreparedPiece[];
   hunks: Array<{ file: string; tool: string; piece: PreparedPiece }>;
 }
@@ -424,6 +432,9 @@ export function buildWorkProductDigest(
       redactedSubstance = redactedSubstance || pp.redactedSubstance;
     }
     const user_prompt = preparedPrompts.map((pp) => pp.text).join("\n\n");
+    // A prompt we know happened but cannot show is a HOLE in the evidence, so it
+    // reads as incomplete rather than as silence.
+    if ((t.user_prompts_withheld ?? 0) > 0) truncated = true;
 
     // assistant_outputs: cap the list length, then id each in occurrence order.
     const outputsIn = t.assistant_outputs.slice(0, MAX_ASSISTANT_OUTPUTS_PER_TURN);

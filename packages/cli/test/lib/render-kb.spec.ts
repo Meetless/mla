@@ -31,27 +31,84 @@ function baseReceipt(): KbAddReceipt {
 }
 
 describe("renderKbAddReceipt B1 extraction honesty", () => {
-  it("states relationship extraction is queued/async on a fresh ingest", () => {
-    const out = renderKbAddReceipt(baseReceipt());
-    expect(out.toLowerCase()).toContain("relationship");
+  // The lane changed under this block. `mla kb add` used to report the whole-doc
+  // GRAPH_EXTRACT relationship lane, which An retired 2026-06-26 because nothing
+  // consumed its accepted candidates. The claim-grain ONTOLOGY_EXTRACT job is the
+  // only mining lane left, so the receipt reports CLAIMS and points at
+  // `mla kb claims --pending`, the queue that actually fills.
+  //
+  // These assertions used to demand the word "relationship". Keeping them would have
+  // pinned the receipt to a lane that no longer runs, which is how the old poll
+  // survived: every test agreed with it, and none of them talked to the server.
+
+  it("states claim extraction is queued/async on a fresh ingest that enqueued a job", () => {
+    const r = baseReceipt();
+    r.extractionJobId = "job-1";
+    const out = renderKbAddReceipt(r);
+    expect(out.toLowerCase()).toContain("claim");
     expect(out.toLowerCase()).toMatch(/queued|extracting|async/);
   });
 
   it("does not leave a bare outbox event as the only post-ingest signal", () => {
-    const out = renderKbAddReceipt(baseReceipt());
-    const hasOutbox = out.includes("KB_INGESTED");
-    const hasRelationships = /relationship/i.test(out);
-    // The outbox line may remain, but a relationships signal MUST accompany it.
-    expect(hasOutbox && hasRelationships).toBe(true);
+    const r = baseReceipt();
+    r.extractionJobId = "job-1";
+    const out = renderKbAddReceipt(r);
+    expect(out.includes("KB_INGESTED") && /claim/i.test(out)).toBe(true);
   });
 
-  it("renders the real extraction result when the ingest pipeline provides it (B3 sync forward-compat)", () => {
-    const r = baseReceipt();
-    r.extraction = { state: "completed", candidateCount: 3, conflictCount: 1 };
-    const out = renderKbAddReceipt(r);
-    expect(out).toMatch(/3 candidate/i);
-    expect(out).toMatch(/1 conflict/i);
+  it("says UNKNOWN, never queued, when the ingest produced no job to poll", () => {
+    // THE REGRESSION THIS BLOCK MISSED. With no job id there is nothing to watch,
+    // and printing the queued sentence there is exactly what made a dead poll
+    // indistinguishable from a slow one on every successful add for months.
+    const out = renderKbAddReceipt(baseReceipt());
+    expect(out.toLowerCase()).toContain("unknown");
+    expect(out.toLowerCase()).not.toMatch(/extraction queued|claim extraction queued/);
   });
+
+  it("renders the real extraction result when the poll resolves it", () => {
+    const r = baseReceipt();
+    r.extractionJobId = "job-1";
+    r.extraction = { state: "completed", candidateCount: 3, conflictCount: 0 };
+    const out = renderKbAddReceipt(r);
+    expect(out).toMatch(/3 claims awaiting review/i);
+    expect(out).toMatch(/mla kb claims --pending/);
+  });
+
+  it("distinguishes 'completed with zero claims' from 'status never arrived'", () => {
+    // The two sentences the old renderer collapsed. A terminal empty extraction is a
+    // finished fact; an unknown status is a missing one, and they call for opposite
+    // operator actions.
+    const done = baseReceipt();
+    done.extractionJobId = "job-1";
+    done.extraction = { state: "completed", candidateCount: 0, conflictCount: 0 };
+    const doneOut = renderKbAddReceipt(done);
+    expect(doneOut).toMatch(/no claims staged/i);
+    expect(doneOut.toLowerCase()).not.toContain("unknown");
+
+    const unknownOut = renderKbAddReceipt(baseReceipt());
+    expect(unknownOut.toLowerCase()).toContain("unknown");
+    expect(unknownOut).not.toMatch(/no claims staged/i);
+  });
+
+  it("reports a failed extraction as failed, with a retry that exists", () => {
+    const r = baseReceipt();
+    r.extractionJobId = "job-1";
+    r.extraction = { state: "failed", candidateCount: null, conflictCount: null };
+    const out = renderKbAddReceipt(r);
+    expect(out).toMatch(/FAILED/);
+    expect(out).toMatch(/mla kb reingest/);
+  });
+
+  it("never points the operator at the retired relationship queue", () => {
+    for (const st of ["queued", "running", "completed", "failed", "unknown"] as const) {
+      const r = baseReceipt();
+      r.extraction = { state: st, candidateCount: 0, conflictCount: 0 };
+      const out = renderKbAddReceipt(r);
+      expect(out).not.toMatch(/`mla kb pending`/);
+      expect(out).not.toMatch(/CONTRADICTS\/SUPERSEDES/);
+    }
+  });
+
 
   it("reports a failed extraction with a retry pointer", () => {
     const r = baseReceipt();
@@ -309,5 +366,55 @@ describe("renderKbPurgeReceipt slice-A governed shape", () => {
     const out = renderKbPurgeReceipt(r);
     expect(out).toContain("already_purged");
     expect(out.toLowerCase()).toMatch(/already redacted|nothing to do/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `noop_unchanged` was one word for two opposite states.
+//
+// Measured 2026-08-07 against the real CLI: `mla kb add` on a 350 KB note that is
+// present on disk printed `outcome: noop_unchanged`, `revisionId: (unset)`,
+// `chunk count: 0`. An operator reads that as "already governed, nothing to do".
+// The truth was the opposite: the document is TOMBSTONED, so it is not chunked, not
+// retrievable, and not governed at all. A healthy already-current document prints a
+// byte-identical receipt, so the two could not be told apart from the surface the
+// operator uses. That note sat in a coverage backlog looking like an unexplained
+// failure until the tombstone was found by querying the database directly.
+//
+// Declining to revive a tombstoned document stays the governed behaviour and is
+// correct. Only the silence is fixed.
+// ---------------------------------------------------------------------------
+describe("kb add receipt: a no-op says WHY when the answer is not 'nothing changed'", () => {
+  const base = {
+    mode: "file" as const,
+    workspaceId: "ws_1",
+    outcome: "noop_unchanged",
+    documentId: "doc_1",
+    canonicalPath: "notes/x.md",
+    parentUuid: "doc_1",
+    provenance: "human_authored",
+    revisionId: null,
+    revisionStatus: null,
+    chunkCount: 0,
+    normalizedBodyHash: null,
+    fullDocumentHash: null,
+    outboxEventType: null,
+  };
+
+  it("names the tombstone, so the reader knows the document is NOT served", () => {
+    const out = renderKbAddReceipt({ ...base, noopReason: "tombstoned" } as any);
+
+    expect(out).toMatch(/no-op reason:\s+tombstoned/);
+    // And it must not read as an error: a tombstone is a governed decision, not a
+    // transport failure, so the failure channel stays untouched.
+    expect(out).not.toContain("FAILED");
+  });
+
+  it("an ordinary no-op grows no line at all", () => {
+    // The common case is a content-identical re-delivery of a healthy document.
+    // That is not a finding and must not acquire a field that reads as one.
+    const out = renderKbAddReceipt(base as any);
+
+    expect(out).not.toMatch(/no-op reason/);
   });
 });

@@ -47,9 +47,21 @@ const PILOT_DELIVERY_CHANNELS: DeliveryChannel[] = ["preToolUse"];
 // rule defaults to WARN (the observe -> warn -> block ramp), a promotion to DENY being a deliberate,
 // separately-attested step. See DEFAULT_FORBIDDEN_ROOT_CEILING below.
 const PILOT_ENFORCEMENT_CEILING: EligibleEnforcement = "DENY";
-// The default authority a generic forbidden-root rule arms at: the non-blocking middle rung (INV-8). A
+// The default authority a generic forbidden-root rule arms at: the non-blocking middle rung. A
 // brand-new mechanically-evaluable rule must never hard-block on its first arming; it warns until it has
 // earned DENY. notes-location-v1 overrides this with PILOT_ENFORCEMENT_CEILING.
+//
+// ATTRIBUTION CORRECTED 2026-08-05. This comment used to cite the first-arming rule as "(INV-8)".
+// INV-8 does not contain it: the invariant requires that blocking rest on an explicit governed rule,
+// unambiguous scope, a clear violation, meaningful consequence, an immediate override mechanism and a
+// complete audit record, and it sends low-confidence cases to warn. Grepping the doctrine for
+// "arming", "armed" or "earned DENY" returns nothing. The ramp is real, and it is GRADUATED-ACTION
+// POLICY (notes/20260710-enforcement-warn-rung-graduated-action.md), a sound application of INV-8's
+// "low-confidence cases warn" rather than a quotation from it.
+//
+// The correction is recorded here because this comment is the ORIGIN of the misattribution: a deleted
+// proposal quoted it as "That is INV-8", the value program inherited that, and a pause point asking An
+// to interpret a clause the invariant does not contain was built on top of it. Do not re-add the cite.
 const DEFAULT_FORBIDDEN_ROOT_CEILING: EligibleEnforcement = "WARN";
 const PILOT_INFRASTRUCTURE_FAILURE_POLICY = "PASS_WITH_ALERT" as const;
 const PILOT_EVALUATOR_CONTRACT_VERSION = "four-state-evaluator-v1";

@@ -37,7 +37,7 @@ describe("acquireOnboardingLock", () => {
     home = mkdtempSync(join(tmpdir(), "mla-lock-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const acquire = (over: Partial<Parameters<typeof acquireOnboardingLock>[0]> = {}) =>
@@ -191,7 +191,7 @@ describe("releaseOnboardingLock", () => {
     home = mkdtempSync(join(tmpdir(), "mla-lock-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const acquire = (runId: string, now = T0) =>

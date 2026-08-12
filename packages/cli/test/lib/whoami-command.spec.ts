@@ -47,7 +47,7 @@ describe("runWhoami", () => {
     if (prevToken === undefined) delete process.env.MEETLESS_CONTROL_TOKEN;
     else process.env.MEETLESS_CONTROL_TOKEN = prevToken;
     errSpy.mockRestore();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function loadRunWhoami(): typeof import("../../src/commands/whoami").runWhoami {

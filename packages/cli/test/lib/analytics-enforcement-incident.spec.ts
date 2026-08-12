@@ -51,7 +51,7 @@ describe("emitEnforcementIncident", () => {
     delete process.env.MEETLESS_NO_TELEMETRY;
     observability.resetRunIdForTesting();
     observability.resetRunTracerForTesting();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function input(over: Partial<EmitModule["emitEnforcementIncident"] extends (i: infer I, ...rest: never[]) => unknown ? I : never> = {}) {

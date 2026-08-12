@@ -96,7 +96,7 @@ describe("mla activate back-fills pre-activation prompts", () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mla-bf-"));
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("spools only the prompt that predates activatedAt, with a deterministic key", async () => {

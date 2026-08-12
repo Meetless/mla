@@ -17,7 +17,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { scanForSecrets } from "../redactor";
-import { classifyMemory } from "./classify";
+import { classifyMemory, isCapturable } from "./classify";
 
 // Tokens that the future Phase 2B pre-upload credential denylist MUST catch
 // (the credential-denylist readiness probe). The space-delimited Redis
@@ -52,6 +52,18 @@ export interface CorpusReport {
   // Project files carrying a secret signal (observe-only; NOT blocked, NOT a
   // value gate). Reported so the operator can eyeball false positives.
   secretSignalFiles: Array<{ file: string; ruleIds: string[] }>;
+  // The same set, split by WHAT KIND of claim the signal is. One undifferentiated
+  // count read "866 of 876 files", of which 856 were generic-entropy only: a number
+  // that large is not a finding, it is a line the operator learns to skip.
+  //
+  // named:       at least one EXPLICIT rule fired (provider prefix, JWT, Redis
+  //              directive, credential-named env assignment). It names the family it
+  //              found, so it is worth a human's attention.
+  // entropyOnly: only `high_entropy_token`. That claim is "this file contains a long
+  //              opaque string", which across a corpus of governed notes is nearly
+  //              always a document identifier. Kept visible, counted apart.
+  namedSecretSignalFiles: Array<{ file: string; ruleIds: string[] }>;
+  entropyOnlySignalFiles: Array<{ file: string; ruleIds: string[] }>;
   // Files carrying a known credential fixture token that the scanner FAILED to
   // match. Empty = the Phase 2B credential-denylist probe holds. Non-empty = a
   // known live secret would slip past a future pre-upload blocker.
@@ -81,6 +93,8 @@ export function analyzeCorpus(memoryDir: string): CorpusReport {
       malformedFiles: 0,
       sizeBytes: { min: 0, median: 0, p90: 0, max: 0 },
       secretSignalFiles: [],
+      namedSecretSignalFiles: [],
+      entropyOnlySignalFiles: [],
       credentialProbeMisses: [],
       credentialProbePass: true,
       manualGates: [],
@@ -110,9 +124,12 @@ export function analyzeCorpus(memoryDir: string): CorpusReport {
     byType[typeKey] = (byType[typeKey] ?? 0) + 1;
     sizes.push(bytes);
 
-    // Scan only what MVP would actually capture (project files); still record
-    // fixture tokens everywhere so a misclassified secret file is visible.
-    const blockRuleIds = cls.type === "project" ? scanForSecrets(text) : [];
+    // Scan exactly what capture would actually upload; still record fixture
+    // tokens everywhere so a misclassified secret file is visible. Bound to
+    // isCapturable so widening eligibility widens the scan in the same move: a
+    // newly captured type that the report did not scan would report a clean
+    // corpus while uploading an unscanned one.
+    const blockRuleIds = isCapturable(cls) ? scanForSecrets(text) : [];
     const lower = text.toLowerCase();
     const hasFixtureToken = FIXTURE_TOKENS.some((t) => lower.includes(t));
 
@@ -123,8 +140,15 @@ export function analyzeCorpus(memoryDir: string): CorpusReport {
   sizes.sort((a, b) => a - b);
 
   const secretSignalFiles = files
-    .filter((f) => f.type === "project" && f.blockRuleIds.length > 0)
+    .filter((f) => f.blockRuleIds.length > 0)
     .map((f) => ({ file: f.file, ruleIds: f.blockRuleIds }));
+  const ENTROPY_RULE = "high_entropy_token";
+  const namedSecretSignalFiles = secretSignalFiles.filter((f) =>
+    f.ruleIds.some((r) => r !== ENTROPY_RULE),
+  );
+  const entropyOnlySignalFiles = secretSignalFiles.filter((f) =>
+    f.ruleIds.every((r) => r === ENTROPY_RULE),
+  );
 
   // Credential-denylist readiness probe: any file carrying a known fixture token
   // must be matched by the scanner. (Scan even non-project files for the
@@ -147,6 +171,8 @@ export function analyzeCorpus(memoryDir: string): CorpusReport {
       max: sizes[sizes.length - 1] ?? 0,
     },
     secretSignalFiles,
+    namedSecretSignalFiles,
+    entropyOnlySignalFiles,
     credentialProbeMisses,
     credentialProbePass: credentialProbeMisses.length === 0,
     manualGates: [

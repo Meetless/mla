@@ -152,7 +152,7 @@ describeIf("home.sh: the hook layer's $HOME repair", () => {
       // every caller treats as "do nothing". It must never come out relative.
       expect(r.stdout).toBe("");
     } finally {
-      rmSync(bin, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -175,7 +175,7 @@ describe("the fallback when home.sh is MISSING (a corrupt install)", () => {
     execFileSync("cp", [join(HOOKS, "common.sh"), join(dir, "common.sh")]);
   });
 
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("common.sh disables capture rather than re-rooting into the cwd", () => {
     const r = spawnSync("bash", ["-c", `source "${join(dir, "common.sh")}"; echo REACHED`], {
@@ -205,7 +205,7 @@ describe("the fallback when home.sh is MISSING (a corrupt install)", () => {
       expect(r.status).toBe(0);
       expect(r.stdout).toBe(join(state, "queue"));
     } finally {
-      rmSync(state, { recursive: true, force: true });
+      rmSync(state, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -218,7 +218,7 @@ describeIf("the hooks under a poisoned $HOME (the incident, replayed)", () => {
   });
 
   afterEach(() => {
-    rmSync(cwd, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // Every shipped hook that resolves state from $HOME. Before this fix each one read

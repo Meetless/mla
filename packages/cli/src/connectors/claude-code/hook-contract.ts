@@ -6,6 +6,34 @@
 // generator's require graph). This module is a constants file: it declares no
 // IO and no behavior, only the shared shape both sides render from.
 
+// THE LAYER-2 ENRICH DEADLINE. One value, here, for every consumer.
+//
+// 10s since 2026-08-09 (d7e5bcc12), an evidence-backed and design-reviewed change, not a
+// latency ceiling raised to hide something: 270 of the 298 timeouts carrying a latency landed
+// in 6,000-6,100ms, which is the CLIENT deadline firing, and a replay served the same request
+// in 1,086ms. Rationale, the forward-only recovery cohort that prices it, and the stop
+// condition live in NT:notes/20260809-mla-the-answer-existed-in-1086ms-and-the-budget-cut-it-at-6000.md.
+//
+// WHY IT SITS IN THE CONTRACT MODULE. d7e5bcc12 gave the deadline one home inside the hook
+// because "a trace that reports a budget the hook did not apply is an instrument lying about
+// the very thing it exists to measure". The same argument does not stop at the script: every
+// READER of that trace has to agree with it too, and `stats.ts` prints the budget beside the
+// success-latency tail and decides from it whether the tail is near the wall. A reader's copy
+// that lags the hook turns that line into a comparison of two different regimes, which is
+// exactly what happened between 08-09 08:39 and this commit.
+//
+// The hook is a standalone bash script and cannot import this at runtime, so
+// `MLA_DEFAULT_INTERCEPT_MAX_S` in hooks-template/user-prompt-submit.sh still carries the
+// literal. It is no longer INDEPENDENT of this one: test/lib/enrich-budget-canonical.spec.ts
+// binds them, and moving either alone goes red. Generating the script would be a much larger
+// change than the drift is worth.
+//
+// NOT the same number as ask-outcomes' PRIOR_ENRICH_BUDGET_MS (6,000). That one is the frozen
+// historical boundary the recovery cohort measures against, and it must NOT follow this when
+// this next moves.
+export const LAYER2_ENRICH_BUDGET_S = 10;
+export const LAYER2_ENRICH_BUDGET_MS = LAYER2_ENRICH_BUDGET_S * 1000;
+
 // PostToolUse matcher. EMPTY STRING is Claude Code's catch-all (equivalent to
 // "*"): the hook fires after EVERY tool call. This is deliberate, not lazy.
 //
@@ -40,11 +68,41 @@ export const POST_TOOL_USE_MATCHER = "";
 // So the block stopped a model that was going to comply anyway and failed to stop the
 // one that wasn't. The matcher now covers Bash (shell redirects, tee, cp/mv, sed -i)
 // and the two file tools the old anchored regex also exempted, MultiEdit and
-// NotebookEdit. It is still an EXACT alternation, NOT the empty catch-all: Read, Grep,
-// Glob and friends never spawn the subcommand. `deriveWriteTargets` then decides what a
-// call actually writes, and a read-only Bash command (`ls`, `grep`) derives no targets
-// and passes straight through.
-export const PRE_TOOL_USE_MATCHER = "^(Write|Edit|MultiEdit|NotebookEdit|Bash)$";
+// NotebookEdit. `deriveWriteTargets` then decides what a call actually writes, and a
+// read-only Bash command (`ls`, `grep`) derives no targets and passes straight through.
+//
+// 2026-08-08 (F1, notes/20260807-did-mla-help-this-session-measured-and-a-fix-proposal.md):
+// Grep and Glob were ADDED. This comment used to end "Read, Grep, Glob and friends never
+// spawn the subcommand", and for Grep and Glob that is no longer true, deliberately.
+//
+// F1 re-surfaces a document mla already delivered THIS TURN at the moment the agent
+// reaches for the same fact by hand. The measured cases were a `Grep` for
+// current_revision_id and a `git log` over profiles.py; only the Bash call reached this
+// hook, so a mechanism registered on the old matcher could not fire on half the evidence
+// it exists for. That is a REACHABILITY failure of the kind that later reads as a tuning
+// problem.
+//
+// READ IS DELIBERATELY NOT HERE, and the reason is measured, not aesthetic. Every hooked
+// call spawns `node dist/pretool-entry.js`, and that spawn costs ~200ms on this machine
+// (benchmarked 2026-08-08: 233ms for the entry on an EMPTY payload, 207ms for a real
+// Write, 222ms for a Read; the spread is noise and F1's own logic is inside it). Bash
+// already pays that toll and always has. Read is the most frequent tool in a coding
+// session by a wide margin, so adding it would roughly double the number of tolled calls
+// for the WEAKEST arm of the matcher: a Read of the exact note mla delivered means the
+// agent is already using the evidence, which is the case F1 least needs to fix. Grep and
+// Glob are SEARCHES -- the agent hunting a fact it does not have -- which is precisely
+// F1's trigger, and they are far rarer than Read.
+//
+// (`extractNeedles` still understands Read. If the spawn cost ever collapses, or a
+// connector hooks Read for its own reasons, the matcher is the only line to change.)
+//
+// WHAT THIS DOES NOT WIDEN: what can be DENIED. `computePretoolDecision` fences the
+// enforcement ladder behind `ENFORCEABLE_TOOLS` (exactly the five write-capable tools),
+// so an inspection call takes the advisory path and returns BEFORE the bundle is read.
+// The enforcement surface is identical to the pre-F1 one; only the advisory surface
+// grew. Leaning on "deriveWriteTargets returns nothing for a Grep" instead would have
+// left the block / no-block boundary resting on an inference about today's rule set.
+export const PRE_TOOL_USE_MATCHER = "^(Write|Edit|MultiEdit|NotebookEdit|Bash|Grep|Glob)$";
 
 // PostToolUse matcher for the CE0 evidence-consultation hook (ce0-post-tool-use.sh,
 // proposal §4.1). Unlike the load-bearing PostToolUse hook (catch-all so the F3-B

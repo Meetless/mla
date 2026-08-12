@@ -45,7 +45,7 @@ describe("reapQueue (RC2 stale-session reaper)", () => {
     queueDir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-reap-"));
   });
   afterEach(() => {
-    fs.rmSync(queueDir, { recursive: true, force: true });
+    fs.rmSync(queueDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("reaps a fully-idle session: empty spool + all sidecars older than maxAgeSec", () => {
@@ -60,8 +60,10 @@ describe("reapQueue (RC2 stale-session reaper)", () => {
     const r = reapQueue({ queueDir, maxAgeSec: DAY, now: NOW });
 
     expect(r.reaped).toEqual([sid]);
-    expect(r.removedFiles).toBe(6);
-    expect(fs.readdirSync(queueDir)).toEqual([]);
+    // `.turn` is deliberately NOT removed: it is the cross-hook join key and a resumed
+    // session must not restart its numbering. See the skip in reapQueue.
+    expect(r.removedFiles).toBe(5);
+    expect(fs.readdirSync(queueDir)).toEqual([`${sid}.turn`]);
   });
 
   it("refuses a session with a non-empty spool while within the stranded gate (no data loss)", () => {
@@ -111,7 +113,7 @@ describe("reapQueue (RC2 stale-session reaper)", () => {
     expect(r.strandedReaped).toEqual([sid]);
     expect(r.discardedEvents).toBe(2);
     expect(r.skippedPending).toBe(0);
-    expect(fs.readdirSync(queueDir)).toEqual([]);
+    expect(fs.readdirSync(queueDir)).toEqual([`${sid}.turn`]);
   });
 
   it("reclaims a stranded draining snapshot past the 7d gate and counts only its events", () => {
@@ -200,7 +202,9 @@ describe("reapQueue (RC2 stale-session reaper)", () => {
     const r = reapQueue({ queueDir, maxAgeSec: DAY, now: NOW });
 
     expect(r.reaped).toEqual(["dead"]);
-    expect(r.removedFiles).toBe(3);
+    // `.turn` is deliberately NOT removed: it is the cross-hook join key and a resumed
+    // session must not restart its numbering. See the skip in reapQueue.
+    expect(r.removedFiles).toBe(2);
     expect(r.skippedPending).toBe(1);
     expect(r.skippedFresh).toBe(1);
     expect(fs.existsSync(path.join(queueDir, "live.jsonl"))).toBe(true);
@@ -230,7 +234,9 @@ describe("reapQueue (RC2 stale-session reaper)", () => {
 
     const dry = reapQueue({ queueDir, maxAgeSec: DAY, now: NOW, dryRun: true });
     expect(dry.reaped).toEqual([sid]);
-    expect(dry.removedFiles).toBe(3);
+    // 2, not 3: `.turn` is preserved by a real reap, and a dry run that promised to
+    // remove it would misreport the very thing this test exists to check.
+    expect(dry.removedFiles).toBe(2);
     expect(dry.skippedPending).toBe(1);
     expect(dry.skippedFresh).toBe(1);
     // nothing actually removed

@@ -16,7 +16,7 @@ describe("enumerateEligibleFiles (containment)", () => {
     outside = mkdtempSync(join(tmpdir(), "amc-out-"));
   });
   afterEach(() => {
-    for (const d of [mem, outside]) rmSync(d, { recursive: true, force: true });
+    for (const d of [mem, outside]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("enumerates direct .md children as complete", () => {

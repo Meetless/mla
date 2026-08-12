@@ -99,7 +99,7 @@ describe("common.sh spawn_auto_index (detached Zone 2 glue)", () => {
     try {
       expect(recorded).toContain("_internal auto-index --session sess-x");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -110,7 +110,7 @@ describe("common.sh spawn_auto_index (detached Zone 2 glue)", () => {
     try {
       expect(recorded).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

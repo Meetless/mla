@@ -150,6 +150,17 @@ const NO_OPERATOR = () => null;
 // list
 // ───────────────────────────────────────────────────────────────────────────
 
+function sinkWithLines() {
+  const outArr: string[] = [];
+  const errArr: string[] = [];
+  return {
+    out: (m: string) => outArr.push(m),
+    err: (m: string) => errArr.push(m),
+    errLines: () => errArr,
+    outLines: () => outArr,
+  };
+}
+
 describe("runRulesListBackend", () => {
   it("reads ACTIVE rules from the backend and renders one line per rule", async () => {
     const { http, calls } = fakeHttp({ get: () => [node(), node({ id: "node_2" })] });
@@ -1634,7 +1645,7 @@ describe("runRulesAttestBackend", () => {
   });
   afterEach(() => {
     closeCe0Store(store);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function pilotObservedSpec(over: Partial<ObservedRuleSpec> = {}): ObservedRuleSpec {
@@ -2514,5 +2525,163 @@ describe("rule delivery", () => {
     expect(code).toBe(0);
     expect(() => JSON.parse(rec.out.join("\n"))).not.toThrow();
     expect(rec.err).toEqual([]);
+  });
+
+  // ── I5 follow-up: a wording correction must not silently change the DELIVERY PLANE ──
+  //
+  // On 2026-08-05 a doctrine-vocabulary correction was made with revoke-and-remint instead
+  // of `edit`, and `mla rules add` defaulted the replacement to `ambient`. The original was
+  // `turn` with seven prompt triggers, so a rule that cost tokens only on design-doc turns
+  // silently became FLOOR delivery on every turn, workspace-wide, forever. The text, the
+  // authority scope, the strength and the lifecycle all looked correct. Nothing objected.
+  //
+  // `edit` is deliberately a FULL RESTATEMENT verb (see the call-site comment: an edit with
+  // no --turn-when-* mints ambient "exactly as an edit with no --must mints a SHOULD one"),
+  // which is what lets P4 flip a plane atomically. That contract is fine. What is not fine
+  // is that the WEAKENING direction is silent, and these tests pin both halves so neither
+  // can drift without a failing build.
+
+  it("edit: restating the triggers keeps ONE node, mints a new version, and stays SCOPED", async () => {
+    let patched: Record<string, unknown> | undefined;
+    const { http, calls } = fakeHttp({
+      get: () =>
+        node({
+          currentVersionId: "ver_1",
+          currentVersion: {
+            payload: {
+              text: "old text",
+              applicability: {
+                mode: "turn",
+                trigger: { promptAny: ["proposal"], explicitPathAny: ["notes/**/*.md"] },
+              },
+            },
+          },
+        } as never),
+      patch: (_p, body) => {
+        patched = body as Record<string, unknown>;
+        return node({ currentVersionId: "ver_2" });
+      },
+    });
+    const { out, err } = sink();
+    const code = await runRulesEditBackend(
+      [
+        "node_1",
+        "the corrected statement",
+        "--must",
+        "--turn-when-prompt",
+        "proposal",
+        "--turn-when-path",
+        "notes/**/*.md",
+      ],
+      { refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
+    );
+    expect(code).toBe(0);
+
+    // (3) the node id is unchanged: edit PATCHes the same node, it does not mint another.
+    expect(calls[0].path).toBe("/internal/v1/rules/node_1?workspaceId=ws_1");
+    // (4) a new version supersedes the prior one rather than overwriting it.
+    expect(patched!.expectedCurrentVersionId).toBe("ver_1");
+
+    const payload = patched!.payload as RulePayloadV1;
+    // (5) applicability is still turn, and (6) the trigger set is exactly unchanged.
+    expect(payload.applicability).toEqual({
+      mode: "turn",
+      trigger: { promptAny: ["proposal"], explicitPathAny: ["notes/**/*.md"] },
+    });
+    // (7) turn mode is what keeps delivery SCOPED; ambient is the floor plane.
+    expect((payload.applicability as { mode: string }).mode).not.toBe("ambient");
+    expect(payload.text).toBe("the corrected statement");
+  });
+
+  it("edit: OMITTING the triggers silently converts turn -> ambient (the trap, pinned)", async () => {
+    // Documents the full-restatement contract as it actually behaves. This test passing is
+    // NOT an endorsement: it is the tripwire. If someone makes edit preserve applicability
+    // instead, this fails loudly and the standing guidance below must be revisited.
+    let patched: Record<string, unknown> | undefined;
+    const { http } = fakeHttp({
+      get: () =>
+        node({
+          currentVersionId: "ver_1",
+          currentVersion: {
+            payload: {
+              text: "old text",
+              applicability: {
+                mode: "turn",
+                trigger: { promptAny: ["proposal"] },
+              },
+            },
+          },
+        } as never),
+      patch: (_p, body) => {
+        patched = body as Record<string, unknown>;
+        return node({ currentVersionId: "ver_2" });
+      },
+    });
+    const { out, err } = sink();
+    const code = await runRulesEditBackend(["node_1", "text only, no flags"], {
+      refreshDelivery: deliver(),
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    const payload = patched!.payload as RulePayloadV1;
+    // The prior version was turn-scoped. Omitting the flags reset it to the FLOOR plane.
+    expect(payload.applicability).toEqual({ mode: "ambient" });
+    // And the strength weakened the same way, from the same omission.
+    expect(payload.strength).toBe("SHOULD_FOLLOW");
+  });
+
+  it("edit: a silent weakening is now SAID out loud, in both directions", async () => {
+    // The reset still happens (the contract is restatement), but it can no longer be silent.
+    const { http } = fakeHttp({
+      get: () =>
+        node({
+          currentVersionId: "ver_1",
+          currentVersion: {
+            payload: {
+              text: "old text",
+              strength: "MUST_FOLLOW",
+              applicability: { mode: "turn", trigger: { promptAny: ["proposal"] } },
+            },
+          },
+        } as never),
+      patch: () => node({ currentVersionId: "ver_2" }),
+    });
+    const { out, err, errLines } = sinkWithLines();
+    const code = await runRulesEditBackend(["node_1", "text only, no flags"], {
+      refreshDelivery: deliver(),
+      loadConfig: cfg,
+      http,
+      resolveOperator: HUMAN,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    const said = errLines().join("\n");
+    expect(said).toContain("MUST_FOLLOW");
+    expect(said).toContain("AMBIENT FLOOR");
+  });
+
+  it("edit: NARROWING stays quiet, because only the weakening direction is dangerous", async () => {
+    const { http } = fakeHttp({
+      get: () =>
+        node({
+          currentVersionId: "ver_1",
+          currentVersion: {
+            payload: { text: "old text", strength: "SHOULD_FOLLOW", applicability: { mode: "ambient" } },
+          },
+        } as never),
+      patch: () => node({ currentVersionId: "ver_2" }),
+    });
+    const { out, err, errLines } = sinkWithLines();
+    const code = await runRulesEditBackend(
+      ["node_1", "now binding and scoped", "--must", "--turn-when-prompt", "proposal"],
+      { refreshDelivery: deliver(), loadConfig: cfg, http, resolveOperator: HUMAN, out, err },
+    );
+    expect(code).toBe(0);
+    expect(errLines().join("\n")).not.toContain("warning:");
   });
 });

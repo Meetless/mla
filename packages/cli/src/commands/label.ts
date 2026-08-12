@@ -7,9 +7,13 @@ import { resolveMeetlessHome } from "../lib/config";
 // to mark a handful of enrichments useful / noisy / harmful / prevented-a
 // -mistake. It writes the reserved `operator_label` block back into a trace line
 // in ~/.meetless/logs/ask-traces.jsonl. Low volume, high signal: this is the
-// ground-truth anchor the composite needs before any weight tuning, and the
-// `harmful` flag is the exact field the A5 carry-forward hook reads to suppress
-// a re-surface, so a `--harmful` label here closes that loop.
+// ground-truth anchor the composite needs before any weight tuning.
+//
+// The `harmful` flag USED to have a second consumer: the A5 carry-forward hook read it
+// to suppress a re-surface, so `--harmful` closed that loop. Carry-forward was removed
+// 2026-08-09 (see test/lib/carry-forward-payload-overlap.spec.ts for the ledger), so the
+// label is now purely an annotation. Nothing downstream acts on it, and that is worth
+// knowing before quoting it as an enforcement signal.
 //
 //   mla label [<trace_id>] [--useful] [--noisy] [--harmful]
 //             [--prevented-mistake] [--note <text>]

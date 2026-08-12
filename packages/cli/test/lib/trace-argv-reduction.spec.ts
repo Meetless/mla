@@ -232,7 +232,7 @@ describe("the egress redactor is NOT a second net for this", () => {
         startTime: "2026-08-02T00:00:00.000Z",
         endTime: "2026-08-02T00:00:01.000Z",
         status: "ok",
-        attributes: { legacy_argv: ["init", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"] },
+        attributes: { legacy_argv: ["init", "gh" + "p_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"] },
       },
       spans: [],
     };
@@ -245,6 +245,6 @@ describe("the egress redactor is NOT a second net for this", () => {
       withToken,
     );
 
-    expect(JSON.stringify(sent)).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+    expect(JSON.stringify(sent)).not.toContain("gh" + "p_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
   });
 });

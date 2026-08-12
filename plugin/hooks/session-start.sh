@@ -102,7 +102,53 @@ meetless_session_disabled "$SESSION_ID" && exit 0
 SOURCE="$(printf '%s' "$INPUT" | jq -r '.source // empty' 2>/dev/null || true)"
 if [[ "$SOURCE" == "compact" || "$SOURCE" == "clear" ]]; then
   rm -f "$(governance_inject_file "$SESSION_ID")" 2>/dev/null || true
+  # F2 (2026-08-06): the delivered-source ledger records what is already IN the
+  # context window, and compact/clear is precisely the event that empties it. Drop it
+  # here so previously-delivered evidence is eligible again, using the boundary this
+  # hook already owns rather than inventing an epoch counter. A `resume` is left
+  # alone on purpose: it reloads the transcript with the original blocks intact, so
+  # the agent still has them and re-sending would be the waste this fix removes.
+  rm -f "$(delivered_ledger_file "$SESSION_ID")" 2>/dev/null || true
 fi
+
+# Orphan sweep for per-session governance state. These files are keyed by session id,
+# so the line above can only ever reap the CURRENT session's; ids from finished sessions
+# never recur and their files sit there indefinitely. On the dogfood machine that left 87
+# inject-*.json files spanning 2026-06-06 to 2026-07-05.
+#
+# Their maximum legitimate lifetime is ONE SESSION: the only reader is
+# user-prompt-submit.sh for its own $SESSION_ID.
+#
+# `-mtime +7` does NOT mean "older than 7 days". Both BSD and GNU find divide the age into
+# whole 24-hour periods, truncating, and `+7` matches strictly more than seven of them, so
+# the REAL deletion boundary is EIGHT days: 7.9d survives, 8.0d is reaped. Measured, not
+# assumed, and bracketed by governance-orphan-sweep.spec.ts. The extra day errs the safe
+# way. Either figure is far beyond any single session and far below the two months these
+# had accumulated, and `-mtime` needs no date arithmetic to stay portable.
+#
+# Here rather than in a sweeper because this path already runs once per session, already
+# touches this directory, and already deletes from it. Deliberately NOT on session end:
+# there is no reliable session-end event, which is exactly why these orphaned. Bounded,
+# best-effort, and it can never fail the hook.
+find "$(governance_dir)" -maxdepth 1 -type f \
+  \( -name 'inject-*.json' -o -name 'unavail-*.json' -o -name 'route-*.json' \) \
+  -mtime +7 -delete 2>/dev/null || true
+
+# Same sweep, same reasoning, different directory: the assembler's per-turn audit
+# (`assemble-audit.<sessionId>.json`) became per-session so the floor delta diffs against
+# THIS session's previous floor instead of whichever of 10+ concurrent sessions wrote last
+# (cache.ts, assembleAuditPath). Per-session means orphaned-by-construction the moment the
+# session ends, exactly like the governance files above, so it gets the same bounded sweep
+# rather than a new mechanism.
+#
+# `-maxdepth 2` because these sit one level deeper, under `workspaces/<workspaceId>/`, and
+# a machine bound to several workspaces has one such directory each. The glob carries the
+# dot before the session id so the LEGACY workspace-shaped `assemble-audit.json` can never
+# match: it is not per-session, nothing reclaims it, and it is still read by callers that
+# cannot name a session.
+find "$MEETLESS_HOME_DIR/workspaces" -maxdepth 2 -type f \
+  -name 'assemble-audit.*.json' \
+  -mtime +7 -delete 2>/dev/null || true
 
 TRANSCRIPT="$(echo "$INPUT" | jq -r '.transcript_path // empty')"
 CWD="$PWD"

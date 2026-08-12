@@ -25,7 +25,7 @@ import { readFileSync } from "node:fs";
 
 import { HOME } from "../config";
 import { scanForCredentials, SECRET_SCANNER_VERSION } from "../redactor";
-import { classifyMemory } from "./classify";
+import { classifyMemory, isCapturable } from "./classify";
 import { enumerateEligibleFiles, MAX_FILE_BYTES } from "./containment";
 import { readLiveLedger, writeLiveLedger } from "./live-ledger";
 import { sha256Hex, syntheticSourceId } from "./pipeline";
@@ -134,8 +134,11 @@ export async function collectAndUploadOnce(
       continue;
     }
 
-    if (cls.type !== "project") {
-      // A previously-tracked project file became non-project: WITHDRAW it. A file
+    if (!isCapturable(cls)) {
+      // Eligibility is classify.isCapturable's call, never a string compared here
+      // (see pipeline.ts for why: the hardcoded compare made the rule dead code).
+      //
+      // A previously-tracked capturable file became ineligible: WITHDRAW it. A file
       // never tracked is simply skipped (it was never uploaded).
       if (prior) {
         const res = await deps.client.withdraw({
@@ -189,6 +192,8 @@ export async function collectAndUploadOnce(
         const cleared: LiveLedgerEntry = { ...prior, lastAttemptAt: now };
         delete cleared.blockedHash;
         delete cleared.blockedScannerVersion;
+        // The reason dies with the block; a clean file must never carry a stale one.
+        delete cleared.blockedRuleIds;
         ledger.entries[f.relativePath] = cleared;
         mutated = true;
       }
@@ -237,6 +242,9 @@ export async function collectAndUploadOnce(
           ...(prior ?? {}),
           blockedHash: hash,
           blockedScannerVersion: scannerVersion,
+          // Rule ids only, never the matched text. Persisted so `status` can name
+          // WHICH files are withheld and WHY after this pass ends.
+          blockedRuleIds: [...secretRuleIds],
           lastAttemptAt: now,
         };
         mutated = true;

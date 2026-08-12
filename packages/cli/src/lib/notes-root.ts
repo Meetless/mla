@@ -154,13 +154,7 @@ export function bestEffortNotesRoot(anchorDir: string = process.cwd()): string {
   if (envRoot) return path.resolve(expandHome(envRoot));
 
   const candidates = notesRootCandidates(anchorDir);
-  const hit = candidates.find((c) => {
-    try {
-      return fs.statSync(path.join(c.root, VAULT_MARKER)).isFile();
-    } catch {
-      return false;
-    }
-  });
+  const hit = candidates.find((c) => holdsVaultMarker(c.root));
   if (hit) return hit.root;
 
   const gitRoot = gitRootForVault(anchorDir);
@@ -171,12 +165,77 @@ export function bestEffortNotesRoot(anchorDir: string = process.cwd()): string {
 // own directory is what makes this correct, and it is what `mla kb add` does;
 // keep it that way. Throws when nothing resolves: the caller cannot mint a
 // governed identity without a root.
+//
+// S4 (2026-08-05): prefer a candidate that DECLARES ITSELF a vault. This is the write
+// path that MINTS identities, and until now it took candidates[0] unconditionally --
+// the first `.git` above the file -- while `bestEffortNotesRoot` beside it has always
+// checked the marker first. That asymmetry forked the corpus. Both of these are in the
+// dev KB right now, one file, two governed documents:
+//
+//   notes/20260628-rev9-augmentation-audit.md
+//   notes/notes/20260628-rev9-augmentation-audit.md
+//
+// Neither string is malformed. The defect is that a note's identity was a function of
+// where `.git` happened to sit ON THE DAY IT WAS INGESTED: with the vault as a plain
+// subdirectory the walk-up lands on the parent repo and the rel path carries a `notes/`
+// segment that the server then prefixes again; once someone runs `git init` inside the
+// vault, the same file mints a different id. A marker is a property of the VAULT, so it
+// survives that flip and the identity stops moving underneath the corpus.
+//
+// Deliberately NOT a `notes/notes` string fix. A `notes/` directory INSIDE a vault is a
+// real path segment and still appears in the identity; what is applied exactly once is
+// the ROOT (see the server's `_external_object_id`). The marker decides where the root
+// is, and nothing inspects the resulting string for repeated segments.
+//
+// Falls back to candidates[0] when nothing declares itself, which is byte-for-byte the
+// old behaviour and is what keeps every already-correct identity in the corpus unchanged.
 export function resolveVaultRootForFile(fileDir: string): string {
+  // An explicit root is AUTHORITATIVE and short-circuits everything, exactly as it
+  // does for every other caller: the operator has said where the vault is.
+  const explicit = explicitNotesRoot();
+  if (explicit) return explicit;
+
+  // The nearest ancestor that DECLARES itself a vault wins. This is a walk, not a new
+  // entry in `notesRootCandidates`, and the difference matters: that list is also used
+  // by `resolveNotesSourceFile`, which starts from an IDENTITY and must guess where the
+  // file lives, which is why it deliberately refuses to consider `<gitRoot>/notes` (two
+  // vaults could hold the same relative path and it would silently open the wrong one).
+  // Here we already HOLD the file. There is nothing to guess: we only need to know
+  // which of its own ancestors is the vault, and the marker answers that directly.
+  const declared = nearestMarkedVaultAbove(fileDir);
+  if (declared) return declared;
+
   const candidates = notesRootCandidates(fileDir);
-  if (candidates.length > 0) return candidates[0].root;
-  throw new NotesRootError(
-    "could not resolve a notes vault root for the governed identity; set MEETLESS_NOTES_ROOT or run inside a git repo",
-  );
+  if (candidates.length === 0) {
+    throw new NotesRootError(
+      "could not resolve a notes vault root for the governed identity; set MEETLESS_NOTES_ROOT or run inside a git repo",
+    );
+  }
+  return candidates[0].root;
+}
+
+// Walk up from `start` for the first directory holding the vault marker. Returns null
+// when none does, which is the unmarked-vault case and keeps the old walk-up behaviour.
+function nearestMarkedVaultAbove(start: string): string | null {
+  let cur = realOrSelf(start);
+  for (;;) {
+    if (holdsVaultMarker(cur)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+// Does this directory declare itself the vault root, rather than merely existing?
+// Shared by the read path (`bestEffortNotesRoot`) and the write path
+// (`resolveVaultRootForFile`) so the root a citation resolves through is the same one
+// that minted it. Two copies of this predicate is how they drifted apart.
+function holdsVaultMarker(root: string): boolean {
+  try {
+    return fs.statSync(path.join(root, VAULT_MARKER)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 export const NOTES_IDENTITY_ROOT = "notes";

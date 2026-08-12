@@ -60,7 +60,7 @@ describe("emitOnboardingFinding", () => {
     delete process.env.MEETLESS_NO_TELEMETRY;
     observability.resetRunIdForTesting();
     observability.resetRunTracerForTesting();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function rows(): Record<string, unknown>[] {

@@ -29,7 +29,7 @@ describe("removeMeetlessMcp", () => {
     expect(after.mcpServers.other).toBeDefined();
     expect(after.projects["/a"].mcpServers).toBeUndefined(); // emptied -> dropped
     expect(after.projects["/b"].mcpServers.keepme).toBeDefined();
-    fs.rmSync(path.dirname(p), { recursive: true, force: true });
+    fs.rmSync(path.dirname(p), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("is a no-op when there is no meetless server anywhere", () => {
@@ -37,7 +37,7 @@ describe("removeMeetlessMcp", () => {
     const res = removeMeetlessMcp(p);
     expect(res.changed).toBe(false);
     expect(res.backupPath).toBeNull();
-    fs.rmSync(path.dirname(p), { recursive: true, force: true });
+    fs.rmSync(path.dirname(p), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("is a safe no-op when the file is missing or unparseable", () => {
@@ -46,6 +46,6 @@ describe("removeMeetlessMcp", () => {
     const p = path.join(dir, ".claude.json");
     fs.writeFileSync(p, "{nope", "utf8");
     expect(removeMeetlessMcp(p).changed).toBe(false);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 });

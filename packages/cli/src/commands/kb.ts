@@ -8,6 +8,7 @@ import { runKbAdd } from "./kb_add";
 import { runKbShow } from "./kb_show";
 import { runKbReingest } from "./kb_reingest";
 import { runKbForget } from "./kb_forget";
+import { runKbReconcile } from "./kb_reconcile";
 import { runKbPurge } from "./kb_purge";
 import { runKbMove } from "./kb_move";
 import { runKbReviewList } from "./kb_pending";
@@ -337,6 +338,9 @@ Usage:
                       [--all] [--audit-all] [--json] [--open]
     mla kb reingest <kbdoc:<id>|note:<path>|<path>> [--path <new-path>] [--reason <s>]
     mla kb forget <kbdoc:<id>|note:<path>|<path>> [--reason <s>]
+    mla kb reconcile [<folder>] [--glob <g>] [--apply] [--reason <s>]
+        Compare a pinned corpus on disk against what the KB serves and withdraw
+        the notes that are no longer there. DRY RUN unless --apply is passed.
     mla kb purge <kbdoc:<id>|note:<path>|<path>> --reason <s> [--force]
     mla kb move <kbdoc:<id>|note:<path>|<path>> <new-path> [--reason <s>]
     mla kb retime <source-item-id> --effective-date <date>
@@ -431,6 +435,8 @@ export async function runKb(argv: string[]): Promise<number> {
       return runKbReingest(rest);
     case "forget":
       return runKbForget(rest);
+    case "reconcile":
+      return runKbReconcile(rest);
     case "purge":
       return runKbPurge(rest);
     case "move":

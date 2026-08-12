@@ -32,7 +32,7 @@ function writeMarker(dir: string, body: unknown): void {
 describe("shared workspace resolver (T1.1)", () => {
   const created: string[] = [];
   afterAll(() => {
-    for (const d of created) fs.rmSync(d, { recursive: true, force: true });
+    for (const d of created) fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("resolves workspaceId + workspaceName from a marker in the start dir", () => {

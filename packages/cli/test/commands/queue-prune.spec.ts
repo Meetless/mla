@@ -26,7 +26,7 @@ describe("runQueuePrune", () => {
   });
   afterEach(() => {
     logSpy.mockRestore();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("previews without --yes and removes nothing", async () => {

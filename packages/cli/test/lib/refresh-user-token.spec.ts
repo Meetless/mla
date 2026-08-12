@@ -100,7 +100,7 @@ describe("refresh_user_token (Part 3 bash helper)", () => {
     fs.mkdirSync(home, { recursive: true });
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("passes through rc 0 when the subcommand reports refreshed", () => {

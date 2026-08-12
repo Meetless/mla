@@ -3,6 +3,8 @@ import * as os from "os";
 import * as path from "path";
 
 import {
+  BUNDLE_CACHE_NEVER_FETCHED,
+  BUNDLE_CACHE_UNREADABLE,
   RULE_BUNDLE_CACHE_SCHEMA_VERSION,
   RULE_BUNDLE_SCHEMA_VERSION,
   readRuleBundleCache,
@@ -34,7 +36,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 function goodPayload(statement = "include a Mermaid diagram in design docs") {
@@ -121,16 +123,31 @@ describe("lease expiry -> stale (acc 17)", () => {
 });
 
 describe("no usable bundle -> unavailable (acc 15)", () => {
-  it("is unavailable when no cache file exists", () => {
+  // The two states below are both "unavailable" and must NOT share a reason. A file that was
+  // never written is the ordinary condition of a workspace nobody has pulled rules for yet
+  // (`mla activate` binds without fetching); a file that exists and will not parse is a corrupt
+  // local cache. `mla doctor` branches on exactly this to decide whether a zero floor is a benign
+  // fresh install or a delivery failure, so pooling them made it fail for every new user
+  // (notes/20260807-mla-activation-onboarding-audit.md §1.2 Finding A).
+  it("is unavailable, and says NEVER FETCHED, when no cache file exists", () => {
     const r = readRuleBundleCache(PRINCIPAL, { home, nowMs: BASE_MS });
-    expect(r).toMatchObject({ status: "unavailable", bundle: null, reason: "no cached rule bundle" });
+    expect(r).toMatchObject({
+      status: "unavailable",
+      bundle: null,
+      reason: BUNDLE_CACHE_NEVER_FETCHED,
+    });
   });
 
-  it("is unavailable on a corrupt (non-JSON) cache file", () => {
+  it("is unavailable, and says UNREADABLE, on a corrupt (non-JSON) cache file", () => {
     const file = ruleBundleCachePath(PRINCIPAL, home);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, "{ not json");
-    expect(readRuleBundleCache(PRINCIPAL, { home }).status).toBe("unavailable");
+    const r = readRuleBundleCache(PRINCIPAL, { home });
+    expect(r.status).toBe("unavailable");
+    // A corrupt cache must never read as a fresh install: that is what would let a real fault
+    // be reported as "nothing to deliver yet".
+    expect(r.reason).toBe(BUNDLE_CACHE_UNREADABLE);
+    expect(r.reason).not.toBe(BUNDLE_CACHE_NEVER_FETCHED);
   });
 
   it("is unavailable when the cache envelope schema does not match", () => {

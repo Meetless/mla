@@ -1,4 +1,4 @@
-import { MCP_RESTART_EXIT_CODE } from "../../src/lib/mcp-restart";
+import { MCP_RESTART_EXIT_CODE, MCP_RELOAD_FLAG } from "../../src/lib/mcp-restart";
 import {
   runMcpSupervisor,
   MCP_RESTART_MAX,
@@ -89,9 +89,13 @@ describe("runMcpSupervisor", () => {
   it("passes the supervisor argv through to every spawned worker", async () => {
     const h = harness([MCP_RESTART_EXIT_CODE, 0]);
     await runMcpSupervisor(["--dir", "/x"], h.deps);
+    // The operator's argv is carried verbatim to every worker. A RESPAWNED worker
+    // additionally carries MCP_RELOAD_FLAG so it announces its new tool list to a
+    // client that never saw the swap (M1; see mcp-reload-announce.spec.ts for the
+    // marking rules and the measured host behaviour behind them).
     expect(h.spawns).toEqual([
       ["--dir", "/x"],
-      ["--dir", "/x"],
+      ["--dir", "/x", MCP_RELOAD_FLAG],
     ]);
   });
 

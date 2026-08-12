@@ -82,6 +82,10 @@ import {
   convertNotesLocationSnapshot,
   NOTES_LOCATION_RULE_ID,
 } from "../lib/rules/attest-notes-location";
+import {
+  buildForbiddenCommandPayload,
+  parseCommandConjunction,
+} from "../lib/rules/attest-command-rule";
 import { serializeObservedRule } from "../lib/rules/observed-rule-hash";
 import { displayComplianceRoot, normalizeForbiddenRoot } from "../lib/rules/durable-observation";
 import { defaultCe0StorePath } from "./evidence";
@@ -159,15 +163,26 @@ export const RULES_ADD_BACKEND_USAGE =
   "  --workspace <id>  file the rule into the given workspace instead of the folder-bound one.";
 
 export const RULES_EDIT_BACKEND_USAGE =
-  "usage: mla rules edit <nodeId> \"<new statement>\" [--must] [--scope <glob>]... [--source <ref>]... [--json] [--workspace <id>]\n" +
-  "  Mints the NEXT version of an existing rule (the previous version is retained).";
+  "usage: mla rules edit <nodeId> \"<new statement>\" [--must] [--scope <glob>]... [--source <ref>]...\n" +
+  "                     [--turn-when-prompt <phrase>]... [--turn-when-path <glob>]... [--json] [--workspace <id>]\n" +
+  "  Mints the NEXT version of an existing rule (the previous version is retained).\n" +
+  "\n" +
+  "  RESTATEMENT, NOT PATCH. Every authored field is taken from THIS command's flags, so an\n" +
+  "  omitted flag takes its DEFAULT rather than the previous version's value. Omitting --must\n" +
+  "  downgrades a MUST_FOLLOW rule to SHOULD_FOLLOW; omitting --turn-when-* moves a turn-scoped\n" +
+  "  rule onto the AMBIENT FLOOR, where it is injected on every turn. Both are warned about on\n" +
+  "  stderr before the edit is sent, but the fix is to restate what you want to keep.\n" +
+  "\n" +
+  "  Complete restatement example (correct a wording error, keep everything else):\n" +
+  "    mla rules edit cmexample0000000000000001 \"<corrected statement>\" --must \\\n" +
+  "      --turn-when-prompt proposal --turn-when-prompt \"design doc\" --turn-when-path \"notes/**/*.md\"";
 
 export const RULES_REVOKE_BACKEND_USAGE =
   "usage: mla rules revoke <nodeId> [--yes] [--workspace <id>]\n" +
   "  Revokes a rule on the backend (the kill switch). Already-revoked is a no-op.";
 
 export const RULES_ATTEST_BACKEND_USAGE =
-  "usage: mla rules attest (--from-observed <hash> | --forbidden-root <path> | --note-vault <absolute-path>) [--ceiling observe|warn]\n" +
+  "usage: mla rules attest (--from-observed <hash> | --forbidden-root <path> | --note-vault <absolute-path> | --command <spec>) [--ceiling observe|warn]\n" +
   "                        [--text <rationale>] [--scope team|personal] [--agent-on-user-request --yes] [--workspace <id>]\n" +
   "  Mints a forbidden-root PROHIBIT rule on the backend.\n" +
   "  --from-observed <hash>   mint from a recorded R0 observed snapshot. With NO --ceiling this is the\n" +
@@ -175,6 +190,8 @@ export const RULES_ATTEST_BACKEND_USAGE =
   "  --forbidden-root <path>  author a rule for <path> directly, no observation needed. Defaults to the\n" +
   "                           WARN ceiling (a non-blocking advisory; a freshly armed rule warns, INV-8).\n" +
   "  --note-vault <path>      govern only YYYYMMDD-*.md working notes and require this absolute vault.\n" +
+  "  --command <spec>         govern the COMMAND about to run, not a path. Clauses join with ' + ' and\n" +
+  "                           ALL must appear in one statement, e.g. \"comp-credit.cjs + --apply\".\n" +
   "  --ceiling observe|warn   the enforcement authority to arm at. ask/deny are refused here: a new rule\n" +
   "                           must earn DENY end to end before it blocks.\n" +
   "  --text <rationale>       the rule statement shown to the agent (direct authoring only; defaulted).\n" +
@@ -794,6 +811,35 @@ export async function runRulesEditBackend(argv: string[], deps: RulesEditBackend
   const runtimeScopeId = existing?.runtimeScopeId ?? resolveActiveRuntimeScopeId();
   const managed = makeManagedRule({ statement, strength, scope, sources });
   const payload = managedRuleToRulePayload(managed, runtimeScopeId, triggerResult.trigger);
+
+  // Full restatement is the contract (see above) and it is what makes an atomic plane flip
+  // possible. But restatement means OMISSION WEAKENS, silently, in the two directions that
+  // matter most: MUST_FOLLOW -> SHOULD_FOLLOW, and turn -> ambient (scoped delivery -> the
+  // permanent floor). On 2026-08-05 exactly that happened to the doctrine-gate rule during a
+  // wording correction: the text, the authority scope and the lifecycle were all verified and
+  // correct, and the rule quietly moved onto every turn of every session, workspace-wide.
+  //
+  // Do not refuse (that would break the atomic flip) and do not preserve (that would break the
+  // restatement contract). Just say it out loud, on stderr, so the operator sees the plane
+  // change they did not ask for. Narrowing (ambient -> turn, SHOULD -> MUST) stays quiet: only
+  // the weakening direction is dangerous.
+  const priorStrength = existing?.strength;
+  const priorMode = (existing?.applicability as { mode?: string } | undefined)?.mode;
+  const nextMode = (payload.applicability as { mode?: string } | undefined)?.mode;
+  if (priorStrength === "MUST_FOLLOW" && payload.strength !== "MUST_FOLLOW") {
+    err(
+      `warning: this edit downgrades ${nodeId} from MUST_FOLLOW to ${payload.strength}. ` +
+        "Pass --must to keep it binding.",
+    );
+  }
+  if (priorMode === "turn" && nextMode === "ambient") {
+    err(
+      `warning: this edit moves ${nodeId} from turn-scoped delivery to the AMBIENT FLOOR, ` +
+        "so it will be injected on every turn instead of only on matching ones. Restate the " +
+        "triggers with --turn-when-prompt / --turn-when-path to keep it scoped.",
+    );
+  }
+
   const requestIdempotencyKey = ruleVersionHash(payload);
 
   try {
@@ -1100,9 +1146,17 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   const observed = attestFlagValue(rest, "--from-observed");
   const forbiddenRoot = attestFlagValue(rest, "--forbidden-root");
   const noteVault = attestFlagValue(rest, "--note-vault");
+  const commandFlag = attestFlagValue(rest, "--command");
   const ceilingFlag = attestFlagValue(rest, "--ceiling");
   const textFlag = attestFlagValue(rest, "--text");
-  if (observed.dangling || forbiddenRoot.dangling || noteVault.dangling || ceilingFlag.dangling || textFlag.dangling) {
+  if (
+    observed.dangling ||
+    forbiddenRoot.dangling ||
+    noteVault.dangling ||
+    commandFlag.dangling ||
+    ceilingFlag.dangling ||
+    textFlag.dangling
+  ) {
     err(RULES_ATTEST_BACKEND_USAGE);
     return 2;
   }
@@ -1114,7 +1168,8 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // function the evaluator applies, so the two can never drift apart.
   const directRoot = forbiddenRoot.value === undefined ? undefined : normalizeForbiddenRoot(forbiddenRoot.value);
   const directNoteVault = noteVault.value;
-  const sourceCount = [observedRuleHash, directRoot, directNoteVault].filter(
+  const directCommand = commandFlag.value;
+  const sourceCount = [observedRuleHash, directRoot, directNoteVault, directCommand].filter(
     (value) => value !== undefined,
   ).length;
   if (sourceCount > 1) {
@@ -1147,6 +1202,7 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   const genericArming =
     directRoot !== undefined ||
     directNoteVault !== undefined ||
+    directCommand !== undefined ||
     requestedCeiling !== undefined;
   if (genericArming && (requestedCeiling === "ASK" || requestedCeiling === "DENY")) {
     err(
@@ -1213,7 +1269,26 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // notesPilot marks the one EARNED-DENY, notes-pinned arming (--from-observed, no --ceiling), used
   // only for the display label; every other arming is the generic forbidden-root family.
   let notesPilot = false;
-  if (directNoteVault !== undefined) {
+  if (directCommand !== undefined) {
+    // The COMMAND family (F2): the subject is the command about to RUN, so there is
+    // no observed snapshot to convert and no path to canonicalize. The parser is the
+    // SAME one the round-trip test drives against the live matcher, so a spec that
+    // mints here is a spec that fires there.
+    const parsed = parseCommandConjunction(directCommand);
+    const sequences = parsed.sequences;
+    if (!sequences) {
+      err(`rules attest: ${parsed.error}`);
+      return 2;
+    }
+    payload = buildForbiddenCommandPayload({
+      sequences,
+      runtimeScopeId,
+      ceiling: genericCeiling,
+      text:
+        textFlag.value ??
+        `Commands matching ${sequences.map((s) => s.join(" ")).join(" + ")} are governed; consult the governed decision before running one.`,
+    });
+  } else if (directNoteVault !== undefined) {
     let canonicalVault: string;
     try {
       canonicalVault = fs.realpathSync(directNoteVault);
@@ -1301,15 +1376,22 @@ export async function runRulesAttestBackend(argv: string[], deps: RulesAttestBac
   // regardless of which converter ran.
   const ceiling = payload.enforcementCeiling;
   const complianceConfig = payload.compliance.config;
+  // The COMMAND family (F2) names no root. Its identity is the conjunction it matches,
+  // rendered the way the operator wrote it, so the confirmation line names the same
+  // thing the later warning will.
   const forbiddenRootLabel =
     "forbiddenRootRelativePath" in complianceConfig
       ? complianceConfig.forbiddenRootRelativePath
-      : complianceConfig.allowedRootAbsolutePath;
+      : "allowedRootAbsolutePath" in complianceConfig
+        ? complianceConfig.allowedRootAbsolutePath
+        : complianceConfig.forbiddenCommandAllOf.map((seq) => seq.join(" ")).join(" + ");
   const ruleLabel = notesPilot
     ? NOTES_LOCATION_RULE_ID
     : "allowedRootAbsolutePath" in complianceConfig
       ? `note-vault:${forbiddenRootLabel}`
-      : `forbidden-root:${forbiddenRootLabel}`;
+      : "forbiddenCommandAllOf" in complianceConfig
+        ? `command:${forbiddenRootLabel}`
+        : `forbidden-root:${forbiddenRootLabel}`;
 
   const audienceNote =
     authorityScope === "TEAM"

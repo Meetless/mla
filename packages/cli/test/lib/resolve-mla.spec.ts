@@ -59,7 +59,7 @@ describe("resolve-mla (generated script)", () => {
     fs.writeFileSync(resolver, renderResolverScript());
     fs.chmodSync(resolver, 0o755);
   });
-  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   function run(env: NodeJS.ProcessEnv, ...args: string[]): string {
     return execFileSync("sh", [resolver, ...args], {
@@ -234,7 +234,7 @@ describe("resolve-mla (generated script)", () => {
       expect(r.code).toBe(127); // refused every candidate and said so, honestly
       expect(r.stderr).toContain("could not find");
       expect(r.stderr.includes("not an absolute path")).toBe(warns);
-      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     });
 
     it("does not bootstrap, so no literal ~ tree is planted in the cwd", () => {
@@ -254,7 +254,7 @@ describe("resolve-mla (generated script)", () => {
       expect(r.code).toBe(127); // reached the honest "could not find mla" exit
       expect(r.stderr).toContain("could not find");
       expect(fs.readdirSync(cwd)).toEqual([]); // the load-bearing assertion
-      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     });
   });
 

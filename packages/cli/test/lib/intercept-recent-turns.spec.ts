@@ -72,7 +72,7 @@ function inCommon(snippet: string, env: Record<string, string> = {}, home?: stri
     encoding: "utf8",
     env: { ...process.env, MEETLESS_HOME: h, MEETLESS_DEBUG: "0", ...env },
   });
-  if (!home) fs.rmSync(h, { recursive: true, force: true });
+  if (!home) fs.rmSync(h, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   return (r.stdout || "").trim();
 }
 
@@ -91,7 +91,7 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
     try {
       expect(inCommon(`collect_recent_turns "sess-fresh"`, {}, home)).toBe("[]");
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -131,7 +131,7 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
       // outcome would be laundered into the model as evidence.
       expect(rows[0].outcome).toBe("unknown");
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -140,21 +140,21 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
     try {
       const out = inCommon(
         [
-          `record_session_turn "s" 1 "t-1" "oldest"`,
-          `record_session_turn "s" 2 "t-2" "middle"`,
-          `record_session_turn "s" 3 "t-3" "newest"`,
+          `record_session_turn "s" 1 "t-1" "Fix the oldest turn."`,
+          `record_session_turn "s" 2 "t-2" "Fix the middle turn."`,
+          `record_session_turn "s" 3 "t-3" "Fix the newest turn."`,
           `collect_recent_turns "s"`,
         ].join("; "),
         {},
         home,
       );
       expect((JSON.parse(out) as TurnRow[]).map((r) => r.user_goal)).toEqual([
-        "newest",
-        "middle",
-        "oldest",
+        "Fix the newest turn.",
+        "Fix the middle turn.",
+        "Fix the oldest turn.",
       ]);
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -162,16 +162,22 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
     const home = turnsHome();
     try {
       const snippet = [
-        ...["a", "b", "c", "d", "e"].map((g, i) => `record_session_turn "s" ${i} "t-${g}" "${g}"`),
+        ...["a", "b", "c", "d", "e"].map(
+          (g, i) => `record_session_turn "s" ${i} "t-${g}" "Fix turn ${g}."`,
+        ),
         `collect_recent_turns "s"`,
       ].join("; ");
       const dflt = JSON.parse(inCommon(snippet, {}, home)) as TurnRow[];
-      expect(dflt.map((r) => r.user_goal)).toEqual(["e", "d", "c"]); // default cap is 3
+      expect(dflt.map((r) => r.user_goal)).toEqual([
+        "Fix turn e.",
+        "Fix turn d.",
+        "Fix turn c.",
+      ]); // default cap is 3
 
       const capped = JSON.parse(
         inCommon(`collect_recent_turns "s"`, { MEETLESS_RECENT_TURNS_MAX: "2" }, home),
       ) as TurnRow[];
-      expect(capped.map((r) => r.user_goal)).toEqual(["e", "d"]);
+      expect(capped.map((r) => r.user_goal)).toEqual(["Fix turn e.", "Fix turn d."]);
 
       // A garbage cap must fall back to the default, not to "unbounded" and not to
       // an empty feed.
@@ -185,26 +191,31 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
         "[]",
       );
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
   it("never reads another session's ledger", () => {
     const home = turnsHome();
     try {
-      inCommon(`record_session_turn "sess-other" 1 "t-1" "their private goal"`, {}, home);
+      inCommon(`record_session_turn "sess-other" 1 "t-1" "Review their private thing."`, {}, home);
       expect(inCommon(`collect_recent_turns "sess-mine"`, {}, home)).toBe("[]");
       const theirs = JSON.parse(inCommon(`collect_recent_turns "sess-other"`, {}, home)) as TurnRow[];
-      expect(theirs.map((r) => r.user_goal)).toEqual(["their private goal"]);
+      expect(theirs.map((r) => r.user_goal)).toEqual(["Review their private thing."]);
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
-  it("truncates a long goal so the feed stays a summary, not a second copy of the prompt", () => {
+  it("keeps the feed a summary by EXTRACTING the request, never by cutting the prompt", () => {
+    // This test used to assert `user_goal.length === 400`, i.e. that a 5000-char
+    // prompt was stored as its first 400 characters. That WAS the defect: a prefix
+    // of a document is not a goal, and 46% of the live ledger was one. The contract
+    // is now extraction -- a whole request sentence, or nothing at all. See
+    // goal-extraction.spec.ts for the extractor itself.
     const home = turnsHome();
     try {
-      const long = "x".repeat(5000);
+      const long = `Please fix the ledger writer. ${"x ".repeat(2500)}`;
       const rows = JSON.parse(
         inCommon(
           [`record_session_turn "s" 1 "t-1" "${long}"`, `collect_recent_turns "s"`].join("; "),
@@ -212,9 +223,26 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
           home,
         ),
       ) as TurnRow[];
-      expect(rows[0].user_goal.length).toBe(400);
+      expect(rows[0].user_goal).toBe("Please fix the ledger writer.");
+      expect(rows[0].user_goal.length).toBeLessThanOrEqual(400);
+
+      // A 5000-char prompt with NO request in it yields a row with no goal -- not a
+      // 400-char slice of it. The row survives because touched_files / outcome are
+      // attached at collect time and are the useful half.
+      const noReq = JSON.parse(
+        inCommon(
+          [
+            `record_session_turn "s2" 1 "t-1" "${"x ".repeat(2500)}"`,
+            `collect_recent_turns "s2"`,
+          ].join("; "),
+          {},
+          home,
+        ),
+      ) as TurnRow[];
+      expect(noReq).toHaveLength(1);
+      expect(noReq[0].user_goal).toBe("");
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -223,9 +251,9 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
     try {
       inCommon(
         [
-          `record_session_turn "" 1 "t-x" "no session"`,
+          `record_session_turn "" 1 "t-x" "Fix the missing session."`,
           `record_session_turn "s" 1 "t-x" ""`,
-          `record_session_turn "s" "banana" "t-ok" "kept anyway"`,
+          `record_session_turn "s" "banana" "t-ok" "Fix the coerced sequence."`,
         ].join("; "),
         {},
         home,
@@ -234,16 +262,18 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
       // because losing the ordinal is cheaper than losing the turn.
       expect(fs.readdirSync(path.join(home, "queue")).sort()).toEqual(["s.turns"]);
       const rows = JSON.parse(inCommon(`collect_recent_turns "s"`, {}, home)) as TurnRow[];
-      expect(rows.map((r) => [r.user_goal, r.sequence])).toEqual([["kept anyway", 0]]);
+      expect(rows.map((r) => [r.user_goal, r.sequence])).toEqual([
+        ["Fix the coerced sequence.", 0],
+      ]);
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
   it("survives a corrupt ledger line rather than dropping the whole feed", () => {
     const home = turnsHome();
     try {
-      inCommon(`record_session_turn "s" 1 "t-1" "real turn"`, {}, home);
+      inCommon(`record_session_turn "s" 1 "t-1" "Fix the real turn."`, {}, home);
       fs.appendFileSync(ledgerPath(home, "s"), "not json at all\n");
       // jq -s aborts on a malformed line, and the guard turns that into [] rather
       // than into a broken hook. Either answer is safe; a crash is not.
@@ -251,7 +281,7 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
       expect(out.startsWith("[")).toBe(true);
       expect(() => JSON.parse(out)).not.toThrow();
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -259,7 +289,7 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
     const home = turnsHome();
     try {
       // 401 appends crosses the keep*2 threshold at least once.
-      const snippet = `for i in $(seq 1 401); do record_session_turn "s" "$i" "t-$i" "goal $i"; done`;
+      const snippet = `for i in $(seq 1 401); do record_session_turn "s" "$i" "t-$i" "Fix goal $i."; done`;
       inCommon(snippet, {}, home);
       const lines = fs
         .readFileSync(ledgerPath(home, "s"), "utf8")
@@ -268,9 +298,9 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
       expect(lines.length).toBeLessThanOrEqual(400);
       // The trim must keep the TAIL: the newest turn is the one we send.
       const rows = JSON.parse(inCommon(`collect_recent_turns "s"`, {}, home)) as TurnRow[];
-      expect(rows[0].user_goal).toBe("goal 401");
+      expect(rows[0].user_goal).toBe("Fix goal 401.");
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -279,8 +309,8 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
     try {
       inCommon(
         [
-          `record_session_turn "s" 1 "t-1" "older"`,
-          `record_session_turn "s" 2 "t-2" "newer"`,
+          `record_session_turn "s" 1 "t-1" "Fix the older turn."`,
+          `record_session_turn "s" 2 "t-2" "Fix the newer turn."`,
         ].join("; "),
         {},
         home,
@@ -301,7 +331,7 @@ describe("collect_recent_turns (common.sh): the request-carried session feed", (
       expect(rows[1].assistant_summary).toBe("");
       expect(rows[1].commands_run).toEqual([]);
     } finally {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -422,7 +452,7 @@ async function runWiredTurns(
     return stub.enrich;
   } finally {
     await stub.close();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 
@@ -460,17 +490,25 @@ describe("user-prompt-submit.sh forwards recent_turns to intel", () => {
   }, 30000);
 
   it("sends at most the cap, freshest first, across a long session", async () => {
-    const bodies = await runWiredTurns(["turn one", "turn two", "turn three", "turn four"]);
+    // Prompts are request-shaped because `user_goal` is now EXTRACTED, not sliced:
+    // "turn one" carries no request and would correctly yield an empty goal, which
+    // would make this assert the extractor rather than the ordering it is about.
+    const bodies = await runWiredTurns([
+      "Fix turn one.",
+      "Fix turn two.",
+      "Fix turn three.",
+      "Fix turn four.",
+    ]);
     expect(bodies.length).toBe(4);
-    expect(bodies[1].recent_turns.map((t: TurnRow) => t.user_goal)).toEqual(["turn one"]);
+    expect(bodies[1].recent_turns.map((t: TurnRow) => t.user_goal)).toEqual(["Fix turn one."]);
     expect(bodies[2].recent_turns.map((t: TurnRow) => t.user_goal)).toEqual([
-      "turn two",
-      "turn one",
+      "Fix turn two.",
+      "Fix turn one.",
     ]);
     expect(bodies[3].recent_turns.map((t: TurnRow) => t.user_goal)).toEqual([
-      "turn three",
-      "turn two",
-      "turn one",
+      "Fix turn three.",
+      "Fix turn two.",
+      "Fix turn one.",
     ]);
     // Distinct turn ids, so intel can dedupe and cite per turn.
     const ids = bodies[3].recent_turns.map((t: TurnRow) => t.turn_id);

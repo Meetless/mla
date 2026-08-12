@@ -37,7 +37,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeCe0Store(store);
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 /** Version ids are the table PK, so the same ruleId LIVE in two scopes needs two distinct ids. */

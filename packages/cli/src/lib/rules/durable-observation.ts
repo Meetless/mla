@@ -79,9 +79,17 @@ export function normalizeForbiddenRoot(forbiddenRootRelativePath: string): strin
  * confirmation and the block can never again name the root differently.
  */
 export function displayComplianceRoot(config: ComplianceEvaluatorConfig): string {
-  return "forbiddenRootRelativePath" in config
-    ? `${normalizeForbiddenRoot(config.forbiddenRootRelativePath)}/`
-    : config.allowedRootAbsolutePath;
+  if ("forbiddenRootRelativePath" in config) {
+    return `${normalizeForbiddenRoot(config.forbiddenRootRelativePath)}/`;
+  }
+  // The COMMAND family (F2) governs a command, not a location, so it HAS no root to
+  // display. Every caller here is building a sentence about where a file may go, and
+  // that sentence does not exist for this family: bundle-enforce routes it to its own
+  // reason builder and never reaches this helper. Returning the empty string keeps the
+  // signature total for any future caller rather than inventing a path-shaped noun for
+  // a rule that named none.
+  if ("forbiddenCommandAllOf" in config) return "";
+  return config.allowedRootAbsolutePath;
 }
 
 /** The snapshot-pure verdict: the SOLE rule by which a stored observation (and its later replay)

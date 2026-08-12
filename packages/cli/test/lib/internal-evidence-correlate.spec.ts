@@ -70,7 +70,7 @@ describe("runInternalEvidenceCorrelate", () => {
     delete process.env.MEETLESS_TELEMETRY;
     delete process.env.MEETLESS_NO_TELEMETRY;
     delete process.env.CLAUDE_CODE_SESSION_ID;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // Seed one mla_evidence_inject at the given turn, return its inject_id. `extra`

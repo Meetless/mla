@@ -187,6 +187,18 @@ function liveLedgerCounts(bindingId: string): {
   return { tracked: entries.length, uploaded, blocked };
 }
 
+// The withheld files, by path, with the credential RULE ids that withheld them.
+// A count alone ("4 blocked") is unactionable: it says the corpus is missing
+// something and refuses to say what. Rule ids are safe to print (the scanner
+// returns identifiers, never the matched secret); the file CONTENT is never read
+// here at all. Sorted so the output is stable across passes.
+export function blockedFiles(bindingId: string): { path: string; ruleIds: string[] }[] {
+  return Object.entries(readLiveLedger(bindingId).entries)
+    .filter(([, e]) => Boolean(e.blockedHash))
+    .map(([path, e]) => ({ path, ruleIds: e.blockedRuleIds ?? [] }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
 function runStatus(args: ParsedArgs): number {
   const bindings = listBindings();
   if (args.json) {
@@ -194,6 +206,7 @@ function runStatus(args: ParsedArgs): number {
       ...b,
       ledgerEntries: Object.keys(readLedger(b.bindingId).entries).length,
       live: liveLedgerCounts(b.bindingId),
+      blockedFiles: blockedFiles(b.bindingId),
     }));
     console.log(JSON.stringify({ bindings: rows }, null, 2));
     return 0;
@@ -214,6 +227,12 @@ function runStatus(args: ParsedArgs): number {
     console.log(
       `  live      ${live.tracked} tracked, ${live.uploaded} uploaded, ${live.blocked} blocked`,
     );
+    // Name the withheld files. A bare count tells the operator the corpus is
+    // incomplete and refuses to say how, which is how 4 files stayed invisible.
+    for (const f of blockedFiles(b.bindingId)) {
+      const why = f.ruleIds.length > 0 ? f.ruleIds.join(", ") : "rule not recorded (blocked before rule ids were persisted)";
+      console.log(`    withheld  ${f.path}  [${why}]`);
+    }
   }
   return 0;
 }
@@ -325,10 +344,20 @@ function runReport(args: ParsedArgs): number {
     `Size bytes: min=${report.sizeBytes.min} median=${report.sizeBytes.median} ` +
       `p90=${report.sizeBytes.p90} max=${report.sizeBytes.max}`,
   );
-  console.log(`Project files with a secret signal (observe-only): ${report.secretSignalFiles.length}`);
-  for (const b of report.secretSignalFiles) {
+  // Named findings first and listed in full: a rule that names the credential family
+  // it matched is worth reading every time. The entropy-only bucket is a COUNT, not a
+  // list, because printing it in full is what made the old undifferentiated number
+  // (866 of 876 real files) unreadable. `--json` still carries both sets whole.
+  console.log(
+    `Project files with a NAMED secret signal (observe-only): ${report.namedSecretSignalFiles.length}`,
+  );
+  for (const b of report.namedSecretSignalFiles) {
     console.log(`  ${b.file}: ${b.ruleIds.join(", ")}`);
   }
+  console.log(
+    `Project files matching only the generic entropy heuristic: ${report.entropyOnlySignalFiles.length}` +
+      ` (usually document identifiers; --json lists them)`,
+  );
   console.log(
     `Phase 2B credential-denylist probe (known fixtures caught): ${report.credentialProbePass ? "PASS" : "FAIL"}`,
   );

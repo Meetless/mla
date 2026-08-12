@@ -24,7 +24,7 @@ describe("binding registry", () => {
   });
 
   afterEach(() => {
-    for (const d of [home, memA, memB]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, memA, memB]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("enables a new binding with a generated id", () => {

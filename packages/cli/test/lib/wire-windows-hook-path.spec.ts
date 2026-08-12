@@ -71,7 +71,7 @@ describe("wire: Windows hook command paths run through the shell", () => {
         expect(c.startsWith('"') && c.endsWith('"')).toBe(true);
       }
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -113,7 +113,7 @@ describe("wire: Windows hook command paths run through the shell", () => {
       expect(postTool[0].hooks[0].command).toBe(hookCommandPath(POSTTOOL));
       expect(postTool[0].hooks[0].command).not.toContain("\\");
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

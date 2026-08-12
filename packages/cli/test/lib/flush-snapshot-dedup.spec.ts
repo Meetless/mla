@@ -153,7 +153,7 @@ describe("flush.sh snapshot dedup (self-inflicted DDoS guard)", () => {
       // Clean drain self-cleans the spool.
       expect(fs.existsSync(queueFile)).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -177,7 +177,7 @@ describe("flush.sh snapshot dedup (self-inflicted DDoS guard)", () => {
 
       expect(countCreateRuns(countFile)).toBe(1);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -200,7 +200,7 @@ describe("flush.sh snapshot dedup (self-inflicted DDoS guard)", () => {
 
       expect(countCreateRuns(countFile)).toBe(2);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

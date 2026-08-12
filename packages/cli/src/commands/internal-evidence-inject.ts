@@ -50,6 +50,8 @@ export interface EvidenceInjectArgs {
   permissionFiltered: boolean;
   stale: boolean;
   topicCategory: string | null;
+  // The router's intent for this turn, forwarded by the hook from the enrich trace.
+  intentType: string | null;
 }
 
 export function parseArgs(argv: string[]): EvidenceInjectArgs {
@@ -68,6 +70,7 @@ export function parseArgs(argv: string[]): EvidenceInjectArgs {
     permissionFiltered: false,
     stale: false,
     topicCategory: null,
+    intentType: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -135,6 +138,9 @@ export function parseArgs(argv: string[]): EvidenceInjectArgs {
       case "--topic-category":
         out.topicCategory = value();
         break;
+      case "--intent-type":
+        out.intentType = value();
+        break;
       default:
         throw new Error(`Unknown flag for \`mla _internal evidence-inject\`: ${a}`);
     }
@@ -191,6 +197,8 @@ export async function runInternalEvidenceInject(
       // access) and threaded in so buildInjectPayload stays hermetic. When false the
       // seal path never stages or POSTs a capture for this inject.
       traceUploadConsented: traceUploadEnabled(env),
+      intentType: args.intentType,
+      queryTopicCategory: args.topicCategory,
       ...(args.injectId ? { injectId: args.injectId } : {}),
     });
 

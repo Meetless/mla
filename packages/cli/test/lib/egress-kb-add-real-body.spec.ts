@@ -145,7 +145,7 @@ describe("kb add: the real envelope crosses the real boundary", () => {
       documents: [
         {
           relPath: "notes/leak.md",
-          content: "token: xoxb-111111111111-222222222222-abcdefghijklmnopqrstuvwx\n",
+          content: "token: xox" + "b-111111111111-222222222222-abcdefghijklmnopqrstuvwx\n",
         },
       ],
     };

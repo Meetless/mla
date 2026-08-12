@@ -140,7 +140,7 @@ describe("user-prompt-submit.sh: per-session turn_index", () => {
       }
     } finally {
       await stub.close();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }, 30000);
 });

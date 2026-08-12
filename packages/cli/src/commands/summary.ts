@@ -60,6 +60,7 @@ interface TraceLine {
   hook?: {
     intercept_latency_ms?: number | null;
     injected?: boolean | null;
+    layer2_injected?: boolean | null;
     injected_chars?: number | null;
     fail_open_reason?: string | null;
     truncated?: boolean | null;
@@ -129,8 +130,25 @@ export function parseSummaryArgs(argv: string[]): SummaryArgs {
   return out;
 }
 
+// The two layers, counted apart and LABELLED.
+//
+// This used to be one counter, `injected`, incremented on
+// `arbitration.decision === "injected"`. That decision is set only when LAYER 2
+// drove the injection, so a session where the floor landed on every turn and
+// delivered ~19KB printed "Injected: 0" while `mla turn` printed
+// "injected: 3,796 chars" off the same file. Both were reading real fields; the
+// label was the lie, and "mla did nothing" is the worst possible thing for an
+// unlabelled counter to imply.
+//
+// Definitions are taken from turn-recap.ts rather than restated here, so the two
+// commands cannot drift apart again:
+//   injected_floor    hook.injected        Layer 1 static floor landed
+//   injected_evidence hook.layer2_injected Layer 2 enrichment landed
+//   injected_chars    total delivered      (floor + evidence, measured together)
 function buildSummary(traces: TraceLine[]) {
-  let injected = 0;
+  let injectedFloor = 0;
+  let injectedEvidence = 0;
+  let totalInjectedChars = 0;
   let discarded = 0;
   let failOpen = 0;
   let timeouts = 0;
@@ -145,7 +163,8 @@ function buildSummary(traces: TraceLine[]) {
 
   for (const t of traces) {
     const decision = t.arbitration?.decision ?? "";
-    if (decision === "injected") injected++;
+    if (t.hook?.injected === true) injectedFloor++;
+    if (t.hook?.layer2_injected === true) injectedEvidence++;
     if (t.arbitration?.discarded_after_compute === true) discarded++;
     if (decision === "fail_open") failOpen++;
 
@@ -158,9 +177,15 @@ function buildSummary(traces: TraceLine[]) {
     const cost = num(t.enrichment?.cost_usd);
     if (cost !== null) totalCost += cost;
 
-    if (decision === "injected") {
+    // Every turn that DELIVERED something, not only the layer-2 ones. Gating this
+    // on the layer-2 decision is what made "Avg injected chars: 0" sit next to a
+    // turn report of 3,796.
+    if (t.hook?.injected === true) {
       const chars = num(t.hook?.injected_chars);
-      if (chars !== null) injectedChars.push(chars);
+      if (chars !== null) {
+        injectedChars.push(chars);
+        totalInjectedChars += chars;
+      }
     }
 
     const strat = t.experiment?.variant || t.enrichment?.strategy || "unknown";
@@ -183,7 +208,9 @@ function buildSummary(traces: TraceLine[]) {
 
   return {
     prompt_count: traces.length,
-    injected,
+    injected_floor: injectedFloor,
+    injected_evidence: injectedEvidence,
+    total_injected_chars: totalInjectedChars,
     discarded_after_compute: discarded,
     fail_open: failOpen,
     avg_enrichment_latency_ms: Math.round(avgLat),
@@ -204,7 +231,8 @@ function renderSummary(s: ReturnType<typeof buildSummary>): string {
     .join(" ");
   return [
     `Prompt count: ${s.prompt_count}`,
-    `Injected: ${s.injected}   Discarded after compute: ${s.discarded_after_compute}   Fail-open: ${s.fail_open}`,
+    `Injected  Layer 1 (floor): ${s.injected_floor}   Layer 2 (evidence): ${s.injected_evidence}` +
+      `   Discarded after compute: ${s.discarded_after_compute}   Fail-open: ${s.fail_open}`,
     `Avg enrichment latency: ${secs(s.avg_enrichment_latency_ms)}   P95: ${secs(
       s.p95_enrichment_latency_ms,
     )}   Timeout rate: ${pct(s.timeout_rate)}`,

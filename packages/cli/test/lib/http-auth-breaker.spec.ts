@@ -102,7 +102,7 @@ describe("doFetch dead-auth circuit breaker", () => {
     if (prevToken === undefined) delete process.env.MEETLESS_CONTROL_TOKEN;
     else process.env.MEETLESS_CONTROL_TOKEN = prevToken;
     global.fetch = prevFetch;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function load(): { http: HttpModule; config: ConfigModule; breaker: BreakerModule } {

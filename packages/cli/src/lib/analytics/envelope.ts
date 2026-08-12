@@ -52,6 +52,20 @@ export const EVENT_TYPES = [
   // fail-closed projector as ids/enums only (INV-POSTHOG-PII-1). The finding's TEXT, its quote,
   // its paths, and its commit never leave the device.
   "mla_onboarding_finding",
+  // Onboarding OFFER lifecycle. One append every time a surface tells a workspace it has no
+  // governed memory and names the remedy.
+  //
+  // It exists because on 2026-08-02 we shipped a SessionStart nudge to fix exactly the funnel
+  // this measures, and four days later could not tell whether it had converted nobody or had
+  // never been shown at all. Those two states demand opposite fixes (fix the trigger vs fix the
+  // ask), and neither was distinguishable, because the nudge emitted nothing. A mitigation you
+  // cannot measure is a mitigation you cannot iterate.
+  //
+  // There is deliberately NO companion `offer_accepted` event. Acceptance is already derivable:
+  // `mla enrich <plan|ingest>` is a normal command and emits its own `mla_command`, so
+  // conversion is this row joined to a later enrich row in the same session. A second event
+  // would be a second thing to keep correct for a number we can already compute.
+  "mla_onboarding_offer",
   // Rule-injection COST (audit 6.G / 7.10). One append per governed prompt: how many bytes and
   // rules we charged the model's context window for, split ambient (the always-on floor, billed
   // on every turn to every user) vs scoped (this turn's targeted rules). This is the only event
@@ -210,6 +224,34 @@ export type OnboardingFindingPhase = (typeof ONBOARDING_FINDING_PHASES)[number];
 export const ONBOARDING_FINDING_VERDICTS = ["code_diverged", "doc_stale", "carve_out"] as const;
 export type OnboardingFindingVerdict = (typeof ONBOARDING_FINDING_VERDICTS)[number];
 
+// --- onboarding-offer enums -------------------------------------------------
+// WHICH surface made the offer. The whole point of the event is to tell "never shown" apart
+// from "shown and ignored", and that only works if each surface is separable: they fire at
+// different moments with different intent, and the 2026-08-02 SessionStart nudge converting
+// nobody says nothing about whether the retrieval-time warning converts.
+//
+//   session_start   the SessionStart nudge, a LEVEL trigger that speaks before the user has
+//                   asked anything (the moment of least intent).
+//   retrieval_empty the MCP `retrieve_knowledge` empty-pull warning (see `explainEmptyPull`
+//                   in packages/mcp/evidence_actions.js), which fires at the moment the gap
+//                   is actually demonstrated.
+//   activate        the `mla activate` hand-off to the onboard skill, an EDGE trigger that by
+//                   construction can never reach a workspace already past it.
+export const ONBOARDING_OFFER_SURFACES = ["session_start", "retrieval_empty", "activate"] as const;
+export type OnboardingOfferSurface = (typeof ONBOARDING_OFFER_SURFACES)[number];
+
+// What the offer was made ON TOP OF, i.e. what the deterministic seed had just achieved. This
+// is the field that keeps the funnel honest once seeding exists: an offer shown to a workspace
+// whose corpus is still empty is a different product event from one shown to a workspace that
+// now holds its own instruction files and is being offered the richer agentic pass.
+//
+//   dark        no governed memory at all, and the seed added none (no instruction files, or
+//               the seed could not run). This is the state the 24 dark workspaces are in.
+//   seeded      the deterministic seed just persisted at least one document this run.
+//   seeded_prior the seed had nothing to do because this checkout is already seeded.
+export const ONBOARDING_OFFER_CORPUS_STATES = ["dark", "seeded", "seeded_prior"] as const;
+export type OnboardingOfferCorpusState = (typeof ONBOARDING_OFFER_CORPUS_STATES)[number];
+
 // --- enforcement-incident enums (§5.1, the deny tile) -----------------------
 // The closed wire forms for the PreToolUse enforcement event. Every value is a
 // fixed enum so no open string (a tool name, a decision verb, a review verdict)
@@ -221,10 +263,24 @@ export type OnboardingFindingVerdict = (typeof ONBOARDING_FINDING_VERDICTS)[numb
 export const ENFORCED_TOOLS = ["Write", "Edit", "unknown"] as const;
 export type EnforcedTool = (typeof ENFORCED_TOOLS)[number];
 
-// The enforcement verdict the hook emitted. Only "deny" fires today; "warn" is
-// reserved for the soft-gate path so the tile can later split block vs warn.
-export const ENFORCEMENT_DECISIONS = ["deny", "warn"] as const;
+// The enforcement verdict the hook emitted, i.e. what actually happened to the user's action.
+// All three fire today: "deny" blocks it, "warn" permits it with a model-facing advisory, and "ask"
+// pauses it for a human answer (a natively-attested ASK ceiling, or a DENY whose bundle lease went
+// stale and degrades to one confirmation rather than blocking on a possibly-revoked rule).
+//
+// "ask" records that the prompt was ISSUED, never that it was approved: Claude Code does not hand a
+// hook the answer to its own prompt, and inferring approval from the tool having run afterwards
+// would be fabricated evidence. See EnforcementIncidentPayload.ask_outcome.
+export const ENFORCEMENT_DECISIONS = ["deny", "warn", "ask"] as const;
 export type EnforcementDecision = (typeof ENFORCEMENT_DECISIONS)[number];
+
+// The enforcement authority a rule was ATTESTED at, snapshotted onto its incident. Structurally the
+// same four rungs as the rules layer's EligibleEnforcement, redeclared here rather than imported
+// because this module is the wire contract and owns its own closed enums (it imports nothing, by
+// design). See EnforcementIncidentPayload.enforcement_ceiling for why this is kept separate from
+// `decision` and why the two are allowed to disagree.
+export const ENFORCEMENT_CEILINGS = ["OBSERVE", "WARN", "ASK", "DENY"] as const;
+export type EnforcementCeiling = (typeof ENFORCEMENT_CEILINGS)[number];
 
 // The human-review label dimension the deny tile needs (§5.1: "confirmed /
 // false-positive / unreviewed"). Born "unreviewed" at emit time; an offline
@@ -398,6 +454,28 @@ export interface EvidenceInjectPayload {
   //     client. It says the client CAN capture, not that it DID.
   trace_upload_consented: boolean;
   work_product_capture_version: number | null;
+  // The ROUTER's intent classification for the turn this inject landed on, copied
+  // from intel's EnrichTrace (which the hook already persists verbatim as
+  // governed_kb_trace). Measured over one session the router returned "unknown" on
+  // 4 of 6 traced turns and injected anyway on 2 of them, both ignored -- and
+  // nothing could tell "the router cannot classify our prompts" apart from "the
+  // label is missing but the ranking was fine", because the intent never reached
+  // the inject event.
+  //
+  // null is NOT "unknown". null means no intent was recorded (an older hook, a
+  // strategy with no router trace); "unknown" means the router ran and could not
+  // classify. Collapsing them would sweep every pre-rollout row into the unknown
+  // bucket and make the split unreadable in exactly the window it is meant to read.
+  intent_type: string | null;
+  // The classified topic of the turn's prompt, carried so the OUTCOME-time
+  // `candidates_found_not_used` gap can be labelled too. It was already computed at
+  // inject time and written onto the INJECT-time gap payload only, so the
+  // correlator -- which reads inject events -- had to hardcode "unknown". Measured
+  // 2026-08-07: every low_confidence_candidates gap since the classifier landed
+  // carries a real topic, and every candidates_found_not_used gap ever minted is
+  // unknown. That is the ranking-failure class, i.e. the half of the roadmap worth
+  // slicing. null (not "unknown") when nothing classified it.
+  query_topic_category: string | null;
 }
 
 export interface EvidenceOutcomePayload {
@@ -534,6 +612,43 @@ export interface EnforcementIncidentPayload {
   // omit it. The review queue reads it DIRECTLY as immutable evidence instead of joining a version
   // id that rots. Authored rule content, not user PII; allowlist-projected out of PostHog.
   rule_text?: string;
+  // The ceiling the human ATTESTED the deciding rule at, snapshotted at incident creation from the
+  // rule payload (never resolved later by joining a version id that rots, exactly like rule_text).
+  // NAMESPACED like `enforced_tool` rather than a bare `ceiling`: a generic key would collide with
+  // differently-scoped ceiling values on other events, and this one means specifically "the
+  // enforcement authority this rule was attested at".
+  //
+  // It is deliberately SEPARATE from `decision` and the two can disagree. `decision` is what
+  // actually happened; `enforcement_ceiling` is what the rule was armed at. A DENY-attested rule
+  // clamped to WARN by the session cap (MEETLESS_ACTION_INTERCEPT_MAX) emits
+  // {decision: "warn", enforcement_ceiling: "DENY"}, and that pair is the only way to tell "this
+  // rule is advisory" from "this rule would have blocked but the cap stopped it".
+  //
+  // A closed four-value enum with no path, text or identity, so it is safe to allowlist through the
+  // PostHog projector (the same reasoning that allowlists `enforced_tool`).
+  //
+  // OPTIONAL: incidents emitted before this field existed do not carry it, and there is NO
+  // backfill. Absent means "emitted before the field existed", which is true; inventing a value for
+  // those 49 historical rows would be the same fabrication as rendering an uninstrumented zero.
+  enforcement_ceiling?: EnforcementCeiling;
+  // INV-8 consent state. "overridden" means a human redeemed a single-use, action-scoped grant and
+  // the hard block was withheld. Absent means the block stood. A closed enum with no path, text or
+  // identity, so it is safe to project to PostHog on the same basis as enforcement_ceiling.
+  consent_state?: "overridden";
+  // The user's answer to an ASK prompt. Present ONLY on `decision: "ask"` rows, and today its only
+  // value is "unknown", by design rather than by omission.
+  //
+  // Claude Code exposes no permission outcome to a hook, and this is documented rather than
+  // inferred: PostToolUse fires only after a tool SUCCEEDS (so a denial produces no event at all),
+  // no hook event carries the user's answer as input, PermissionDenied fires only for the auto-mode
+  // classifier and not for an interactive denial, Stop and SessionEnd carry no permission history,
+  // and the session transcript's schema is explicitly undocumented and unstable with official
+  // guidance not to parse it.
+  //
+  // So an explicit "unknown" is the honest record. Inferring approval from the tool having run
+  // afterwards would be fabricated evidence of a human decision, which is the worst thing this
+  // payload could carry. If the host ever exposes the answer, this field is where it lands.
+  ask_outcome?: "unknown";
   // The review label dimension (§5.1). Always "unreviewed" from the CLI; a later
   // offline labeler emits a superseding event to flip it.
   review_status: EnforcementReviewStatus;
@@ -640,6 +755,35 @@ export interface OnboardingFindingPayload {
   minted_rule: boolean;
 }
 
+// The emitted onboarding-offer payload. Counts and closed enums only: no path, no filename, no
+// rule text, no corpus size. Corpus size in particular is deliberately absent, for the same
+// reason the MCP's empty-pull warning carries no count: the pull crosses an ACL boundary and the
+// size of another principal's corpus is not ours to disclose.
+export interface OnboardingOfferPayload {
+  offer_surface: OnboardingOfferSurface;
+  offer_corpus_state: OnboardingOfferCorpusState;
+  // The three seed counters below are NULL, not zero, at a surface that runs no seed.
+  //
+  // `session_start` is a seeding surface: it syncs the checkout's instruction files and then
+  // speaks, so 0 there is a real measurement ("nothing to seed"). `retrieval_empty` fires inside
+  // an MCP pull that never touches the repository, so a 0 would assert a seed ran and found
+  // nothing, and `seed_failed: false` would assert a seed ran and succeeded. Both are claims we
+  // have no evidence for, and control's projector drops null, so the mirrored row simply omits
+  // what did not happen instead of reporting a fiction.
+  //
+  // How many agent-instruction documents the deterministic seed persisted on THIS run. 0 is the
+  // common steady state (already seeded, or nothing to seed) and is meaningful, not missing.
+  seeded_documents: number | null;
+  // T1 instruction files present in the checkout, whether or not they were seeded this run.
+  // This is the denominator that separates "this repo has nothing written down" from "this repo
+  // has instructions and we failed to seed them", which is the P0-1 kill criterion's real
+  // question and is unanswerable from `seeded_documents` alone.
+  instruction_files_present: number | null;
+  // True when the seed attempted a POST and the server refused it (or the POST threw). Keeps a
+  // persistently-failing intel from reading as a repo that simply has nothing to seed.
+  seed_failed: boolean | null;
+}
+
 // The emitted rule-injection payload: the measured meter, plus its turn coordinate and the
 // derived token estimates. Tokens sit ALONGSIDE the bytes rather than replacing them: bytes are
 // the measurement, tokens are a 4-bytes-per-token convention, and keeping both means a real
@@ -687,6 +831,9 @@ export type AnalyticsEvent =
   | (AnalyticsEnvelope & {
       event_type: "mla_onboarding_finding";
     } & OnboardingFindingPayload)
+  | (AnalyticsEnvelope & {
+      event_type: "mla_onboarding_offer";
+    } & OnboardingOfferPayload)
   | (AnalyticsEnvelope & { event_type: "mla_rule_injection" } & RuleInjectionPayload);
 
 // --- envelope construction --------------------------------------------------

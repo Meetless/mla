@@ -206,9 +206,33 @@ export interface DatePrefixedNoteVaultComplianceEvaluatorConfig {
   filenamePrefixPattern: "^\\d{8}-";
 }
 
+/**
+ * The COMMAND family (F2, 2026-08-07): a rule whose subject is the command about to
+ * RUN, not a path it writes. The two families above answer "where may this land";
+ * this one answers "may this operation happen at all", which is the question the
+ * production-billing case needed and neither path family can express.
+ *
+ * CONJUNCTIVE, and that is the load-bearing choice. `comp-credit.cjs --apply` is
+ * dangerous only when the script AND the mutating flag are both present, and they
+ * are never contiguous in a real invocation, so no single forbidden run can state
+ * it. A disjunctive encoding would warn on every `--apply` in the repository, and a
+ * rule that cries wolf trains the operator to scroll past the banner the working
+ * path rules depend on.
+ *
+ * The outer list is a SET (order and duplicates carry no meaning; the hash sorts and
+ * dedupes it). Each inner list is a SEQUENCE: it is a contiguous token run, so its
+ * order IS its meaning and it is hashed verbatim.
+ */
+export interface ForbiddenCommandComplianceEvaluatorConfig {
+  /** Token runs that must ALL appear in ONE statement segment, e.g.
+   * `[["comp-credit.cjs"], ["--apply"]]`. */
+  forbiddenCommandAllOf: string[][];
+}
+
 export type ComplianceEvaluatorConfig =
   | ForbiddenRootComplianceEvaluatorConfig
-  | DatePrefixedNoteVaultComplianceEvaluatorConfig;
+  | DatePrefixedNoteVaultComplianceEvaluatorConfig
+  | ForbiddenCommandComplianceEvaluatorConfig;
 
 /**
  * The evaluator SEMANTICS that produce a verdict, version-bound so a later MLA build cannot

@@ -140,7 +140,7 @@ describe("diagnostic-bundle: structure + positive utility", () => {
     home = tmpHome();
   });
   afterEach(() => {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("emits the fixed four-file set plus a manifest, always", () => {
@@ -237,7 +237,7 @@ describe("diagnostic-bundle: selection", () => {
     home = tmpHome();
   });
   afterEach(() => {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("filters by trace id: only the target trace is included", () => {
@@ -297,7 +297,7 @@ describe("diagnostic-bundle: errors.jsonl projection", () => {
     home = tmpHome();
   });
   afterEach(() => {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("projects a failing command into a structured error with a stable fingerprint", () => {
@@ -362,7 +362,7 @@ describe("diagnostic-bundle: ADVERSARIAL allowlist enforcement", () => {
     home = tmpHome();
   });
   afterEach(() => {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // The whole-bundle text: every emitted file concatenated. Used to prove a

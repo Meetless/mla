@@ -10,7 +10,7 @@ import { ScanResult } from "../../src/lib/scanner/types";
 describe("applyContextVerdict", () => {
   let home: string;
   beforeEach(() => { home = mkdtempSync(join(tmpdir(), "mla-ctx-")); });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("records an accept and removes it from dismissed if present", () => {
     applyContextVerdict({ home, workspaceId: "ws1", action: "dismiss", id: "s1" });
@@ -66,8 +66,8 @@ describe("runContext workspace resolution", () => {
     } else {
       process.env.MEETLESS_WORKSPACE_ID = origEnv;
     }
-    rmSync(markerDir, { recursive: true, force: true });
-    rmSync(home, { recursive: true, force: true });
+    rmSync(markerDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("resolves workspaceId from .meetless.json when MEETLESS_WORKSPACE_ID is unset", async () => {
@@ -91,7 +91,7 @@ describe("runContext workspace resolution", () => {
 describe("advisoryLines (read-only agent-memory advisory list)", () => {
   let home: string;
   beforeEach(() => { home = mkdtempSync(join(tmpdir(), "mla-adv-")); });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   const cacheWith = (advisory: ScanResult["advisoryDirectives"]): ScanResult => ({
     schemaVersion: 1, workspaceId: "ws-a", commitSha: "c", generatedAt: "t",
@@ -141,7 +141,7 @@ describe("reconciliationLines (the full live set behind `mla context list`)", ()
     root = mkdtempSync(join(tmpdir(), "mla-ctx-recon-"));
     writeFileSync(join(root, "CLAUDE.md"), BODY);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   const cacheWith = (findings: unknown[], fetchedAt?: string) =>
     ({ reconciliationFindings: findings, reconciliationFetchedAt: fetchedAt } as never);
@@ -208,7 +208,7 @@ describe("reconciliationLines (the full live set behind `mla context list`)", ()
 describe("latestReviewCardItems", () => {
   let home: string;
   beforeEach(() => { home = mkdtempSync(join(tmpdir(), "mla-rc-")); });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("reads the latest review-card items from the local jsonl", () => {
     const dir = join(home, ".meetless", "workspaces", "ws1");

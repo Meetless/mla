@@ -62,11 +62,17 @@ function outcome(
   } as unknown as AnalyticsEvent;
 }
 
-function coverageGap(type: string, createdMsAgo: number): AnalyticsEvent {
+function coverageGap(
+  type: string,
+  createdMsAgo: number,
+  extra: { topic?: string; confidence?: string } = {},
+): AnalyticsEvent {
   return {
     event_type: "mla_coverage_gap",
     created_at: isoAgo(createdMsAgo),
     coverage_gap_type: type,
+    query_topic_category: extra.topic ?? "unknown",
+    retrieval_confidence: extra.confidence ?? "none",
   } as unknown as AnalyticsEvent;
 }
 
@@ -162,18 +168,40 @@ describe("buildDashboard", () => {
     expect(d.evidence.ignored).toBe(1);
   });
 
-  it("counts a still-pending inject in the denominator, never drops it (INV-LOCAL-STATS-2)", () => {
+  // INV-LOCAL-STATS-2 at the dashboard level, REVISED 2026-08-08 (F4). The "stays in the
+  // denominator" clause is retired here for the same reason it is retired in
+  // analytics-metrics.spec.ts; the "never drops it" clause is kept and strengthened.
+  //
+  // This exact shape is the defect: session 4f958189 had ONE inject and ZERO outcomes,
+  // and the dashboard reported 0% referenced. That 0 is an assertion about an
+  // opportunity nobody observed.
+  it("F4: a still-pending inject is reported as unresolved, and never scored 0% (INV-LOCAL-STATS-2, revised)", () => {
     const events = [
       inject({ id: "p1", createdMsAgo: 1 * DAY, offered: 1, offeredIds: ["NT:a"] }), // no outcome yet
     ];
     const d = buildDashboard(events, 30, NOW);
+    // KEPT: not dropped. It is still counted, still pending, still visible.
     expect(d.injections).toBe(1);
     expect(d.evidence.pending).toBe(1);
-    expect(d.evidence.injects_offered).toBe(1); // stays in denominator
+    expect(d.evidence.unresolved).toBe(1);
+    // RETIRED: it no longer sits in the rate denominator as a fabricated miss.
+    expect(d.evidence.injects_offered).toBe(0);
     expect(d.evidence.injects_referenced).toBe(0);
-    expect(d.evidence.injection_utilization).toBe(0); // 0/1, not n/a, not dropped
+    expect(d.evidence.injection_utilization).toBeNull(); // undefined, NOT 0%
     expect(d.evidence.reference_precision_v1).toBeNull(); // no closed window
     expect(d.evidence.closed_windows).toBe(0);
+  });
+
+  // The render half of the same fix: the number a human reads must say "unresolved",
+  // not print a percentage over a population of zero.
+  it("F4: the render names the unresolved windows instead of implying a measured miss", () => {
+    const events = [
+      inject({ id: "p1", createdMsAgo: 1 * DAY, offered: 1, offeredIds: ["NT:a"] }),
+    ];
+    const out = renderDashboard(buildDashboard(events, 30, NOW), false);
+    expect(out).toMatch(/unresolved/i);
+    // The old render printed "0%" here off a null-safe pct(); it must not reappear.
+    expect(out).not.toMatch(/Proactive Injection Reference Rate:\s*0%/);
   });
 
   it("windows the inject denominator but attaches a late-closing outcome by id", () => {
@@ -210,8 +238,56 @@ describe("buildDashboard", () => {
     ];
     const d = buildDashboard(events, 30, NOW);
     expect(d.coverage_gaps_total).toBe(3);
-    expect(d.coverage_gaps[0]).toEqual({ type: "no_candidate_found", count: 2 });
-    expect(d.coverage_gaps[1]).toEqual({ type: "permission_filtered", count: 1 });
+    expect(d.coverage_gaps[0]).toMatchObject({ type: "no_candidate_found", count: 2 });
+    expect(d.coverage_gaps[1]).toMatchObject({ type: "permission_filtered", count: 1 });
+  });
+
+  // A2 (notes/20260805-did-mla-help-...md fix 7). Section 4 is labelled "the
+  // roadmap" and shipped a bare {type, count}, which is not actionable: it says
+  // something failed and refuses to say what KIND of question failed or how close
+  // retrieval got. The eval-set builder needs a query CLASS, not a query.
+  //
+  // The query TEXT is deliberately absent and stays absent. It is not retained
+  // anywhere on this path (internal-evidence-inject receives --topic-category, a
+  // closed enum, never the prompt) and INV-POSTHOG-PII-1 bars the prompt from
+  // this plane outright. Exposing it would mean BUILDING a prompt-capture path,
+  // which is the opposite of the ask. Everything below is a closed enum already
+  // on the payload.
+  it("A2: breaks each gap down by topic and by how close retrieval got", () => {
+    const events = [
+      coverageGap("no_candidate_found", 2 * DAY, { topic: "architecture", confidence: "none" }),
+      coverageGap("no_candidate_found", 1 * DAY, { topic: "architecture", confidence: "none" }),
+      coverageGap("no_candidate_found", 3 * DAY, { topic: "process", confidence: "low" }),
+    ];
+    const d = buildDashboard(events, 30, NOW);
+    const g = d.coverage_gaps[0];
+    expect(g.type).toBe("no_candidate_found");
+    expect(g.count).toBe(3);
+    expect(g.topics).toEqual([
+      { topic: "architecture", count: 2 },
+      { topic: "process", count: 1 },
+    ]);
+    expect(g.confidences).toEqual([
+      { confidence: "none", count: 2 },
+      { confidence: "low", count: 1 },
+    ]);
+  });
+
+  it("A2: reports the most recent occurrence, so a dead gap is distinguishable from a live one", () => {
+    const d = buildDashboard(
+      [coverageGap("retrieval_error", 9 * DAY), coverageGap("retrieval_error", 2 * DAY)],
+      30,
+      NOW,
+    );
+    expect(d.coverage_gaps[0].last_seen).toBe(isoAgo(2 * DAY));
+  });
+
+  it("A2: never carries query text, on any gap row", () => {
+    const d = buildDashboard([coverageGap("no_candidate_found", 1 * DAY)], 30, NOW);
+    const serialized = JSON.stringify(d.coverage_gaps);
+    for (const forbidden of ["query_text", "prompt", "question", "redacted_query"]) {
+      expect(serialized).not.toContain(forbidden);
+    }
   });
 
   it("ranks load-bearing knowledge and collapses ids by normId", () => {
@@ -321,14 +397,20 @@ describe("buildDashboard", () => {
 });
 
 describe("renderDashboard", () => {
-  it("labels reference follow-through as the v1 honest wording and shows the pending count", () => {
+  // The "shows the pending count" claim survives F4; only its WORD changed. An open
+  // window is still surfaced, now under the name that says what it means for the rate
+  // beside it ("unresolved ... censored"), rather than a bare "pending" in a
+  // parenthetical next to a percentage that had already counted it as a miss.
+  it("labels reference follow-through as the v1 honest wording and still surfaces the open window", () => {
     const events = [
       inject({ id: "p1", createdMsAgo: 1 * DAY, offered: 1, offeredIds: ["NT:a"] }),
     ];
     const d = buildDashboard(events, 30, NOW);
     const text = renderDashboard(d, false);
     expect(text).toContain("Reference follow-through (v1)");
-    expect(text).toContain("pending");
+    expect(text).toContain("Unresolved windows");
+    expect(text).toContain("still open");
+    expect(text).toContain("censored");
     expect(text).not.toContain("Inject Precision"); // §4.2: never call v1 that
     expect(text).not.toContain("Reference Precision"); // rollout step 4: no longer "precision"
   });
@@ -490,7 +572,12 @@ describe("runStats", () => {
     expect(fetchGlobal).toHaveBeenCalledWith(7);
     const out = logSpy.mock.calls[0][0] as string;
     expect(out).toContain("global: 3 workspaces");
-    expect(out).toContain("Injection Utilization:    75%");
+    // Renamed 2026-08-06: the metric counts PROACTIVE PUSHES only and was blind to
+    // the agent's own retrieve_knowledge calls, so the unqualified name over-claimed.
+    // M1 (2026-08-08): "Utilization" said the evidence was USED; the numerator is
+    // `referenced` (an explicit pull, citation or open). The FIELD name is unchanged,
+    // so no stored series moved; only the human-facing string did.
+    expect(out).toContain("Proactive Injection Reference Rate: 75%");
   });
 
   it("surfaces the cross-workspace blocked-action count with the honest split under --global", async () => {
@@ -837,6 +924,7 @@ function rollup(
     unknown: 0,
     no_opportunity: 0,
     pending: 0,
+    unresolved: 0,
     closed_windows: 0,
     ...opts.evidence,
   };

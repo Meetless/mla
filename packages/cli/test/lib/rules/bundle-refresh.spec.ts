@@ -66,7 +66,7 @@ describe("refreshBundleCache", () => {
     home = mkdtempSync(join(tmpdir(), "mla-br-home-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("fetches the authority bundle and persists it as this machine's cached bundle", async () => {
@@ -96,7 +96,7 @@ describe("refreshBundleForScan", () => {
     home = mkdtempSync(join(tmpdir(), "mla-br-home-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("reports delivered and caches the bundle on success", async () => {

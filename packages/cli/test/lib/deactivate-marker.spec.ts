@@ -74,7 +74,7 @@ describe("mla deactivate (workspace-binding removal, T2.2)", () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mla-deact2-"));
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("removes the marker at cwd with --yes", async () => {

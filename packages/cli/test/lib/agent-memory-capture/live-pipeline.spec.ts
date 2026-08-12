@@ -108,7 +108,7 @@ describe("collectAndUploadOnce (live §4 router)", () => {
     };
   });
   afterEach(() => {
-    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, mem]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("new clean project file -> uploaded; ledger settles to the acked hash (COMMIT-1)", async () => {
@@ -295,6 +295,35 @@ describe("collectAndUploadOnce (live §4 router)", () => {
     expect(led.blockedHash).toBe(r.hash);
     expect(led.blockedScannerVersion).toBe("vTest");
     expect(led.lastUploadedHash).toBeUndefined();
+  });
+
+  // A1 (notes/20260805-did-mla-help-this-session-...md issue 6). The pass-local
+  // LiveRecord names the rules that fired, but the ledger dropped them, so
+  // `agent-memory status` could only say "4 blocked" and no surface could say
+  // WHICH files or WHY. Four files sat silently missing from the corpus with no
+  // way to enumerate them. Rule IDS are safe to persist by construction: the
+  // scanner returns rule identifiers, never the matched secret text.
+  it("A1: the block marker persists the rule ids that fired, so blocked files are enumerable", async () => {
+    writeFileSync(join(mem, "a.md"), projectFile("config: requirepass O3o7j8zX"));
+    const client = makeClient();
+    await collectAndUploadOnce(binding, deps(client, { scannerVersion: "vTest" }));
+    const led = readLiveLedger("bind-1", home).entries["a.md"];
+    expect(led.blockedRuleIds).toContain("redis_directive");
+  });
+
+  it("A1: clearing a block clears its rule ids too (no stale reason on a clean file)", async () => {
+    const clean = projectFile("clean v1");
+    writeFileSync(join(mem, "a.md"), clean);
+    const client = makeClient();
+    await collectAndUploadOnce(binding, deps(client, { scannerVersion: "vTest" }));
+    writeFileSync(join(mem, "a.md"), projectFile("requirepass O3o7j8zX"));
+    await collectAndUploadOnce(binding, deps(client, { scannerVersion: "vTest" }));
+    expect(readLiveLedger("bind-1", home).entries["a.md"].blockedRuleIds).toBeTruthy();
+    writeFileSync(join(mem, "a.md"), clean);
+    await collectAndUploadOnce(binding, deps(client, { scannerVersion: "vTest" }));
+    const led = readLiveLedger("bind-1", home).entries["a.md"];
+    expect(led.blockedHash).toBeUndefined();
+    expect(led.blockedRuleIds).toBeUndefined();
   });
 
   it("block: same bytes + same scanner version -> unchanged (no re-emit)", async () => {

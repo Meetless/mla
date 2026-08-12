@@ -38,7 +38,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeCe0Store(store);
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 const IN_BUCKET = "00000000".padEnd(64, "0"); // fraction 0.0

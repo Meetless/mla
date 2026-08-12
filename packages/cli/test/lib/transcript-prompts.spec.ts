@@ -176,7 +176,7 @@ describe("backfillSessionPrompts", () => {
     fs.mkdirSync(path.join(projectsRoot, "-Users-me-repo"), { recursive: true });
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function writeTranscript(rows: string[]): void {

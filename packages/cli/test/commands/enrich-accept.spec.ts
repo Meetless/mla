@@ -351,7 +351,7 @@ describe("mla enrich accept (end to end, real sidecar + mint + file write)", () 
   });
 
   afterAll(() => {
-    rmSync(HOME, { recursive: true, force: true });
+    rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   beforeEach(() => {
@@ -373,8 +373,8 @@ describe("mla enrich accept (end to end, real sidecar + mint + file write)", () 
     logSpy.mockRestore();
     errSpy.mockRestore();
     process.chdir(cwd0);
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(join(HOME, "workspaces"), { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(join(HOME, "workspaces"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function seed(runId: string, candidates: OnboardingCandidateRecord[]): void {

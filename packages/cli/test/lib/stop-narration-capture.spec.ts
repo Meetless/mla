@@ -85,7 +85,7 @@ function mkHarness(activate = true): { h: Harness; cleanup: () => void } {
       fs.writeFileSync(path.join(queueDir, `${sessionId}.turn`), String(n));
     },
   };
-  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }) };
+  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }) };
 }
 
 // modern-transcript builders ------------------------------------------------

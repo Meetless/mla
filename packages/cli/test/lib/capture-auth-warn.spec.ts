@@ -83,7 +83,7 @@ describe("warn_capture_auth (T1.5 fail-soft capture warning)", () => {
     fs.mkdirSync(home, { recursive: true });
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("records one local warning on a 403 capture rejection", () => {

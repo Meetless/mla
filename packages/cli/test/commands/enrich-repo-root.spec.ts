@@ -61,7 +61,7 @@ describe("mla enrich: the git root comes from cwd, not from the marker directory
 
   beforeEach(() => {
     seedCliConfig();
-    rmSync(join(HOME, "workspaces"), { recursive: true, force: true });
+    rmSync(join(HOME, "workspaces"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     // The umbrella carries the marker and is deliberately NOT a git repo. `git init` is run
     // only in the child, so a walk that starts at the umbrella finds no toplevel (unless the
     // system tmpdir itself is inside a repo, which it is not).
@@ -80,11 +80,11 @@ describe("mla enrich: the git root comes from cwd, not from the marker directory
     logSpy.mockRestore();
     errSpy.mockRestore();
     restoreCwd();
-    rmSync(umbrella, { recursive: true, force: true });
+    rmSync(umbrella, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   afterAll(() => {
-    rmSync(HOME, { recursive: true, force: true });
+    rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("plans against the repo the human is standing in, with the marker at a non-git parent", async () => {

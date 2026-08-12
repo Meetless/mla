@@ -20,7 +20,7 @@ function tmp(prefix: string): string {
 }
 
 afterEach(() => {
-  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   dirs = [];
 });
 

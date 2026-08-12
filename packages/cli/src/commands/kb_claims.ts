@@ -290,7 +290,30 @@ export async function runKbClaims(argv: string[]): Promise<number> {
   if (claims.some((c) => (c.reviewOutcome || "PENDING") === "PENDING")) {
     console.log("Rule on one:  mla kb accept <claimId>   |   mla kb reject <claimId>");
   }
+  console.log(renderGroundingCapability());
   return 0;
+}
+
+// Claim-grounding verification has never been implemented (owner ruling
+// 2026-08-06). `record_grounding` and the whole `groundingStatus` seam exist in
+// intel and are correctly guarded, but NOTHING in production calls them, so every
+// claim in every workspace sits at `UNKNOWN`. That is expected behavior, not a
+// broken caller, and the surface must say so: a reader who sees "88 accepted"
+// otherwise concludes those 88 are trusted for generation, which is exactly the
+// inference that produced a whole wrong analysis on 2026-08-05.
+//
+// Derived from CODE OWNERSHIP, not from a persisted capability flag: no verifier
+// exists to write a verdict, so the count is structurally zero and there is no
+// state to keep in sync. If a verifier ever ships, this function is the one place
+// that has to learn about it.
+export function renderGroundingCapability(): string {
+  return [
+    "",
+    "Claim grounding verification: not implemented",
+    "Verified claims: 0",
+    "A verdict records TRUST, not grounding. Accepting a claim does not make it",
+    "trusted-for-generation; that path is reserved and currently unreachable.",
+  ].join("\n");
 }
 
 // ── verdict ──────────────────────────────────────────────────────────────────

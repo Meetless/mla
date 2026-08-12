@@ -55,3 +55,73 @@ describe("scanForSecrets (block-on-detect)", () => {
     expect(scanForSecrets(undefined)).toEqual([]);
   });
 });
+
+// --- Phase 4: narrow redis_directive to real arguments -----------------------
+// notes/20260805-did-mla-help-...md §12.5b. Two rules do ALL the blocking in this
+// corpus: env_assignment and redis_directive. The entropy rule blocks nothing, so
+// it is deliberately untouched here.
+//
+// Measured 2026-08-06 against the live scanner: env_assignment needs NO change.
+// Every placeholder shape passes already (sk_test_..., <secret>, [REDACTED],
+// YOUR_TOKEN, ${TOKEN}) and every realistic credential blocks, including one
+// pasted into a sentence. redis_directive is the one that lacks that guard.
+//
+// The narrowing is STRUCTURAL only. A value is exempt when it is unmistakably a
+// placeholder or a redaction, never because it happens to sit in prose: we cannot
+// tell an English word from a password, and fail-closed is the correct default.
+describe("redis_directive: true positives keep blocking", () => {
+  it("blocks a realistic password", () => {
+    expect(scanForSecrets("requirepass Xk9mQ2vLp4Rt7Ns1")).toContain("redis_directive");
+  });
+
+  it("blocks a realistic password quoted", () => {
+    expect(scanForSecrets(`requirepass "Xk9mQ2vLp4Rt7Ns1"`)).toContain("redis_directive");
+  });
+
+  it("blocks a credential pasted into a sentence, because prose is not an exemption", () => {
+    expect(scanForSecrets("we set requirepass Xk9mQ2vLp4Rt7Ns1 on the prod box")).toContain("redis_directive");
+  });
+
+  it("blocks a short but real-looking value: we cannot prove a word is not a password", () => {
+    expect(scanForSecrets("requirepass hunter2")).toContain("redis_directive");
+  });
+
+  it("still blocks the sibling directives", () => {
+    expect(scanForSecrets("masterauth Xk9mQ2vLp4Rt7Ns1")).toContain("redis_directive");
+    expect(scanForSecrets("masteruser Xk9mQ2vLp4Rt7Ns1")).toContain("redis_directive");
+  });
+});
+
+describe("redis_directive: structural placeholders are not credentials", () => {
+  // Each of these currently BLOCKS, which is the false positive being fixed. They
+  // are the shapes documentation actually uses when describing the directive.
+  it.each([
+    ["angle placeholder", "requirepass <secret>"],
+    ["angle placeholder, named", "requirepass <password>"],
+    ["bracket redaction", "requirepass [REDACTED]"],
+    ["env var reference", "requirepass ${REDIS_PASSWORD}"],
+    ["shell var reference", "requirepass $REDIS_PASSWORD"],
+    ["your-x-here", "requirepass your-password-here"],
+    ["YOUR_TOKEN", "requirepass YOUR_PASSWORD"],
+    ["ellipsis", "requirepass ..."],
+    ["truncated value", "requirepass Xk9m..."],
+    ["x-mask", "requirepass xxxxxxxx"],
+  ])("does not block a %s", (_label, text) => {
+    expect(scanForSecrets(text)).not.toContain("redis_directive");
+  });
+
+  it("does not block the directive named with no argument at all", () => {
+    expect(scanForSecrets("set requirepass")).not.toContain("redis_directive");
+  });
+
+  it("STILL blocks `the requirepass directive.`, and that is the correct trade", () => {
+    // Deliberately asserted, because I first wrote the opposite and it was wrong.
+    // Here `requirepass` is an adjective and `directive.` is an English word, but
+    // nothing structural separates that from `requirepass hunter2`. Telling them
+    // apart needs an NLP classifier, which is explicitly out of scope, so this
+    // stays a false positive ON PURPOSE. A file blocked by it is now NAMED with
+    // its rule (`mla agent-memory status`), so the cost is one visible, diagnosable
+    // withhold rather than a silent one.
+    expect(scanForSecrets("the requirepass directive.")).toContain("redis_directive");
+  });
+});

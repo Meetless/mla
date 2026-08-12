@@ -153,7 +153,7 @@ describe("mla activate provision-or-bind + repo-root guard (T2.1)", () => {
   });
   afterEach(async () => {
     await fake.close();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function mkRepo(name = "repo"): string {

@@ -42,11 +42,57 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
     // move: Write -> DENIED, then `Bash: cat > notes/design.md` -> succeeded, because the
     // hook never fired.
     //
-    // Still an EXACT alternation, NOT the catch-all: Read/Grep/Glob must never spawn the
-    // subcommand. What a Bash call actually writes is decided by deriveWriteTargets, so a
-    // read-only command (`ls`, `grep`) derives no targets and passes straight through.
-    expect(PRE_TOOL_USE_MATCHER).toBe("^(Write|Edit|MultiEdit|NotebookEdit|Bash)$");
+    // WIDENED AGAIN 2026-08-08, for a different reason, and the reason matters because
+    // the two widenings are not the same kind of change.
+    //
+    // 07-11 widened what could be BLOCKED, to close a bypass. 08-08 adds Grep and Glob
+    // to widen what can be ADVISED, so F1's moment-of-need pointer can fire where the
+    // agent actually reaches for a fact: the measured `Grep` for current_revision_id
+    // never reached this hook at all.
+    //
+    // Read is deliberately excluded on a MEASUREMENT, not a preference. Every hooked call
+    // spawns node (~200ms on this machine, benchmarked 2026-08-08 at 233ms for an empty
+    // payload, so the toll is process startup and not our logic). Read is the most
+    // frequent tool in a session and it is F1's weakest arm -- an agent reading the exact
+    // note mla delivered is already using the evidence. Grep and Glob are searches, which
+    // is the case F1 exists for, and they are rare by comparison.
+    //
+    // The enforcement surface did NOT move with it. `ENFORCEABLE_TOOLS` in
+    // internal-pretool-observe.ts fences the ladder to the five write-capable tools, and
+    // the case below proves an inspection call can only ever produce an advisory. That
+    // separation is the invariant worth defending now; the literal is just its shadow.
+    expect(PRE_TOOL_USE_MATCHER).toBe("^(Write|Edit|MultiEdit|NotebookEdit|Bash|Grep|Glob)$");
     expect(PRE_TOOL_USE_MATCHER).not.toBe(""); // never the catch-all
+  });
+
+  it("a tool reachable ONLY because of the F1 widening can never be denied or asked", async () => {
+    // The load-bearing half of the widening. If a future rule change let the bundle
+    // ladder decide about a Read, MLA would start blocking reads nobody asked it to
+    // block, and it would have arrived through a matcher edit rather than a policy one.
+    //
+    // Driven through the real decision function with a bundle that DENIES everything, so
+    // this fails if the fence is removed rather than if some unrelated rule is absent.
+    const { runInternalPretoolObserve } = await import("../../src/commands/internal-pretool-observe");
+    for (const tool of ["Grep", "Glob"]) {
+      let stdout = "";
+      await runInternalPretoolObserve([], {
+        readStdin: async () =>
+          JSON.stringify({
+            session_id: "s1",
+            tool_name: tool,
+            tool_input: { file_path: "/repo/notes/x.md", pattern: "anything" },
+            cwd: "/repo",
+          }),
+        writeOut: (s: string) => {
+          stdout = s;
+        },
+        // Would deny every write-capable call; must be unreachable from here.
+        resolveMaxEnforcement: () => "deny" as never,
+        evidencePointer: null,
+      });
+      const body = JSON.parse(stdout);
+      expect(body?.hookSpecificOutput?.permissionDecision).toBeUndefined();
+    }
   });
 
   it("registers PreToolUse with the narrow matcher and observe script on a fresh file", () => {
@@ -62,7 +108,7 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       expect(entries[0].hooks[0].type).toBe("command");
       expect(JSON.stringify(entries[0])).not.toMatch(/permissionDecision|"decision"/);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -74,7 +120,7 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       expect(res.added).toContain("PreToolUse");
       expect(preToolUse(p).length).toBe(1);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -107,7 +153,7 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       expect(ours).toBeDefined();
       expect(ours.matcher).toBe(PRE_TOOL_USE_MATCHER);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -119,7 +165,7 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       const entries = preToolUse(p);
       expect(entries.length).toBe(1);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -133,7 +179,7 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       expect(res.removed).toContain("PreToolUse");
       expect(preToolUse(p).length).toBe(0);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -142,7 +188,9 @@ describe("ensureClaudeSettings: observe-only PreToolUse registration", () => {
       path.resolve(__dirname, "../../src/connectors/claude-code/hook-contract.ts"),
       "utf8",
     );
-    expect(src).toMatch(/PRE_TOOL_USE_MATCHER\s*=\s*"\^\(Write\|Edit\|MultiEdit\|NotebookEdit\|Bash\)\$"/);
+    expect(src).toMatch(
+      /PRE_TOOL_USE_MATCHER\s*=\s*"\^\(Write\|Edit\|MultiEdit\|NotebookEdit\|Bash\|Grep\|Glob\)\$"/,
+    );
     expect(src).toMatch(/pre-tool-use\.sh/);
   });
 });

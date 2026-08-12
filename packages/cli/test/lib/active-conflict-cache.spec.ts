@@ -27,7 +27,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 function conflict(over: Partial<ActiveConflict> = {}): ActiveConflict {

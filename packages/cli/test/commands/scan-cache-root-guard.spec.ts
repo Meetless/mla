@@ -100,7 +100,7 @@ describe("scan-cache scan-root guard (Finding A: two checkouts, one workspace)",
   });
 
   afterEach(() => {
-    for (const d of [home, repoA, repoB]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, repoA, repoB]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("stamps the scan with the realpath of its scan root", () => {
@@ -204,7 +204,7 @@ describe("scan-cache workspace-global slot ownership (Finding A, write side)", (
   });
 
   afterEach(() => {
-    for (const d of [home, repoA, repoB]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, repoA, repoB]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("a scan from a throwaway root cannot take the slot from a live checkout", () => {
@@ -215,7 +215,7 @@ describe("scan-cache workspace-global slot ownership (Finding A, write side)", (
     try {
       rescanAndCache({ cwd: throwaway, workspaceId: WS, home, now: () => "t" });
     } finally {
-      rmSync(throwaway, { recursive: true, force: true });
+      rmSync(throwaway, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
 
     // Before this fix the slot named the temp dir, the temp dir was then deleted, and every root
@@ -256,7 +256,7 @@ describe("scan-cache workspace-global slot ownership (Finding A, write side)", (
     // The temp dir is deleted, which is exactly what left the 2026-07-28 cache unmatchable
     // forever: "that directory is then deleted, so the cache can never match again and nothing
     // self-heals."
-    rmSync(ghost, { recursive: true, force: true });
+    rmSync(ghost, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     rescanAndCache({ cwd: repoA, workspaceId: WS, home, now: () => "t" });
     expect(readScanCache(home, WS)!.scanRootPath).toBe(realpathSync(repoA));
   });
@@ -277,7 +277,7 @@ describe("scan-cache workspace-global slot ownership (Finding A, write side)", (
     rescanAndCache({ cwd: ghost, workspaceId: WS, home, now: () => "t" });
     expect(existsSync(scanCachePathForRoot(WS, ghostPath, home))).toBe(true);
 
-    rmSync(ghost, { recursive: true, force: true });
+    rmSync(ghost, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     rescanAndCache({ cwd: repoB, workspaceId: WS, home, now: () => "t" }); // any write prunes
 
     expect(existsSync(scanCachePathForRoot(WS, ghostPath, home))).toBe(false);
@@ -306,7 +306,7 @@ describe("latestReviewCardItems scan-root filter (Finding A)", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "mla-cards-home-"));
   });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("returns the card for the current checkout, skipping a sibling checkout's later card", () => {
     appendCard("/repo/a", "from-a");
@@ -332,7 +332,7 @@ describe("latestReviewCardItems scan-root filter (Finding A)", () => {
     try {
       expect(resolveScanRootIdentity(d)).toBe(realpathSync(d));
     } finally {
-      rmSync(d, { recursive: true, force: true });
+      rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

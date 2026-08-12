@@ -75,7 +75,7 @@ describe("runLogin early-return gates", () => {
     else process.env.MEETLESS_CONTROL_TOKEN = prevToken;
     logSpy.mockRestore();
     errSpy.mockRestore();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // A complete browser-login bundle for the bootstrap-then-login path. Shape
@@ -254,7 +254,7 @@ describe("runLogin dead-session self-heal", () => {
     else process.env.MEETLESS_CONTROL_TOKEN = prevToken;
     logSpy.mockRestore();
     errSpy.mockRestore();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function loadRunLogin(): (

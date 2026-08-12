@@ -74,3 +74,13 @@ export const assertSafeWorkspaceId = (workspaceId: string): string =>
   assertSafePathComponent("workspace id", workspaceId);
 
 export const assertSafeRunId = (runId: string): string => assertSafePathComponent("run id", runId);
+
+// A session id is a FILENAME SUFFIX rather than a directory, but the reasoning above is
+// unchanged and the consequence is sharper. The per-session assemble audit exists so one
+// session's floor delta is diffed against ITS OWN previous floor; sanitizing two distinct
+// ids onto one filename would silently re-mix two sessions' baselines, which is exactly
+// the defect the per-session file was introduced to close (floor-delta-session-scope.spec.ts).
+// So: reject. Callers on the hot path already treat the audit as best-effort and swallow a
+// throw, so a malformed id costs a delta line, never a turn.
+export const assertSafeSessionId = (sessionId: string): string =>
+  assertSafePathComponent("session id", sessionId);

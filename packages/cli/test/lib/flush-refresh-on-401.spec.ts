@@ -229,7 +229,7 @@ describe("flush.sh reactive refresh-on-401 (Part 3 T7)", () => {
       expect(readWarnings(home)).toEqual([]);
       expect(fs.existsSync(queueFile)).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -259,7 +259,7 @@ describe("flush.sh reactive refresh-on-401 (Part 3 T7)", () => {
       expect(warnings).toHaveLength(1);
       expect(fs.existsSync(queueFile)).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -282,7 +282,7 @@ describe("flush.sh reactive refresh-on-401 (Part 3 T7)", () => {
       expect(readWarnings(home)).toHaveLength(1);
       expect(fs.existsSync(queueFile)).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -303,7 +303,7 @@ describe("flush.sh reactive refresh-on-401 (Part 3 T7)", () => {
       expect(readWarnings(home)).toHaveLength(1);
       expect(fs.existsSync(queueFile)).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -326,7 +326,7 @@ describe("flush.sh reactive refresh-on-401 (Part 3 T7)", () => {
       expect(readWarnings(home)).toHaveLength(1);
       expect(fs.existsSync(queueFile)).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -355,7 +355,7 @@ describe("flush.sh reactive refresh-on-401 (Part 3 T7)", () => {
       expect(readWarnings(home)).toHaveLength(1);
       expect(fs.existsSync(queueFile)).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

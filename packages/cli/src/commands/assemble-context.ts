@@ -26,6 +26,7 @@ import {
   PersistedAssembleAudit,
   readScanCache,
   writeAssembleAudit,
+  readAssembleAudit,
 } from "../lib/scanner/cache";
 import { ArtifactByteReader } from "../lib/scanner/reconciliation-rehash";
 import {
@@ -34,6 +35,7 @@ import {
 } from "../lib/scanner/reconciliation-live";
 import { readScanCacheForRoot, resolveScanRoot } from "./scan-context";
 import { assembleContext } from "../lib/scanner/assemble";
+import { floorDelta, type FloorRuleRef } from "../lib/scanner/floor-delta";
 import { extractExplicitPaths } from "../lib/scanner/prompt-paths";
 import {
   renderIncompleteDeliveryMarker,
@@ -82,7 +84,17 @@ export interface AssembleContextDeps {
   // checkout, but the floor block is bundle-sourced and workspace-global, so it is correct to
   // deliver from any root's scan. See Row 5.
   readGlobalCache?: (home: string | undefined, workspaceId: string) => ScanResult | null;
-  writeAudit?: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
+  writeAudit?: (
+    home: string | undefined,
+    workspaceId: string,
+    audit: PersistedAssembleAudit,
+    sessionId?: string,
+  ) => void;
+  readAudit?: (
+    home: string | undefined,
+    workspaceId: string,
+    sessionId?: string,
+  ) => PersistedAssembleAudit | null;
   writeMeter?: (path: string, json: string) => void;
   // Byte reader for the reconciliation rehash gate (ADR §3.3 item 9). Injected in tests to feed
   // controlled bytes; defaults to a repoRoot-contained filesystem reader built per call.
@@ -113,6 +125,17 @@ interface AssembleStdin {
   // next turn would inject last turn's unverified findings under trust="governed". A temp path the
   // caller creates and deletes makes that structurally impossible: no file means no block.
   reconcileFile?: string;
+  // The Claude Code session this turn belongs to, from the hook's own `.session_id`. Used for
+  // exactly one thing: keying the assemble audit, whose stored floor delta is a claim about
+  // "since YOUR last turn".
+  //
+  // Absent is a supported state, not a degraded one. Non-hook callers (`mla` run by hand, the
+  // test harness) have no session, and they get the legacy workspace-shaped receipt rather
+  // than a guess at someone else's. What they must never get is a stranger's baseline, which
+  // is what every caller got when this key did not exist: measured on session bc08eb20,
+  // 35 foreign assemblies landed between one agent's two turns and its receipt reported
+  // `removed: []` while three [MUST] rules left its floor.
+  sessionId?: string;
 }
 
 function byteLength(s: string): number {
@@ -144,7 +167,23 @@ function parseInput(raw: string): AssembleStdin | null {
   const meterFile = typeof j.meterFile === "string" && j.meterFile ? j.meterFile : undefined;
   const reconcileFile =
     typeof j.reconcileFile === "string" && j.reconcileFile ? j.reconcileFile : undefined;
-  return { base, prompt, workingSet, workspaceId, repoRoot, safeTotal, meterFile, reconcileFile };
+  // Empty or non-string reads as ABSENT, matching every optional above. That is the honest
+  // mapping: the audit path treats `undefined` as "this caller cannot name a session" and
+  // falls back to the workspace-shaped receipt, whereas an empty string would build
+  // `assemble-audit..json` and quietly become a second shared file, which is the exact defect
+  // the session key exists to remove.
+  const sessionId = typeof j.sessionId === "string" && j.sessionId.trim() ? j.sessionId.trim() : undefined;
+  return {
+    base,
+    prompt,
+    workingSet,
+    workspaceId,
+    repoRoot,
+    safeTotal,
+    meterFile,
+    reconcileFile,
+    sessionId,
+  };
 }
 
 // Sanitize the git working set to repo-relative, contained paths (§4.7 "full working set").
@@ -173,7 +212,23 @@ interface AssembleCtx {
   now: () => string;
   readCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
   readGlobalCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
-  writeAudit: (home: string | undefined, workspaceId: string, audit: PersistedAssembleAudit) => void;
+  writeAudit: (
+    home: string | undefined,
+    workspaceId: string,
+    audit: PersistedAssembleAudit,
+    sessionId?: string,
+  ) => void;
+  // M6: the audit this turn is about to overwrite. Read so the floor delta is computed
+  // against what was actually delivered last turn, with no second copy persisted anywhere.
+  //
+  // F1: keyed by SESSION as well as workspace. "Last turn" has to mean this session's, and on
+  // a machine where 10+ sessions share a checkout the workspace-shaped receipt meant whichever
+  // session wrote last (cache.ts, assembleAuditPath).
+  readAudit: (
+    home: string | undefined,
+    workspaceId: string,
+    sessionId?: string,
+  ) => PersistedAssembleAudit | null;
   // Reads one repo-relative instruction file's bytes for the rehash gate; null when unreadable.
   readArtifactBytes: ArtifactByteReader;
 }
@@ -253,6 +308,103 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
         }
       : {};
 
+  // Which ruleIds belong to the always-on FLOOR, as opposed to the working-set-scoped tail.
+  //
+  // G1: this is the question `tier` was being asked and cannot answer. A floor MUST rides
+  // tier "floor-must", but a floor SHOULD that fits rides "best-effort" -- the SAME tier a
+  // scoped SHOULD rides -- so a tier filter sees the floor's MUST half only. Membership comes
+  // from the cache that produced both arrays, which is the authority on which set a rule is in.
+  const floorRuleIds = new Set((cache?.floorRules ?? []).map((f) => f.ruleId));
+
+  // M6: the floor rules DELIVERED this turn, as the delta speaks about them. Floor only: a
+  // scoped rule appearing or disappearing is the scoping working as designed (it tracks the
+  // working set), not an obligation being withdrawn, and reporting it would bury the rare real
+  // event under per-turn churn.
+  //
+  // A rule that was OMITTED is absent from `delivered` and is therefore absent from THIS list,
+  // which is correct: the list is what rode. It is not a removal, and that half of G1 is
+  // reversed as of I3 (2026-08-10). G1 read "squeezed out for bytes" as the common way a rule
+  // leaves the floor with nobody deciding to remove it, and treated the silence as a blind spot.
+  // In production the sentence it produced ("floor changed since your last turn: -2 removed")
+  // is false: nobody withdrew anything, the floor block discloses the size drop on that same turn
+  // in its own precedence sentence, and the rule rides again on the next shorter prompt. So the
+  // omission set is handed to `floorDelta` below as the third state of absence, and only a rule
+  // this turn's assembler cannot account for AT ALL reads as a withdrawal. G1's FIRST blind spot
+  // (a delivered floor SHOULD rides tier "best-effort" and a tier filter cannot see it) stands
+  // untouched: that is what `floorRuleIds` above is for.
+  const floorRefs = (delivered: Array<{ ruleId: string; tier: string }>): FloorRuleRef[] =>
+    delivered
+      .filter((d) => floorRuleIds.has(d.ruleId))
+      .map((d) => ({ ruleId: d.ruleId, text: identityByRuleId.get(d.ruleId)?.text ?? "" }));
+
+  // States where `delivered` records no floor knowledge because none was knowable. The degraded
+  // branches ship a PRE-RENDERED floor block and pass `delivered: []`, for the same reason their
+  // meter reports `always_on_rules: 0` with `degraded: true`: a rendered block cannot say how many
+  // rules are inside it. Empty there means UNKNOWN, never NONE.
+  //
+  // Both directions have to honour that or the delta becomes a liar on exactly the turns the floor
+  // is most degraded: diffing a real prior against the unknown reports every floor rule as
+  // withdrawn, and treating the unknown as the next turn's prior reports the entire floor as new.
+  // This line rides a footer the agent sees every turn, so one spurious "-13 removed" costs it the
+  // credibility that makes a real removal worth reading.
+  const floorUnknown = (state: PersistedAssembleAudit["state"]): boolean =>
+    state === "incomplete" || state === "old-schema" || state === "base-invariant";
+
+  // Compare against the audit we are about to overwrite, and emit the field only when
+  // something actually moved. Absent-on-no-change is what lets the recap treat its
+  // presence as the signal. Best-effort: a missing or malformed prior audit reads as "no
+  // prior", which floorDelta correctly renders as no delta rather than as N additions.
+  const floorDeltaField = (
+    state: PersistedAssembleAudit["state"],
+    delivered: Array<{ ruleId: string; tier: string }>,
+    omitted: Array<{ ruleId: string; reason: string }>,
+  ): { floorDelta?: { added: FloorRuleRef[]; removed: FloorRuleRef[] } } => {
+    if (floorUnknown(state)) return {};
+    let prior: FloorRuleRef[] | null = null;
+    // F3: the PREVIOUS turn's whole delivered snapshot, floor and scoped alike. `delivered`
+    // on the receipt has always carried every rule that rode, of every tier; only the
+    // `floor: true` marker and the `text` copy are floor-only. So the union is already on
+    // disk and needs no new field, no schema bump and no second receipt -- which is the
+    // whole reason the invariant could be closed at the diff boundary.
+    let priorDelivered: Set<string> | null = null;
+    // I3: the previous turn's WITHHELD set, from the same receipt and by the same rule as
+    // `priorDelivered`. Read on this side too because the alarm is symmetric: a rule that
+    // lost last turn's budget contest and fits this one is not an addition.
+    let priorOmitted: Set<string> | null = null;
+    try {
+      const previous = ctx.readAudit(ctx.home, input.workspaceId, input.sessionId);
+      if (previous && !floorUnknown(previous.state)) {
+        prior = previous.delivered
+          // `floor` is the marker; `tier === "floor-must"` is the READ-side fallback for a
+          // receipt written before this field existed. Without it the first turn after an
+          // upgrade sees an empty prior floor and announces the whole floor as added. With it,
+          // that turn announces only the SHOULD half -- rules that genuinely did just become
+          // visible to the delta -- and every turn after is exact.
+          .filter((d) => d.floor === true || d.tier === "floor-must")
+          .map((d) => ({ ruleId: d.ruleId, text: d.text ?? "" }));
+        priorDelivered = new Set(previous.delivered.map((d) => d.ruleId));
+        // An older receipt predates the field; absent reads as "nothing knowably withheld",
+        // which is the pre-I3 verdict rather than a claim that nothing was.
+        priorOmitted = new Set((previous.omitted ?? []).map((o) => o.ruleId));
+      }
+    } catch {
+      prior = null;
+      priorDelivered = null;
+      priorOmitted = null;
+    }
+    const d = floorDelta(prior, floorRefs(delivered), {
+      ...(priorDelivered ? { prev: priorDelivered } : {}),
+      ...(priorOmitted ? { prevOmitted: priorOmitted } : {}),
+      curr: new Set(delivered.map((x) => x.ruleId)),
+      // I3: the third state of absence, from the receipt this very call is about to write.
+      // A best-effort SHOULD that lost the byte contest was WITHHELD, not withdrawn, and the
+      // floor block tells the agent so on this same turn in its own precedence sentence.
+      currOmitted: new Set(omitted.map((o) => o.ruleId)),
+    });
+    if (d.added.length === 0 && d.removed.length === 0) return {};
+    return { floorDelta: d };
+  };
+
   const emitAudit = (
     state: PersistedAssembleAudit["state"],
     text: string,
@@ -261,7 +413,10 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
     omitted: Array<{ ruleId: string; reason: string }>,
     bytes = byteLength(text),
   ): void => {
-    ctx.writeAudit(ctx.home, input.workspaceId, {
+    ctx.writeAudit(
+      ctx.home,
+      input.workspaceId,
+      {
       schemaVersion: 1,
       at: ctx.now(),
       workspaceId: input.workspaceId,
@@ -277,8 +432,15 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
           tier: d.tier,
           ...(id?.versionId ? { versionId: id.versionId } : {}),
           ...(id?.represents && id.represents.length ? { represents: id.represents } : {}),
+          // Floor rules only: see PersistedAssembleAudit.delivered. A rule that leaves the
+          // floor is gone from the next scan cache, so this is the only place its statement
+          // survives for the next turn's delta to name it. Keyed on floor MEMBERSHIP, not on
+          // tier: a floor SHOULD rides "best-effort" and its statement is exactly as needed.
+          ...(floorRuleIds.has(d.ruleId) ? { floor: true as const } : {}),
+          ...(floorRuleIds.has(d.ruleId) && id?.text ? { text: id.text } : {}),
         };
       }),
+      ...floorDeltaField(state, delivered, omitted),
       omitted: omitted.map((o) => {
         const id = identityByRuleId.get(o.ruleId);
         return {
@@ -291,7 +453,9 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
       // audit (no findings in the cache), matching the versionId/represents "absent when unknown"
       // idiom above so an older reader still parses.
       ...reconciliationAudit,
-    });
+      },
+      input.sessionId,
+    );
   };
 
   // A degraded-branch meter: the cache could not be assembled from, so no rule COUNT is knowable
@@ -498,6 +662,7 @@ export async function runAssembleContext(
       // Unguarded by design, and used on Row 5 only. See AssembleContextDeps.readGlobalCache.
       readGlobalCache: deps.readGlobalCache ?? readScanCache,
       writeAudit: deps.writeAudit ?? writeAssembleAudit,
+      readAudit: deps.readAudit ?? readAssembleAudit,
     };
     const log = deps.log ?? ((out: string) => process.stdout.write(out));
     const logErr = deps.logErr ?? ((out: string) => process.stderr.write(out));

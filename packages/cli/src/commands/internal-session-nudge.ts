@@ -7,6 +7,12 @@ import {
   MarkerMissingWorkspaceIdError,
 } from "../lib/workspace";
 import { fetchOnboardingStatus } from "../lib/enrichment/onboarding-status-client";
+import { seedWorkspaceInstructions, type SeedOutcome } from "../lib/enrichment/seed-workspace";
+import {
+  emitOnboardingOffer,
+  type OnboardingOfferInput,
+} from "../lib/analytics/onboarding-offer";
+import type { OnboardingOfferCorpusState } from "../lib/analytics/envelope";
 
 // `mla _internal session-nudge`: the SessionStart hook's one-line "Meetless is
 // installed but inactive here" explanation.
@@ -30,6 +36,8 @@ import { fetchOnboardingStatus } from "../lib/enrichment/onboarding-status-clien
 //   - valid marker, logged in, NEVER onboarded: nudge `/mla onboard` (see below).
 //   - valid marker, logged in, onboarded/unknown: silent. The active hook path
 //       injects context.
+// In EVERY logged-in, activated case (including both silent ones) the corpus
+// synchronization runs first and independently; only the sentence is conditional.
 //   - broken marker (no workspaceId):    nudge `mla doctor` regardless of auth; a
 //       present-but-broken marker is itself evidence of intent worth repairing.
 // In every other case it prints nothing and exits 0. It writes no files, keeps no
@@ -45,6 +53,10 @@ interface SessionNudgeDeps {
     workspaceId: string,
     cfg: CliConfig,
   ) => Promise<boolean | null>;
+  /** The deterministic bind-time seed (P0-1). Injected so a test never reaches git or intel. */
+  seedWorkspace?: (cwd: string, workspaceId: string, cfg: CliConfig) => Promise<SeedOutcome>;
+  /** The offer telemetry seam (P0-3). Injected so a test can assert the row without a spool. */
+  emitOffer?: (input: OnboardingOfferInput) => void;
 }
 
 function defaultIsGitRepo(dir: string): boolean {
@@ -97,6 +109,56 @@ const NEVER_ONBOARDED_MSG =
   "read-only scouts read the docs and git history and surface candidates born PENDING " +
   "for review, and nothing is accepted automatically. This is a one-time step per workspace.";
 
+// Spoken once the deterministic seed has actually INDEXED this repository's own written
+// instructions. Deliberately not "governed": that is the authority word, it is what a human
+// review confers, and it is the one thing this path does not do. Calling born-PENDING material
+// governed tells the agent the corpus carries team authority it was never granted.
+// It replaces the chore above with a state change, which is the whole point
+// of P0-1: the workspace stopped being un-answerable without anybody being asked to do anything.
+//
+// Three things it must say and keep saying:
+//   1. retrieval WORKS now, so the agent stops reading empty as absent.
+//   2. the material is PENDING. Serving and trust are different gates (PENDING claims are
+//      readable on every surface by design), and blurring that is how an unreviewed line starts
+//      reading as team authority.
+//   3. what is still MISSING. Instruction files are what the repo wrote down; decisions and the
+//      reasoning behind them are not in them, and that is what the scouts are for. Onboarding is
+//      reframed from the doorway into the product to the enrichment step after it.
+function seededMsg(documents: number): string {
+  const plural = documents === 1 ? "" : "s";
+  return (
+    `Meetless just indexed ${documents} agent-instruction file${plural} from this repository, ` +
+    "with no model and no review, and shared them with the workspace. `retrieve_knowledge` can " +
+    "now answer from this repo's own written rules, so stop treating an empty result here as " +
+    "proof a fact is unrecorded. This material is PENDING: retrievable and citable, NOT accepted " +
+    "as team authority until a human reviews it. It also covers only what is written DOWN. For " +
+    "the decisions behind the rules and the history that changed them, run `/mla onboard` (two " +
+    "read-only scouts read the docs and git log; nothing is accepted automatically)."
+  );
+}
+
+// The steady state after a seed: this checkout's instruction files are already governed and
+// unchanged, but the workspace has still never had an onboarding run. Distinct from the message
+// above because repeating "just indexed N files" every session would be a lie by the second one.
+// P2-6: what teammate number two sees. Their sync ingested their own private copies, found a
+// teammate already shares each file, and retracted them, so they added nothing durable and must
+// not be told they did. Same gate, opposite feeling: the workspace is already answerable.
+const SHARED_BY_TEAMMATE_MSG =
+  "This repository's agent-instruction files are already indexed and shared with this workspace " +
+  "by a teammate, so `retrieve_knowledge` can answer from them right now; an empty result is a " +
+  "miss, not proof a fact is unrecorded. They are PENDING: retrievable, not accepted as team " +
+  "authority until a human reviews them. What is still missing is everything NOT written down " +
+  "in them: the decisions behind the rules and the history that changed them. Run `/mla onboard` " +
+  "to index that too; nothing is accepted automatically.";
+
+const SEEDED_PRIOR_MSG =
+  "This repository's agent-instruction files are already indexed and retrievable in Meetless, " +
+  "so `retrieve_knowledge` can answer from them; an empty result is a miss, not proof a fact is " +
+  "unrecorded. They are PENDING: retrievable, not accepted as team authority until a human " +
+  "reviews them. What is still missing is everything NOT written down in them: the decisions " +
+  "behind the rules and the history that changed them. Run `/mla onboard` to index that too; " +
+  "nothing is accepted automatically.";
+
 // How long SessionStart will wait for the onboarding answer. Deliberately far below
 // the 10s default the other callers use: this runs before every session, the answer
 // only decides whether to print one paragraph, and an unreachable intel must cost the
@@ -119,6 +181,30 @@ async function defaultWorkspaceEverOnboarded(
   return (
     await fetchOnboardingStatus(kbCfg, { timeoutMs: ONBOARD_PROBE_TIMEOUT_MS })
   ).onboarded;
+}
+
+// The real seams, kept out of the handler so the handler reads as policy and the wiring stays
+// one line each. Both are fail-soft at their own layer as well: belt and braces, because this
+// path runs before every session and a throw here is a broken session start, not a lost metric.
+async function defaultSeedWorkspace(
+  cwd: string,
+  workspaceId: string,
+  cfg: CliConfig,
+): Promise<SeedOutcome> {
+  return seedWorkspaceInstructions({ cwd, workspaceId, cfg });
+}
+
+// The workspace id is carried on the input rather than re-resolved here: the handler already
+// holds the id from the RESOLVED marker, and re-deriving it from cli-config would attribute the
+// row to the home workspace whenever this repo binds a different one.
+function makeDefaultEmitOffer(workspaceId: string) {
+  return (input: OnboardingOfferInput): void => {
+    emitOnboardingOffer(input, {
+      workspaceId,
+      sessionId: (process.env.CLAUDE_CODE_SESSION_ID || "").trim() || null,
+      nowMs: Date.now(),
+    });
+  };
 }
 
 export async function runInternalSessionNudge(
@@ -169,9 +255,37 @@ export async function runInternalSessionNudge(
     // skill, but that is an EDGE at activation time; a workspace already past it can
     // only be reached here, at SessionStart, which is a LEVEL condition.
     //
+    // ---- SYNCHRONIZE FIRST, and independently of the probe below -------------
+    //
+    // This is the ONLY trigger that reaches a workspace already past `mla activate`: hooks gate
+    // on an existing `.meetless.json` and only activate writes one, so there is no hook-driven
+    // bind to hang a seed on. `activate` is an EDGE; this is the LEVEL.
+    //
+    // It runs BEFORE the probe and does not read its answer, because the two answer different
+    // questions with different failure modes. "Are this checkout's instruction files in the
+    // corpus?" is a LOCAL receipt-versus-scan diff that costs one `git ls-files` and one file
+    // read in steady state. "Has this workspace ever run agentic onboarding?" is a remote lookup
+    // on a 2500ms budget that was sized, in its own comment, for deciding whether to print one
+    // paragraph. Hanging the corpus off that budget meant a slow intel silently cost us the
+    // corpus; and gating on `onboarded === false` meant that once `/mla onboard` had ever run,
+    // a CLAUDE.md added next week would never be picked up at all.
+    //
+    // The fix is the decoupling, not a bigger timeout: the probe now decides COPY and nothing else.
+    const seed = deps.seedWorkspace ?? defaultSeedWorkspace;
+    let outcome: SeedOutcome | null = null;
+    try {
+      outcome = await seed(cwd, ctx.workspaceId, cfg);
+    } catch {
+      // A nudge is not a gate. An unreachable intel costs the user nothing and retries next
+      // session; the workspace is simply still dark, and the copy below says so.
+      outcome = null;
+    }
+
+    // ---- then decide what, if anything, to SAY --------------------------------
     // Tri-state, and ONLY an affirmative `false` speaks. `null` (offline, 5xx,
     // timeout) is silence: a nudge is not a gate, and failing quiet is what keeps a
-    // network hiccup from becoming a nag on every session.
+    // network hiccup from becoming a nag on every session. Silence here no longer
+    // means nothing happened; the sync above already ran.
     const everOnboarded = deps.workspaceEverOnboarded ?? defaultWorkspaceEverOnboarded;
     let onboarded: boolean | null = null;
     try {
@@ -180,7 +294,50 @@ export async function runInternalSessionNudge(
       onboarded = null;
     }
     if (onboarded === false) {
-      log(additionalContext(NEVER_ONBOARDED_MSG));
+      // What WE durably added, counted off what was SHARED rather than off what was added.
+      // Adding is not the achievement: a document that lands and then fails to promote is
+      // invisible to the team, and a teammate's copy is retracted outright. Measured live, a
+      // teammate whose receipt was lost produced ingested+noop = 2 with nothing shared at all,
+      // and counting the add would have claimed two indexed files for a run that achieved none.
+      const landed = outcome ? outcome.shared : 0;
+      // Files this checkout did not have to add because the corpus already answers for them:
+      // ours from a previous session, a teammate's shared copy, or a path we have abandoned.
+      const alreadySeeded = outcome
+        ? outcome.unchanged + outcome.redundant + outcome.blocked
+        : 0;
+      const corpusState: OnboardingOfferCorpusState =
+        landed > 0 ? "seeded" : alreadySeeded > 0 ? "seeded_prior" : "dark";
+      // Within `seeded_prior`, a teammate's shared corpus and our own prior seed are the same
+      // product state but different sentences: only one of them can honestly say "a teammate".
+      const sharedByTeammate = (outcome?.redundant ?? 0) > 0 && landed === 0;
+
+      // P0-3, emitted BEFORE the message so a fault in rendering cannot cost us the row, and
+      // wrapped so a fault in the row cannot cost us the session.
+      try {
+        (deps.emitOffer ?? makeDefaultEmitOffer(ctx.workspaceId))({
+          surface: "session_start",
+          corpusState,
+          seededDocuments: landed,
+          instructionFilesPresent: landed + alreadySeeded,
+          // A seed that failed and a repo with nothing to seed are both zero documents and
+          // demand opposite fixes, so they must not collapse into one row.
+          seedFailed: outcome === null || outcome.failed > 0,
+        });
+      } catch {
+        /* telemetry must never fail the session start it observes */
+      }
+
+      log(
+        additionalContext(
+          corpusState === "seeded"
+            ? seededMsg(landed)
+            : corpusState === "seeded_prior"
+              ? sharedByTeammate
+                ? SHARED_BY_TEAMMATE_MSG
+                : SEEDED_PRIOR_MSG
+              : NEVER_ONBOARDED_MSG,
+        ),
+      );
     }
     return 0;
   } catch (e) {

@@ -472,3 +472,69 @@ test("a plain validation error is NOT an intel transport error (passes through)"
   assert.equal(isIntelHttpOrTransportError(null), false);
   assert.equal(isIntelHttpOrTransportError(undefined), false);
 });
+
+// --- G2 DEFECT PIN -------------------------------------------------------------------
+//
+// notes/20260812-did-mla-help-session-8751d447-both-clients-blamed-the-wrong-service.md
+//
+// These record CURRENT behaviour, so they are GREEN today. They exist because the
+// taxonomy below is RIGHT and was still wrong on the wire, which no existing test could
+// have caught: every test above hands the classifier an error that already carries
+// `.status`, so the branch that fires in production is the one branch nothing exercised
+// against a real outage.
+//
+// MEASURED, session 8751d447, 2026-08-12. `control` was down, so intel answered
+// `503 {"detail":"Auth backend unavailable"}` on POST /v1/ask/retrieve in 0.15s, from the
+// exact URL the MCP is bound to. `meetless__retrieve_knowledge` nonetheless reported
+// "intel is unreachable (the connection failed)": the NO-STATUS branch. intel was up,
+// answering /health in 4.5ms, and had just returned a numeric status on that same path.
+//
+// This module's own docstring names the harm precisely: collapsing the shapes "sends an
+// operator to check DNS, ingress and the deploy when intel is plainly answering". It did
+// exactly that. The taxonomy is not the defect; a caller that loses `.status` is, and
+// this file cannot see that caller. What it CAN pin is the asymmetry that makes the loss
+// expensive: with a status the copy is careful and correct, without one it names a
+// service it has no evidence about.
+//
+// THE EDIT THAT CLOSES THIS (G2a): the no-status branch must describe the failure without
+// asserting WHICH service failed, because a status-free transport error is exactly the
+// case where the module does not know. G2b (find the leg that drops `.status`) is blocked
+// on an unproven premise and is deliberately not pinned here.
+
+test("G2 pin: WITH a status the copy is careful, and says intel is reachable", () => {
+  const c = classifyIntelError(httpErr(503, { detail: "Auth backend unavailable" }), { noun: "retrieval" });
+  assert.equal(c.category, "unavailable");
+  assert.equal(c.status, 503);
+  assert.equal(c.transient, true);
+  // The correct half. This is what the production turn SHOULD have rendered.
+  assert.match(c.message, /server error \(HTTP 503\)/);
+  assert.match(c.message, /Intel is reachable; this is not a connectivity fault/);
+  assert.doesNotMatch(c.message, /the connection failed/);
+});
+
+test("G2 pin: WITHOUT a status it names intel specifically, on no evidence", () => {
+  // The shape a transport failure arrives in: undici's TypeError, no .status.
+  const e = new TypeError("fetch failed");
+  const c = classifyIntelError(e, { noun: "retrieval" });
+  assert.equal(c.category, "unavailable");
+  assert.equal(c.status, undefined);
+  assert.equal(c.transient, true);
+  // PIN. When G2a lands, the message stops naming intel and these two flip.
+  assert.match(c.message, /intel is unreachable \(the connection failed\)/);
+  assert.doesNotMatch(c.message, /governed-memory backend/);
+});
+
+test("G2 pin: the two branches must never converge, in either direction", () => {
+  // VACUITY GUARD. Without this, deleting shapeOfUnavailable and hardcoding one string
+  // would leave one pin above green and read as health. The point of the finding is that
+  // these are two DIFFERENT facts about the world; a fix may reword either, never merge
+  // them.
+  const withStatus = classifyIntelError(httpErr(503, "boom"), { noun: "retrieval" }).message;
+  const without = classifyIntelError(new TypeError("fetch failed"), { noun: "retrieval" }).message;
+  assert.notEqual(withStatus, without);
+  // 429 is the third shape and the one where retrying without backoff makes it worse, so
+  // it must stay distinct from both.
+  const rate = classifyIntelError(httpErr(429, "slow down"), { noun: "retrieval" }).message;
+  assert.notEqual(rate, withStatus);
+  assert.notEqual(rate, without);
+});

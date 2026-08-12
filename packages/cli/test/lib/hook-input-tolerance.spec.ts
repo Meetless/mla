@@ -74,7 +74,7 @@ function runHook(hookFile: string, stdin: string): RunResult {
 
   const queueDir = path.join(meetlessHome, "queue");
   const queueFiles = fs.existsSync(queueDir) ? fs.readdirSync(queueDir) : [];
-  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   return {
     status: r.status ?? -1,
     stdout: r.stdout,

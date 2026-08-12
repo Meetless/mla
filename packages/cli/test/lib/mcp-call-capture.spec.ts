@@ -94,7 +94,7 @@ function mkHarness(activate = true): { h: Harness; cleanup: () => void } {
       return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
     },
   };
-  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }) };
+  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }) };
 }
 
 function mcpInput(opts: {
@@ -102,12 +102,14 @@ function mcpInput(opts: {
   tool: string;
   toolInput?: object;
   toolResponse?: unknown;
+  toolUseId?: string;
 }) {
   return {
     session_id: opts.sessionId,
     tool_name: opts.tool,
     tool_input: opts.toolInput ?? {},
     tool_response: opts.toolResponse ?? "",
+    ...(opts.toolUseId ? { tool_use_id: opts.toolUseId } : {}),
   };
 }
 
@@ -142,6 +144,59 @@ describe("post-tool-use.sh: per-turn meetless MCP-call capture (P1)", () => {
       expect(c.source_ids).toEqual(
         expect.arrayContaining(["NT:20260526-solo-founder-vs-agents", "DD:abc123"]),
       );
+    } finally {
+      cleanup();
+    }
+  });
+
+  // D3. The forwarded AgentRunEvent has carried an honest `outcome` since the
+  // governed-story work; the LOCAL ledger row, which is what every helpfulness audit
+  // is actually written from, did not. The verdict was computed 30 lines below the
+  // writer and then thrown away.
+  //
+  // `tool_use_id` rides along because the Stop-time refusal backstop
+  // (mcp-failure-scan.ts) needs a stable key to tell "already in the ledger" from
+  // "never recorded". It is the agent's own tool-use identity, which is the only id
+  // both writers can see.
+  it("D3: stamps the classified outcome and the tool_use_id on the LOCAL ledger row", () => {
+    const { h, cleanup } = mkHarness();
+    try {
+      h.seedTurn("sess-out", 2);
+      const status = h.fire(
+        mcpInput({
+          sessionId: "sess-out",
+          tool: "mcp__meetless__meetless__retrieve_knowledge",
+          toolInput: { query: "governed memory" },
+          // The array-shaped success Claude Code actually sends.
+          toolResponse: [{ type: "text", text: JSON.stringify({ candidates: [] }) }],
+          toolUseId: "toolu_LIVE_1",
+        }),
+      );
+      expect(status).toBe(0);
+      const c = h.mcpCalls()[0];
+      expect(c.outcome).toBe("success");
+      expect(c.tool_use_id).toBe("toolu_LIVE_1");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("D3: an outcome the classifier cannot read is `unknown`, never an invented success", () => {
+    const { h, cleanup } = mkHarness();
+    try {
+      h.seedTurn("sess-unk", 1);
+      h.fire(
+        mcpInput({
+          sessionId: "sess-unk",
+          tool: "mcp__meetless__meetless__retrieve_knowledge",
+          toolInput: { query: "q" },
+          // Empty array: a shape the grammar in common.sh deliberately refuses to call
+          // a completed pull.
+          toolResponse: [],
+          toolUseId: "toolu_LIVE_2",
+        }),
+      );
+      expect(h.mcpCalls()[0].outcome).toBe("unknown");
     } finally {
       cleanup();
     }

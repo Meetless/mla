@@ -38,3 +38,52 @@ export function readLogJsonl(file: string): Record<string, unknown>[] {
   }
   return out;
 }
+
+// Default tail window for readLogJsonlTail. ask-traces lines average ~8.4KB (measured over
+// the last 200 rows of the live spool, max 34KB), so 8MB is roughly the last 950 turns
+// across every concurrent session on this machine. A Stop-time reader is looking for a line
+// its OWN turn wrote at prompt time, so it would take ~950 intervening turns from other
+// sessions, inside one turn, to fall out of the window.
+const TAIL_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Read the TAIL of one jsonl trace file, for readers that only ever want a recent turn.
+ *
+ * ask-traces.jsonl is 35MB and grows; parsing all of it to find one line is the kind of cost
+ * that gets a best-effort hook killed by its own timeout. This reads the last `maxBytes`
+ * only, drops the leading (possibly partial) line, and otherwise behaves exactly like
+ * readLogJsonl.
+ *
+ * Deliberately NOT used by computeTurnRecap: that reader also answers `mla turn N` for an
+ * arbitrary N, where truncating the window would turn an old turn into a silent "no trace"
+ * and it would read as a liveness gap rather than as a windowing artifact.
+ */
+export function readLogJsonlTail(file: string, maxBytes = TAIL_BYTES): Record<string, unknown>[] {
+  const p = path.join(logsDir(), file);
+  if (!fs.existsSync(p)) return [];
+  const size = fs.statSync(p).size;
+  if (size <= maxBytes) return readLogJsonl(file);
+
+  const fd = fs.openSync(p, "r");
+  try {
+    const buf = Buffer.allocUnsafe(maxBytes);
+    fs.readSync(fd, buf, 0, maxBytes, size - maxBytes);
+    const text = buf.toString("utf8");
+    const out: Record<string, unknown>[] = [];
+    // Drop the first element: the window almost certainly starts mid-line, and a half-line
+    // is not a parse failure to tolerate, it is a known artifact of the window.
+    const lines = text.split("\n").slice(1);
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const o = JSON.parse(line);
+        if (o && typeof o === "object") out.push(o as Record<string, unknown>);
+      } catch {
+        // tolerate a partially-written or corrupt line
+      }
+    }
+    return out;
+  } finally {
+    fs.closeSync(fd);
+  }
+}

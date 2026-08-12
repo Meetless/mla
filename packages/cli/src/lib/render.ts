@@ -326,23 +326,36 @@ function fmtHashPrefix(hash: string | null | undefined): string {
 // B1: turn a GRAPH_EXTRACT extraction state into a human + agent signal. The
 // async-queued case is the current default (the worker owns the LLM detector);
 // the concrete states arrive once B3 polls the job to completion.
+// The line describes the CLAIM lane, because that is the only mining lane left.
+// It used to say "relationships" and point at `mla kb pending`, describing the
+// whole-doc GRAPH_EXTRACT job An retired 2026-06-26 (nothing consumed its accepted
+// candidates). Two branches were unreachable and the others named a queue that
+// would never fill.
+//
+// "completed with zero claims" and "we never learned the status" are DIFFERENT
+// sentences here, deliberately. They were the same sentence before, which is what
+// let a permanently-stalled poll read as ordinary asynchrony.
 function fmtExtractionValue(ex: NonNullable<KbAddReceipt["extraction"]>): string {
   switch (ex.state) {
     case "queued":
-      return "extraction queued (async; check `mla kb show` once it completes)";
+      return "claim extraction queued (async; review with `mla kb claims --pending`)";
     case "running":
-      return "extracting now (async; check `mla kb show` once it completes)";
+      return "extracting claims now (async; review with `mla kb claims --pending`)";
     case "completed": {
       const n = ex.candidateCount ?? 0;
-      const c = ex.conflictCount ?? 0;
-      const noun = `${n} candidate${n === 1 ? "" : "s"}`;
-      const conflictPart =
-        c > 0 ? ` (${c} conflict${c === 1 ? "" : "s"}: CONTRADICTS/SUPERSEDES)` : "";
-      const review = n > 0 ? "; review with `mla kb pending`" : "; none to review";
-      return `${noun}${conflictPart}${review}`;
+      if (n === 0) {
+        // Terminal AND empty. Its own sentence, never the queued one.
+        return "extraction complete; no claims staged from this document";
+      }
+      return `${n} claim${n === 1 ? "" : "s"} awaiting review; review with \`mla kb claims --pending\``;
     }
     case "failed":
-      return "extraction FAILED; retry with `mla kb reingest`";
+      return "claim extraction FAILED; retry with `mla kb reingest`";
+    case "unknown":
+      // The poll never learned a status: no job id on the receipt, or a status the
+      // mapping does not recognise. Never printed as "queued", which would be a
+      // claim about a job we cannot see.
+      return "claim extraction status UNKNOWN (no job to poll; check `mla kb claims --pending`)";
     case "skipped":
       return "not re-extracted (no body change)";
   }
@@ -369,12 +382,15 @@ export interface KbAddReceipt {
   normalizedBodyHash?: string | null;
   fullDocumentHash?: string | null;
   outboxEventType?: string | null;
+  /** ONTOLOGY_EXTRACT job id, the canonical handle on extraction state. Null when
+   *  nothing was enqueued (a no-op re-add) or the best-effort enqueue failed. */
+  extractionJobId?: string | null;
   // B1/B3: relationship extraction (GRAPH_EXTRACT) status for this ingest. When
   // the ingest pipeline reports a concrete state (sync poll, B3) it is rendered
   // verbatim; when absent on a body-changing ingest the receipt infers the
   // async-queued state. A bare `outbox event` is never the only signal.
   extraction?: {
-    state: "queued" | "running" | "completed" | "failed" | "skipped";
+    state: "queued" | "running" | "completed" | "failed" | "skipped" | "unknown";
     candidateCount?: number | null;
     conflictCount?: number | null;
     jobId?: string | null;
@@ -402,6 +418,9 @@ export interface KbAddReceipt {
   };
   // failure metadata when outcome=failed
   failure?: { code: string; reason: string; failedAt: string } | null;
+  // WHY a no-op was a no-op, when the answer is not "nothing changed". Absent on the
+  // ordinary path. See the render branch below.
+  noopReason?: string | null;
 }
 
 export function renderKbAddReceipt(r: KbAddReceipt): string {
@@ -422,6 +441,20 @@ export function renderKbAddReceipt(r: KbAddReceipt): string {
     out.push(fmtKv("FAILED at:", r.failure.failedAt));
   } else {
     out.push("");
+    // `noop_unchanged` was one word for two OPPOSITE states, and the receipt was
+    // byte-identical for both. A content-identical re-delivery of a healthy document
+    // is a no-op and is fine. A re-delivery of a TOMBSTONED document is also a no-op,
+    // and it is the opposite of fine: that document is not chunked, not retrievable,
+    // and not governed. Measured 2026-08-07, a 350 KB note sat in a coverage backlog
+    // looking like an unexplained failure until the tombstone was found by querying
+    // the database, because this surface said only "noop_unchanged".
+    //
+    // Printed ONLY when the server sends a reason, so the common path grows nothing
+    // that reads as a problem, and printed as a no-op rather than through the FAILED
+    // channel, because a tombstone is a governed decision and not a transport error.
+    if (r.noopReason) {
+      out.push(fmtKv("no-op reason:", r.noopReason));
+    }
     out.push(fmtKv("revisionId:", r.revisionId || "(unset)"));
     out.push(fmtKv("revision status:", r.revisionStatus || "(unset)"));
     out.push(fmtKv("chunk count:", r.chunkCount ?? 0));
@@ -429,13 +462,18 @@ export function renderKbAddReceipt(r: KbAddReceipt): string {
     out.push(fmtKv("fullDocument:", fmtHashPrefix(r.fullDocumentHash)));
     out.push(fmtKv("outbox event:", r.outboxEventType || "(none)"));
     // B1: never let `outbox event` be the only post-ingest signal. A minted
-    // revision enqueues GRAPH_EXTRACT; say so honestly. A noop_unchanged delivery
+    // revision enqueues ONTOLOGY_EXTRACT; say so honestly. A noop_unchanged delivery
     // mints nothing, so it enqueues no extraction.
+    // The fallback is UNKNOWN, not "queued". An ingest that produced no job id has
+    // nothing to poll, and printing the queued sentence there is what made a dead
+    // poll indistinguishable from a slow one for months.
     const enqueuesExtraction = r.outcome === "ingested";
     if (r.extraction) {
-      out.push(fmtKv("relationships:", fmtExtractionValue(r.extraction)));
+      out.push(fmtKv("claims:", fmtExtractionValue(r.extraction)));
     } else if (enqueuesExtraction) {
-      out.push(fmtKv("relationships:", fmtExtractionValue({ state: "queued" })));
+      out.push(
+        fmtKv("claims:", fmtExtractionValue({ state: r.extractionJobId ? "queued" : "unknown" })),
+      );
     }
   }
 

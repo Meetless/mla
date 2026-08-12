@@ -26,7 +26,7 @@ describe("ensureClaudeMcpServer", () => {
     expect(after.mcpServers[MCP_SERVER_KEY]).toEqual({ command: MLA, args: ["mcp"] });
     // user-scope: no env block, no nesting under projects
     expect(after.mcpServers[MCP_SERVER_KEY].env).toBeUndefined();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("adds the server while preserving other servers and unrelated keys", () => {
@@ -43,7 +43,7 @@ describe("ensureClaudeMcpServer", () => {
     expect(after.mcpServers[MCP_SERVER_KEY]).toEqual({ command: MLA, args: ["mcp"] });
     expect(after.mcpServers.other).toEqual({ command: "x" });
     expect(after.projects["/a"]).toEqual({});
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("is a no-op (no write, no backup) when the canonical entry already exists", () => {
@@ -60,7 +60,7 @@ describe("ensureClaudeMcpServer", () => {
     expect(fs.readFileSync(p, "utf8")).toBe(before); // byte-identical: untouched
     // no backup created
     expect(fs.readdirSync(dir).filter((f) => f.includes(".bak."))).toHaveLength(0);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("updates a stale entry (wrong command or args) and backs up the original", () => {
@@ -81,7 +81,7 @@ describe("ensureClaudeMcpServer", () => {
     expect(after.mcpServers[MCP_SERVER_KEY]).toEqual({ command: MLA, args: ["mcp"] });
     // a timestamped backup of the original was written
     expect(fs.readdirSync(dir).filter((f) => f.includes(".claude.json.bak."))).toHaveLength(1);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("skips (and leaves untouched) an unparseable ~/.claude.json", () => {
@@ -92,6 +92,6 @@ describe("ensureClaudeMcpServer", () => {
     expect(res.action).toBe("skipped");
     expect(res.detail).toMatch(/not valid JSON/i);
     expect(fs.readFileSync(p, "utf8")).toBe("{nope"); // untouched
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 });

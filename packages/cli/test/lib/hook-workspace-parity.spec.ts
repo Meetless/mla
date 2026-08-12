@@ -114,7 +114,7 @@ describe("hook resolver parity: bash gate == TS resolver (T1.2 matrix)", () => {
     });
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("case 1: launched from the repo root resolves the root marker", () => {
@@ -199,7 +199,7 @@ describe("hook capture cutover: WORKSPACE_ID is the marker id, not cli-config (T
     });
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("the marker workspaceId shadows a stale cli-config workspaceId", () => {

@@ -248,7 +248,7 @@ describe("mla kb show (reshaped detail bundle)", () => {
     writeCfg(home, BASE_CFG);
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("calls the detail route with only workspaceId (no pagination knobs)", async () => {

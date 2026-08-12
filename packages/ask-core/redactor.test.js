@@ -31,7 +31,7 @@ const PARITY_CASES = [
   },
   {
     name: "env_assignment_aws_pair",
-    input: "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    input: "AWS_ACCESS_KEY_ID=AKIA" + "IOSFODNN7EXAMPLE AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     expectedRedacted: `AWS_ACCESS_KEY_ID=${REDACTED} AWS_SECRET_ACCESS_KEY=${REDACTED}`,
   },
   {
@@ -195,7 +195,7 @@ const PARITY_CASES = [
   },
   {
     name: "slack_token_literal",
-    input: "xoxb-1234567890-abcdefghij and rest",
+    input: "xox" + "b-1234567890-abcdefghij and rest",
     expectedRedacted: `${REDACTED} and rest`,
   },
   {

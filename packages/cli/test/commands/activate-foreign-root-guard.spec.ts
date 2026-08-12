@@ -90,7 +90,7 @@ describe("a foreign root may not erase the floor it cannot compute", () => {
   });
 
   afterEach(() => {
-    for (const d of [home, owner, stranger]) rmSync(d, { recursive: true, force: true });
+    for (const d of [home, owner, stranger]) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("a stranger carrying an EMPTY floor cannot wipe the incumbent's real floor", () => {
@@ -139,6 +139,7 @@ describe("a foreign root may not erase the floor it cannot compute", () => {
     const warning = renderForeignRootWarning({
       scan: mkScan(stranger, { inventory: { ...mkScan(stranger).inventory, instructionFiles: 0 } }),
       incumbentRootPath: owner,
+      markerAtThisFolder: false,
     });
     expect(warning).toBeTruthy();
     // It has to name the OTHER checkout, or the operator cannot act on it.
@@ -152,14 +153,45 @@ describe("a foreign root may not erase the floor it cannot compute", () => {
       renderForeignRootWarning({
         scan: mkScan(owner, { inventory: { ...mkScan(owner).inventory, instructionFiles: 0 } }),
         incumbentRootPath: owner,
+        markerAtThisFolder: false,
       }),
     ).toBeNull();
     expect(
       renderForeignRootWarning({
         scan: mkScan(owner, { inventory: { ...mkScan(owner).inventory, instructionFiles: 0 } }),
         incumbentRootPath: null,
+        markerAtThisFolder: false,
       }),
     ).toBeNull();
+  });
+
+  it("stays silent for a doc-less repo that carries its OWN marker (D2 multi-repo bind)", () => {
+    // The shape this warning was built for is a throwaway dir that INHERITS a
+    // live workspace from an ancestor marker. A folder holding its own marker
+    // was bound deliberately: `mla activate --workspace <id>` was run here, or
+    // the team committed the marker into this repo. A small company repo with no
+    // CLAUDE.md of its own is the normal case under one shared workspace, and
+    // warning on it every time is how a real warning gets ignored later.
+    expect(
+      renderForeignRootWarning({
+        scan: mkScan(stranger, { inventory: { ...mkScan(stranger).inventory, instructionFiles: 0 } }),
+        incumbentRootPath: owner,
+        markerAtThisFolder: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("still warns for the inherited-from-an-ancestor throwaway shape", () => {
+    // The regression this pair guards: silencing the D2 case must not silence
+    // the incident case. Same scan, same incumbent, only the marker locality
+    // differs, and that is the whole signal.
+    expect(
+      renderForeignRootWarning({
+        scan: mkScan(stranger, { inventory: { ...mkScan(stranger).inventory, instructionFiles: 0 } }),
+        incumbentRootPath: owner,
+        markerAtThisFolder: false,
+      }),
+    ).toBeTruthy();
   });
 
   it("stays silent when the second checkout brought its own instruction files", () => {
@@ -169,6 +201,7 @@ describe("a foreign root may not erase the floor it cannot compute", () => {
       renderForeignRootWarning({
         scan: mkScan(stranger, { inventory: { ...mkScan(stranger).inventory, instructionFiles: 3 } }),
         incumbentRootPath: owner,
+        markerAtThisFolder: false,
       }),
     ).toBeNull();
   });
@@ -183,7 +216,7 @@ describe("a foreign root may not erase the floor it cannot compute", () => {
       expect(scan.floorRulesXml ?? "").toBe("");
       expect(scan.inventory.instructionFiles).toBe(0);
     } finally {
-      rmSync(throwaway, { recursive: true, force: true });
+      rmSync(throwaway, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

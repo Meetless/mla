@@ -50,7 +50,7 @@ describe("ensureClaudeSettings: bounded, change-only backups", () => {
   afterEach(() => {
     if (prevMlHome === undefined) delete process.env.MEETLESS_HOME;
     else process.env.MEETLESS_HOME = prevMlHome;
-    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     jest.resetModules();
   });
 

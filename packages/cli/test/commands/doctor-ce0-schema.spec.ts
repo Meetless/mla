@@ -108,7 +108,7 @@ describe("managedPreToolUseHookCheck (P0.58, MLA is the sole effective Write/Edi
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   test("passes when the only Write/Edit PreToolUse hook is the managed MLA hook", () => {
@@ -259,7 +259,7 @@ describe("ce0QuickCheckResult against a real database (no mocks)", () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   test("returns 'ok' for a sound, freshly opened CE0 store, so ce0IntegrityCheck passes", () => {
@@ -310,7 +310,7 @@ describe("CE0 store posture against a real database (no mocks)", () => {
 
   afterEach(() => {
     closeCe0Store(store);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   test("a freshly opened CE0 store passes all three posture checks", () => {

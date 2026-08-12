@@ -72,7 +72,7 @@ describe("mla enrich plan: plan-digest idempotency gate", () => {
 
   beforeEach(() => {
     seedCliConfig();
-    rmSync(join(HOME, "workspaces"), { recursive: true, force: true });
+    rmSync(join(HOME, "workspaces"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     repoDir = mkdtempSync(join(tmpdir(), "mla-enrich-idem-repo-"));
     initRepo(repoDir);
     restoreCwd = bindWorkspaceMarker(repoDir, WS);
@@ -86,11 +86,11 @@ describe("mla enrich plan: plan-digest idempotency gate", () => {
     logSpy.mockRestore();
     errSpy.mockRestore();
     restoreCwd();
-    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   afterAll(() => {
-    rmSync(HOME, { recursive: true, force: true });
+    rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // Run one `enrich plan --json`, then simulate a COMPLETED run of it the way `enrich ingest`

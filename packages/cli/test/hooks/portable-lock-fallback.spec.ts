@@ -32,7 +32,7 @@ describe("portable hook mutex: mkdir(2) fallback works with flock absent (Bug #2
   });
 
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("holds mutual exclusion, atomic appends, trylock, and stale-reap without flock", () => {

@@ -53,7 +53,7 @@ describe("mintAttestedRuleVersion chooses the logical identity (canonical R1 wri
 
   afterEach(() => {
     closeCe0Store(store);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("--new-rule mints a fresh logical rule as LIVE with no predecessor", () => {

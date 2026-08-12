@@ -141,7 +141,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   restoreCwd();
   delete process.env.MEETLESS_HOME;
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 beforeEach(() => {

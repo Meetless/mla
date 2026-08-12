@@ -70,7 +70,7 @@ const PATTERNS: Array<[string, RegExp, string]> = [
   // below and spelled out once at REFERENCE_GUARD.
   [
     "env_assignment",
-    /\b(?!(?![A-Za-z0-9_-]*(?:password|passwd|pwd|passphrase|PASSWORD|PASSWD|PWD|PASSPHRASE)[^\S\r\n]*[:=])[A-Za-z0-9_.-]*[^\S\r\n]*[:=][^\S\r\n]*(?:'[A-Za-z]{1,12}'|"[A-Za-z]{1,12}"|[A-Za-z]{1,12})(?=[\s,;)\]}`'"]|$))((?:[A-Z][A-Z0-9_]*_)?(?:TOKEN|KEY|SECRET|PASSWORD|PWD|API[_-]?KEY|ACCESS[_-]?KEY)|SECRET_[A-Z0-9_]+|PASSWORD|PASSWD|AWS_(?:ACCESS|SECRET)_(?:ACCESS_)?KEY(?:_ID)?|GH_TOKEN|GITHUB_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)([^\S\r\n]*[:=][^\S\r\n]*)((?!['"]?(?:\$[({A-Za-z_]|\{\{|<|\[REDACTED\]))(?!['"]?[A-Za-z0-9_\-+/=]*\.\.\.['"]?(?=[\s,;)\]}`'"]|$))(?!['"]?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*_(?:TOKEN|KEY|SECRET|PASSWORD|PWD|token|key|secret|password|pwd)['"]?(?=[\s,;)\]}`'"]|$))(?=[^\s]*[A-Za-z0-9])(?:'[^']*'|"[^"]*"|\S+))/gm,
+    /\b(?!(?![A-Za-z0-9_-]*(?:password|passwd|pwd|passphrase|PASSWORD|PASSWD|PWD|PASSPHRASE)[^\S\r\n]*[:=])[A-Za-z0-9_.-]*[^\S\r\n]*[:=][^\S\r\n]*(?:'[A-Za-z]{1,12}'|"[A-Za-z]{1,12}"|[A-Za-z]{1,12})(?=[\s,;)\]}`'"]|$))((?:[A-Z][A-Z0-9_]*_)?(?:TOKEN|KEY|SECRET|PASSWORD|PWD|API[_-]?KEY|ACCESS[_-]?KEY)|SECRET_[A-Z0-9_]+|PASSWORD|PASSWD|AWS_(?:ACCESS|SECRET)_(?:ACCESS_)?KEY(?:_ID)?|GH_TOKEN|GITHUB_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)([^\S\r\n]*[:=][^\S\r\n]*)((?!['"]?(?:\$[({A-Za-z_]|\{\{|<|\[REDACTED\]))(?!['"]?phc_[A-Za-z0-9]{20,}['"]?(?=[\s,;)\]}`'"]|$))(?!['"]?[A-Za-z0-9_\-+/=]*\.\.\.['"]?(?=[\s,;)\]}`'"]|$))(?!['"]?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*_(?:TOKEN|KEY|SECRET|PASSWORD|PWD|token|key|secret|password|pwd)['"]?(?=[\s,;)\]}`'"]|$))(?=[^\s]*[A-Za-z0-9])(?:'[^']*'|"[^"]*"|\S+))/gm,
     // Keep the name. It is not a credential, and it is usually the primary
     // retrieval key: "OPENAI_API_KEY=[REDACTED]" still answers "which key was
     // set?", while a bare "[REDACTED]" answers nothing and makes the whole line
@@ -122,7 +122,7 @@ const PATTERNS: Array<[string, RegExp, string]> = [
   //
   // REFERENCE_GUARD (both entries): a REFERENCE is not a VALUE.
   //
-  //   (?!['"]?(?:\$[({A-Za-z_]|\{\{|<|\[REDACTED\]))              a sigil
+  //   (?!['"]?(?:\$[({A-Za-z_]|\{\{|<|\[REDACTED\]))(?!['"]?phc_[A-Za-z0-9]{20,}['"]?(?=[\s,;)\]}`'"]|$))              a sigil
   //   (?!['"]?[A-Za-z0-9_\-+/=]*\.\.\.TAIL)                       an elision
   //   (?!['"]?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*_(?:TOKEN|KEY|…)TAIL) a name
   //   (?=[^\s]*[A-Za-z0-9])                                       not empty
@@ -281,7 +281,7 @@ const PATTERNS: Array<[string, RegExp, string]> = [
   // "a PHRASE is a credential shape, not a placeholder".
   [
     "env_assignment",
-    /\b(?!(?![A-Za-z0-9_-]*(?:password|passwd|pwd|passphrase|PASSWORD|PASSWD|PWD|PASSPHRASE)[^\S\r\n]*[:=])[A-Za-z0-9_.-]*[^\S\r\n]*[:=][^\S\r\n]*(?:'[A-Za-z]{1,12}'|"[A-Za-z]{1,12}"|[A-Za-z]{1,12})(?=[\s,;)\]}`'"]|$))([A-Za-z0-9_-]*(?:api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|bearer[_-]?token|access[_-]?key(?:[_-]?id)?|secret[_-]?(?:access[_-]?)?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|client[_-]?secret|app[_-]?secret|signing[_-]?secret|webhook[_-]?secret|password|passwd|passphrase))([^\S\r\n]*[:=][^\S\r\n]*)((?!['"]?(?:\$[({A-Za-z_]|\{\{|<|\[REDACTED\]))(?!['"]?[A-Za-z0-9_\-+/=]*\.\.\.['"]?(?=[\s,;)\]}`'"]|$))(?!['"]?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*_(?:TOKEN|KEY|SECRET|PASSWORD|PWD|token|key|secret|password|pwd)['"]?(?=[\s,;)\]}`'"]|$))(?=[^\s]*[A-Za-z0-9])(?:'[^']*'|"[^"]*"|[A-Za-z0-9_\-./+=:~]+(?=\s|$)))/gi,
+    /\b(?!(?![A-Za-z0-9_-]*(?:password|passwd|pwd|passphrase|PASSWORD|PASSWD|PWD|PASSPHRASE)[^\S\r\n]*[:=])[A-Za-z0-9_.-]*[^\S\r\n]*[:=][^\S\r\n]*(?:'[A-Za-z]{1,12}'|"[A-Za-z]{1,12}"|[A-Za-z]{1,12})(?=[\s,;)\]}`'"]|$))([A-Za-z0-9_-]*(?:api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|bearer[_-]?token|access[_-]?key(?:[_-]?id)?|secret[_-]?(?:access[_-]?)?key|private[_-]?key|signing[_-]?key|encryption[_-]?key|client[_-]?secret|app[_-]?secret|signing[_-]?secret|webhook[_-]?secret|password|passwd|passphrase))([^\S\r\n]*[:=][^\S\r\n]*)((?!['"]?(?:\$[({A-Za-z_]|\{\{|<|\[REDACTED\]))(?!['"]?phc_[A-Za-z0-9]{20,}['"]?(?=[\s,;)\]}`'"]|$))(?!['"]?[A-Za-z0-9_\-+/=]*\.\.\.['"]?(?=[\s,;)\]}`'"]|$))(?!['"]?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*_(?:TOKEN|KEY|SECRET|PASSWORD|PWD|token|key|secret|password|pwd)['"]?(?=[\s,;)\]}`'"]|$))(?=[^\s]*[A-Za-z0-9])(?:'[^']*'|"[^"]*"|[A-Za-z0-9_\-./+=:~]+(?=\s|$)))/gi,
     `$1$2${REDACTED}`,
   ],
   // The tail must be credential-SHAPED, not merely word-shaped. A bare
@@ -322,7 +322,15 @@ const PATTERNS: Array<[string, RegExp, string]> = [
   ],
   [
     "provider_token",
-    /\b(sk-(?:proj-|ant-)?[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{35}|hf_[A-Za-z0-9]{20,}|lf_(?:sk|pk)_[A-Za-z0-9]{20,})\b/g,
+    // sntry[usd]_ is Sentry's issuer prefix (u = user auth token, s = org token,
+    // d = DSN-scoped). Added because it was the ONE real credential shape in the
+    // live corpus that no explicit rule matched: it was caught only by the generic
+    // entropy heuristic, which means `scanForCredentials` (the fail-closed
+    // pre-upload gate, which excludes entropy by design) did not catch it AT ALL.
+    // A live Sentry user token was therefore eligible for upload. Since
+    // CREDENTIAL_RULE_IDS derives from this table, one entry closes the observe
+    // scanner's dependency on entropy AND the block gate's hole in the same move.
+    /\b(sk-(?:proj-|ant-)?[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{35}|hf_[A-Za-z0-9]{20,}|lf_(?:sk|pk)_[A-Za-z0-9]{20,}|sntry[usd]_[A-Za-z0-9]{20,})\b/g,
     REDACTED,
   ],
   // A JWT is a live credential and must go WHOLE. The entropy heuristic cannot
@@ -465,6 +473,75 @@ const ENTROPY_BARS: Record<RedactProfile, { minClasses: number; minEntropy: numb
  */
 function looksPathLike(token: string): boolean {
   return token.includes("/") && /[a-z]/.test(token) && !/[A-Z]/.test(token);
+}
+
+/**
+ * DOC_IDENTIFIER_EXEMPTION: a repo-relative file identifier, recognised by its
+ * extension. Applied ONLY to the generic entropy fallback in `scanForSecrets`,
+ * and only AFTER every explicit issuer-prefix rule has already run.
+ *
+ * Why it exists. `mla agent-memory report` printed "Project files with a secret
+ * signal (observe-only)" for 866 of 876 files, 98.9%, and 856 of those on
+ * `high_entropy_token` ALONE. The driver is this product's own naming convention:
+ * `reference_identifier_boost_ranks_the_doc_that_names_the_thing.md` is 62
+ * characters of two-class, no-whitespace text and clears the 32/2/3.5 bar
+ * comfortably. A signal that fires on every file is not a control, it is a line
+ * the operator learns to skip.
+ *
+ * Why `looksPathLike` was not enough. It requires a SLASH, so it catches
+ * `notes/2026...md` and misses every bare filename, which is most of the corpus.
+ *
+ * Why an extension whitelist and not "looks like a word". The extension is what
+ * makes this a DOCUMENT identifier rather than "any long lowercase blob": it is a
+ * structural claim about the token's last few characters that a random credential
+ * generator does not satisfy by accident.
+ *
+ * Why remote targets are excluded. A relative markdown target is a file in this
+ * repo; an `http(s)://` target can carry a signed URL, a query-string token or
+ * embedded credentials, so it gets no exemption and falls through to the entropy
+ * test. Same for anything with an `@`, which is the userinfo credential shape.
+ *
+ * What this is NOT. "Document-shaped" is a SIGNATURE, not proof of innocence. A
+ * secret deliberately suffixed `.md` matches and passes. That residual is pinned
+ * by a test rather than argued away, it is the reason this scanner stays
+ * OBSERVE-ONLY rather than being promoted to a gate, and it costs nothing on the
+ * blocking path: `scanForCredentials` never ran the entropy heuristic to begin
+ * with, and every real shape now carries an explicit rule.
+ */
+const _DOC_IDENTIFIER =
+  /^[A-Za-z0-9._/\[\]-]+\.(md|mdx|txt|ts|tsx|js|jsx|py|sh|json|ya?ml|sql|toml|lock|css|html|prisma|env|cfg|ini|xml|csv|proto|rs|go|rb|java|kt|swift)$/;
+
+// `[[note_name]]`: the wiki-link form, and the single largest driver in the real
+// corpus (it beat every extension-bearing shape). It carries no extension, so the
+// rule above cannot see it, and it is unambiguously a DOCUMENT REFERENCE: the
+// double brackets are the structural marker, exactly like the extension is above.
+// A trailing sentence period is allowed because these appear mid-prose.
+const _WIKI_LINK = /^\[\[[A-Za-z0-9._/-]+\]\]\.?$/;
+
+// Canonical UUID. Long enough and mixed enough to clear the entropy bar, and it is
+// an opaque IDENTIFIER, not a credential: ours appear as session ids and trace ids.
+const _UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * ENTROPY_TOKEN's character class deliberately excludes `.`, so a match inside
+ * `reference_a_long_note_name.md` is the STEM only and never carries the extension
+ * that identifies it. Testing the bare match therefore could not have worked; the
+ * span has to be re-widened over document-identifier characters before it is judged.
+ * That is the tokenization boundary, and it is why the earlier "strip UUIDs" theory
+ * cleared only 16 of 866 files: the shape was never being looked at whole.
+ */
+function docIdentifierSpan(text: string, start: number, end: number): string {
+  const isDocChar = (c: string) => /[A-Za-z0-9._/\[\]-]/.test(c);
+  let i = start;
+  let j = end;
+  while (i > 0 && isDocChar(text[i - 1])) i--;
+  while (j < text.length && isDocChar(text[j])) j++;
+  return text.slice(i, j);
+}
+
+function looksDocIdentifier(span: string): boolean {
+  if (span.includes("://") || span.includes("@")) return false;
+  return _UUID.test(span) || _WIKI_LINK.test(span) || _DOC_IDENTIFIER.test(span);
 }
 
 function shannonEntropy(s: string): number {
@@ -646,7 +723,35 @@ export function redact(
 // argument, with the tie-breaks executable, is pinned in
 // test/lib/redactor-redis-directive.spec.ts.
 const BLOCK_DIRECTIVE_PATTERNS: Array<[string, RegExp]> = [
-  ["redis_directive", /\b(requirepass|masterauth|masteruser)\s+('[^']*'|"[^"]*"|\S+)/gi],
+  // The directive rule carries the same STRUCTURAL placeholder guard env_assignment
+  // has had all along; it was simply never given one. Measured 2026-08-06 against
+  // the live scanner: env_assignment already passes every placeholder shape
+  // (sk_test_..., <secret>, [REDACTED], YOUR_TOKEN, ${TOKEN}) and blocks every
+  // realistic credential including one pasted into a sentence, so it needed no
+  // change. This rule blocked `requirepass <secret>` and `requirepass
+  // your-password-here`, which is documentation, not a credential.
+  //
+  // The exemption is STRUCTURAL ONLY, and deliberately narrow:
+  //   $VAR / ${VAR}  a reference is not a value
+  //   <...>          an angle placeholder
+  //   [REDACTED]     an existing redaction, re-redacting it says nothing
+  //   YOUR_* / your-*-here   the documentation convention
+  //   ...            an elided or truncated value
+  //   xxxx+          an x-mask
+  //
+  // Prose is NOT an exemption. `requirepass hunter2` and `the requirepass
+  // directive.` both still block, because nothing structural separates an English
+  // word from a password and telling them apart needs a classifier we are not
+  // building. Fail-closed stays the default; a blocked file is now named with its
+  // rule by `mla agent-memory status`, so the residual cost is one visible,
+  // diagnosable withhold instead of a silent one.
+  //
+  // The entropy rule is untouched: it blocks NOTHING in this corpus, so it was
+  // never responsible for a withhold and loosening it would buy a bypass for free.
+  [
+    "redis_directive",
+    /\b(requirepass|masterauth|masteruser)\s+(?!(?:['"]?(?:\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|<[^>\s]*>|\[REDACTED\]|YOUR[_-][A-Za-z0-9_-]*|your-[a-z0-9-]*-here|x{4,}|\.\.\.)['"]?|[A-Za-z0-9_\-+/=]*\.\.\.)(?=[\s,;)\]}`'"]|$))('[^']*'|"[^"]*"|\S+)/gi,
+  ],
 ];
 
 // A pure-hex token (git SHA, content hash, digest) is not a secret, and the
@@ -684,6 +789,11 @@ export function scanForSecrets(text: string | null | undefined): string[] {
     // a false negative costs a live credential. It never uses "events": the
     // path exemption exists to protect a ledger's READABILITY, and this scanner
     // is not deciding readability, it is deciding whether a secret ships.
+    // Document identifiers are suppressed HERE, at the generic fallback, and
+    // nowhere else: every explicit issuer-prefix rule above has already run and
+    // already recorded its hit, so a real credential that happens to end in a
+    // doc extension is still caught by the rule that actually knows what it is.
+    if (looksDocIdentifier(docIdentifierSpan(text, m.index, m.index + tok.length))) continue;
     if (!isHexToken(tok) && looksHighEntropy(tok, "full")) {
       hits.add("high_entropy_token");
       break;

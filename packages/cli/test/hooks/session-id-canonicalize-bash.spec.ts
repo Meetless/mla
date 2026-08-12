@@ -42,7 +42,7 @@ describe("canonicalize_agent_session_id bash twin cross-language fixture (S1-a)"
   });
 
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function canon(input: string): string {

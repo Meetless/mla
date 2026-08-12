@@ -27,11 +27,17 @@
 // bundle fixtures and the real hasher (no mocks).
 
 import type { BundleCacheRead } from "./bundle-cache";
+import {
+  classifyCommandAllOf,
+  FORBIDDEN_COMMAND_CANONICALIZER_VERSION,
+  FORBIDDEN_COMMAND_EVALUATOR_CONTRACT_VERSION,
+  FORBIDDEN_COMMAND_MATCHER_SCHEMA_VERSION,
+} from "./command-match";
 import type { RuleBundleEntry } from "./control-rule-client";
 import { type EligibleEnforcement, projectEligibleEnforcement } from "./deny-admission";
 import { displayComplianceRoot } from "./durable-observation";
 import type { EvaluationTarget } from "./evaluation-input-hash";
-import { selectRule, type ToolCall } from "./evaluator";
+import { selectRule, verdictForForbiddenCommand, type ToolCall } from "./evaluator";
 import { matchesGlob } from "./glob-match";
 import {
   classifyDatePrefixedNoteVaultTarget,
@@ -60,6 +66,13 @@ export interface WarnEvidence {
   targetPath: string | null;
   /** The warned rule's own statement (RulePayloadV1.text), snapshotted at warn time. */
   ruleText: string;
+  /** The ceiling the human ATTESTED this rule at, snapshotted from the payload at warn time. This is
+   * deliberately NOT the effective decision: a DENY-attested rule clamped to WARN by the session cap
+   * (MEETLESS_ACTION_INTERCEPT_MAX) reports `enforcementCeiling: "DENY"` on an incident whose
+   * `decision` is "warn", and that disagreement is the whole point of carrying it. Collapsing the two
+   * would erase the only signal that distinguishes "the rule is advisory" from "the rule would have
+   * blocked but the session cap stopped it". */
+  enforcementCeiling: EligibleEnforcement;
 }
 
 /** The PreToolUse decision. DENY/ASK carry the deciding rule's node + version identity so the
@@ -82,8 +95,26 @@ export type BundleEnforceDecision =
       // cut over or the version is superseded. Authored rule content, not user PII; still
       // dropped from PostHog by the fail-closed allowlist (INV-POSTHOG-PII-1).
       ruleText: string;
+      // The ceiling the human ATTESTED this rule at, snapshotted at block time. On a DENY the
+      // attested ceiling and the effective decision agree; the field is carried on both arms so the
+      // incident schema is uniform and a consumer never has to branch on `decision` to learn whether
+      // a ceiling is available. See WarnEvidence.enforcementCeiling for why the two are kept apart.
+      enforcementCeiling: EligibleEnforcement;
     }
-  | { kind: "ASK"; reason: string; ruleNodeId: string; ruleVersionId: string; degraded: boolean }
+  // An ASK PAUSES the user, so it is an intervention and records like one. It carries the same birth
+  // facts as WARN and DENY: the caller emits one incident per issued ask. `enforcementCeiling` is the
+  // ATTESTED ceiling, which on a stale-degraded ask is DENY rather than ASK, because collapsing that
+  // would erase why the human was interrupted.
+  | {
+      kind: "ASK";
+      reason: string;
+      ruleNodeId: string;
+      ruleVersionId: string;
+      degraded: boolean;
+      targetPath: string | null;
+      ruleText: string;
+      enforcementCeiling: EligibleEnforcement;
+    }
   // The non-blocking middle rung (INV-8). One or more VIOLATIONs whose attested ceiling is WARN, with
   // no DENY or ASK outranking them. `reason` is the already-aggregated, cap-honored advisory body the
   // hook renders as model-facing additionalContext (never a permissionDecision); `count` is how many
@@ -102,6 +133,19 @@ export interface BundleEnforceInput {
   read: BundleCacheRead;
   /** The activated runtime project root (absolute); relative targets resolve from here. */
   runtimeProjectRoot: string;
+  /**
+   * The base a RELATIVE write target resolves against: the shell's actual working directory, taken
+   * from the PreToolUse payload's `cwd`. Optional, and falls back to `runtimeProjectRoot`.
+   *
+   * Added 2026-08-05 for a live false positive. An Edit or Write tool call sends an absolute
+   * `file_path`, so resolving against the repo root was invisible there. A Bash redirect target is
+   * usually relative and the operator has usually `cd`'d somewhere first, so `cat >> 20260805-x.md`
+   * run from inside the notes vault resolved to `<repo>/20260805-x.md` and warned that a compliant
+   * file was "outside the required note vault", suggesting the path it was already at.
+   *
+   * A wrong location is not a wrong verdict here, it is a verdict about a DIFFERENT FILE.
+   */
+  relativeBase?: string;
   /**
    * The current checkout's runtime scope identity (realpath of the active project root, the same
    * `resolveActiveRuntimeScopeId` value attest stamped into `payload.runtimeScopeId`). A PERSONAL rule
@@ -156,32 +200,230 @@ function policyPhrase(payload: RulePayloadV1): string {
     : `outside the required note vault "${displayRoot(payload)}"`;
 }
 
+/**
+ * D.1 SOURCE: on whose authority, when, and which version.
+ *
+ * Deliberately does NOT name a person. The bundle carries only `attestedByUserId`, an opaque cuid,
+ * and no human-readable attester exists anywhere in the entry (verified against the live bundle
+ * cache: no name-, display-, email- or author-shaped key on any rule). Printing the raw cuid would
+ * add a token the operator cannot act on, and resolving it would mean a network lookup on the
+ * PreToolUse hot path, which this seam must never take. So the clause states the three facts that
+ * ARE both present and legible: when it was attested, at what authority, and which version fired.
+ *
+ * The date is rendered date-only: the attestation instant's time-of-day is noise in a block message,
+ * and a bad `attestedAt` degrades to omitting the clause rather than printing "Invalid Date".
+ */
+function buildSourceClause(entry: RuleBundleEntry, payload: RulePayloadV1): string {
+  const day = entry.attestedAt.slice(0, 10);
+  const dated = /^\d{4}-\d{2}-\d{2}$/.test(day) ? `Attested ${day}, ` : "";
+  return `${dated}ceiling ${payload.enforcementCeiling}, version ${entry.ruleVersionId}.`;
+}
+
+/**
+ * D.2 NEXT ACTION: the concrete path that would satisfy the rule, or nothing.
+ *
+ * Derived ONLY from an explicit destination root, and only through the same `allowedRootAbsolutePath`
+ * the note-vault canonicalizer itself reads (`classifyDatePrefixedNoteVaultTarget`). No new path
+ * semantics, and no inference.
+ *
+ * A `forbiddenRootRelativePath` config states where a file may NOT go and names no destination, so
+ * there is nothing to derive and this returns null. Guessing a plausible destination there would be
+ * INV-4 (authority is not inference) applied to a suggestion: the rule never said where the file
+ * belongs, so neither may we.
+ */
+function buildNextActionClause(payload: RulePayloadV1, target: EvaluationTarget): string | null {
+  const config = payload.compliance.config;
+  if (!("allowedRootAbsolutePath" in config)) return null;
+  const root = config.allowedRootAbsolutePath;
+  if (typeof root !== "string" || root.length === 0) return null;
+  if (target.kind !== "RUNTIME_RELATIVE") return null;
+  // The basename of the path the rule just judged. posix-split: the target is already the
+  // canonicalized runtime-relative path, so it is posix-shaped by construction.
+  const base = target.path.split("/").filter(Boolean).pop();
+  if (!base) return null;
+  return `Compliant path: ${root.replace(/\/+$/, "")}/${base}`;
+}
+
+/** Assemble the SOURCE and (where derivable) NEXT ACTION clauses onto a reason body. Kept to at most
+ * two short lines per rule so the WARN_AGGREGATE_CAP still bounds an aggregate advisory. */
+function withProvenance(
+  body: string,
+  entry: RuleBundleEntry,
+  payload: RulePayloadV1,
+  target: EvaluationTarget,
+): string {
+  const next = buildNextActionClause(payload, target);
+  return next === null
+    ? `${body}\n${buildSourceClause(entry, payload)}`
+    : `${body}\n${buildSourceClause(entry, payload)}\n${next}`;
+}
+
 /** The hard-block reason. Same prose shape as the legacy CE0 deny so the operator sees one block voice. */
 function buildBundleDenyReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  return `Blocked by Meetless rule ${entry.ruleNodeId}. Writing ${where} ${policyPhrase(payload)} is prohibited. ${payload.text}`;
+  return withProvenance(
+    `Blocked by Meetless rule ${entry.ruleNodeId}. Writing ${where} ${policyPhrase(payload)} is prohibited. ${payload.text}`,
+    entry,
+    payload,
+    target,
+  );
 }
 
 /** The degrade-to-ASK reason: a DENY that cannot be enforced on a stale lease, asking for one confirmation. */
 function buildDegradedAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  return (
+  return withProvenance(
     `Meetless rule ${entry.ruleNodeId} would block writing ${where} ${policyPhrase(payload)}, ` +
-    `but its rule bundle is stale (offline past its lease), so this needs your explicit confirmation. ${payload.text}`
+      `but its rule bundle is stale (offline past its lease), so this needs your explicit confirmation. ${payload.text}`,
+    entry,
+    payload,
+    target,
   );
 }
 
 /** The native-ASK reason: a ceiling the human attested as ASK, surfacing one confirmation prompt. */
 function buildAskReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  return `Meetless rule ${entry.ruleNodeId} asks you to confirm writing ${where} ${policyPhrase(payload)}. ${payload.text}`;
+  return withProvenance(
+    `Meetless rule ${entry.ruleNodeId} asks you to confirm writing ${where} ${policyPhrase(payload)}. ${payload.text}`,
+    entry,
+    payload,
+    target,
+  );
 }
 
 /** The non-blocking WARN reason: a VIOLATION whose attested ceiling is WARN. Advises but never gates,
  * so the copy names the concern and leaves the correction to the agent (INV-8: no false-positive block). */
 function buildWarnReason(entry: RuleBundleEntry, payload: RulePayloadV1, target: EvaluationTarget): string {
   const where = describeTarget(target);
-  return `Meetless rule ${entry.ruleNodeId}: writing ${where} ${policyPhrase(payload)} is discouraged. ${payload.text}`;
+  return withProvenance(
+    `Meetless rule ${entry.ruleNodeId}: writing ${where} ${policyPhrase(payload)} is discouraged. ${payload.text}`,
+    entry,
+    payload,
+    target,
+  );
+}
+
+/**
+ * The COMMAND family's reason body (F2, 2026-08-07). Deliberately NOT built from the
+ * path builders above: every one of them says "writing <path> ...", and this family
+ * judges no path. Reusing them would have put a script path into an operator-facing
+ * sentence about a write that never happened.
+ *
+ * The command string itself is NOT echoed back. It is the operator's own shell line,
+ * so it tells them nothing they do not have on screen, and it routinely carries an
+ * account id or an amount. The rule text plus the rule id is what they cannot see and
+ * is exactly what was missing when this action ran ungoverned.
+ */
+function buildCommandReason(
+  entry: RuleBundleEntry,
+  payload: RulePayloadV1,
+  verb: string,
+): string {
+  return `Meetless rule ${entry.ruleNodeId}: this command ${verb}. ${payload.text}\n${buildSourceClause(entry, payload)}`;
+}
+
+/**
+ * Evaluate a COMMAND-family entry: the THIRD compliance family, whose subject is the
+ * command about to run rather than a path it writes (F2).
+ *
+ * Returns null unless the entry is an enforceable PROHIBIT action rule, delivered to
+ * preToolUse, whose attested version triple matches EXACTLY, that selects this call,
+ * and whose conjunction matches the command string.
+ *
+ * SELECTION IS STRICT, and that is the one place this deliberately differs from the
+ * path families. Those widen past their attested `tools` because a forbidden root is a
+ * statement about a PATH, and an agent that is denied `Write` can reach the same file
+ * with `Bash: cat >`; enforcement that only stops the compliant is not enforcement.
+ * A command rule has no such step-around: its subject IS the Bash command string, so
+ * there is no second tool that performs the same operation while presenting a
+ * different payload, and widening would only invent matches on tools that carry no
+ * command at all.
+ */
+function evaluateCommandEntry(
+  entry: RuleBundleEntry,
+  payload: RulePayloadV1,
+  sequences: readonly (readonly string[])[],
+  call: ToolCall,
+  stale: boolean,
+  maxEnforcement: EligibleEnforcement,
+): EntryDecision {
+  const compliance = payload.compliance;
+  // The same exact-triple gate the note-vault family carries. A payload minted against
+  // different evaluator semantics is NOT enforced, rather than enforced under semantics
+  // its attester never saw.
+  if (
+    compliance.evaluatorContractVersion !== FORBIDDEN_COMMAND_EVALUATOR_CONTRACT_VERSION ||
+    compliance.matcherSchemaVersion !== FORBIDDEN_COMMAND_MATCHER_SCHEMA_VERSION ||
+    compliance.pathCanonicalizerVersion !== FORBIDDEN_COMMAND_CANONICALIZER_VERSION
+  ) {
+    return null;
+  }
+  if (!Array.isArray(payload.deliveryChannels) || !payload.deliveryChannels.includes("preToolUse")) {
+    return null;
+  }
+  if (selectRule(call, payload.applicability) !== "APPLIES") return null;
+
+  const field = payload.applicability.mode === "action" ? payload.applicability.matcher.field : "command";
+  // MATCHES_FORBIDDEN is the only verdict; NO_MATCH and INDETERMINATE are both UNKNOWN
+  // (a shell string is opaque, so a non-match never proves compliance) and UNKNOWN
+  // projects to OBSERVE, which returns null below. Every miss therefore fails silent.
+  const verdict = verdictForForbiddenCommand(classifyCommandAllOf(call.toolInput[field], sequences));
+  // The verdict type is the WIDE four-state RuleEvaluation, which includes
+  // NOT_APPLICABLE; `projectEligibleEnforcement` takes the three-state admission type.
+  // This matcher structurally cannot return NOT_APPLICABLE (selection already happened
+  // above, and the classifier's three outcomes map onto VIOLATION / UNKNOWN / UNKNOWN),
+  // so narrow explicitly rather than casting: if it ever could, this reads as UNKNOWN,
+  // which is the silent direction.
+  const admissible = verdict.result === "VIOLATION" ? "VIOLATION" : "UNKNOWN";
+  const eligible = clampEnforcement(
+    projectEligibleEnforcement(admissible, payload.enforcementCeiling),
+    maxEnforcement,
+  );
+  if (eligible === "OBSERVE") return null;
+
+  // `targetPath` stays null on every arm: this family judged no path, and synthesizing
+  // one would file the script's location in the review queue's blocked-path column as
+  // though we had judged a write to it.
+  if (eligible === "WARN") {
+    return {
+      kind: "WARN",
+      reason: buildCommandReason(entry, payload, "is discouraged"),
+      targetPath: null,
+      ruleText: payload.text,
+      enforcementCeiling: payload.enforcementCeiling,
+    };
+  }
+  if (eligible === "DENY") {
+    return stale
+      ? {
+          kind: "ASK",
+          reason: buildCommandReason(
+            entry,
+            payload,
+            "would be blocked, but its rule bundle is stale (offline past its lease), so it needs your explicit confirmation",
+          ),
+          degraded: true,
+          targetPath: null,
+          ruleText: payload.text,
+          enforcementCeiling: payload.enforcementCeiling,
+        }
+      : {
+          kind: "DENY",
+          reason: buildCommandReason(entry, payload, "is prohibited"),
+          targetPath: null,
+          ruleText: payload.text,
+          enforcementCeiling: payload.enforcementCeiling,
+        };
+  }
+  return {
+    kind: "ASK",
+    reason: buildCommandReason(entry, payload, "needs your confirmation"),
+    degraded: false,
+    targetPath: null,
+    ruleText: payload.text,
+    enforcementCeiling: payload.enforcementCeiling,
+  };
 }
 
 // The authority ladder as an ordinal so eligibility can be clamped to the session ceiling cap. The
@@ -212,9 +454,30 @@ function aggregateWarnReasons(reasons: string[]): string {
 /** Per-entry resolution: DENY (fresh block), ASK (stale-degraded or native ask), WARN (non-blocking
  * advisory), or null (not selected). */
 type EntryDecision =
-  | { kind: "DENY"; reason: string; targetPath: string | null; ruleText: string }
-  | { kind: "ASK"; reason: string; degraded: boolean }
-  | { kind: "WARN"; reason: string; targetPath: string | null; ruleText: string }
+  | {
+      kind: "DENY";
+      reason: string;
+      targetPath: string | null;
+      ruleText: string;
+      /** The ATTESTED ceiling, carried from the payload so the aggregator can stamp it onto the
+       * incident without re-reading the entry. Never the clamped `eligible`. */
+      enforcementCeiling: EligibleEnforcement;
+    }
+  | {
+      kind: "ASK";
+      reason: string;
+      degraded: boolean;
+      targetPath: string | null;
+      ruleText: string;
+      enforcementCeiling: EligibleEnforcement;
+    }
+  | {
+      kind: "WARN";
+      reason: string;
+      targetPath: string | null;
+      ruleText: string;
+      enforcementCeiling: EligibleEnforcement;
+    }
   | null;
 
 /**
@@ -240,6 +503,8 @@ async function evaluateEntry(
   entry: RuleBundleEntry,
   call: ToolCall,
   runtimeProjectRoot: string,
+  /** Where a RELATIVE target resolves from: the shell's cwd, or runtimeProjectRoot as the fallback. */
+  relativeBase: string,
   currentRuntimeScopeId: string,
   classify: (rawFilePath: unknown, runtimeProjectRoot: string) => Promise<EvaluationTarget>,
   classifyNoteVault: (
@@ -277,6 +542,17 @@ async function evaluateEntry(
   const compliance = payload.compliance;
   const config = compliance?.config;
   if (!config) return null;
+  // The THIRD family (F2), dispatched before the two path families and returning
+  // whatever it decides. It judges the COMMAND, so none of the path machinery below
+  // applies to it: no write-target derivation, no glob over paths, no canonicalizer.
+  // A degenerate empty conjunction is INDETERMINATE inside the matcher, never
+  // match-all, so a malformed rule falls out silently instead of warning on every
+  // Bash call in the session.
+  if ("forbiddenCommandAllOf" in config) {
+    const sequences = config.forbiddenCommandAllOf;
+    if (!Array.isArray(sequences)) return null;
+    return evaluateCommandEntry(entry, payload, sequences, call, stale, maxEnforcement);
+  }
   const forbidden =
     "forbiddenRootRelativePath" in config
       ? config.forbiddenRootRelativePath
@@ -330,12 +606,14 @@ async function evaluateEntry(
   let target: EvaluationTarget | null = null;
   let verdict: ReturnType<typeof versionBackedVerdict> | null = null;
   for (const raw of candidates) {
-    const t = await classify(raw, runtimeProjectRoot);
+    // Relative targets resolve against where the shell actually is; absolute ones ignore the base
+    // entirely, so this is a no-op for every Edit/Write call.
+    const t = await classify(raw, relativeBase);
     let resolvedVerdict: ReturnType<typeof versionBackedVerdict>;
     if (noteVault) {
       resolvedVerdict = await classifyNoteVault(
           raw,
-          runtimeProjectRoot,
+          relativeBase,
           noteVault.allowedRootAbsolutePath,
           noteVault.filenamePrefixPattern,
         ).then((classification) => {
@@ -391,20 +669,39 @@ async function evaluateEntry(
       reason: buildWarnReason(entry, payload, target),
       targetPath: runtimeRelativePath(target),
       ruleText: payload.text,
+      // The ATTESTED ceiling, not `eligible`: `eligible` is already clamped by the session cap, so
+      // reading it here would report WARN for a DENY-attested rule and erase the clamp.
+      enforcementCeiling: payload.enforcementCeiling,
     };
   }
   if (eligible === "DENY") {
     return stale
-      ? { kind: "ASK", reason: buildDegradedAskReason(entry, payload, target), degraded: true }
+      ? {
+          kind: "ASK",
+          reason: buildDegradedAskReason(entry, payload, target),
+          degraded: true,
+          targetPath: runtimeRelativePath(target),
+          ruleText: payload.text,
+          // The rule is still attested at DENY; the lease is what degraded, not the authority.
+          enforcementCeiling: payload.enforcementCeiling,
+        }
       : {
           kind: "DENY",
           reason: buildBundleDenyReason(entry, payload, target),
           targetPath: runtimeRelativePath(target),
           ruleText: payload.text,
+          enforcementCeiling: payload.enforcementCeiling,
         };
   }
   // eligible === "ASK": a natively-attested ASK ceiling, surfaced regardless of bundle freshness.
-  return { kind: "ASK", reason: buildAskReason(entry, payload, target), degraded: false };
+  return {
+    kind: "ASK",
+    reason: buildAskReason(entry, payload, target),
+    degraded: false,
+    targetPath: runtimeRelativePath(target),
+    ruleText: payload.text,
+    enforcementCeiling: payload.enforcementCeiling,
+  };
 }
 
 /**
@@ -432,7 +729,17 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
   const maxEnforcement = input.maxEnforcement ?? "DENY";
   const entries = [...read.bundle.rules].sort((a, b) => (a.ruleNodeId < b.ruleNodeId ? -1 : a.ruleNodeId > b.ruleNodeId ? 1 : 0));
 
-  let ask: { reason: string; ruleNodeId: string; ruleVersionId: string; degraded: boolean } | null = null;
+  let ask:
+    | {
+        reason: string;
+        ruleNodeId: string;
+        ruleVersionId: string;
+        degraded: boolean;
+        targetPath: string | null;
+        ruleText: string;
+        enforcementCeiling: EligibleEnforcement;
+      }
+    | null = null;
   const warns: string[] = [];
   const warnings: WarnEvidence[] = [];
   for (const entry of entries) {
@@ -442,6 +749,12 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
         entry,
         input.call,
         input.runtimeProjectRoot,
+        // Absolute-only: a relative or empty cwd cannot resolve anything, and joining two relative
+        // paths would invent a third meaningless one. Fall back to the repo root, which is the
+        // behavior every caller had before this parameter existed.
+        input.relativeBase && input.relativeBase.startsWith("/")
+          ? input.relativeBase
+          : input.runtimeProjectRoot,
         input.runtimeScopeId,
         classify,
         classifyNoteVault,
@@ -461,6 +774,7 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
         ruleVersionId: entry.ruleVersionId,
         targetPath: decided.targetPath,
         ruleText: decided.ruleText,
+        enforcementCeiling: decided.enforcementCeiling,
       };
     }
     if (decided.kind === "WARN") {
@@ -473,15 +787,33 @@ export async function decideBundleEnforcement(input: BundleEnforceInput): Promis
         ruleVersionId: entry.ruleVersionId,
         targetPath: decided.targetPath,
         ruleText: decided.ruleText,
+        enforcementCeiling: decided.enforcementCeiling,
       });
       continue;
     }
     if (ask === null) {
-      ask = { reason: decided.reason, ruleNodeId: entry.ruleNodeId, ruleVersionId: entry.ruleVersionId, degraded: decided.degraded };
+      ask = {
+        reason: decided.reason,
+        ruleNodeId: entry.ruleNodeId,
+        ruleVersionId: entry.ruleVersionId,
+        degraded: decided.degraded,
+        targetPath: decided.targetPath,
+        ruleText: decided.ruleText,
+        enforcementCeiling: decided.enforcementCeiling,
+      };
     }
   }
   if (ask !== null) {
-    return { kind: "ASK", reason: ask.reason, ruleNodeId: ask.ruleNodeId, ruleVersionId: ask.ruleVersionId, degraded: ask.degraded };
+    return {
+      kind: "ASK",
+      reason: ask.reason,
+      ruleNodeId: ask.ruleNodeId,
+      ruleVersionId: ask.ruleVersionId,
+      degraded: ask.degraded,
+      targetPath: ask.targetPath,
+      ruleText: ask.ruleText,
+      enforcementCeiling: ask.enforcementCeiling,
+    };
   }
   if (warns.length > 0) {
     return { kind: "WARN", reason: aggregateWarnReasons(warns), count: warns.length, warnings };

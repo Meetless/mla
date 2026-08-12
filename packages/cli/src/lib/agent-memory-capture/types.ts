@@ -137,6 +137,13 @@ export interface LiveLedgerEntry {
   // version that no longer matches re-evaluates the file (RETRY-2 for blocks).
   blockedHash?: string;
   blockedScannerVersion?: string;
+  // The credential RULE ids that caused the block, persisted so a blocked file is
+  // ENUMERABLE with its reason after the pass that produced it is gone. Rule ids
+  // only, exactly like LiveRecord.secretRuleIds: the scanner returns identifiers
+  // (e.g. "redis_directive"), never the matched secret text, so this is safe at
+  // rest. Cleared whenever the block clears. Without it `status` could say "4
+  // blocked" and nothing could say which four or why.
+  blockedRuleIds?: string[];
   // ISO of the last processing ATTEMPT (success or failure), for observability.
   lastAttemptAt: string;
 }

@@ -9,7 +9,7 @@ jest.mock("../../src/commands/kb_claims", () => ({
 
 import { isReviewListInvocation, pendingAliasArgs, runKb, runKbDocumentReviewRetired } from "../../src/commands/kb";
 import { runKbClaimVerdict } from "../../src/commands/kb_claims";
-import { parseKbPendingArgs } from "../../src/commands/kb_pending";
+import { parseKbPendingArgs, renderPendingHuman } from "../../src/commands/kb_pending";
 
 describe("isReviewListInvocation", () => {
   it("no args => list", () => {
@@ -117,5 +117,36 @@ describe("runKb routes accept/reject on the SHAPE of the argument", () => {
     // verdict we DID record is how a user learns to ignore the message.
     const msg = errSpy.mock.calls.map((c) => String(c[0])).join("\n");
     expect(msg).not.toContain("is retired");
+  });
+});
+
+// --- A3: an empty relationship queue must not read as "nothing pending" -------
+// Measured live 2026-08-05 (notes/20260805-did-mla-help-this-session-...md §12.3).
+// `mla kb pending` is a deprecated alias onto the relationship-candidate queue.
+// It answered "No relationship candidates pending review" while 14,108 CLAIMS sat
+// PENDING, and the operator (correctly reading the command name, not the noun in
+// the message) recorded "the review queue is unreachable" and built a whole
+// diagnosis on it. The empty state already points at `mla graph connections`; it
+// never pointed at the claim queue, which is both the largest queue and the one a
+// person typing "kb pending" is most likely asking about.
+describe("renderPendingHuman empty state names every sibling queue", () => {
+  const emptyView = { workspaceId: "ws_test", rows: [], scopeNote: null };
+
+  it("points at the claim-grain trust queue, not just graph connections", () => {
+    const out = renderPendingHuman(emptyView as never);
+    expect(out).toContain("mla kb claims --pending");
+  });
+
+  it("still points at the claim-grain connections queue", () => {
+    const out = renderPendingHuman(emptyView as never);
+    expect(out).toContain("mla graph connections");
+  });
+
+  it("says which queue it just reported on, so empty cannot read as empty-everywhere", () => {
+    const out = renderPendingHuman(emptyView as never);
+    expect(out).toContain("No relationship candidates pending review");
+    // the load-bearing assertion: an operator reading ONLY this output can tell
+    // that two other queues exist and were not consulted.
+    expect(out).toMatch(/separate/i);
   });
 });

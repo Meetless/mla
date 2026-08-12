@@ -49,12 +49,12 @@ describe("canonicalRepoPath", () => {
     // On a case-SENSITIVE volume the swapped name is a genuinely different
     // directory, so there is nothing to collapse and nothing to assert.
     if (!caseInsensitive) {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
       return;
     }
 
     expect(canonicalRepoPath(swapped)).toBe(canonicalRepoPath(dir));
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("falls back to a resolved path instead of throwing when the folder is gone", () => {

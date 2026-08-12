@@ -72,7 +72,7 @@ describe("runInternalRuleMeter", () => {
     delete process.env.MEETLESS_HOME;
     delete process.env.MEETLESS_TELEMETRY;
     delete process.env.CLAUDE_CODE_SESSION_ID;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const baseArgv = (meter: unknown = METER, over: string[] = []): string[] => [

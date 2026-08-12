@@ -85,6 +85,7 @@ const NOTE_VAULT_CONFIG_KEYS = new Set([
   "allowedRootAbsolutePath",
   "filenamePrefixPattern",
 ]);
+const FORBIDDEN_COMMAND_CONFIG_KEYS = new Set(["forbiddenCommandAllOf"]);
 const APPLICABILITY_AMBIENT_KEYS = new Set(["mode"]);
 const APPLICABILITY_ACTION_KEYS = new Set(["mode", "tools", "matcher"]);
 const APPLICABILITY_TURN_KEYS = new Set(["mode", "trigger"]);
@@ -105,6 +106,37 @@ function rejectUnknownKeys(obj: object, allowed: Set<string>, context: string): 
  * channels are ASCII, so code unit and code point coincide and the order matches JCS key ordering. */
 function sortedDedupedSet(values: readonly string[]): string[] {
   return Array.from(new Set(values)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** Joins tokens into a clause identity key. NUL is not a legal shell token character,
+ * so it cannot occur inside a token and the key is injective: `["a","b"]` and `["a b"]`
+ * stay distinct clauses. A space here would collapse them into one, silently dropping a
+ * condition from a conjunction and BROADENING the rule. */
+const CLAUSE_TOKEN_SEPARATOR = "\u0000";
+
+/**
+ * Canonicalize a COMMAND family conjunction. The two levels have DIFFERENT identity
+ * semantics and conflating them would either lose meaning or split one rule into two
+ * hashes:
+ *
+ *   outer  a CONJUNCTION. `[["a"],["b"]]` and `[["b"],["a"]]` are the same rule, and a
+ *          repeated clause adds no condition, so it is sorted + deduped exactly like
+ *          `tools` and `deliveryChannels`.
+ *   inner  a contiguous token RUN. `["git","push"]` and `["push","git"]` are different
+ *          operations, so the order is meaning and is preserved verbatim.
+ *
+ * Sorted by the NUL-joined form so the key is a pure function of the token sequence and
+ * cannot collide across clause boundaries: NUL is not a shell token character, so
+ * `["a","b"]` and `["a b"]` sort as the distinct clauses they are.
+ */
+function canonicalCommandConjunction(sequences: readonly (readonly string[])[]): string[][] {
+  const seen = new Map<string, string[]>();
+  for (const seq of sequences) {
+    seen.set(seq.join(CLAUSE_TOKEN_SEPARATOR), [...seq]);
+  }
+  return Array.from(seen.keys())
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    .map((k) => seen.get(k) as string[]);
 }
 
 function buildApplicabilityPayload(a: RuleApplicability): CanonicalObject {
@@ -152,9 +184,14 @@ export function buildRuleVersionPayload(payload: RulePayloadV1): CanonicalObject
   rejectUnknownKeys(payload.compliance, COMPLIANCE_KEYS, "compliance");
   const config = payload.compliance.config;
   const isForbiddenRoot = "forbiddenRootRelativePath" in config;
+  const isForbiddenCommand = "forbiddenCommandAllOf" in config;
   rejectUnknownKeys(
     config,
-    isForbiddenRoot ? FORBIDDEN_ROOT_CONFIG_KEYS : NOTE_VAULT_CONFIG_KEYS,
+    isForbiddenRoot
+      ? FORBIDDEN_ROOT_CONFIG_KEYS
+      : isForbiddenCommand
+        ? FORBIDDEN_COMMAND_CONFIG_KEYS
+        : NOTE_VAULT_CONFIG_KEYS,
     "compliance.config",
   );
 
@@ -167,10 +204,12 @@ export function buildRuleVersionPayload(payload: RulePayloadV1): CanonicalObject
       pathCanonicalizerVersion: payload.compliance.pathCanonicalizerVersion,
       config: isForbiddenRoot
         ? { forbiddenRootRelativePath: config.forbiddenRootRelativePath }
-        : {
-            allowedRootAbsolutePath: config.allowedRootAbsolutePath,
-            filenamePrefixPattern: config.filenamePrefixPattern,
-          },
+        : isForbiddenCommand
+          ? { forbiddenCommandAllOf: canonicalCommandConjunction(config.forbiddenCommandAllOf) }
+          : {
+              allowedRootAbsolutePath: config.allowedRootAbsolutePath,
+              filenamePrefixPattern: config.filenamePrefixPattern,
+            },
     },
     effect: payload.effect,
     strength: payload.strength,

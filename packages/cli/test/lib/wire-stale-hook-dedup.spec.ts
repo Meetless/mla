@@ -69,7 +69,7 @@ describe("ensureClaudeSettings: stale-path hook dedup (F3-E double-hook fix)", (
       expect(entries.length).toBe(1); // reconciled, not duplicated
       expect(entries[0].hooks[0].command).toBe(canonical); // healed to canonical path
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -106,7 +106,7 @@ describe("ensureClaudeSettings: stale-path hook dedup (F3-E double-hook fix)", (
       expect(entries.length).toBe(1);
       expect(entries[0].hooks[0].command).toBe(canonical);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -135,7 +135,7 @@ describe("ensureClaudeSettings: stale-path hook dedup (F3-E double-hook fix)", (
       expect(entries[0].hooks[0].command).toBe(canonical);
       expect(entries[0].matcher).toBe(POST_TOOL_USE_MATCHER);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -169,7 +169,7 @@ describe("ensureClaudeSettings: stale-path hook dedup (F3-E double-hook fix)", (
       );
       expect(oursEntries.length).toBe(1); // ours appended alongside, exactly once
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

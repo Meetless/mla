@@ -70,7 +70,7 @@ describe("resolveMlaBinary", () => {
     const res = resolveMlaBinary({ PATH: dir } as NodeJS.ProcessEnv);
     expect(res.binPath).toBe(bin);
     expect(res.realPath).toBe(fs.realpathSync(target));
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("returns nulls when mla is not on PATH", () => {
@@ -79,6 +79,6 @@ describe("resolveMlaBinary", () => {
       binPath: null,
       realPath: null,
     });
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 });

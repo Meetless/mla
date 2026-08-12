@@ -73,7 +73,7 @@ describe("mla mute (per-session capture OFF)", () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mla-mute-"));
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("writes a <sid>.off sentinel for the current session", async () => {
@@ -135,7 +135,7 @@ describe("mla unmute (per-session capture back ON)", () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mla-unmute-"));
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("removes the <sid>.off sentinel for the current session", async () => {

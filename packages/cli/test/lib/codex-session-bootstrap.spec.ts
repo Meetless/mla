@@ -85,7 +85,7 @@ describe("Codex session bootstrap", () => {
         ),
       ).toBe("ws_codex");
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -136,7 +136,7 @@ describe("Codex session bootstrap", () => {
         .map((line) => JSON.parse(line));
       expect(events.filter((event) => event.event === "session_started")).toHaveLength(2);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

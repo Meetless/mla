@@ -69,7 +69,7 @@ describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the hear
       expect(entries[0].matcher).toBe(POST_TOOL_USE_MATCHER);
       expect(entries[0].hooks[0].command).toMatch(/post-tool-use\.sh"$/);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -99,7 +99,7 @@ describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the hear
       expect(entries[0].matcher).toBe(POST_TOOL_USE_MATCHER);
       expect(entries[0].hooks[0].command).toBe(cmd);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -133,7 +133,7 @@ describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the hear
       expect(ours).toBeDefined();
       expect(ours.matcher).toBe(POST_TOOL_USE_MATCHER);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -181,7 +181,7 @@ describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the hear
       expect(merged[0].matcher).toBe("Bash"); // multi-hook entry untouched
       expect(merged[0].hooks.length).toBe(2);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -192,7 +192,7 @@ describe("ensureClaudeSettings: PostToolUse matcher is the catch-all so the hear
       expect(res.added).not.toContain("PostToolUse");
       expect(postToolUse(p).length).toBe(0);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

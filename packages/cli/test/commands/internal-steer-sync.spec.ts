@@ -60,7 +60,7 @@ describe("internal steer-sync writes the active-conflict snapshot", () => {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     jest.resetModules();
   });
 
@@ -148,8 +148,8 @@ describe("internal steer-sync job 4: rule-bundle sync", () => {
     // rm takes the stamp with it. Until 2026-07-13 rescanAndCache stamped the REAL ~/.meetless
     // and this teardown had to reach into the operator's own home to delete it.
     process.chdir(prevCwd);
-    fs.rmSync(cwd, { recursive: true, force: true });
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     jest.resetModules();
   });
 

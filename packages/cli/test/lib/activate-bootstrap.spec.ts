@@ -146,7 +146,7 @@ describe("mla activate current-session bootstrap", () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mla-boot-"));
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("bootstraps the current session when CLAUDE_CODE_SESSION_ID is set", async () => {

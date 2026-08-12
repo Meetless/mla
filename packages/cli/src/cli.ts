@@ -107,7 +107,10 @@ import { runInternalForwardEnforcement } from "./commands/internal-forward-enfor
 import { runInternalEnforcementCorrelate } from "./commands/internal-enforcement-correlate";
 import { runInternalRedactCapture } from "./commands/internal-redact-capture";
 import { runInternalRedactEvents } from "./commands/internal-redact-events";
+import { runInternalScrubTraces } from "./commands/internal-scrub-traces";
 import { runInternalTurnRecap } from "./commands/internal-turn-recap";
+import { runInternalEchoScan } from "./commands/internal-echo-scan";
+import { runInternalCaptureMcpFailures } from "./commands/internal-capture-mcp-failures";
 import { runInternalRefresh } from "./commands/internal-refresh";
 import { runInternalSessionNudge } from "./commands/internal-session-nudge";
 import {
@@ -163,6 +166,8 @@ import {
 //   mla init [flags]
 //   mla rewire [flags]
 //   mla activate [--name <name>] [--note <text>] [--here|--create|--repair] [--bootstrap <fast|agentic>]
+//   mla activate --workspace <id>
+//   mla workspace [show | list | invite <email> | members | remove <email> | reactivate]
 //   mla deactivate [--yes] [--from-root|--marker <path>]
 //   mla mute | mla unmute
 //   mla review [--plain] [--no-flush]
@@ -263,6 +268,13 @@ export const COMMANDS: CommandSpec[] = [
                     (provision-or-bind a workspace for this folder: no marker in
                      the tree provisions a new one named after the dir; a marker
                      present binds to it)
+  mla activate --workspace <id>
+                    (bind THIS folder to a workspace that already exists, so several
+                     repos can share one company workspace. Provisions nothing; each
+                     folder still keeps its own scan root, so one repo's instruction
+                     files are never served as another's. Idempotent when already
+                     bound to that id; refuses rather than repointing a folder bound
+                     to a different one. Run 'mla workspace list' to see the ids.)
   mla activate --here
                     (in-Git subdir override: bind/provision THIS subdir, shadowing
                      any parent marker via nearest-wins)
@@ -329,6 +341,9 @@ export const COMMANDS: CommandSpec[] = [
     summary: "Show the workspace bound to this folder and manage its members.",
     usage: `  mla workspace [show]
                     (print the workspace bound to this folder + its health)
+  mla workspace list
+                    (every workspace you belong to, with its id: the id you pass to
+                     'mla activate --workspace <id>' to bind another folder to one)
   mla workspace invite <email> [--json] [--workspace <id>]
                     (add a teammate's email as a MEMBER so they can share this
                      workspace's governed memory, cases, and conflicts; owner/admin)
@@ -724,9 +739,10 @@ export const COMMANDS: CommandSpec[] = [
   },
   {
     name: "turn",
-    summary: "Per-turn assist recap: did mla run this turn and did it help?",
+    summary: "Per-turn assist recap: did mla run this turn, and was its evidence explicitly referenced?",
     usage: `  mla turn [N] [--session <sid>] [--json]
-                    (per-turn assist recap: did mla run this turn and did it help?
+                    (did mla run this turn, and was its evidence explicitly
+                     referenced? An OBSERVATION, never a claim that it helped.
                      no N recaps the latest completed turn of the current session;
                      N recaps turn N. The per-turn analog of \`mla stats\`; also
                      reachable as \`mla stats --turn [N]\`.)`,
@@ -972,6 +988,12 @@ export const COMMANDS: CommandSpec[] = [
                      the session transcript and append one mla_enforcement_outcome
                      per closed deny -- redirected, stopped, or retried-blocked.
                      Fired detached from the Stop hook; idempotent; fail-soft)
+  mla _internal echo-scan --session <sid> --turn <n>
+                    (F1b: read the turn's closing output on stdin and record which
+                     INJECTED snippets it quoted verbatim, to logs/evidence-echoes.jsonl.
+                     Heuristic, reported beside pulled/cited/opened and never merged into
+                     them. Stores source ids only, never turn text. Fired from stop.sh;
+                     fail-soft, always exits 0.)
   mla _internal turn-recap [--session <sid>] [--turn <n>]
                     [--style footer|block|block-context] [--json] [--emit-langfuse]
                     (the machine-facing per-turn assist recap; shelled out by the
@@ -1027,7 +1049,13 @@ export const COMMANDS: CommandSpec[] = [
       if (sub === "enforcement-correlate") return runInternalEnforcementCorrelate(rest);
       if (sub === "redact-capture") return runInternalRedactCapture(rest);
       if (sub === "redact-events") return runInternalRedactEvents(rest);
+      if (sub === "scrub-traces") return runInternalScrubTraces(rest);
       if (sub === "turn-recap") return runInternalTurnRecap(rest);
+      if (sub === "echo-scan") return runInternalEchoScan(rest);
+      // D3: the Stop-time recovery of governed pulls that were REFUSED. PostToolUse
+      // does not fire on an errored tool result, so this is the only writer that can
+      // see them. See src/lib/analytics/mcp-failure-scan.ts.
+      if (sub === "capture-mcp-failures") return runInternalCaptureMcpFailures(rest);
       if (sub === "refresh") return runInternalRefresh(rest);
       if (sub === "session-nudge") return runInternalSessionNudge(rest);
       if (sub === "update-check") return runInternalUpdateCheck();
@@ -1506,13 +1534,31 @@ export async function runCliBootstrap(argv: string[]): Promise<number> {
   // the same way `mla review`/`mla summary` bind it. Skipped once HOME is gone
   // (BUG-1 D): the local jsonl append calls ensureHome() and would recreate the
   // very directory an uninstall just removed.
+  // Re-resolve the marker HERE rather than reusing the pre-dispatch value.
+  //
+  // `workspaceId` above is read before the command runs, and `mla activate` is the command that
+  // WRITES the marker it would be read from. So activate's own event carried workspace_id: null,
+  // every time, and `isRemotelyEmittable` withholds any event without a workspace, by design
+  // (INV-JOIN-1). The row appended locally and never left the machine: measured 2026-08-08 in a
+  // clean room, activate's local row had workspace_id null while the `scan` that followed it
+  // carried the real id and forwarded fine.
+  //
+  // That is why prod shows an activate event for only 6 of 75 workspaces. It is not a flush race
+  // (the forward is already awaited at this point); the 6 are re-activations of an ALREADY-bound
+  // folder, the only case where the marker existed at start. Activation was therefore invisible
+  // in the funnel for precisely the users who were activating for the first time.
+  //
+  // Re-resolving is safe for every other command: the marker does not move mid-run, so this
+  // returns the same id. When a run REMOVES the binding (deactivate, uninstall) it returns null,
+  // which is the honest attribution for a run that ended unbound.
+  const effectiveWorkspaceId = workspaceId ?? (cfg ? tryResolveWorkspaceId() : null);
   if (!homeRemoved) {
     await captureCommandEvent({
       argv,
       exitCode: code,
       threw,
       thrown,
-      workspaceId,
+      workspaceId: effectiveWorkspaceId,
       sessionId: (process.env.CLAUDE_CODE_SESSION_ID || "").trim() || null,
       actorUserId: cfg?.actorUserId ?? null,
       mlaVersion: buildInfo.version,

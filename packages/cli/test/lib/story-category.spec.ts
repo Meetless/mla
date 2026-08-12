@@ -38,7 +38,7 @@ function callFn(fn: string, arg: string): string {
     }
     return (r.stdout ?? "").trim();
   } finally {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

@@ -248,7 +248,16 @@ export function renderPendingHuman(view: PendingView): string {
     const pointer =
       "Note: claim-grain relationship connections (the console /relationships queue) " +
       "are a separate surface. List them with `mla graph connections`.";
-    const body = `${base}\n${pointer}`;
+    // The SECOND sibling queue, and the one that actually burned an operator on
+    // 2026-08-05: trust review lives at CLAIM grain, in its own queue, and this
+    // command has never touched it. An empty relationship queue was read as "the
+    // review queue is unreachable" while 14,108 claims sat PENDING, and a whole
+    // diagnosis was built on that reading. Naming it here costs one line and is
+    // the only thing standing between an empty result and that inference.
+    const claimPointer =
+      "Note: claim TRUST verdicts (accept / reject, the thing that decides grounding) " +
+      "are a separate queue this command never reads. List them with `mla kb claims --pending`.";
+    const body = `${base}\n${pointer}\n${claimPointer}`;
     return view.scopeNote ? `${view.scopeNote}\n${body}` : body;
   }
 

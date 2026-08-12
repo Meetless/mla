@@ -40,6 +40,11 @@ export interface WorkspaceContext {
   workspaceName?: string;
   markerPath: string;
   markerDir: string;
+  // "worktree" when this binding was inherited from the origin checkout of a
+  // linked git worktree (D1). DIAGNOSTIC ONLY, exactly like FoundActivation.via:
+  // status and doctor render it so inheritance is never silent. Nothing scopes,
+  // authorizes, or branches on it.
+  via?: "worktree";
 }
 
 // Non-throwing lookup: returns the resolved context, or null when no usable
@@ -56,6 +61,7 @@ export function findWorkspaceContext(
     workspaceName: found.workspaceName,
     markerPath: found.path,
     markerDir: found.dir,
+    ...(found.via ? { via: found.via } : {}),
   };
 }
 

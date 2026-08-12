@@ -5,6 +5,7 @@ import * as path from "path";
 import { SCAN_SCHEMA_VERSION } from "../../src/lib/scanner/types";
 import { SCOPED_UNAVAILABLE_MARKER_TEXT } from "../../src/lib/scanner/render";
 import { SAFE_TOTAL } from "../../src/commands/assemble-context";
+import { assembleAuditPath } from "../../src/lib/scanner/cache";
 
 // P3.2 hook integration test (targeted-rule-injection §Phase 3): exercise the REAL
 // user-prompt-submit.sh bash hook driving the REAL built `mla _internal assemble-context`
@@ -152,8 +153,18 @@ async function runHook(args: {
         HOME: args.root,
         MEETLESS_HOME: args.home,
         MEETLESS_DEBUG: "0",
+        // This suite's subject is the byte-exact Layer-1 head, and its assertions are
+        // "nothing appended after". These sandboxes have no pending-count cache, and
+        // since P13 that legitimately emits a once-per-session "review status
+        // UNAVAILABLE" notice at the tail. Muting the unrelated surface isolates the
+        // unit under test rather than weakening the byte assertions; governance has its
+        // own suites (governance-silent-reason, intercept-hook).
+        MEETLESS_GOVERNANCE_HINT: "0",
       },
     });
+    // A chunk boundary can fall INSIDE a multi-byte character; setEncoding puts a
+    // StringDecoder in front of the seam so `+=` never accumulates a U+FFFD pair.
+    child.stdout.setEncoding("utf8");
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", () => {});
     child.on("error", reject);
@@ -179,7 +190,19 @@ async function runHook(args: {
     }
   };
   const wsDir = path.join(args.home, "workspaces", WS);
-  const audit = readJson<PersistedAudit>(path.join(wsDir, "assemble-audit.json"));
+  // PER SESSION since 6b86b437e. The assemble audit is also the floor delta's baseline, so
+  // keying it on the workspace alone made every session on the machine diff against
+  // whatever stranger wrote last; the hook now threads `sessionId` down to the assembler
+  // and the receipt lands at `assemble-audit.<sessionId>.json`. Read through
+  // `assembleAuditPath` rather than re-spelling the name here, so the next re-key moves
+  // this harness with the code instead of stranding it on a filename.
+  //
+  // `args.root`, NOT `args.home`. `resolveStateRoot` appends `.meetless` to whatever it is
+  // given, and `args.home` is already `<root>/.meetless`; passing it would look for the
+  // receipt under `<root>/.meetless/.meetless/`. The sandbox sets HOME=<root> and
+  // MEETLESS_HOME=<root>/.meetless for exactly that reason, so the two spellings are the
+  // same directory reached by two different conventions.
+  const audit = readJson<PersistedAudit>(assembleAuditPath(WS, args.root, args.sessionId));
   const receipt = readJson<HookReceipt>(path.join(wsDir, "hook-receipt.json"));
   return { status, additionalContext, audit, receipt, stdout: out };
 }
@@ -242,7 +265,7 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
   }, 180000);
 
   afterAll(() => {
-    for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
+    for (const r of roots) fs.rmSync(r, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function sandbox(cache: CacheSeed): { root: string; home: string } {
@@ -344,8 +367,11 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     expect(r.audit!.explicitPaths).toContain("apps/control/outbox.ts");
     // The manifest identifies each delivered rule by its immutable version (acceptance 29):
     // version-scoped delivery accounting, not bare rule ids.
+    // M6: the floor entry also carries its own `text`, so next turn's assembler can name
+    // a rule that LEFT the floor (it is gone from the new scan cache by then). Floor tier
+    // only; the scoped entry is unchanged because the scoped tail is not diffed.
     expect(r.audit!.delivered).toEqual([
-      { ruleId: "fm_push", tier: "floor-must", versionId: "v1" },
+      { ruleId: "fm_push", tier: "floor-must", versionId: "v1", text: FLOOR_MUST_TEXT, floor: true },
       { ruleId: "s_outbox", tier: "scoped-required", versionId: "v1" },
     ]);
     expect(r.audit!.omitted).toEqual([]);
@@ -435,7 +461,7 @@ describe("P3.2 hook integration — real user-prompt-submit.sh + real mla assemb
     expect(r.audit!.state).toBe("normal");
     expect(r.audit!.overflow).toBe(false);
     expect(r.audit!.delivered).toEqual([
-      { ruleId: "fm_big", tier: "floor-must", versionId: "v1" },
+      { ruleId: "fm_big", tier: "floor-must", versionId: "v1", text: "z".repeat(SAFE_TOTAL + 1000), floor: true },
     ]);
     expect(r.audit!.omitted).toEqual([]);
     expect(r.audit!.bytes).toBeGreaterThan(r.audit!.safeTotal);

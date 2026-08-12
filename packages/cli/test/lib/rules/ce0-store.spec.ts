@@ -52,7 +52,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeCe0Store(store);
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 const subject = (over: Partial<TurnRuleObligationRecord["requiredSubjects"][number]> = {}) => ({
@@ -801,7 +801,7 @@ describe("CE0 store: schema-version drift guard", () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dvDir, { recursive: true, force: true });
+    fs.rmSync(dvDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   /** Fabricate the legacy store exactly as the pre-`source` mla left it: the three tables present,

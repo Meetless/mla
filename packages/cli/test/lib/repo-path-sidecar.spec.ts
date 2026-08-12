@@ -112,10 +112,10 @@ describe("repoPath sidecar (Wedge v6 Epoch 35)", () => {
         expect(written.length).toBeGreaterThan(0);
         expect(fs.realpathSync(written)).toBe(fs.realpathSync(fakeRepo));
       } finally {
-        fs.rmSync(fakeRepo, { recursive: true, force: true });
+        fs.rmSync(fakeRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
       }
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -136,7 +136,7 @@ describe("repoPath sidecar (Wedge v6 Epoch 35)", () => {
       const sidecars = files.filter((f) => f.endsWith(".repoPath"));
       expect(sidecars).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -235,7 +235,7 @@ exit 0
       // is the 24h idle reaper's job. (prod session 11436b5c, 2026-07-04)
       expect(fs.existsSync(sidecarPath)).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -301,7 +301,7 @@ exit 0
       const captured = fs.readFileSync(envCaptureFile, "utf8");
       expect(captured).toContain("MEETLESS_REPO_PATH=<unset>");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -379,7 +379,7 @@ exit 0
       const respooled = lines.filter((l) => l.includes('"event":"finalize_requested"'));
       expect(respooled.length).toBeGreaterThanOrEqual(1);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

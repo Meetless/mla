@@ -517,17 +517,24 @@ export function enumerateDocuments(
 // read-only poll. See notes/20260604-b3-sync-extract-poll.md.
 
 export interface PolledExtraction {
-  state: "queued" | "running" | "completed" | "failed";
+  // `unknown` is not a job status; it is the receipt's word for "we never learned
+  // one". It exists so the renderer can stop printing "queued" over a poll that has
+  // nothing to poll. See fmtExtractionValue.
+  state: "queued" | "running" | "completed" | "failed" | "unknown";
   candidateCount?: number | null;
   conflictCount?: number | null;
   jobId?: string | null;
 }
 
 export interface ExtractionPollDeps {
-  // Read the current GRAPH_EXTRACT state for a document. Returns null when the
-  // intel detail route carries no `extraction` field (pre-B2 intel), so the
-  // poller leaves the receipt's inferred queued state untouched.
-  fetchExtraction: (documentId: string) => Promise<PolledExtraction | null>;
+  // Read the current ONTOLOGY_EXTRACT state for a receipt. Returns null when there
+  // is no job to watch (no id on the receipt, or an unrecognised job status), so the
+  // poller leaves the receipt's inferred queued state untouched rather than
+  // inventing a terminal one.
+  fetchExtraction: (
+    documentId: string,
+    extractionJobId?: string | null,
+  ) => Promise<PolledExtraction | null>;
   // Injectable sleep + monotonic clock so tests drive the budget without timers.
   sleep: (ms: number) => Promise<void>;
   now: () => number;
@@ -558,7 +565,7 @@ export async function pollReceiptsToTerminal(
     for (;;) {
       let polled: PolledExtraction | null;
       try {
-        polled = await deps.fetchExtraction(r.documentId);
+        polled = await deps.fetchExtraction(r.documentId, r.extractionJobId);
       } catch {
         // A transient read failure must NOT fail the ingest: the revision is
         // already committed. Stop polling this receipt and let whatever state
@@ -586,55 +593,91 @@ const EXTRACTION_POLL_BUDGET_MS = 25_000;
 const EXTRACTION_POLL_INTERVAL_MS = 1_500;
 const EXTRACTION_DETAIL_TIMEOUT_MS = 8_000;
 
-// Minimal slice of the intel detail response this poll reads. Kept local (not
-// the full DetailResponse from kb_show) so a server-side field add never breaks
-// the poll, and so the candidate-count math is explicit.
-interface KbDetailForPoll {
-  extraction?: {
-    state: "queued" | "running" | "completed" | "failed";
-    jobId?: string | null;
-  } | null;
-  candidates?: Array<{ relationType: string; status: string }>;
+// The ONE thing this poll reads state from, and the only surface that owns it.
+//
+// WHAT THIS REPLACED (2026-08-07). It used to GET the detail route and project
+// `detail.extraction` / `detail.candidates`. That route serves eight keys and
+// neither is among them: document, serving, servingStatus, headRevision, revisions,
+// chunks, claims, audit. The lane those fields described (whole-doc GRAPH_EXTRACT)
+// was retired by An on 2026-06-26 because nothing consumed its accepted candidates;
+// the claim-grain ONTOLOGY_EXTRACT job is the only mining lane left.
+//
+// So the fetcher returned null on every call, the poll took its "pre-B2 intel"
+// compatibility branch, and the receipt printed "extraction queued (async; check
+// `mla kb show` once it completes)" on every successful add, forever, pointing at a
+// command that cannot answer either. It failed CLOSED, which is exactly why it
+// survived: nothing crashed, a plausible line was printed, and it was never true.
+//
+// The canonical owner of extraction state is the job. `GET /internal/v1/jobs/{id}`
+// is workspace-fenced and already on the CLI edge, and the ingest receipt now
+// carries the ONTOLOGY_EXTRACT id (intel lifted it out of the stats it was already
+// computing and discarding on both ingest paths).
+type IntelGet = <T>(path: string, timeoutMs: number) => Promise<T>;
+
+interface JobForPoll {
+  status?: string | null;
 }
 
-// Build the real fetcher: GET the B2 detail route and project its `extraction`
-// field into a PolledExtraction. When the job has COMPLETED we count the
-// PENDING_REVIEW candidates on the doc (the ones `mla kb pending` will list) so
-// the receipt summary lines up with the review command it points at; conflicts
-// are the CONTRADICTS / SUPERSEDES subset.
-function buildExtractionFetcher(
-  cfg: KbCliConfig,
+// The claim rail on the detail bundle: the grain the surviving lane produces. Read
+// ONLY once the job is terminal, so a count can never be mistaken for progress.
+interface KbDetailClaimsForPoll {
+  claims?: Array<{ reviewOutcome?: string | null; lifecycleStatus?: string | null }>;
+}
+
+// intel JobStatus -> the receipt's vocabulary. `pending` is the queue.
+const JOB_STATUS_TO_STATE: Record<string, PolledExtraction["state"]> = {
+  pending: "queued",
+  running: "running",
+  completed: "completed",
+  failed: "failed",
+};
+
+export function buildExtractionFetcher(
   workspaceId: string,
+  get: IntelGet,
 ): ExtractionPollDeps["fetchExtraction"] {
-  return async (documentId: string): Promise<PolledExtraction | null> => {
-    const qs = new URLSearchParams({
-      workspaceId,
-      revisionLimit: "1",
-      auditLimit: "1",
-    }).toString();
-    const detail = await intelGet<KbDetailForPoll>(
-      cfg,
-      `/internal/v1/kb/documents/${encodeURIComponent(documentId)}/detail?${qs}`,
+  return async (documentId: string, jobId?: string | null): Promise<PolledExtraction | null> => {
+    // No job id means nothing was enqueued to watch (a no-op re-add, or a
+    // best-effort enqueue that failed). Null, and the receipt says so, rather than
+    // polling a job that does not exist.
+    if (!jobId) return null;
+
+    // `/v1/jobs`, NOT the internal-prefixed spelling. The jobs router is mounted on the plain
+    // `/v1` prefix (server.py: include_router(jobs_router, prefix="/v1")) and it is
+    // the CLI edge allowlist entry, unlike every KB route this file otherwise calls.
+    // Probed live before shipping: /internal/v1/jobs 404s, /v1/jobs answers.
+    // Its query param is snake_case `workspace_id`, also unlike the KB routes.
+    const qs = new URLSearchParams({ workspace_id: workspaceId }).toString();
+    const job = await get<JobForPoll>(
+      `/v1/jobs/${encodeURIComponent(jobId)}?${qs}`,
       EXTRACTION_DETAIL_TIMEOUT_MS,
     );
-    const ex = detail.extraction;
-    if (!ex) return null;
-    let candidateCount: number | null = null;
-    let conflictCount: number | null = null;
-    if (ex.state === "completed") {
-      const pending = (detail.candidates ?? []).filter(
-        (c) => c.status === "PENDING_REVIEW",
-      );
-      candidateCount = pending.length;
-      conflictCount = pending.filter(
-        (c) => c.relationType === "CONTRADICTS" || c.relationType === "SUPERSEDES",
-      ).length;
+    const state = JOB_STATUS_TO_STATE[String(job?.status ?? "").toLowerCase()];
+    // An unrecognised status is NOT a completion. Reporting one would let a schema
+    // change print "0 candidates" over a job that is still running.
+    if (!state) return null;
+    if (state !== "completed") {
+      return { state, jobId, candidateCount: null, conflictCount: null };
     }
+
+    // Terminal. Now the counts are meaningful, and a ZERO is a real zero: it means
+    // extraction ran and staged nothing, which the receipt must distinguish from
+    // "status never arrived". That distinction is the whole point of reading the
+    // job first and the claims second.
+    const detailQs = new URLSearchParams({ workspaceId }).toString();
+    const detail = await get<KbDetailClaimsForPoll>(
+      `/internal/v1/kb/documents/${encodeURIComponent(documentId)}/detail?${detailQs}`,
+      EXTRACTION_DETAIL_TIMEOUT_MS,
+    );
+    const pending = (detail?.claims ?? []).filter((c) => c.reviewOutcome === "PENDING");
     return {
-      state: ex.state,
-      jobId: ex.jobId ?? null,
-      candidateCount,
-      conflictCount,
+      state: "completed",
+      jobId,
+      candidateCount: pending.length,
+      // The retired lane counted CONTRADICTS / SUPERSEDES edges. The claim grain has
+      // no equivalent on this rail, so it is 0 rather than a number invented to keep
+      // a sentence shaped the way it used to be.
+      conflictCount: 0,
     };
   };
 }
@@ -1261,7 +1304,7 @@ export async function runKbAdd(argv: string[]): Promise<number> {
   const willPoll = !flags.queue && receipts.some(receiptEnqueuesExtraction);
   if (willPoll) {
     console.error(
-      "waiting for relationship extraction (up to 25s; pass --queue to skip and check `mla kb show` later)...",
+      "waiting for claim extraction (up to 25s; pass --queue to skip and review with `mla kb claims --pending` later)...",
     );
   }
   await pollReceiptsToTerminal(
@@ -1272,7 +1315,9 @@ export async function runKbAdd(argv: string[]): Promise<number> {
       intervalMs: EXTRACTION_POLL_INTERVAL_MS,
     },
     {
-      fetchExtraction: buildExtractionFetcher(cfg, workspaceId),
+      fetchExtraction: buildExtractionFetcher(workspaceId, (path, timeoutMs) =>
+        intelGet(cfg, path, timeoutMs),
+      ),
       sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
       now: () => Date.now(),
     },

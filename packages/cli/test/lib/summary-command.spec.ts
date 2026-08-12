@@ -64,7 +64,7 @@ async function withHome(
     else process.env.MEETLESS_HOME = prevHome;
     if (prevSession === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
     else process.env.CLAUDE_CODE_SESSION_ID = prevSession;
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 
@@ -108,7 +108,10 @@ describe("mla summary: tallies", () => {
     expect(res.code).toBe(0);
     const s = JSON.parse(res.stdout);
     expect(s.prompt_count).toBe(4);
-    expect(s.injected).toBe(2);
+    // Was one `injected` counter keyed off arbitration.decision. Split into the two
+    // layers it always conflated: the base fixture lands the floor and no evidence.
+    expect(s.injected_floor).toBe(2);
+    expect(s.injected_evidence).toBe(0);
     expect(s.discarded_after_compute).toBe(1);
     expect(s.fail_open).toBe(1);
     // timeout rate = 1 of 4
@@ -131,7 +134,7 @@ describe("mla summary: tallies", () => {
     const s = JSON.parse(res.stdout);
     expect(s.prompt_count).toBe(2);
     expect(s.fail_open).toBe(0); // the fail_open is the oldest, excluded by --last 2
-    expect(s.injected).toBe(2);
+    expect(s.injected_floor).toBe(2);
   });
 
   it("skips unparseable lines without crashing", async () => {
@@ -143,7 +146,9 @@ describe("mla summary: tallies", () => {
   it("renders the plain-text shape with the five §6.9 lines", async () => {
     const res = await withHome([makeTrace({})], () => runSummary([]));
     expect(res.stdout).toMatch(/^Prompt count: 1$/m);
-    expect(res.stdout).toMatch(/Injected: 1\s+Discarded after compute: 0\s+Fail-open: 0/);
+    expect(res.stdout).toMatch(
+      /Injected {2}Layer 1 \(floor\): 1 {3}Layer 2 \(evidence\): 0\s+Discarded after compute: 0\s+Fail-open: 0/,
+    );
     expect(res.stdout).toMatch(/Avg enrichment latency: 18\.0s\s+P95: 18\.0s\s+Timeout rate: 0%/);
     expect(res.stdout).toMatch(/Total cost: \$0\.14\s+Avg injected chars: 2104\s+Strategies: agentic_mission_structured=1/);
     expect(res.stdout).toMatch(/Operator labels: 0 useful \/ 0 noisy \/ 0 harmful \/ 1 unlabeled/);
@@ -203,5 +208,58 @@ describe("mla summary: session scoping (auto, no flag)", () => {
     expect(res.code).toBe(1);
     expect(res.stderr).toMatch(/session/i);
     expect(res.stderr).toMatch(/--all/);
+  });
+});
+
+// --- F6: one command said mla did nothing, the other said it injected 19KB ----
+//
+// Same session, same source file, both shipping:
+//   mla summary : "Injected: 0", "Avg injected chars: 0"
+//   mla turn    : "injected: 3,796 chars", hook.injected true, injected_chars 3796
+//
+// summary counted `arbitration.decision === "injected"`, which is true only when
+// LAYER 2 drove the injection, and then printed it under the bare label "Injected".
+// Every turn in that session was `layer1_only`: the floor landed on all five and
+// delivered ~19KB, which is exactly what mla turn was reporting. Neither number was
+// wrong; the label was, and an unlabelled counter that reads as "mla did nothing"
+// is worse than no counter.
+//
+// turn-recap.ts already carries the correct field definitions (injected_floor =
+// hook.injected, injected_evidence = hook.layer2_injected, injected_chars = total
+// delivered). summary now reads THOSE, so the two commands cannot drift again.
+describe("mla summary reports the two layers separately, and agrees with mla turn", () => {
+  const floorOnly = (over: Record<string, unknown> = {}) =>
+    makeTrace({
+      arbitration: { decision: "layer1_only", reason: "no_relevant_context", discarded_after_compute: false },
+      hook: { intercept_latency_ms: 300, injected: true, layer2_injected: false, injected_chars: 3796, fail_open_reason: null, truncated: false },
+      ...over,
+    });
+
+  it("does not report zero for a session where the floor injected on every turn", async () => {
+    const out = await withHome([floorOnly(), floorOnly(), floorOnly(), floorOnly(), floorOnly()], () => runSummary([]));
+    expect(out.code).toBe(0);
+    // The old line. It is the whole bug: five turns, ~19KB delivered, "Injected: 0".
+    expect(out.stdout).not.toMatch(/(^|\s)Injected: 0(\s|$)/);
+    expect(out.stdout).toMatch(/Layer 1 \(floor\): 5/);
+    expect(out.stdout).toMatch(/Layer 2 \(evidence\): 0/);
+  });
+
+  it("counts layer 2 only when layer 2 actually landed", async () => {
+    const withEvidence = makeTrace({
+      arbitration: { decision: "injected", reason: "enrichment_driven", discarded_after_compute: false },
+      hook: { intercept_latency_ms: 300, injected: true, layer2_injected: true, injected_chars: 5000, fail_open_reason: null, truncated: false },
+    });
+    const out = await withHome([floorOnly(), withEvidence], () => runSummary([]));
+    expect(out.stdout).toMatch(/Layer 1 \(floor\): 2/);
+    expect(out.stdout).toMatch(/Layer 2 \(evidence\): 1/);
+  });
+
+  it("totals the delivered characters over every turn that injected, not just layer-2 turns", async () => {
+    const out = await withHome([floorOnly(), floorOnly()], () => runSummary(["--json"]));
+    const parsed = JSON.parse(out.stdout);
+    expect(parsed.injected_floor).toBe(2);
+    expect(parsed.injected_evidence).toBe(0);
+    expect(parsed.total_injected_chars).toBe(3796 * 2);
+    expect(parsed.avg_injected_chars).toBe(3796);
   });
 });

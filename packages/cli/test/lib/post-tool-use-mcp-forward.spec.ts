@@ -117,7 +117,7 @@ function mkHarness(opts?: { mlaPath?: string }): {
       fs.writeFileSync(path.join(queueDir, `${sessionId}.turn`), String(n));
     },
   };
-  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }) };
+  return { h, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }) };
 }
 
 function mcpInput(overrides: Record<string, unknown> = {}): object {
@@ -307,7 +307,7 @@ describe("post-tool-use.sh forwarded tool_used_mcp", () => {
         expect(JSON.stringify(payload)).not.toContain("auth flow");
       } finally {
         cleanup();
-        fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
       }
     });
 

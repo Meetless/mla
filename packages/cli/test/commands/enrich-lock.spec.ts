@@ -85,7 +85,7 @@ describe("mla enrich plan: active-run guard wiring", () => {
   beforeEach(() => {
     seedCliConfig();
     // Fresh per-workspace lock/run state so one test never leaks a held lock into the next.
-    rmSync(join(HOME, "workspaces"), { recursive: true, force: true });
+    rmSync(join(HOME, "workspaces"), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     repoDir = mkdtempSync(join(tmpdir(), "mla-enrich-lock-repo-"));
     initRepo(repoDir);
     restoreCwd = bindWorkspaceMarker(repoDir, WS);
@@ -99,11 +99,11 @@ describe("mla enrich plan: active-run guard wiring", () => {
     logSpy.mockRestore();
     errSpy.mockRestore();
     restoreCwd();
-    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   afterAll(() => {
-    rmSync(HOME, { recursive: true, force: true });
+    rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("a clean plan claims the lock keyed to the run it just minted", async () => {

@@ -62,7 +62,24 @@ describe("computeMetrics", () => {
     expect(m.closed_windows).toBe(3); // pending is open, not closed
   });
 
-  it("INV-LOCAL-STATS-2: a pending inject stays in the injection denominator, never counted ignored", () => {
+  // INV-LOCAL-STATS-2, REVISED 2026-08-08 (F4). The invariant carried three claims and
+  // only one of them is being changed, so they are split rather than deleted.
+  //
+  //   KEPT: a pending inject is never DROPPED from the report (it is reported as
+  //         `unresolved`, with its own count, and `pending` still holds it).
+  //   KEPT: a pending inject is never counted `ignored`.
+  //   RETIRED: "a pending inject stays in the RATE denominator". That clause made an
+  //         open window arithmetically identical to a miss, which is the exact thing
+  //         the invariant's own prose ("never silently calls them ignored",
+  //         notes/20260607-mla-tracking-and-analytics.md §7.4) forbids. An open window
+  //         is CENSORED: the opportunity has not been observed yet, so it cannot be
+  //         evidence either way.
+  //
+  // This is the rule `no_opportunity` already carries ("the agent never had a turn is
+  // not a missed use, so it can never drag down a utilization or precision rate",
+  // 4d51c879 / ce081439), extended to the other unobserved class. It is an extension of
+  // the governed direction, not a reversal of it.
+  it("INV-LOCAL-STATS-2 (kept): a pending inject is reported, never counted ignored", () => {
     const m = computeMetrics([
       mk({
         evidence_offered: 1,
@@ -79,11 +96,53 @@ describe("computeMetrics", () => {
         outcome: "pending",
       }),
     ]);
-    expect(m.injects_offered).toBe(2); // the pending inject IS in the denominator
+    expect(m.ignored).toBe(0); // NOT counted as ignored
+    expect(m.pending).toBe(1); // NOT dropped from the report
+    expect(m.unresolved).toBe(1); // and named for what it is
+  });
+
+  it("F4: an open window is CENSORED out of every rate denominator, not scored a miss", () => {
+    const m = computeMetrics([
+      mk({
+        evidence_offered: 1,
+        offered_source_ids: ["x"],
+        referenced: true,
+        referenced_source_ids: ["x"],
+        outcome: "used",
+      }),
+      mk({
+        evidence_offered: 1,
+        offered_source_ids: ["y"],
+        referenced: false,
+        referenced_source_ids: [],
+        outcome: "pending",
+      }),
+    ]);
+    // The denominator is the DECIDED population only: one inject, and it was referenced.
+    expect(m.injects_offered).toBe(1);
     expect(m.injects_referenced).toBe(1);
-    expect(m.injection_utilization).toBe(0.5); // 1/2; the open inject is not yet referenced
-    expect(m.ignored).toBe(0); // and it is NOT counted as ignored
-    expect(m.pending).toBe(1);
+    expect(m.injection_utilization).toBe(1); // 1/1, NOT 1/2
+    // The item drilldown censors the open window's offered ids for the same reason:
+    // "y" has not had its opportunity, so counting it as an unreferenced document is
+    // the same fabricated miss one level down.
+    expect(m.distinct_offered).toBe(1);
+    expect(m.evidence_item_utilization).toBe(1); // 1/1, NOT 1/2
+    // And the censored count is reported, so the sample size behind the rate is legible.
+    expect(m.unresolved).toBe(1);
+  });
+
+  it("F4: a window that is ENTIRELY unresolved yields null rates, never 0%", () => {
+    const m = computeMetrics([
+      mk({ evidence_offered: 2, offered_source_ids: ["a", "b"], outcome: "pending" }),
+      mk({ evidence_offered: 1, offered_source_ids: ["c"], outcome: "pending" }),
+    ]);
+    // The session that produced this proposal had exactly this shape: 1 inject, 0
+    // outcomes. The old math reported 0% referenced, which asserts a miss nobody
+    // observed. `null` is the honest reading: undefined, not zero.
+    expect(m.injection_utilization).toBeNull();
+    expect(m.evidence_item_utilization).toBeNull();
+    expect(m.unresolved).toBe(2);
+    expect(m.pending).toBe(2);
   });
 
   it("no_opportunity is a side count, excluded from EVERY rate denominator (agent never had a turn)", () => {

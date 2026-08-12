@@ -194,7 +194,7 @@ describe("flush.sh preserves capture across turns of a live session", () => {
       // POST, so the marker never appears.
       expect(fs.readFileSync(capture, "utf8")).toContain("PROMPT_B_LATER");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

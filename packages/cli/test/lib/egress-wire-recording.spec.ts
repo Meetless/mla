@@ -214,6 +214,7 @@ describe("the generated route samples are honest", () => {
       "redact control POST ^\\/internal\\/v1\\/analytics\\/enforcement\\/incidents\\/[^/]+\\/adjudicate$",
       "block_on_detect control POST ^\\/internal\\/v1\\/repo-instruction-snapshots$",
       "block_on_detect control POST ^\\/internal\\/v1\\/repo-instruction-snapshots\\/sweep$",
+      "block_on_detect intel POST ^\\/internal\\/v1\\/kb\\/withdraw$",
       "block_on_detect intel POST ^\\/internal\\/v1\\/kb\\/add$",
       "passthrough control POST ^\\/internal\\/v1\\/workspaces$",
       "passthrough control POST ^\\/internal\\/v1\\/workspaces\\/(deactivate|reactivate)$",

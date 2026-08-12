@@ -134,7 +134,7 @@ describe("makeTranscriptStatusResolver — disk reconciliation (real fs)", () =>
     root = fs.mkdtempSync(path.join(os.tmpdir(), "ml-reconcile-"));
   });
   afterEach(() => {
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function project(repoPath: string): string {

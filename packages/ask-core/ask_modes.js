@@ -259,6 +259,23 @@ export function makeAskModes({
       });
       const out = normalizeIntelResponse(raw, "canonical");
       out.answer = null;
+      // Confidence has to come down WITH the answer. normalizeIntelResponse passes
+      // intel's `raw.confidence` straight through, and intel scored a synthesized
+      // prose answer that we are about to discard, so keeping its value would report
+      // high confidence in an answer this branch just deleted. Observed live through
+      // `meetless__query` mode:"canonical": `answer: null`, `confidence: "high"`, and
+      // a warning saying it had fallen off the canonical path, all at once.
+      //
+      // "low" rather than a new value: the ambiguous-match arm twenty lines below has
+      // always returned `answer: null` with `confidence: "low"`, so the invariant
+      // already existed here and was applied to one of the two arms that empty the
+      // answer. This is the other arm, not a new policy.
+      //
+      // Scoped to the QUERY surface on purpose. The agentic ask loop deliberately
+      // allows a high-confidence refusal (a refusal makes no grounded claim, so it
+      // legitimately carries no citation); that carve-out is a different surface and
+      // is untouched.
+      out.confidence = "low";
       out.warnings = [
         ...out.warnings,
         "no INDEX.md match; fell back to retrieval with canonical hint",

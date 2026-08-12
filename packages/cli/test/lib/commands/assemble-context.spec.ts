@@ -80,6 +80,16 @@ async function run(
   // The UNGUARDED workspace-global cache. Only Row 5 reads it, to recover the floor when no cache
   // is readable for this root. Defaults to null = no global cache on disk either.
   globalCacheValue: ScanResult | null = null,
+  // The audit THIS turn is about to overwrite, i.e. the previous turn's delivery receipt. The
+  // floor delta is a diff against it, so a test that asserts on the delta has to supply it.
+  //
+  // Injected, and that is the whole point: without it the subcommand falls back to the real
+  // `readAssembleAudit`, which reads `home` ("/tmp/unused") and returns null. A null prior makes
+  // `floorDelta` return an empty delta on EVERY turn, so an un-injected delta assertion is
+  // vacuous -- it passes for the same reason whether the code is right or wrong. The first
+  // version of the G1 test below was written without this and could not have passed at any
+  // point, in either direction.
+  priorAudit: PersistedAssembleAudit | null = null,
 ): Promise<Harness> {
   const audits: PersistedAssembleAudit[] = [];
   const meters: { path: string; json: string }[] = [];
@@ -88,6 +98,7 @@ async function run(
     readStdin: () => (typeof stdin === "string" ? stdin : JSON.stringify(stdin)),
     readCache: () => cacheValue,
     readGlobalCache: () => globalCacheValue,
+    readAudit: () => priorAudit,
     writeAudit: (_home, _ws, audit) => {
       audits.push(audit);
     },
@@ -134,8 +145,11 @@ describe("assemble-context — Row 1/2: current schema, normal assembly", () => 
     // Delivered entries carry the RuleVersion they delivered (§7.4 version-scoped delivery
     // accounting): the audit records which version rode, so enforcement evidence and the
     // represent-edge can be attributed to an exact version rather than a bare ruleId.
+    // M6: floor entries also carry their own `text`. Next turn's assembler diffs its
+    // floor against this array, and a rule that LEFT the floor is gone from the new scan
+    // cache, so its statement can only survive here. Floor tier only; scoped is not diffed.
     expect(h.audits[0].delivered).toEqual([
-      { ruleId: "fm1", tier: "floor-must", versionId: "v1" },
+      { ruleId: "fm1", tier: "floor-must", versionId: "v1", text: "never push without consent", floor: true },
       { ruleId: "s1", tier: "scoped-required", versionId: "v1" },
     ]);
     // stdout is EXACTLY the assembled head, nothing appended after the assembler's byte assertion:
@@ -163,7 +177,7 @@ describe("assemble-context — Row 1/2: current schema, normal assembly", () => 
     // Both the floor MUST and the oversize scoped MUST are delivered, each stamped with the exact
     // RuleVersion that rode (§7.4). Nothing is omitted.
     expect(h.audits[0].delivered).toEqual([
-      { ruleId: "fm1", tier: "floor-must", versionId: "v1" },
+      { ruleId: "fm1", tier: "floor-must", versionId: "v1", text: "floor", floor: true },
       { ruleId: "s_big", tier: "scoped-required", versionId: "v1" },
     ]);
     expect(h.audits[0].omitted).toEqual([]);
@@ -278,7 +292,7 @@ describe("assemble-context: a floor larger than SAFE_TOTAL is delivered whole (b
     expect(h.audits[0].overflow).toBe(false);
     expect(h.audits[0].bytes).toBe(Buffer.byteLength(h.stdout, "utf8"));
     expect(h.audits[0].delivered).toEqual([
-      { ruleId: "fm_big", tier: "floor-must", versionId: "v1" },
+      { ruleId: "fm_big", tier: "floor-must", versionId: "v1", text: "z".repeat(3000), floor: true },
     ]);
   });
 });
@@ -883,8 +897,8 @@ describe("assemble-context: the byte reader is rooted where the finding paths ar
 
   afterEach(() => {
     process.chdir(origCwd);
-    rmSync(markerDir, { recursive: true, force: true });
-    rmSync(home, { recursive: true, force: true });
+    rmSync(markerDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("renders a finding whose path resolves under the scan root, not under repoRoot", async () => {
@@ -934,5 +948,262 @@ describe("assemble-context: the byte reader is rooted where the finding paths ar
 
     expect(code).toBe(0);
     expect(existsSync(reconcileFile)).toBe(false);
+  });
+});
+
+// G1 (notes/20260809-mla-helpfulness-session-345a4bce-*.md): the floor delta is built
+// from `delivered` filtered to tier "floor-must", so it cannot see either way a floor
+// SHOULD rule stops being delivered. Measured live on 2026-08-09: three newly-created
+// MUST rules pushed two ACTIVE floor SHOULD rules into `omitted` with reason
+// "best-effort:did-not-fit", and the turn recap rendered "+3 added" with no removals.
+//
+// UN-SKIPPED 2026-08-09 when G1 landed. It was parked as `describe.skip` rather than
+// left red because this tree is shared by 10+ concurrent sessions and a
+// deliberately-failing test is hostile to every one of them; it went live the moment
+// the caller started building the delta from the whole delivered floor.
+describe("G1: the audit's floor delta covers floor SHOULD rules", () => {
+  const MUST = { ruleId: "fm1", versionId: "v1", text: "a must rule", strength: "MUST" as const };
+  // The SHOULD is deliberately LONG, and that is a fixture repair rather than a style
+  // choice. It read "a should rule that will be squeezed out" (39 chars) and went red at
+  // 85dce566d, which made the floor block's PARTIAL-delivery sentence longer than its
+  // COMPLETE one. The budget baseline is sized with the partial sentence (the correct
+  // worst case: no SHOULD accepted), so the trial that accepts the LAST SHOULD swaps that
+  // sentence for the shorter complete one and refunds ~40 bytes to itself. A 39-char
+  // SHOULD fits inside that refund; the squeeze the test is about never happened, and the
+  // test measured a sentence length instead of a budget contest.
+  //
+  // The refund is not a defect -- the delivered text still fits `budget`, which is the
+  // only guarantee the assembler makes -- but a fixture whose verdict turns on 40 bytes of
+  // prose is not testing what its name says. At 600 chars the contest is decided by the
+  // budget and nothing else, and no future wording change can flip it.
+  const SHOULD = {
+    ruleId: "fs1",
+    versionId: "v1",
+    text: "a should rule that will be squeezed out. " + "s".repeat(600),
+    strength: "SHOULD" as const,
+  };
+  const BIG_MUST = { ruleId: "fm2", versionId: "v1", text: "z".repeat(5800), strength: "MUST" as const };
+
+  it("records a delivered floor SHOULD as part of the floor, whatever tier carried it", async () => {
+    // Blind spot 1, at its source. The SHOULD fits, so it is DELIVERED -- but under tier
+    // "best-effort", which it shares with scoped rules. Marking floor membership on the row is
+    // what lets the next turn diff the whole floor instead of only its MUST half.
+    const h = await run(stdin(), cache({ floorRules: [MUST, SHOULD] }));
+    const row = h.audits[0].delivered.find((d) => d.ruleId === "fs1");
+    expect(row).toBeDefined();
+    expect(row!.floor).toBe(true);
+    // And its statement is retained, for the same reason a MUST's is: a rule that leaves the floor
+    // is absent from the next scan cache, so this is the only surviving copy for the delta to quote.
+    expect(row!.text).toBe(SHOULD.text);
+  });
+
+  it("does NOT report a floor SHOULD that lost its slot to a new MUST as a removal (I3 reverses this half of G1)", async () => {
+    // REVERSED 2026-08-10, measured in session bb182a52. G1 shipped this assertion the other
+    // way round and it was wrong in production: the recap told the agent "-2 removed" about two
+    // rules the same process's receipt recorded, seconds earlier, as "best-effort:did-not-fit".
+    //
+    // Nobody withdrew them. The floor block discloses the size drop on this very turn in its own
+    // precedence sentence ("except best-effort [SHOULD] rules that did not fit this turn"), the
+    // rules are still ACTIVE in the store, and they ride again the moment the prompt is shorter.
+    // Because omission tracks PROMPT LENGTH, the old assertion made the line fire on every budget
+    // flip, on a line whose entire value is being "absent almost always".
+    //
+    // What survives from G1 is the test above: a delivered floor SHOULD is floor membership, not
+    // tier "floor-must". That was the blind spot worth closing.
+    const first = await run(stdin(), cache({ floorRules: [MUST, SHOULD] }));
+    expect(first.audits[0].delivered.map((d) => d.ruleId)).toContain("fs1");
+
+    // Turn 2: a big new MUST arrives and the SHOULD no longer fits. The previous turn's receipt is
+    // fed in, because the delta is a diff against it and nothing else.
+    const second = await run(
+      stdin(),
+      cache({ floorRules: [MUST, BIG_MUST, SHOULD] }),
+      [],
+      undefined,
+      null,
+      first.audits[0],
+    );
+    // The assembler still records WHY it went missing, on the same receipt. That record is the
+    // whole reason the delta can now tell the two cases apart.
+    expect(second.audits[0].omitted.map((o) => o.ruleId)).toContain("fs1");
+    expect(second.audits[0].omitted.find((o) => o.ruleId === "fs1")?.reason).toBe("best-effort:did-not-fit");
+    expect(second.audits[0].floorDelta?.removed.map((r) => r.ruleId) ?? []).not.toContain("fs1");
+    // The genuinely new obligation still announces itself. Suppressing the false half must not
+    // cost the true half.
+    expect(second.audits[0].floorDelta?.added.map((r) => r.ruleId)).toContain("fm2");
+  });
+
+  it("still reports a floor SHOULD that was genuinely revoked, on the same budget-squeezed turn", async () => {
+    // The other half of I3, end to end and in the hardest shape: one SHOULD is withheld for bytes
+    // and another is deleted from the cache on the SAME turn. If presence were "ignore anything
+    // absent" instead of "delivered union omitted", this real withdrawal would vanish with the
+    // false one.
+    const REVOKED = {
+      ruleId: "fs2",
+      versionId: "v1",
+      text: "a should rule that is about to be revoked outright. " + "r".repeat(200),
+      strength: "SHOULD" as const,
+    };
+    const first = await run(stdin(), cache({ floorRules: [MUST, SHOULD, REVOKED] }));
+    expect(first.audits[0].delivered.map((d) => d.ruleId)).toEqual(expect.arrayContaining(["fs1", "fs2"]));
+
+    // fs2 is gone from the cache entirely (revoked); fs1 is still configured but squeezed out.
+    const second = await run(
+      stdin(),
+      cache({ floorRules: [MUST, BIG_MUST, SHOULD] }),
+      [],
+      undefined,
+      null,
+      first.audits[0],
+    );
+    expect(second.audits[0].omitted.map((o) => o.ruleId)).toContain("fs1");
+    expect(second.audits[0].floorDelta?.removed.map((r) => r.ruleId)).toEqual(["fs2"]);
+    // Quotable, for the same reason M6 quotes at all: a count says something changed, not which
+    // obligation, and "which" is the half an agent mid-task needs.
+    expect(second.audits[0].floorDelta?.removed.find((r) => r.ruleId === "fs2")?.text).toBe(REVOKED.text);
+  });
+
+  it("does not announce a re-fitted SHOULD as added when the budget frees up again", async () => {
+    // The symmetric alarm, which fires on the very next short prompt. `prev` on the delta is the
+    // previous receipt's DELIVERED set, so without reading that receipt's `omitted` too, a rule
+    // that merely re-fits reads as a brand-new obligation.
+    const squeezed = await run(stdin(), cache({ floorRules: [MUST, BIG_MUST, SHOULD] }));
+    expect(squeezed.audits[0].omitted.map((o) => o.ruleId)).toContain("fs1");
+
+    const roomy = await run(
+      stdin(),
+      cache({ floorRules: [MUST, SHOULD] }),
+      [],
+      undefined,
+      null,
+      squeezed.audits[0],
+    );
+    expect(roomy.audits[0].delivered.map((d) => d.ruleId)).toContain("fs1");
+    expect(roomy.audits[0].floorDelta?.added.map((r) => r.ruleId) ?? []).not.toContain("fs1");
+  });
+
+  it("does not report a removal when the SHOULD merely moved tier", async () => {
+    // The false-alarm direction. Delivered last turn and delivered this turn is delivered; if the
+    // fix reported tier CHANGES it would trade one false silence for per-turn noise.
+    const first = await run(stdin(), cache({ floorRules: [MUST, SHOULD] }));
+    const second = await run(stdin(), cache({ floorRules: [MUST, SHOULD] }), [], undefined, null, first.audits[0]);
+    expect(second.audits[0].floorDelta).toBeUndefined();
+  });
+
+  it("stays silent on a degraded turn instead of reporting the whole floor as removed", async () => {
+    // The degraded branches (Row 5 no-cache, Rows 3/4 old-schema) deliver a PRE-RENDERED floor
+    // block and record `delivered: []`, because a rendered block cannot say how many rules are
+    // inside it -- which is why the meter for those branches sets `degraded: true` and
+    // `always_on_rules: 0`. Empty there means UNKNOWN, not NONE.
+    //
+    // Diffing a real prior against that unknown reads every floor rule as withdrawn. The line
+    // rides a footer the agent sees every turn, so one spurious "-13 removed" is exactly the false
+    // alarm that teaches it to skip the line -- and it would fire hardest on the turns where the
+    // floor is most degraded.
+    const first = await run(stdin(), cache({ floorRules: [MUST, SHOULD] }));
+    const degraded = await run(stdin(), null, [], undefined, null, first.audits[0]);
+    expect(degraded.audits[0].state).toBe("incomplete");
+    expect(degraded.audits[0].floorDelta).toBeUndefined();
+  });
+
+  it("does not report the whole floor as added on the turn AFTER a degraded one", async () => {
+    // The other half of the same hazard: a degraded receipt carries no floor knowledge, so treating
+    // its empty `delivered` as a real prior makes the next healthy turn announce the entire floor
+    // as new. An unknown prior must read as "no prior", which floorDelta already renders as silence.
+    const degradedAudit = (await run(stdin(), null)).audits[0];
+    const healthy = await run(stdin(), cache({ floorRules: [MUST, SHOULD] }), [], undefined, null, degradedAudit);
+    expect(healthy.audits[0].state).toBe("normal");
+    expect(healthy.audits[0].floorDelta).toBeUndefined();
+  });
+});
+
+// F3 (notes/20260809-did-mla-help-session-ae6411e4-fix-proposal.md D4). The floor delta
+// answers "was an obligation WITHDRAWN under me". It computes that from floor membership
+// alone, so a rule RECLASSIFIED from the always-on floor to the turn-scoped set reads as a
+// withdrawal on the turn it moves -- while the agent is still being told the rule, in the
+// `<meetless-context kind="scoped-rules">` block one paragraph down.
+//
+// FIVE recorded instances of this class before this one, which is why it is a defect and
+// not a rough edge: b83bb228 proposal D7 (a whole session spent disproving it),
+// `floor-delta-session-scope.spec.ts`, the 2026-08-10 floor-rule classification audit,
+// session b2204299 (floor 13 -> 9 -> 11 while scoped went 1 -> 4 -> 2), and session
+// ae6411e4, where the alarm named the Mermaid design-doc rule as evicted with that rule
+// visibly present in the delivered scoped block.
+//
+// `mla rules edit --turn-when-*` is the operator action that produces the move, so this is
+// a supported flow, not a corrupt-state edge.
+//
+// THE INVARIANT: a rule has LEFT the delivered snapshot only when its stable id is absent
+// from BOTH the current floor set and the current scoped set. Symmetric, because the
+// mirror case (scoped -> floor) would otherwise announce a rule the agent already had as
+// newly added.
+describe("F3: a rule reclassified between floor and scoped has not left the snapshot", () => {
+  const MUST = { ruleId: "fm1", versionId: "v1", text: "never push without consent", strength: "MUST" as const };
+  const MOVER = {
+    ruleId: "r_mermaid",
+    versionId: "v1",
+    text: "When authoring a design doc, proposal, plan, RFC, or architecture spec, include a complete Mermaid sequence diagram.",
+    strength: "MUST" as const,
+  };
+  // Matches the prompt below, so the reclassified rule is genuinely DELIVERED this turn.
+  const MOVER_SCOPED = { ...MOVER, globs: ["notes/**"] };
+  const PROMPT = { prompt: "please edit notes/20260810-thing.md" };
+
+  it("does not report a removal when a floor rule became a scoped rule that still delivered", async () => {
+    const first = await run(stdin(PROMPT), cache({ floorRules: [MUST, MOVER] }));
+    expect(first.audits[0].delivered.map((d) => d.ruleId)).toContain("r_mermaid");
+
+    const second = await run(
+      stdin(PROMPT),
+      cache({ floorRules: [MUST], scopedRules: [MOVER_SCOPED] }),
+      [],
+      undefined,
+      null,
+      first.audits[0],
+    );
+    // The premise of the assertion: the rule really did ride this turn, in the scoped block.
+    expect(second.audits[0].delivered.map((d) => d.ruleId)).toContain("r_mermaid");
+    expect(second.stdout).toContain("Mermaid sequence diagram");
+    // ...so nothing was withdrawn, and the line must stay silent.
+    expect(second.audits[0].floorDelta?.removed.map((r) => r.ruleId) ?? []).not.toContain("r_mermaid");
+  });
+
+  it("does not report an addition when a scoped rule became a floor rule", async () => {
+    // The mirror. Without it the fix would trade one false alarm for the other: the agent is
+    // told a rule is NEW when it read the same obligation on the previous turn.
+    const first = await run(stdin(PROMPT), cache({ floorRules: [MUST], scopedRules: [MOVER_SCOPED] }));
+    expect(first.audits[0].delivered.map((d) => d.ruleId)).toContain("r_mermaid");
+
+    const second = await run(
+      stdin(PROMPT),
+      cache({ floorRules: [MUST, MOVER] }),
+      [],
+      undefined,
+      null,
+      first.audits[0],
+    );
+    expect(second.audits[0].delivered.map((d) => d.ruleId)).toContain("r_mermaid");
+    expect(second.audits[0].floorDelta?.added.map((r) => r.ruleId) ?? []).not.toContain("r_mermaid");
+  });
+
+  it("still reports a removal when the rule left the floor and NO block carried it", async () => {
+    // The half that must not be broken by the fix. A reclassified rule whose scope does not
+    // match this turn is genuinely not in front of the agent, and that is the event M6 exists
+    // to announce. Same cache as the first test, different prompt: the glob does not match.
+    const first = await run(stdin(PROMPT), cache({ floorRules: [MUST, MOVER] }));
+
+    const second = await run(
+      stdin({ prompt: "please edit apps/control/outbox.ts" }),
+      cache({ floorRules: [MUST], scopedRules: [MOVER_SCOPED] }),
+      [],
+      undefined,
+      null,
+      first.audits[0],
+    );
+    expect(second.audits[0].delivered.map((d) => d.ruleId)).not.toContain("r_mermaid");
+    expect(second.audits[0].floorDelta?.removed.map((r) => r.ruleId)).toContain("r_mermaid");
+    // And it is quotable: the statement survives on the prior receipt, which is the only
+    // place it exists once the rule is gone from the floor.
+    expect(second.audits[0].floorDelta?.removed.find((r) => r.ruleId === "r_mermaid")?.text).toBe(MOVER.text);
   });
 });

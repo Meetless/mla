@@ -128,8 +128,8 @@ describe("`mla review` fires an on-demand finalize trigger (PATCH 5 / INV-M6)", 
     if (originalSessionEnv === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
     else process.env.CLAUDE_CODE_SESSION_ID = originalSessionEnv;
     global.fetch = fetchOriginal;
-    fs.rmSync(tmpHome, { recursive: true, force: true });
-    fs.rmSync(nonRepo, { recursive: true, force: true });
+    fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    fs.rmSync(nonRepo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   // Route by URL: finalize POST is captured + 200; the packet GET returns a

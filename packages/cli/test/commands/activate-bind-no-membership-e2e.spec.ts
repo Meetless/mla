@@ -75,8 +75,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  fs.rmSync(HOME, { recursive: true, force: true });
-  fs.rmSync(FAKE_HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  fs.rmSync(FAKE_HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   if (prevHomeEnv === undefined) delete process.env.HOME;
   else process.env.HOME = prevHomeEnv;
 });
@@ -114,7 +114,7 @@ async function runActivateInBoundFolder(): Promise<{
     logSpy.mockRestore();
     errSpy.mockRestore();
     process.chdir(prevCwd);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

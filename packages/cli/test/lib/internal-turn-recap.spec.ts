@@ -31,7 +31,16 @@ function recap(over: Partial<TurnRecap> = {}): TurnRecap {
     evidence_tools_pulled: ["retrieve_knowledge"],
     pull_count: 2,
     referenced_source_ids: ["NT:a.md"],
+    opened_source_ids: [],
+    path_targeted_source_ids: [],
+    echoed_source_ids: [],
+    engaged_source_ids: ["NT:a.md"],
     cited_source_ids: [],
+    opened_source_ids: [],
+    path_targeted_source_ids: [],
+    echoed_source_ids: [],
+    injected_chars: null,
+    engaged_source_ids: ["NT:a.md"],
     verdict: "USED",
     ...over,
   };
@@ -75,9 +84,23 @@ describe("parseTurnRecapArgs", () => {
 
 describe("runInternalTurnRecap: render styles", () => {
   it("default style prints the footer line", async () => {
-    const r = await run(["--session", "s1", "--turn", "7"], { compute: () => recap() });
+    // The B.6 invitation is pinned separately in label-invitation.spec.ts. Here it is explicitly
+    // DECLINED so this assertion keeps testing the footer's own format rather than silently
+    // depending on whether this session has already spent its one label ask.
+    const r = await run(["--session", "s1", "--turn", "7"], {
+      compute: () => recap(),
+      claimInvitation: () => false,
+    });
     expect(r.code).toBe(0);
-    expect(r.out).toBe("🔎 mla · turn 7 · evidence injected (1 src, 412ms) · pulled retrieve_knowledge ×2 · cited 0 · USED");
+    expect(r.out).toBe("🔎 mla · turn 7 · evidence injected (1 src, 412ms) · pulled retrieve_knowledge ×2 · cited 0 · opened 0 · explicit evidence reference observed");
+  });
+
+  it("appends the exact-trace label invitation when the session has not yet been asked", async () => {
+    const r = await run(["--session", "s1", "--turn", "7"], {
+      compute: () => recap(),
+      claimInvitation: () => true,
+    });
+    expect(r.out).toContain("· useful? mla label ");
   });
 
   it("--style block-context wraps the footer for injection", async () => {
@@ -89,7 +112,11 @@ describe("runInternalTurnRecap: render styles", () => {
   it("--style block expands the full recap", async () => {
     const r = await run(["--session", "s1", "--turn", "7", "--style", "block"], { compute: () => recap() });
     expect(r.out).toMatch(/turn 7 recap/);
-    expect(r.out).toMatch(/verdict:\s+USED/);
+    // Renamed from `verdict:` to `outcome:` deliberately: USED is an OBSERVATION that a
+    // deterministic signal fired, not a judgement on the agent (see outcomePhrase).
+    // The printed phrase then stopped being the bare word too, so that the positive and
+    // negative arms are symmetric and neither reads as a verdict beside a hedge.
+    expect(r.out).toContain("outcome:    explicit evidence reference observed");
   });
 
   it("--json emits the full TurnRecap object", async () => {

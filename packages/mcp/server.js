@@ -123,6 +123,10 @@ export async function dispatchTool(name, args, deps) {
     agentRuntime = null,
     mintSubmissionId = randomUUID,
     recordFailure = null,
+    // P0-2 onboarding-gap sink. Same ownership rule as `recordFailure`: env/fs-bound, so the
+    // CALLER wires it (`mla mcp` emits the mla_onboarding_offer row) and server.js stays pure.
+    // Null in tests and in any embedding that does not want the telemetry.
+    recordOnboardingGap = null,
   } = deps;
 
   if (name === "meetless__kb_doc_detail") {
@@ -130,6 +134,15 @@ export async function dispatchTool(name, args, deps) {
       const result = await runKbDocDetail(args || {}, {
         intelFetch,
         defaultWorkspaceId,
+        // F4: the two non-KB citation classes with a real backing lookup resolve
+        // through CONTROL, not intel (a decision record and a case detail are not KB
+        // documents). Bound here rather than inside the handler for the same reason
+        // every other dep is: this file owns the transport, the handler owns the rule.
+        controlFetch,
+        // The audited viewer for the viewer-scoped case read. Null on the shared-key
+        // plane, and the handler says so by name instead of letting control's 400
+        // read as "no such case".
+        operatorUserId,
       });
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -156,6 +169,7 @@ export async function dispatchTool(name, args, deps) {
       const result = await runRetrieveKnowledge(args || {}, {
         intelFetch,
         defaultWorkspaceId,
+        recordOnboardingGap,
       });
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -498,10 +512,25 @@ function inactiveStatusResult(status) {
   return { content: [{ type: "text", text: renderInactiveStatus(status) }] };
 }
 
+// The capabilities BOTH front doors declare. `tools.listChanged` is the
+// load-bearing part: it is the protocol signal that this server may change its
+// tool list mid-session, and it is what makes a host re-request `tools/list`
+// after `notifications/tools/list_changed`.
+//
+// Measured 2026-08-09 against the real binaries (raw JSON-RPC log, not model
+// narration): Claude Code 2.1.211 (protocol 2025-11-25) re-requests tools/list
+// 5 ms after the notification and the refreshed schema reaches the MODEL (it
+// called a tool that did not exist at handshake and passed a parameter that did
+// not exist at handshake). Codex 0.144.6 (protocol 2025-06-18) ignores it.
+//
+// Declaring it is also what the SDK's assertNotificationCapability gates on, so
+// this is not decoration: without a truthy `tools` the notification throws.
+const SERVER_CAPABILITIES = { tools: { listChanged: true } };
+
 function createInactiveServer(status) {
   const server = new Server(
     { name: "meetless-mcp", version: "0.1.0" },
-    { capabilities: { tools: {} } },
+    { capabilities: SERVER_CAPABILITIES },
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [INACTIVE_STATUS_TOOL],
@@ -551,6 +580,10 @@ export function createMcpServer(deps) {
     // it null, so dispatchTool's emitEvidenceFailure is a no-op there. server.js
     // itself never touches fs/env: the caller owns the sink.
     recordFailure = null,
+    // Optional onboarding-gap sink (P0-2), wired by `mla mcp` to emit the
+    // mla_onboarding_offer row on the retrieval_empty surface. Same ownership rule as
+    // recordFailure: the caller owns it, server.js touches no fs and no env.
+    recordOnboardingGap = null,
   } = deps;
 
   // §6.8.2 / §12.2.1: fail loudly if the read-only evidence manifest and the
@@ -574,11 +607,12 @@ export function createMcpServer(deps) {
     operatorUserId,
     agentRuntime,
     recordFailure,
+    recordOnboardingGap,
   };
 
   const server = new Server(
     { name: "meetless-mcp", version: "0.1.0" },
-    { capabilities: { tools: {} } },
+    { capabilities: SERVER_CAPABILITIES },
   );
 
   // Only a supervised child self-heals: it can be respawned, so it tracks
@@ -620,10 +654,39 @@ export function createMcpServer(deps) {
  * depend on the parent-death watchdog (which an intervening volta shim defeats,
  * since the shim, not the worker, becomes the pid-1 orphan).
  */
-export async function runStdioServer(deps) {
+export async function runStdioServer(deps, opts = {}) {
   const server = createMcpServer(deps);
-  const transport = new StdioServerTransport();
+  // Injectable so a test can drive the lifecycle without owning process.stdin.
+  const createTransport = opts.createTransport ?? (() => new StdioServerTransport());
+  const transport = createTransport();
   await server.connect(transport);
+
+  // M1: move the model-visible CONTRACT, not just the handler code.
+  //
+  // The supervisor holds fd 0/1 across a worker swap precisely so the client
+  // never sees a disconnect. The cost of that is that the client also never
+  // re-handshakes, so it keeps serving the model the tool schema it cached at
+  // spawn: after a self-heal reload the handler is new and the advertised schema
+  // is old. That is the M1 defect, and it is not fixed by respawning harder. A
+  // clean-exit respawn does not fix it either: Claude Code respawns a cleanly
+  // exited stdio server transparently but never asks the new process for
+  // tools/list, and Codex treats the exit as a fatal "Transport closed".
+  //
+  // So the reloaded worker says so explicitly. There is no schema/handler skew
+  // to worry about: THIS process emits the notification and THIS process answers
+  // the follow-up tools/list from its own in-memory manifest.
+  //
+  // Only on a reload. A first boot is followed by the handshake's own tools/list.
+  // Fails open: a client that has gone away must not turn a courtesy
+  // notification into a boot failure.
+  if (deps && deps.announceToolListChanged) {
+    try {
+      await server.sendToolListChanged();
+    } catch {
+      // nothing to tell: the client is gone or does not accept the notification
+    }
+  }
+
   await new Promise((resolve) => {
     let settled = false;
     const finish = () => {

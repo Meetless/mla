@@ -268,6 +268,25 @@ const WITNESSES: Record<string, Witness> = {
   // "file" | "corpus"), a `provenance` OBJECT (every caller sends a string), and
   // it omitted `agentSession` and `corpusName`, which kb_add.ts sends on every
   // invocation. That omission is what made `mla kb add` a dead command.
+  // The withdraw sibling of kb/add. It had NO rule at all, so every withdraw the
+  // agent-memory pipeline attempted was refused at the boundary with
+  // `no egress rule`. Found live 2026-08-06 while exercising Phase 2 capture: a
+  // memory file deleted locally, or reclassified to a non-capturable type, could
+  // never be withdrawn from the governed KB. It failed every pass, forever, and
+  // the retry loop meant it failed silently and repeatedly rather than once
+  // loudly. The body below is READ FROM upsert-client.ts:withdraw, not written
+  // from the rule (that inversion is what made kb/add dead for months).
+  [`intel POST ${/^\/internal\/v1\/kb\/withdraw$/.source}`]: {
+    caller: "agent-memory-capture/upsert-client.ts:withdraw",
+    path: "/internal/v1/kb/withdraw",
+    body: {
+      workspaceId: "ws_1",
+      actor: "user_1",
+      captureMethod: "agent_auto_memory",
+      relPath: "agent-memory/bind_1/reference_x.md",
+      reason: "reclassified",
+    },
+  },
   [`intel POST ${/^\/internal\/v1\/kb\/add$/.source}`]: {
     caller:
       "commands/kb_add.ts:baseBody + agent-memory-capture/upsert-client.ts:upsert + commands/enrich.ts:persist",

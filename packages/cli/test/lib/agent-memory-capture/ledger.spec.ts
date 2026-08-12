@@ -13,7 +13,7 @@ describe("ledger", () => {
     home = mkdtempSync(join(tmpdir(), "aml-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("returns an empty ledger when none exists (fail-open)", () => {

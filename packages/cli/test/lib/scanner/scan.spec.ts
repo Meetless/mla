@@ -38,7 +38,7 @@ describe("scanWorkspace", () => {
     git(repo, ["add", "."]);
     git(repo, ["commit", "-m", "init"]);
   });
-  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+  afterEach(() => rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("produces directives, stale signals, inventory, and pre-rendered XML", () => {
     const result = scanWorkspace(repo, { workspaceId: "ws1", now: () => "2026-06-12T00:00:00Z" });
@@ -135,7 +135,7 @@ describe("scanWorkspace", () => {
         // whole corpus. That is the single-CLAUDE.md-just-deleted case, the common one.
         expect(result.instructionFilePaths).toEqual([]);
       } finally {
-        rmSync(bare, { recursive: true, force: true });
+        rmSync(bare, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
       }
     });
 
@@ -151,7 +151,7 @@ describe("scanWorkspace", () => {
 
         expect(result.instructionFilePaths).toBeUndefined();
       } finally {
-        rmSync(nongit, { recursive: true, force: true });
+        rmSync(nongit, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
       }
     });
 
@@ -352,7 +352,7 @@ describe("scanWorkspace", () => {
     try {
       fn(bundleHome);
     } finally {
-      rmSync(bundleHome, { recursive: true, force: true });
+      rmSync(bundleHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }
 

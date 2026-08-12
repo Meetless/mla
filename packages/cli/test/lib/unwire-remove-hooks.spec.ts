@@ -28,7 +28,7 @@ describe("removeMeetlessHooks", () => {
     expect(res.backupPath).not.toBeNull();
     const after = JSON.parse(fs.readFileSync(p, "utf8"));
     expect(after.hooks).toBeUndefined(); // whole hooks object emptied -> dropped
-    fs.rmSync(path.dirname(p), { recursive: true, force: true });
+    fs.rmSync(path.dirname(p), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("leaves an operator's own SessionStart hook untouched", () => {
@@ -45,7 +45,7 @@ describe("removeMeetlessHooks", () => {
     const after = JSON.parse(fs.readFileSync(p, "utf8"));
     expect(after.hooks.SessionStart).toHaveLength(1);
     expect(after.hooks.SessionStart[0].hooks[0].command).toBe("/usr/local/bin/my-own.sh");
-    fs.rmSync(path.dirname(p), { recursive: true, force: true });
+    fs.rmSync(path.dirname(p), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("does not touch a multi-hook entry an operator merged our command into", () => {
@@ -66,7 +66,7 @@ describe("removeMeetlessHooks", () => {
     expect(res.changed).toBe(false);
     const after = JSON.parse(fs.readFileSync(p, "utf8"));
     expect(after.hooks.Stop[0].hooks).toHaveLength(2);
-    fs.rmSync(path.dirname(p), { recursive: true, force: true });
+    fs.rmSync(path.dirname(p), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("is a no-op (no change, no backup) on a settings file with no meetless hooks", () => {
@@ -74,7 +74,7 @@ describe("removeMeetlessHooks", () => {
     const res = removeMeetlessHooks(p);
     expect(res.changed).toBe(false);
     expect(res.backupPath).toBeNull();
-    fs.rmSync(path.dirname(p), { recursive: true, force: true });
+    fs.rmSync(path.dirname(p), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("is a safe no-op when the file is missing or unparseable", () => {
@@ -83,6 +83,6 @@ describe("removeMeetlessHooks", () => {
     const p = path.join(dir, "settings.json");
     fs.writeFileSync(p, "{not json", "utf8");
     expect(removeMeetlessHooks(p).changed).toBe(false);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 });

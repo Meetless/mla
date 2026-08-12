@@ -123,7 +123,7 @@ describe("mla deactivate E2 retire matrix (design §3)", () => {
     marker = writeMarker(repo, WS);
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const active = (over: Partial<DeactivationPreflightResult> = {}): DeactivationPreflightResult => ({

@@ -39,7 +39,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeCe0Store(store);
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 // A valid R0 tool_attempt in scope_a. Each test overrides only what it exercises.

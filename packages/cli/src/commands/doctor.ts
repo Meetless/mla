@@ -72,10 +72,13 @@ import {
 import { codexHooksInstalled, isOurMlaCommand } from "../connectors/codex/wire";
 import {
   readRuleBundleCache,
+  BUNDLE_CACHE_NEVER_FETCHED,
   type BundleCacheRead,
 } from "../lib/rules/bundle-cache";
 import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 
+import { inspectFloorProjection } from "../lib/scanner/floor-projection-writer";
+import type { Directive } from "../lib/scanner/types";
 // `mla doctor` (§4.9, §6.4 step 14, Acceptance §11.14)
 //
 // Verifies the chain end to end. Red anywhere = block dogfood.
@@ -377,29 +380,79 @@ export interface RuleDeliveryProbe {
   globalCache: ScanResult | null;
   // The last turn's delivery receipt, written by the bash hook. Null before any turn has run.
   receipt: PersistedDeliveryReceipt | null;
+  // What we know about this workspace's ACTIVE governed rules. A zero floor has three causes that
+  // demand three different sentences, and pooling them is what produced a health check that failed
+  // for every new user and prescribed a command that could not help
+  // (notes/20260807-mla-activation-onboarding-audit.md §1.2 Finding A):
+  //
+  //   known, count > 0   the workspace HAS rules and this checkout is not carrying them.
+  //                      Delivery is genuinely broken. RED, and `mla scan` is the right lever.
+  //   known, count === 0 nothing to deliver YET. Correctly installed, nothing governed. INFO,
+  //                      and the remedy is onboarding, because `mla scan` provably cannot help:
+  //                      a floor rule needs `attestation === "human_attested"` AND a `rule-bundle`
+  //                      source (scan.ts buildStructuredRules / isBundleSourced), and scanning
+  //                      instruction files only ever mints FILE-sourced directives. That is the
+  //                      closed loop: fail, prescribe scan, fail identically after it.
+  //   never-fetched      no bundle has been pulled onto this machine yet. `mla activate` binds the
+  //                      folder without fetching, so this is the ordinary state one command before
+  //                      the first scan. INFO, and here `mla scan` IS the lever. We deliberately do
+  //                      NOT claim "nothing governed": rules may exist on the authority and simply
+  //                      not be here, and saying otherwise would hide an undelivered rule set.
+  //   unknown            the cache exists and is unusable (corrupt, schema or principal mismatch).
+  //                      Stays RED. Unknown must never SUPPRESS a delivery failure; that is the
+  //                      2026-08-02 regression this check exists to catch.
+  governedRules?:
+    | { kind: "known"; count: number }
+    | { kind: "never-fetched" }
+    | { kind: "unknown" };
   now: Date;
 }
 
 export function ruleDeliveryDoctorChecks(probe: RuleDeliveryProbe): Check[] {
   const checks: Check[] = [];
   const { cacheForThisRoot: mine, globalCache, root, receipt } = probe;
+  const governed = probe.governedRules ?? { kind: "unknown" as const };
+  // Only an affirmative zero says "nothing governed"; see the field comment.
+  const nothingGovernedYet = governed.kind === "known" && governed.count === 0;
+  const neverFetched = governed.kind === "never-fetched";
+  const benignZero = nothingGovernedYet || neverFetched;
 
   if (mine) {
     const floor = mine.floorRules?.length ?? 0;
     const scoped = mine.scopedRules?.length ?? 0;
+    const base = `${root}: ${floor} floor, ${scoped} scoped, scanned ${ageLabel(mine.generatedAt, probe.now)}`;
     checks.push({
       id: "rules.scan-cache",
       // A cache that resolves but carries zero floor rules still delivers nothing, and that is
       // exactly the state the old jq receipt could not distinguish from health, so it is not ok.
-      ok: floor > 0,
+      // UNLESS there is provably nothing to deliver, or nothing has been fetched yet: a health
+      // check must not code "new" as "broken".
+      ok: floor > 0 || benignZero,
+      level: floor === 0 && benignZero ? "info" : undefined,
       label:
         floor > 0
           ? "rule delivery cache resolves for this checkout"
-          : "rule delivery cache carries NO floor rules",
+          : nothingGovernedYet
+            ? "no governed rules to deliver yet"
+            : neverFetched
+              ? "no rule bundle fetched for this workspace yet"
+              : "rule delivery cache carries NO floor rules",
       detail:
-        `${root}: ${floor} floor, ${scoped} scoped, scanned ${ageLabel(mine.generatedAt, probe.now)}` +
-        (floor > 0 ? "" : "; the hook will emit no floor block here, run `mla scan`"),
+        base +
+        (floor > 0
+          ? ""
+          : nothingGovernedYet
+            ? "; this workspace has no accepted rules, so there is nothing to deliver. Run the " +
+              "`/mla onboard` skill to propose some from this repository, or `mla rules add` to " +
+              "write one directly. `mla scan` cannot change this: it reads instruction files, " +
+              "and the floor carries only accepted governed rules."
+            : neverFetched
+              ? "; `mla activate` binds the folder without pulling rules. Run `mla scan` to fetch " +
+                "this workspace's bundle. Nothing is wrong yet: this is the state one command " +
+                "before the first scan."
+              : "; the hook will emit no floor block here, run `mla scan`"),
     });
+
   } else if (globalCache) {
     // The 2026-08-02 signature, named explicitly so the operator does not have to reconstruct it.
     const foreign = globalCache.scanRootPath ?? "an unstamped scan";
@@ -421,6 +474,84 @@ export function ruleDeliveryDoctorChecks(probe: RuleDeliveryProbe): Check[] {
       detail: `nothing scanned for ${root}; run \`mla scan\``,
     });
   }
+
+  // Issue-list item 6. Doctor verified the CACHE and the RECEIPT and never the projection file,
+  // which is the artifact that actually reaches the model as project instructions. Measured
+  // 2026-08-09 on one workspace: two roots at rev-126 and `intel/` still at rev-67 from Jul 13,
+  // four weeks stale, with nothing reporting it.
+  //
+  // Compares the payload HASH, never the bundle revision. `bundleRevision` is per
+  // (workspaceId, principalUserId), so revision comparison reads every principal boundary as
+  // drift, and the writer only refreshes the header when the BODY changes, so a byte-perfect
+  // projection can sit many revisions "behind". Read-only by design: a governing instruction
+  // file must not change under an agent that is mid-session reading it, so the repair stays an
+  // explicit foreground `mla scan`.
+  // Sourced from `mine ?? globalCache`, NOT from `mine` alone. The floor is scoped per
+  // (workspaceId, principalUserId), not per root, so the workspace-global cache is a correct
+  // source for a root that has never scanned. That distinction is the whole point here: `intel/`
+  // is the root that was four weeks stale AND has no local cache, so a check that only ran inside
+  // the `mine` branch printed nothing for the exact case it was built for. Caught by running
+  // `mla doctor` in that directory rather than by reading the code.
+  //
+  // `floorRules` is the cache's ALREADY-FILTERED floor list (FloorRuleEntry), not the
+  // Directive[] the renderer takes, so it is mapped back to the minimal shape `isFloorRule`
+  // accepts. Verified live rather than assumed: this mapping reproduces the payload hash of the
+  // real on-disk projection for this workspace exactly.
+  const asDirectives = ((mine ?? globalCache)?.floorRules ?? []).map(
+    (r) =>
+      ({
+        id: r.ruleId,
+        text: r.text,
+        source: "rule-bundle",
+        kind: "RULE",
+        strength: r.strength === "MUST" ? "MUST_FOLLOW" : "SHOULD_FOLLOW",
+        attestation: "human_attested",
+      }) as unknown as Directive,
+  );
+  const projection = inspectFloorProjection(root, asDirectives);
+  const projectionCheck: Record<string, { ok: boolean; level?: "info"; label: string; detail: string }> =
+    {
+      match: {
+        ok: true,
+        level: "info",
+        label: "floor projection matches the governed floor",
+        detail: `${projection.path} (${projection.declaredBundleId ?? "unstamped"})`,
+      },
+      drift: {
+        ok: false,
+        label: "floor projection is STALE and is still being loaded as project instructions",
+        detail:
+          `${projection.path} carries ${projection.declaredHash?.slice(0, 20)}..., the governed ` +
+          `floor is ${projection.intendedHash?.slice(0, 20)}... Every agent opening this ` +
+          "directory reads the stale file. Run `mla scan` HERE to rewrite it; doctor will not " +
+          "rewrite a governing instruction file underneath a running session.",
+      },
+      edited: {
+        ok: true,
+        level: "info",
+        label: "floor projection was hand-edited, so MLA no longer owns it",
+        detail: `${projection.path}; MLA leaves user-owned files alone. Delete it to hand the path back.`,
+      },
+      foreign: {
+        ok: true,
+        level: "info",
+        label: "a non-MLA file occupies the floor projection path",
+        detail: `${projection.path}; MLA will never overwrite it.`,
+      },
+      absent: {
+        ok: true,
+        level: "info",
+        label: "no floor projection written for this root yet",
+        detail: `${projection.path} does not exist; \`mla scan\` writes it.`,
+      },
+      no_floor_rules: {
+        ok: true,
+        level: "info",
+        label: "no floor rules to project",
+        detail: "the bundle carries no floor rules here, so there is nothing that can go stale.",
+      },
+    };
+  checks.push({ id: "rules.floor-projection", ...projectionCheck[projection.status] });
 
   if (!receipt) {
     checks.push({
@@ -1013,6 +1144,124 @@ export function ce0QuickCheckResult(store: Ce0Store): string {
   }
 }
 
+/**
+ * One live `mla mcp` process, as `ps` already reports it. Nothing is registered
+ * or tracked: `pid` and the start time are the only facts, and both come from a
+ * single `ps` call.
+ */
+export interface RunningMcpServer {
+  pid: number;
+  startedAtMs: number;
+}
+
+/**
+ * M1's fallback lane: tell the operator when a LIVE MCP server predates the
+ * build currently on disk, so it is serving an older tool contract to its host.
+ *
+ * Why this exists even though the reload announcement (lib/mcp-restart.ts) fixes
+ * it in-band: measured 2026-08-09 against the real binaries, Claude Code 2.1.211
+ * honours `notifications/tools/list_changed` (it re-requests tools/list 5 ms
+ * later and the new schema reaches the model), but Codex 0.144.6 ignores it
+ * outright and treats a clean server exit as a fatal "Transport closed". There
+ * is no in-band way to refresh Codex, so the only honest remedy is to name the
+ * condition and let the operator restart the host.
+ *
+ * Built entirely from information that already exists: the `builtAt` stamp
+ * dist/build-info.json already carries (the same file lib/staleness.ts reads)
+ * and process start times `ps` already reports. Deliberately NOT a manifest
+ * hash, a server registry, or any cross-process coordination.
+ *
+ * Fails open in both directions that could produce a false alarm: no build stamp
+ * (a dev build, an unparseable value) and no running server are both silent.
+ */
+export function staleMcpServerCheck(
+  builtAt: string | null,
+  running: RunningMcpServer[],
+): Check {
+  const id = "mcp.server.fresh";
+  const builtAtMs = builtAt ? Date.parse(builtAt) : NaN;
+  if (!Number.isFinite(builtAtMs)) {
+    return {
+      id,
+      ok: true,
+      level: "info",
+      label: "MCP server freshness not checked",
+      detail: "no dist/build-info.json stamp to compare running servers against",
+    };
+  }
+  if (running.length === 0) {
+    return {
+      id,
+      ok: true,
+      level: "info",
+      label: "No MCP server running",
+      detail: "nothing to compare against the current build",
+    };
+  }
+  const stale = running.filter((s) => s.startedAtMs < builtAtMs);
+  if (stale.length === 0) {
+    return {
+      id,
+      ok: true,
+      label: "MCP servers are on the current build",
+      detail: `${running.length} running, all started after ${builtAt}`,
+    };
+  }
+  const oldest = stale.reduce((a, b) => (a.startedAtMs <= b.startedAtMs ? a : b));
+  return {
+    id,
+    ok: false,
+    label: "MCP server is serving an older tool contract",
+    detail:
+      `${stale.length} of ${running.length} running server(s) started before the current build ` +
+      `(${builtAt}); oldest is pid ${oldest.pid}, ${ageLabel(new Date(oldest.startedAtMs).toISOString(), new Date())}. ` +
+      "Claude Code reloads itself once the worker respawns, but Codex ignores the " +
+      "tool-list-changed notification, so restart the host to pick up the new contract.",
+  };
+}
+
+/**
+ * Enumerate live `mla mcp` WORKER processes and their start times from one `ps`
+ * call. Only the `--child` workers are counted: the supervising parent and the
+ * intervening volta shim never load the MCP dist, so their age says nothing
+ * about which tool contract is being served. Returns [] on any failure; a
+ * freshness hint must never be the thing that breaks doctor.
+ */
+export function probeRunningMcpServers(now = new Date()): RunningMcpServer[] {
+  let raw: string;
+  try {
+    raw = execFileSync("ps", ["-axo", "pid=,etime=,command="], {
+      encoding: "utf8",
+      timeout: 5000,
+      maxBuffer: 8 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return [];
+  }
+  const out: RunningMcpServer[] = [];
+  for (const line of raw.split("\n")) {
+    const m = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const [, pidStr, etime, cmd] = m;
+    if (!cmd.includes(" mcp") || !cmd.includes("--child")) continue;
+    const secs = parseEtimeSeconds(etime);
+    if (secs === null) continue;
+    out.push({ pid: Number(pidStr), startedAtMs: now.getTime() - secs * 1000 });
+  }
+  return out;
+}
+
+/** `ps` etime, one of `SS`, `MM:SS`, `HH:MM:SS`, `DD-HH:MM:SS`, into seconds. */
+export function parseEtimeSeconds(etime: string): number | null {
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$|^(\d+)$/.exec(etime.trim());
+  if (!m) return null;
+  if (m[5] !== undefined) return Number(m[5]);
+  const days = m[1] ? Number(m[1]) : 0;
+  const hours = m[2] ? Number(m[2]) : 0;
+  return days * 86400 + hours * 3600 + Number(m[3]) * 60 + Number(m[4]);
+}
+
 // Newest mtime (ms) of any .ts file under `dir`, walked recursively. Used by
 // the build-freshness check to detect a dist/ that lags behind src/.
 function newestTsMtimeMs(dir: string): number {
@@ -1147,11 +1396,12 @@ export async function runDoctor(argv: string[]): Promise<number> {
   // (whoami, kb/health) report that instead of calling control with no id.
   const markerWorkspaceId = tryResolveWorkspaceId();
   if (markerWorkspaceId) {
-    checks.push(
-      ...ruleBundleDoctorChecks(
-        readRuleBundleCache(resolveBundlePrincipal(markerWorkspaceId)),
-      ),
-    );
+    // Read ONCE and share. The bundle answers "do any governed rules exist for this workspace",
+    // which is what lets the delivery check below tell a broken hand-off from a workspace that
+    // simply has not governed anything yet. Reading it twice could also answer the two checks
+    // differently, which is how a health surface starts contradicting itself.
+    const bundleRead = readRuleBundleCache(resolveBundlePrincipal(markerWorkspaceId));
+    checks.push(...ruleBundleDoctorChecks(bundleRead));
     // The bundle check above says the rules EXIST. This one says they were DELIVERED, from this
     // checkout, on the last turn. Same reader the hook uses (readScanCacheForRoot), so a doctor
     // green and a hook green are now statements about the same artifact.
@@ -1161,6 +1411,15 @@ export async function runDoctor(argv: string[]): Promise<number> {
         cacheForThisRoot: readScanCacheForRoot(undefined, markerWorkspaceId, process.cwd()),
         globalCache: readScanCache(undefined, markerWorkspaceId),
         receipt: readDeliveryReceipt(undefined, markerWorkspaceId),
+        // Three states, never pooled. A readable bundle answers the count outright; a bundle that
+        // was never pulled is the ordinary post-`activate` condition and is NOT evidence that the
+        // workspace has no rules; anything else (corrupt, schema or principal mismatch) stays
+        // unknown and therefore stays loud.
+        governedRules: bundleRead.bundle
+          ? { kind: "known", count: bundleRead.bundle.rules.length }
+          : bundleRead.reason === BUNDLE_CACHE_NEVER_FETCHED
+            ? { kind: "never-fetched" }
+            : { kind: "unknown" },
         now: new Date(),
       }),
     );
@@ -1620,6 +1879,26 @@ export async function runDoctor(argv: string[]): Promise<number> {
     }
   }
 
+  // 6b. Are the LIVE MCP servers on that build? The check above asks whether the
+  // artifact on disk is current; this one asks whether anything is still serving
+  // an older one. A long-lived stdio server pins its tool contract for the life of
+  // the client session, so an MCP fix reaches a running host only via the reload
+  // announcement (lib/mcp-restart.ts) or a host restart. Claude Code takes the
+  // former; Codex, measured 2026-08-09, honours neither the notification nor a
+  // clean-exit respawn, so for Codex this row IS the remedy.
+  {
+    let builtAt: string | null = null;
+    try {
+      const bi = JSON.parse(
+        fs.readFileSync(path.join(__dirname, "..", "build-info.json"), "utf8"),
+      );
+      builtAt = typeof bi.builtAt === "string" ? bi.builtAt : null;
+    } catch {
+      // no stamp: staleMcpServerCheck degrades to a silent info row
+    }
+    checks.push(staleMcpServerCheck(builtAt, probeRunningMcpServers()));
+  }
+
   // 7a. hook lock primitive. common.sh locks via flock when present and falls
   // back to a portable mkdir(2) mutex when it is absent (Windows Git Bash ships
   // no flock, macOS ships none by default). So flock is an OPTIMIZATION, never a
@@ -1810,6 +2089,21 @@ export async function runDoctor(argv: string[]): Promise<number> {
       level: activation.workspaceId ? "info" : undefined,
       label: `folder activated: ${activation.path} -> ${wsDetail}`,
     });
+    // D1: an INHERITED binding must never be silent. This directory carries no
+    // marker of its own; it is a linked git worktree and the binding came from
+    // its origin checkout. Say so, and say what did NOT come with it, because
+    // the checkout keeps its own scan root and runtime scope.
+    if (activation.via === "worktree") {
+      checks.push({
+        ok: true,
+        level: "info",
+        label:
+          `  inherited from the origin checkout of this linked worktree ` +
+          `(no .meetless.json here). Workspace binding only: this checkout keeps ` +
+          `its own scan root, rules and runtime scope. Write a .meetless.json here ` +
+          `to bind this worktree somewhere else.`,
+      });
+    }
     if (activation.parseError) {
       checks.push({
         ok: false,
@@ -1915,11 +2209,20 @@ export async function runDoctor(argv: string[]): Promise<number> {
                   }),
                 ),
               );
-            } else {
+            } else if ("allowedRootAbsolutePath" in config) {
               checks.push({
                 ok: true,
                 level: "info",
                 label: `notes vault rule uses ${config.allowedRootAbsolutePath}`,
+              });
+            } else {
+              // The COMMAND family (F2) has no path root, so the P0.63 path-root gate
+              // simply does not apply to it. Report that rather than falling through to
+              // a note-vault label, which would name a vault this rule never mentioned.
+              checks.push({
+                ok: true,
+                level: "info",
+                label: `rule governs a command, not a path; path-root gate not applicable`,
               });
             }
           } else {

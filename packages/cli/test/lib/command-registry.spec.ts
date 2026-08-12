@@ -316,7 +316,9 @@ describe("machine-owned command-reference region", () => {
   // run in another terminal recreates it as an empty node_modules shell the moment
   // it goes missing, and an existence check on it can read true with no content.
   const MONOREPO = path.resolve(__dirname, "../../../../..");
-  const DOCS_PAGE = path.join(MONOREPO, "docs/src/content/docs/reference/commands.md");
+  // .mdx: see the note in scripts/gen-command-reference.ts. This test read the pre-rename
+  // path and ENOENTed on every run after f8d0ccd88.
+  const DOCS_PAGE = path.join(MONOREPO, "docs/src/content/docs/reference/commands.mdx");
   const itInMonorepo = fs.existsSync(path.join(MONOREPO, "pnpm-workspace.yaml")) ? it : it.skip;
 
   itInMonorepo("the website's command index is fresh (regenerate: pnpm gen:command-reference)", () => {

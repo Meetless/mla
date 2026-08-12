@@ -197,7 +197,7 @@ describe("ingestRun: top-level rejections", () => {
     home = mkdtempSync(join(tmpdir(), "mla-ingest-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("rejects a malformed envelope (bad protocolVersion)", async () => {
@@ -259,7 +259,7 @@ describe("ingestRun: candidate verification", () => {
     seedRun(home);
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const completeDoc = (candidates: unknown[]) => [{ scout: "documentation", status: "complete", candidates }];
@@ -329,7 +329,7 @@ describe("ingestRun: orchestration", () => {
     home = mkdtempSync(join(tmpdir(), "mla-ingest-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("marks status complete only when EVERY scout completes; writes state", async () => {
@@ -990,7 +990,7 @@ describe("ingestRun: batched persistence (progress must survive a failure)", () 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "ml-ingest-batch-"));
   });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   // Batching needs MORE documents than one POST carries, and no `limits` override can supply
   // them: the per-role caps live in SCOUT_CANDIDATE_CAPS, so a run record cannot widen them.
@@ -1674,7 +1674,7 @@ describe("candidates sidecar IO", () => {
     home = mkdtempSync(join(tmpdir(), "mla-sidecar-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const record = (over: Partial<OnboardingCandidateRecord> = {}): OnboardingCandidateRecord => ({
@@ -1780,7 +1780,7 @@ describe("ingestRun writes the candidates sidecar", () => {
     seedRun(home);
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const completeDoc = (candidates: unknown[]) => [{ scout: "documentation", status: "complete", candidates }];
@@ -1807,7 +1807,7 @@ describe("ingestRun reports the findings that newly landed (design §9)", () => 
     home = mkdtempSync(join(tmpdir(), "mla-ingest-newfindings-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const reconResults = (candidates: unknown[]) => [
@@ -1896,7 +1896,7 @@ describe("the sidecar carries the finding the CLI verified", () => {
     home = mkdtempSync(join(tmpdir(), "mla-ingest-sidecar-inc-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const reconResults = (candidates: unknown[]) => [
@@ -1967,7 +1967,7 @@ describe("a rejected candidate reports WHAT it dropped", () => {
     home = mkdtempSync(join(tmpdir(), "mla-ingest-excerpt-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const scoutResult = (candidates: unknown[]) => ({

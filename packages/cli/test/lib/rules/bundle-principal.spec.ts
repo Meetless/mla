@@ -101,7 +101,7 @@ describe("recordBundlePrincipal / resolveBundlePrincipal index round-trip", () =
   });
 
   afterEach(() => {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("resolves the control-stamped foreign-workspace principal once recorded", () => {

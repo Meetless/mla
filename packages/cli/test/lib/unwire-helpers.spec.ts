@@ -15,7 +15,7 @@ describe("unwire helpers", () => {
     const bak = backupFile(f);
     expect(bak.startsWith(f + ".bak.")).toBe(true);
     expect(fs.readFileSync(bak, "utf8")).toBe('{"a":1}');
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("removeDir reports removed=true for an existing dir, false when absent", () => {
@@ -26,7 +26,7 @@ describe("unwire helpers", () => {
     expect(removeDir(sub)).toEqual({ removed: true });
     expect(fs.existsSync(sub)).toBe(false);
     expect(removeDir(sub)).toEqual({ removed: false });
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("countQueuedSessions counts .jsonl files only, ignores sidecars and missing dir", () => {
@@ -37,7 +37,7 @@ describe("unwire helpers", () => {
     fs.writeFileSync(path.join(dir, "a.turn"), "", "utf8");
     expect(countQueuedSessions(dir)).toBe(2);
     expect(countQueuedSessions(path.join(dir, "nope"))).toBe(0);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("countQueuedEvents sums event lines across .jsonl, ignores sidecars and empties, missing dir is 0", () => {
@@ -52,6 +52,6 @@ describe("unwire helpers", () => {
     fs.writeFileSync(path.join(dir, "a.turn"), "noise\n", "utf8"); // sidecar: ignored
     expect(countQueuedEvents(dir)).toBe(5);
     expect(countQueuedEvents(path.join(dir, "nope"))).toBe(0);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 });

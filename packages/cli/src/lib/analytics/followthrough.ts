@@ -49,7 +49,23 @@ export interface McpCall {
   // McpCall constructions stay valid; the per-turn recap reads it to report which
   // evidence tools the agent pulled.
   tool?: string;
+  // D3. How the call ENDED, which the ledger could not say until 2026-08-09.
+  //
+  // `error` is the refusal: the agent reached for governed memory and was told no.
+  // Those rows do not come from PostToolUse (Claude Code does not fire it on an
+  // errored tool result); they are recovered from the transcript at Stop by
+  // mcp-failure-scan.ts.
+  //
+  // `unknown` is what the 1773 rows already on disk read as. It is deliberately NOT
+  // back-filled to `success`: those rows predate the field, and inventing a verdict
+  // for them would put a number on history we never measured. Every consumer that
+  // cares about the distinction must therefore treat `unknown` as "not a refusal we
+  // can prove", which is what the pre-D3 world already assumed.
+  outcome?: McpOutcome;
 }
+
+/** The honest three-valued outcome, matching `classify_mcp_outcome` in common.sh. */
+export type McpOutcome = "success" | "error" | "unknown";
 
 export interface ReportCitation {
   session_id: string;
@@ -296,6 +312,7 @@ export function parseMcpCalls(lines: Record<string, unknown>[]): McpCall[] {
     const session_id = asStr(c.session_id);
     const turn_index = asNum(c.turn_index);
     if (!session_id || turn_index === null) continue;
+    const rawOutcome = asStr(c.outcome);
     out.push({
       session_id,
       turn_index,
@@ -303,6 +320,11 @@ export function parseMcpCalls(lines: Record<string, unknown>[]): McpCall[] {
       source_ids: asStrArray(c.source_ids),
       query: asStr(c.query),
       tool: asStr(c.tool),
+      // A row with no outcome is LEGACY, not successful. See McpCall.outcome.
+      outcome:
+        rawOutcome === "success" || rawOutcome === "error" || rawOutcome === "unknown"
+          ? rawOutcome
+          : "unknown",
     });
   }
   return out;

@@ -547,3 +547,85 @@ test("runAnswer omits asOf from the intel call when caller did not set it", asyn
   await modes.runAnswer({ query: "q" });
   assert.equal(calls[0].asOf, undefined);
 });
+
+// ---------- H3: confidence must not survive an emptied answer -----------------
+//
+// GATE. Blocking. Surface: query/canonical (NOT the agentic ask loop, which has its
+// own deliberate carve-out allowing a confident refusal; that invariant is untouched
+// here and must stay untouched).
+//
+// Observed live via `meetless__query` mode:"canonical":
+//     answer: null
+//     confidence: "high"
+//     warnings: ["no INDEX.md match; fell back to retrieval with canonical hint"]
+//
+// The surface returned nothing, KNEW it had fallen off the canonical path, recorded
+// that in warnings, and left intel's confidence untouched. `runCanonical`'s no-match
+// branch calls normalizeIntelResponse (which passes `raw.confidence` straight
+// through), then sets `out.answer = null` and appends the warning, and never revisits
+// confidence.
+//
+// This is not a new policy. The SIBLING branch of the same function, the
+// ambiguous-match arm, already returns `answer: null` with `confidence: "low"`. The
+// invariant exists in this file and was applied to one of two branches. These rows
+// hold both arms to it.
+//
+// ask-core is shared by BOTH front-ends (@meetless/mcp and @meetless/mla), so this
+// binds the MCP query surface where the defect was observed and the CLI equally.
+
+test("H3: canonical no-INDEX-match must not report high confidence with a null answer", async () => {
+  const { modes } = harness({
+    intelResponse: { answer: "synth", confidence: "high", citations: [] },
+    matchCanonical: () => ({ matches: [], reason: "no INDEX.md match" }),
+  });
+
+  const out = await modes.runCanonical({ query: "mla scan cache root identity guard" });
+
+  // The surface discriminator, asserted so a future reader can never mistake this
+  // result for the agentic loop's.
+  assert.equal(out.mode, "canonical");
+
+  // The defect signature, structurally: emptied answer + a warning that says why.
+  assert.equal(out.answer, null);
+  assert.ok(out.warnings.length > 0, "expected a fell-off-the-canonical-path warning");
+
+  // The gate. Matching the ambiguous-match arm's existing precedent rather than
+  // inventing a value.
+  assert.notEqual(out.confidence, "high");
+  assert.equal(out.confidence, "low");
+});
+
+test("H3: the ambiguous-match arm already holds the invariant (precedent, must not regress)", async () => {
+  const { modes } = harness({
+    intelResponse: { answer: "synth", confidence: "high", citations: [] },
+    matchCanonical: () => ({
+      matches: [
+        { path: "notes/a.md", topic: "t", status: "current", lastReviewed: "2026-01-01" },
+        { path: "notes/b.md", topic: "t", status: "current", lastReviewed: "2026-01-02" },
+      ],
+      reason: "topic",
+    }),
+  });
+
+  const out = await modes.runCanonical({ query: "ambiguous" });
+  assert.equal(out.answer, null);
+  assert.equal(out.confidence, "low");
+  assert.ok(out.warnings.length > 0);
+});
+
+test("H3: a REAL answer keeps the confidence intel assigned", async () => {
+  // The control arm. Without it, "never return high" would pass a fix that simply
+  // hardcoded low everywhere and destroyed the signal.
+  const { modes } = harness({
+    intelResponse: { answer: "a real synthesized answer", confidence: "high", citations: [] },
+    matchCanonical: () => ({
+      matches: [{ path: "notes/a.md", topic: "t", status: "current", lastReviewed: "2026-01-01" }],
+      reason: "topic",
+    }),
+  });
+
+  const out = await modes.runCanonical({ query: "unique match" });
+  assert.equal(out.mode, "canonical");
+  assert.ok(out.answer, "unique-match arm should synthesize an answer");
+  assert.equal(out.confidence, "high");
+});

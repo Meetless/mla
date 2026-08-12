@@ -439,6 +439,115 @@ export async function runWorkspaceReactivate(
   }
 }
 
+// One row of `mla workspace list`: an active WorkspaceUser of the signed-in
+// human, as carried on the identity response. `repoPath` is deliberately typed
+// (control sends it) and deliberately NOT rendered; see renderWorkspaceList.
+export interface MembershipRow {
+  workspaceId: string;
+  name?: string;
+  role?: string;
+  retiredAt?: string | null;
+  repoPath?: string | null;
+}
+
+// `mla workspace list` (D2, 2026-08-10).
+//
+// The discovery half of `mla activate --workspace <id>`: you cannot bind a
+// second repo to your company workspace without knowing its id, and until now no
+// CLI surface could name one. `mla workspace` shows only the FOLDER-bound
+// workspace, and `mla whoami` shows the session's home.
+//
+// `repoPath` is never rendered even though control sends it. It records whichever
+// folder happened to provision the workspace, and the entire point of D2 is that
+// a workspace has SEVERAL repos, so showing that one path as "the" repository is
+// not merely unhelpful, it is confidently wrong at exactly the moment the
+// operator is deciding which id to bind.
+//
+// Pure: takes rows and the folder's current binding, returns text.
+export function renderWorkspaceList(
+  rows: MembershipRow[],
+  boundWorkspaceId: string | null,
+): string {
+  if (rows.length === 0) {
+    return [
+      "You are not a member of any workspace yet.",
+      "",
+      "  Run `mla activate` in a repository to create one, or ask a workspace",
+      "  owner to run `mla workspace invite <your-email>` so you can join theirs.",
+    ].join("\n");
+  }
+  const idWidth = Math.max(...rows.map((r) => r.workspaceId.length));
+  const nameWidth = Math.max(...rows.map((r) => (r.name ?? "").length), 4);
+  const lines = [`Workspaces you belong to (${rows.length}):`, ""];
+  for (const r of rows) {
+    const marks: string[] = [];
+    if (boundWorkspaceId && r.workspaceId === boundWorkspaceId) marks.push("bound to this folder");
+    if (r.retiredAt) marks.push("deactivated");
+    lines.push(
+      `  ${r.workspaceId.padEnd(idWidth)}  ${(r.name ?? "").padEnd(nameWidth)}  ${r.role ?? ""}` +
+        (marks.length ? `  (${marks.join(", ")})` : ""),
+    );
+  }
+  lines.push("");
+  lines.push("  Bind another folder to one of these:");
+  lines.push("    cd <that folder> && mla activate --workspace <id>");
+  lines.push("  Each folder keeps its own scan root, so one repo's instruction files");
+  lines.push("  are never served as another repo's rules.");
+  return lines.join("\n");
+}
+
+interface IdentityResponse {
+  mode?: string;
+  memberships?: MembershipRow[];
+}
+
+// Fetch the caller's memberships from the identity endpoint `mla whoami` already
+// uses. No new route: the guard resolves this list onto `request.auth` on every
+// authenticated call, and `getMe` now surfaces it.
+async function runWorkspaceList(deps: WorkspaceMemberDeps = {}): Promise<number> {
+  const out = deps.out ?? ((l: string) => console.log(l));
+  const err = deps.err ?? ((l: string) => console.error(l));
+  if (!configExists()) {
+    err(`workspace list: cli-config.json not found at ${CFG_PATH}. Run \`mla login\` first.`);
+    return 2;
+  }
+  let cfg: CliConfig;
+  try {
+    cfg = readConfig();
+  } catch (e) {
+    err(`workspace list: ${(e as Error).message}`);
+    return 2;
+  }
+  let me: IdentityResponse;
+  try {
+    me = await get<IdentityResponse>(cfg, "/internal/v1/auth/me", 8000);
+  } catch (e) {
+    err(`workspace list failed: ${serverMessageOrRaw(e as HttpError)}`);
+    return 1;
+  }
+  if (me.mode === "shared-key") {
+    // A shared key is not a human, so it has no membership set to enumerate.
+    // Say which credential is in play rather than printing an empty list, which
+    // would read as "you belong to nothing".
+    err(
+      "workspace list: this machine is authenticated with a workspace key (shared-key mode), " +
+        "which carries no personal identity. Run `mla login` to list the workspaces you belong to.",
+    );
+    return 1;
+  }
+  // Best effort: an unbound folder is a normal place to run this from (it is how
+  // you find the id you are about to bind), so a failure to resolve one is not
+  // an error here.
+  let bound: string | null = null;
+  try {
+    bound = resolveWorkspaceContext().workspaceId;
+  } catch {
+    bound = null;
+  }
+  out(renderWorkspaceList(me.memberships ?? [], bound));
+  return 0;
+}
+
 // `mla workspace use <id>` is removed (T3.2). It rewrote the global cli-config
 // workspaceId, which is no longer a workspace source under folder = workspace.
 // Hard-error with a pointer to the replacement verb instead of silently doing
@@ -460,6 +569,9 @@ export async function runWorkspace(argv: string[]): Promise<number> {
   if (sub === undefined || sub === "show") {
     return runWorkspaceShow();
   }
+  if (sub === "list") {
+    return runWorkspaceList();
+  }
   if (sub === "use") {
     return runWorkspaceUseRemoved();
   }
@@ -477,7 +589,7 @@ export async function runWorkspace(argv: string[]): Promise<number> {
   }
   console.error(
     `Unknown workspace subcommand: ${sub}. Usage: mla workspace ` +
-      `[show | invite <email> | members | remove <email> | reactivate] ` +
+      `[show | list | invite <email> | members | remove <email> | reactivate] ` +
       `(use 'mla activate' / 'mla deactivate' to change the folder binding).` +
       staleCommandHint(),
   );

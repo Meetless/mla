@@ -114,7 +114,7 @@ const USAGE = `mla enrich: agent-orchestrated onboarding enrichment.
       active-run lock from an abandoned run (one whose agent crashed or was
       interrupted), which otherwise blocks a re-run until it expires.
 
-  mla enrich brief --run-id <id> --role <documentation|history> [--workspace <id>]
+  mla enrich brief --run-id <id> --role <${DISPATCH_SCOUT_NAMES.join("|")}> [--workspace <id>]
       Print the exact subagent brief for one scout role, rendered from the run
       record named by --run-id. Read-only; used by \`/mla onboard\` to dispatch each
       scout with the run-specific prompt \`enrich ingest\` will validate against.
@@ -672,6 +672,11 @@ export function renderIngestSummary(
   status: string | undefined,
   reviewUrl: string,
   findings?: IngestFindingsView,
+  // The run whose candidates these are, so the last line can be a command the operator can run
+  // where they already are. Optional and last so every existing caller is unchanged; without it
+  // the handoff degrades to the console-only sentence rather than printing a command with a
+  // missing id, which would be worse than no command at all.
+  runId?: string,
 ): string {
   const lines = [`Onboarding ingest complete (state: ${status ?? "unknown"}).`, ``];
 
@@ -760,19 +765,31 @@ export function renderIngestSummary(
     if (totalNew === 0) {
       // Pure dedup: a re-run added nothing. This is onboarding proving it is idempotent.
       lines.push(
-        `Next: all ${totalPersisted} candidate${plural} were already present from a prior onboarding run ` +
-          `(nothing new to add). Review them in the console at ${reviewUrl} (the "Needs Review" tab).`,
+        `${totalPersisted} candidate${plural} were already present from a prior onboarding run ` +
+          `(nothing new to add). They are on the console KB at ${reviewUrl} (the "Needs Review" tab).`,
       );
     } else if (totalDeduped > 0) {
       lines.push(
-        `Next: review ${totalPersisted} candidate${plural} born PENDING (${totalNew} new, ${totalDeduped} already present) ` +
-          `in the console at ${reviewUrl} (the "Needs Review" tab). Nothing is accepted until you say so.`,
+        `${totalPersisted} candidate${plural} born PENDING (${totalNew} new, ${totalDeduped} already present). ` +
+          `They are on the console KB at ${reviewUrl} (the "Needs Review" tab). Nothing is accepted until you say so.`,
       );
     } else {
       lines.push(
-        `Next: review ${totalPersisted} candidate${plural} born PENDING in the console at ` +
+        `${totalPersisted} candidate${plural} born PENDING, on the console KB at ` +
           `${reviewUrl} (the "Needs Review" tab). Nothing is accepted until you say so.`,
       );
+    }
+    // The LAST line is the next action, and the last line is where a terminal state actually
+    // ends. It used to be "review N candidates in the console at <url>": a to-do list handed to
+    // an operator standing in a terminal that can already do the job, and a context switch to a
+    // different surface at the exact moment the run had just proved its worth.
+    //
+    // `mla enrich accept --run-id <id>` with neither --all nor --only is READ-ONLY review that
+    // prints the durable rules right here. It already existed; nothing new is built, and no
+    // second review surface is introduced. The console stays reachable above, it is just no
+    // longer the only way through.
+    if (runId) {
+      lines.push(``, `Next:  mla enrich accept --run-id ${runId}`);
     }
   }
   return lines.join("\n");
@@ -944,6 +961,9 @@ async function runEnrichIngest(argv: string[]): Promise<number> {
         res.state?.status,
         consoleDeepLink(cfg, "/kb"),
         sidecar ? { runId: sidecar.runId, candidates: sidecar.candidates } : undefined,
+        // From the ingest RESULT, not the sidecar: a run that persisted only rules writes no
+        // findings sidecar, and that run needs the review gesture just as much as one that did.
+        res.runId,
       ),
     );
   }

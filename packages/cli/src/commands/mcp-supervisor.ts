@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import { MCP_RESTART_EXIT_CODE } from "../lib/mcp-restart";
+import { MCP_RESTART_EXIT_CODE, MCP_RELOAD_FLAG } from "../lib/mcp-restart";
 import { installOrphanGuard } from "../lib/orphan-guard";
 
 // The supervising parent for `mla mcp` (see lib/mcp-restart.ts for the why).
@@ -107,7 +107,16 @@ export async function runMcpSupervisor(
 
   const restarts: number[] = [];
   for (;;) {
-    const code = await spawnChild(argv, (kill) => {
+    // Mark every worker AFTER the first as a reload. The worker uses it to
+    // announce `notifications/tools/list_changed`, which is the only thing that
+    // moves the model-visible tool schema across a swap the client never sees
+    // (we hold fd 0/1 precisely so it does not). Derived from the loop state and
+    // appended to a COPY, so it can never accumulate across reloads, and skipped
+    // when the caller already passed it.
+    const isReload = restarts.length > 0;
+    const childArgv =
+      isReload && !argv.includes(MCP_RELOAD_FLAG) ? [...argv, MCP_RELOAD_FLAG] : argv;
+    const code = await spawnChild(childArgv, (kill) => {
       killCurrentChild = kill;
     });
     killCurrentChild = () => {};

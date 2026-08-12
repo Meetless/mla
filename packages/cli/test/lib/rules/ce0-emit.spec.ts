@@ -52,7 +52,7 @@ describe("emitCe0Event", () => {
     delete process.env.MEETLESS_NO_TELEMETRY;
     observability.resetRunIdForTesting();
     observability.resetRunTracerForTesting();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("appends a CE0 RecordInput to the local spool under a hook envelope (real recorder)", () => {

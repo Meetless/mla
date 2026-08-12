@@ -92,6 +92,10 @@ const SIDECAR_SUFFIXES = [
   ".turn",
   ".lock",
 ] as const;
+// The one sidecar the reaper never removes. See the skip in reapQueue for why: its value is
+// a cross-hook join key, and restarting it collides two turns of a resumed session.
+const TURN_COUNTER_SUFFIX = ".turn";
+
 const DEFAULT_QUEUE_GC_MAX_AGE_SEC = 86_400; // 24h idle before a session is litter
 // A much longer gate before we reclaim a session that STILL has undelivered work.
 // reapQueue normally refuses pending spools forever (skippedPending). But a
@@ -243,6 +247,23 @@ export function reapQueue(
     }
     let removed = 0;
     for (const f of g.files) {
+      // The turn counter OUTLIVES the reap. It is the only sidecar here whose VALUE is an
+      // identity other systems join on: user-prompt-submit.sh builds the cross-hook key
+      // `${SESSION_ID}:${TURN_INDEX}` from it, post-tool-use.sh rebuilds the same key for
+      // MCP rows, and the analytics correlators key on (session_id, turn_index).
+      //
+      // `next_turn_index` reads a missing file as 0 and hands out 1, so reaping this file
+      // restarts the numbering of a session id that can still come back. Session ids are
+      // UUIDs a human resumes across days, and the newest-mtime gate cannot tell "dead"
+      // from "parked over a weekend": d629ac1c ran 07-31 to 08-06 with a 43-hour gap and
+      // its ledger reads 1,2,3 then 1,2,3 then 1,2. Measured corpus-wide on 2026-08-06:
+      // 394 colliding (session_id, turn_index) pairs, 160 of 646 sessions (24.8%).
+      //
+      // Keeping it costs a handful of bytes per session id, forever, and session ids never
+      // recur so the value can never be misapplied. Everything else in this group is
+      // genuinely reclaimable: locks, spools, and the touched/repoPath/gitBaseline state a
+      // resumed session rebuilds on its next turn.
+      if (f.endsWith(TURN_COUNTER_SUFFIX)) continue;
       if (dryRun) {
         // Count what WOULD be removed without touching disk (doctor's read-only
         // debt probe). statSync already succeeded above for files we counted, so
@@ -322,11 +343,17 @@ export function planQueuePrune(
       g = { files: [], unflushedEvents: 0, bytes: 0, newestMtimeMs: 0 };
       groups.set(c.sessionId, g);
     }
-    g.files.push(full);
+    // The turn counter survives pruning too, for the reason spelled out in reapQueue: its
+    // value is a cross-hook join key and restarting it collides two turns of a resumed
+    // session. Excluded from the PLAN as well as from the deletion, so the "will remove N
+    // files / M bytes" an operator reads stays exactly what happens. It still contributes
+    // its mtime, because liveness is a property of the session, not of what we may delete.
+    const isTurnCounter = name.endsWith(TURN_COUNTER_SUFFIX);
+    if (!isTurnCounter) g.files.push(full);
     try {
       const st = fs.statSync(full);
       if (st.mtimeMs > g.newestMtimeMs) g.newestMtimeMs = st.mtimeMs;
-      g.bytes += st.size;
+      if (!isTurnCounter) g.bytes += st.size;
       if ((c.isSpool || c.isDraining) && st.size > 0) {
         const raw = fs.readFileSync(full, "utf8");
         g.unflushedEvents += raw.split("\n").filter((l) => l.trim().length > 0).length;
@@ -343,6 +370,9 @@ export function planQueuePrune(
       plan.skippedFresh += 1;
       continue;
     }
+    // A session whose only surviving file is its preserved counter has nothing to prune.
+    // Listing it would report a candidate that removes zero files.
+    if (g.files.length === 0) continue;
     plan.candidates.push({
       sessionId,
       files: g.files,

@@ -18,7 +18,7 @@ describe("governance-cache (A-0c pending-count hand-off)", () => {
     home = fs.mkdtempSync(path.join(os.tmpdir(), "mla-govcache-"));
   });
   afterEach(() => {
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("lands the cache under logs/governance with the bash-compatible filename", () => {

@@ -47,7 +47,7 @@ maybe("sync-plugin --check", () => {
     pluginRoot = path.join(sandbox, "plugin");
   });
   afterEach(() => {
-    fs.rmSync(sandbox, { recursive: true, force: true });
+    fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("reports clean immediately after a sync", () => {

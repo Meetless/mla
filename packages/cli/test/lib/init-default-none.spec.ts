@@ -44,7 +44,7 @@ describe("runInit auth.mode default (tokenless first run)", () => {
     else process.env.MEETLESS_HOME = prevHome;
     if (prevToken === undefined) delete process.env.MEETLESS_CONTROL_TOKEN;
     else process.env.MEETLESS_CONTROL_TOKEN = prevToken;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     jest.resetModules();
   });
 

@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 
 import { HOME } from "../config";
 import { scanForSecrets, SECRET_SCANNER_VERSION } from "../redactor";
-import { classifyMemory } from "./classify";
+import { classifyMemory, isCapturable } from "./classify";
 import { enumerateEligibleFiles, MAX_FILE_BYTES } from "./containment";
 import { readLedger, writeLedger } from "./ledger";
 import type { DecisionRecord, Ledger, MemoryBinding, ScanSummary, ScannerMode } from "./types";
@@ -107,9 +107,13 @@ export function collectOnce(binding: MemoryBinding, deps: CollectDeps): ScanSumm
       continue;
     }
 
-    if (cls.type !== "project") {
-      // Was it previously a tracked project file? Ledger presence is the signal
-      // (we only ever create entries for project files).
+    if (!isCapturable(cls)) {
+      // Eligibility is classify.isCapturable's call, never a string compared here.
+      // This branch used to hardcode `type !== "project"`, which made isCapturable
+      // dead code and any widening of it silently inert.
+      //
+      // Was it previously a tracked capturable file? Ledger presence is the signal
+      // (we only ever create entries for capturable files).
       if (prior) {
         delete ledger.entries[f.relativePath];
         mutated = true;

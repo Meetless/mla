@@ -186,7 +186,7 @@ describe("flush.sh finalize-time sidecar reap (Part 3 hard gate)", () => {
       );
       expect(survivors).toEqual([...ALL_SIDECARS]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -211,7 +211,7 @@ describe("flush.sh finalize-time sidecar reap (Part 3 hard gate)", () => {
       expect(fs.existsSync(path.join(queueDir, `${sessionId}.repoPath`))).toBe(true);
       expect(fs.existsSync(path.join(queueDir, `${sessionId}.jsonl`))).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

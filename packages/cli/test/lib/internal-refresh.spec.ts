@@ -57,7 +57,7 @@ describe("mla _internal refresh", () => {
     else process.env.MEETLESS_CONTROL_TOKEN = prevToken;
     logSpy.mockRestore();
     errSpy.mockRestore();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function loadRun(): (

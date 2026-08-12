@@ -16,7 +16,11 @@ import { resolve } from "node:path";
 import { COMMANDS } from "../src/cli";
 import { renderCommandIndex, spliceCommandIndex } from "../src/lib/command-reference";
 
-const DOCS_PAGE = resolve(__dirname, "../../../../docs/src/content/docs/reference/commands.md");
+// .mdx, not .md. f8d0ccd88 renamed all 18 reference pages (they were .md carrying MDX, so
+// every one leaked its import line), and this generator plus the freshness test in
+// command-registry.spec.ts kept writing and reading the old extension. The generator
+// silently created a SECOND, orphaned commands.md nobody renders, and the test ENOENTed.
+const DOCS_PAGE = resolve(__dirname, "../../../../docs/src/content/docs/reference/commands.mdx");
 
 const check = process.argv.includes("--check");
 const current = readFileSync(DOCS_PAGE, "utf8");

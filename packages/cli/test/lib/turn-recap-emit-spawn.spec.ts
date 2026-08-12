@@ -122,7 +122,7 @@ describe("common.sh spawn_turn_recap_emit (detached Layer D glue)", () => {
         "_internal turn-recap --session sess-x --turn 5 --emit-langfuse",
       );
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -133,7 +133,7 @@ describe("common.sh spawn_turn_recap_emit (detached Layer D glue)", () => {
     try {
       expect(recorded).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -142,7 +142,7 @@ describe("common.sh spawn_turn_recap_emit (detached Layer D glue)", () => {
     try {
       expect(recorded).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -168,7 +168,7 @@ describe("spawn_turn_recap_emit x MEETLESS_TURN_RECAP decoupling (2x2 Langfuse h
     try {
       expect(recorded).toContain(FIRES);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -182,7 +182,7 @@ describe("spawn_turn_recap_emit x MEETLESS_TURN_RECAP decoupling (2x2 Langfuse h
     try {
       expect(recorded).toContain(FIRES);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -196,7 +196,7 @@ describe("spawn_turn_recap_emit x MEETLESS_TURN_RECAP decoupling (2x2 Langfuse h
     try {
       expect(recorded).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -209,7 +209,7 @@ describe("spawn_turn_recap_emit x MEETLESS_TURN_RECAP decoupling (2x2 Langfuse h
     try {
       expect(recorded).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

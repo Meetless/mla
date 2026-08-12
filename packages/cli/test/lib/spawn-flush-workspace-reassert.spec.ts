@@ -77,7 +77,7 @@ describe("common.sh spawn_flush re-asserts the workspace sidecar", () => {
       expect(fs.existsSync(sidecar)).toBe(true);
       expect(fs.readFileSync(sidecar, "utf8")).toBe("ws_reassert");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -97,7 +97,7 @@ describe("common.sh spawn_flush re-asserts the workspace sidecar", () => {
 
       expect(fs.readFileSync(sidecar, "utf8")).toBe("ws_from_session_start");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -115,7 +115,7 @@ describe("common.sh spawn_flush re-asserts the workspace sidecar", () => {
 
       expect(fs.existsSync(sidecar)).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

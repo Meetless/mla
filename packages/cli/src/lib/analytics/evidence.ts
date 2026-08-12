@@ -104,6 +104,13 @@ export interface InjectInput {
   // payload so the seal path and rollup know whether this inject could EVER egress a
   // capture. Defaults to false when omitted so an old caller never over-claims consent.
   traceUploadConsented?: boolean;
+  // The router's intent classification for this turn (intel EnrichTrace.intent_type,
+  // carried through the hook). Omitted -> null, which records "not labelled" and is
+  // deliberately distinct from the router's own "unknown".
+  intentType?: string | null;
+  // The classified topic of the prompt (hook classify_query_topic). Rides on the
+  // inject so the outcome-time coverage gap can be labelled from it.
+  queryTopicCategory?: string | null;
   // Test/replay seam: reuse a known inject_id instead of minting a fresh one.
   injectId?: string;
 }
@@ -141,6 +148,15 @@ export function buildInjectPayload(input: InjectInput): EvidenceInjectPayload {
     // false so the rollup can distinguish "capable-but-declined" from "old client".
     trace_upload_consented: input.traceUploadConsented === true,
     work_product_capture_version: CURRENT_CAPTURE_CONTRACT_VERSION,
+    // Free-form on purpose: the enum lives in intel (EnrichIntentType) and pinning a
+    // copy here would silently drop any intent a newer intel adds, which is the one
+    // value this field exists to notice.
+    intent_type:
+      typeof input.intentType === "string" && input.intentType.length > 0 ? input.intentType : null,
+    query_topic_category:
+      typeof input.queryTopicCategory === "string" && input.queryTopicCategory.length > 0
+        ? input.queryTopicCategory
+        : null,
   };
 }
 

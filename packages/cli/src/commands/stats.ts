@@ -29,7 +29,31 @@ import {
   EvidenceOutcomePayload,
   StatsViewedPayload,
 } from "../lib/analytics/envelope";
-import { computeMetrics, MetricFamily, MetricInput, REFERENCE_PRECISION_V1_LABEL } from "../lib/analytics/metrics";
+import {
+  computeMetrics,
+  MetricFamily,
+  MetricInput,
+  EVIDENCE_ITEM_REFERENCE_RATE_LABEL,
+  PROACTIVE_INJECTION_UTILIZATION_LABEL,
+  REFERENCE_PRECISION_V1_LABEL,
+} from "../lib/analytics/metrics";
+import { readLogJsonl, readLogJsonlTail } from "../lib/analytics/logs";
+import { parseMcpCalls, parseReportCitations } from "../lib/analytics/followthrough";
+import { parsePointerFires } from "../lib/evidence-pointer";
+import { IgnoredDocument, ignoredDocuments } from "../lib/analytics/ignored-by-document";
+import { matchOpenedIds, parseFileReads } from "../lib/analytics/turn-recap";
+import {
+  POINTER_KILL_MIN_FIRES,
+  PointerOutcome,
+  buildPointerEngagements,
+  pointerVerdict,
+  scorePointerOutcomes,
+} from "../lib/analytics/pointer-outcome";
+import { PullSummary, computePullSummary, emptyPullSummary } from "../lib/analytics/pull";
+import { FloorSummary, computeFloorSummary, emptyFloorSummary } from "../lib/analytics/floor";
+import { renderAskOutcomes, summarizeAskOutcomes, toAskTraceRow } from "../lib/analytics/ask-outcomes";
+import { renderDailyTimeoutSeries, summarizeDailyTimeoutSeries } from "../lib/analytics/ask-daily-series";
+import { LAYER2_ENRICH_BUDGET_MS } from "../connectors/claude-code/hook-contract";
 import { coverageGapPresentation } from "../lib/analytics/coverage-gap-presentation";
 import { normId } from "../lib/analytics/followthrough";
 import { readEvents } from "../lib/analytics/store";
@@ -48,7 +72,7 @@ import { runTurn } from "./turn";
 // --- args -------------------------------------------------------------------
 
 export interface StatsArgs {
-  section: "evidence" | null;
+  section: "evidence" | "ask" | null;
   windowDays: number;
   windowLabel: string;
   json: boolean;
@@ -89,10 +113,10 @@ export function parseStatsArgs(argv: string[]): StatsArgs {
   // in v1; once selected, the remaining argv belongs to that section's handler.
   if (argv[i] !== undefined && !argv[i].startsWith("-")) {
     const section = argv[i];
-    if (section !== "evidence") {
-      throw new Error(`Unknown \`mla stats\` section: ${section} (known: evidence)`);
+    if (section !== "evidence" && section !== "ask") {
+      throw new Error(`Unknown \`mla stats\` section: ${section} (known: evidence, ask)`);
     }
-    out.section = "evidence";
+    out.section = section;
     out.rest = argv.slice(i + 1);
     return out;
   }
@@ -115,6 +139,20 @@ export function parseStatsArgs(argv: string[]): StatsArgs {
 export interface CoverageGapBreakdown {
   type: CoverageGapType;
   count: number;
+  // What KIND of question failed, and how close retrieval got. Section 4 calls
+  // itself "the roadmap" but shipped a bare {type, count}, which says something
+  // failed and refuses to say what: an eval-set builder cannot act on it.
+  //
+  // The query TEXT is deliberately absent and stays absent. It is not retained on
+  // this path at all (internal-evidence-inject takes --topic-category, a closed
+  // enum, never the prompt) and INV-POSTHOG-PII-1 bars the prompt from this plane.
+  // Exposing it would mean BUILDING a prompt-capture path. Both fields below are
+  // closed enums already on the payload; nothing new is captured.
+  topics: { topic: string; count: number }[];
+  confidences: { confidence: string; count: number }[];
+  // Most recent occurrence, so a gap that stopped happening is distinguishable
+  // from one that is still firing. Null only if no event carried a timestamp.
+  last_seen: string | null;
 }
 
 export interface LoadBearingItem {
@@ -150,6 +188,17 @@ export interface EnforcementSummary {
   unclassified?: number;
 }
 
+// Utilization for one intent bucket. `unlabelled` counts injects whose event
+// carried no intent at all (an older hook, or a strategy with no router trace);
+// those are in NEITHER bucket, because "the router said unknown" and "nobody told
+// us" are different facts and merging them would make the split unreadable in
+// exactly the window it exists to read.
+export interface IntentSplit {
+  known: { injects_offered: number; injects_referenced: number; injection_utilization: number | null };
+  unknown: { injects_offered: number; injects_referenced: number; injection_utilization: number | null };
+  unlabelled: number;
+}
+
 export interface StatsDashboard {
   window: string;
   window_days: number;
@@ -161,14 +210,124 @@ export interface StatsDashboard {
   // observable). Contradiction/supersession and governed-decision counts have no
   // local producer -- they live in the server rollup behind `mla stats --global`.
   enforcement: EnforcementSummary;
+  // Section 1b: the PULL path -- what the agent fetched for itself. Reported
+  // separately from `evidence` and never merged into it: they answer different
+  // questions (did our push land vs did the agent's own lookup go anywhere), and
+  // one number covering both would hide whichever is doing the work.
+  pull: PullSummary;
+  // Section 1c (F1, 2026-08-08): the FLOOR path -- the always-on rules that ride on
+  // every turn whether or not anything was retrieved. The third channel, reported
+  // beside the other two and never merged into either.
+  //
+  // It is a COST number and it is labelled as one. There is no observable event for
+  // "the agent obeyed a MUST" the way there is for a pull (a citation) or a push (a
+  // reference), so counting delivery as value would be the same over-claim `mla
+  // status` was fixed for. What it buys is that the channel becomes VISIBLE: a
+  // regression in floor delivery, or a floor that doubles in size, is now detectable
+  // rather than invisible to every number on the page.
+  floor: FloorSummary;
+  // Section 1a: the SAME inject population, decomposed by the router's intent.
+  // A decomposition, never a filter: the headline metric family above is unchanged.
+  intent_split: IntentSplit;
   // Section 4: coverage gaps, sorted by demand.
   coverage_gaps: CoverageGapBreakdown[];
   coverage_gaps_total: number;
   // Section 5: load-bearing knowledge (local: by id; remote sees opaque ids).
   load_bearing: LoadBearingItem[];
+  // Section 5c: F6. Documents pushed repeatedly and never once engaged with. A
+  // CANDIDATE negative for a human to look at, never a ranking input; see
+  // lib/analytics/ignored-by-document.ts for why that boundary is the design.
+  ignored_documents: IgnoredDocument[];
+  // Section 5b: F1's moment-of-need pointer, on its OWN instrument.
+  //
+  // Kept out of the metric family above ON PURPOSE. F1 resurfaces evidence at the tool
+  // call, so its success is usually an `opened` or a silent read, neither of which is in
+  // `referenced`; and when a pointer DOES cause a pull, that pull is mla's own output.
+  // Folding either into the injection rate would make the number un-interpretable in one
+  // direction or the other. See lib/analytics/pointer-outcome.ts.
+  pointer: PointerOutcome;
   // Section 6: activity footnote (only populated when --verbose).
   commands_total: number;
   commands_by_name: { command: string; count: number }[];
+  // ACTIVATION, and deliberately NOT windowed like everything above it. "Has this workspace ever
+  // reached first value" is a lifetime question; scoping it to 30 days would un-activate a
+  // workspace that activated in month one and quietly answer a different question.
+  activation: ActivationSummary;
+}
+
+/**
+ * Did MLA ever do something in this repository that the session would not have done without it?
+ *
+ * THE DEFINITION (An's ruling, 2026-08-08): activation is the first agent turn carrying
+ * REPO-SCOPED governed state or REPO-DERIVED evidence. Deliberately narrower than "any governed
+ * rule": the always-on floor is largely generic and global, so counting it would mark a workspace
+ * activated for delivering rules that prove nothing was ever learned about THIS repository.
+ *
+ * Two signals qualify, and both are already emitted:
+ *   scoped_rule  an `mla_rule_injection` turn with scoped_rules > 0. A scoped rule matched this
+ *                turn's paths or prompt, which only happens against repo-specific targeting.
+ *   evidence     an `mla_evidence_inject`. Evidence is retrieved from this workspace's own corpus.
+ *
+ * Utilization stays a SEPARATE and stronger question (section 1): activation says the product
+ * delivered something repo-specific, not that the agent used it.
+ */
+export interface ActivationSummary {
+  activated: boolean;
+  /** ISO of the first qualifying turn; null when it never happened. */
+  first_governed_turn_at: string | null;
+  /** ISO of the earliest local command, the clock this is measured from. */
+  first_command_at: string | null;
+  /** Whole minutes between the two; null when either endpoint is missing. */
+  minutes_to_activation: number | null;
+  /** Which signal proved it, so the number is never quoted without its cause. */
+  via: "scoped_rule" | "evidence" | null;
+}
+
+/**
+ * Compute activation over the FULL local event history (never the window; see the field comment).
+ * Pure, and exported so a test can pin the definition rather than the rendering.
+ */
+export function computeActivation(events: AnalyticsEvent[]): ActivationSummary {
+  let firstCommandAt: string | null = null;
+  let firstGovernedAt: string | null = null;
+  let via: "scoped_rule" | "evidence" | null = null;
+
+  for (const e of events) {
+    const at = e.created_at;
+    if (typeof at !== "string" || at.length === 0) continue;
+    if (e.event_type === "mla_command" && (firstCommandAt === null || at < firstCommandAt)) {
+      firstCommandAt = at;
+    }
+    const qualifies =
+      e.event_type === "mla_evidence_inject"
+        ? "evidence"
+        : e.event_type === "mla_rule_injection" &&
+            typeof (e as { scoped_rules?: unknown }).scoped_rules === "number" &&
+            (e as { scoped_rules: number }).scoped_rules > 0
+          ? "scoped_rule"
+          : null;
+    if (qualifies && (firstGovernedAt === null || at < firstGovernedAt)) {
+      firstGovernedAt = at;
+      via = qualifies;
+    }
+  }
+
+  // Only report a duration when both endpoints exist AND the order makes sense. A governed turn
+  // stamped before the first command means the local spool was pruned or clock-skewed, and a
+  // negative "time to value" is worse than an absent one.
+  let minutes: number | null = null;
+  if (firstCommandAt && firstGovernedAt) {
+    const delta = Date.parse(firstGovernedAt) - Date.parse(firstCommandAt);
+    if (Number.isFinite(delta) && delta >= 0) minutes = Math.round(delta / 60000);
+  }
+
+  return {
+    activated: firstGovernedAt !== null,
+    first_governed_turn_at: firstGovernedAt,
+    first_command_at: firstCommandAt,
+    minutes_to_activation: minutes,
+    via,
+  };
 }
 
 // The server rollup read-model behind `mla stats --global` (control's
@@ -335,6 +494,10 @@ export function buildDashboard(
   events: AnalyticsEvent[],
   windowDays: number,
   nowMs: number,
+  // The pull join, computed by the caller from the two local trace files. Passed in
+  // rather than read here so buildDashboard stays a pure function of its inputs,
+  // which is what every existing test of it relies on.
+  pull: PullSummary = emptyPullSummary(),
 ): StatsDashboard {
   const startMs = nowMs - windowDays * 24 * 60 * 60 * 1000;
 
@@ -357,19 +520,72 @@ export function buildDashboard(
   });
   const evidence = computeMetrics(metricInputs);
 
+  // The intent decomposition, over the SAME decided-inject population the headline
+  // uses (evidence_offered > 0; no_opportunity AND pending both censored, F4), so the
+  // two can be read together without a denominator mismatch. This filter and
+  // computeMetrics' `scored` filter have to move together; if they ever disagree, the
+  // split will not sum to the headline and neither number will be trustworthy.
+  const bucket = () => ({ injects_offered: 0, injects_referenced: 0, injection_utilization: null as number | null });
+  const known = bucket();
+  const unknown = bucket();
+  let unlabelled = 0;
+  for (const inj of injects) {
+    const o = outcomes.get(inj.inject_id);
+    if (o === undefined || o.outcome === "no_opportunity" || o.outcome === "pending") continue;
+    if (inj.evidence_offered <= 0) continue;
+    const intent = (inj as unknown as { intent_type?: string | null }).intent_type;
+    if (typeof intent !== "string" || intent.length === 0) {
+      unlabelled++;
+      continue;
+    }
+    const b = intent === "unknown" ? unknown : known;
+    b.injects_offered++;
+    if (o?.referenced) b.injects_referenced++;
+  }
+  for (const b of [known, unknown]) {
+    b.injection_utilization = b.injects_offered ? b.injects_referenced / b.injects_offered : null;
+  }
+  const intent_split: IntentSplit = { known, unknown, unlabelled };
+
   // Section 2: governed-rule denies (the "wrong actions caught" value signal).
   // Contradiction/supersession and governed-decision counts are server-side only
   // (no local producer); the local view points at `mla stats --global` for them.
   const enforcement = summarizeEnforcement(events, startMs, nowMs);
 
   // Section 4: coverage gaps by type, sorted by demand (most frequent first).
-  const gapCounts = new Map<CoverageGapType, number>();
+  const gapAgg = new Map<
+    CoverageGapType,
+    { count: number; topics: Map<string, number>; confidences: Map<string, number>; lastSeen: string | null }
+  >();
   for (const e of events) {
     if (e.event_type !== "mla_coverage_gap" || !inWindow(e.created_at, startMs, nowMs)) continue;
-    gapCounts.set(e.coverage_gap_type, (gapCounts.get(e.coverage_gap_type) ?? 0) + 1);
+    let agg = gapAgg.get(e.coverage_gap_type);
+    if (!agg) {
+      agg = { count: 0, topics: new Map(), confidences: new Map(), lastSeen: null };
+      gapAgg.set(e.coverage_gap_type, agg);
+    }
+    agg.count += 1;
+    const topic = e.query_topic_category ?? "unknown";
+    agg.topics.set(topic, (agg.topics.get(topic) ?? 0) + 1);
+    const conf = e.retrieval_confidence ?? "none";
+    agg.confidences.set(conf, (agg.confidences.get(conf) ?? 0) + 1);
+    if (e.created_at && (agg.lastSeen === null || e.created_at > agg.lastSeen)) {
+      agg.lastSeen = e.created_at;
+    }
   }
-  const coverage_gaps: CoverageGapBreakdown[] = Array.from(gapCounts.entries())
-    .map(([type, count]) => ({ type, count }))
+  // Descending by count, then by name, so a tie renders the same way twice.
+  const byDemand = (m: Map<string, number>, key: "topic" | "confidence") =>
+    Array.from(m.entries())
+      .map(([k, count]) => ({ [key]: k, count }) as never)
+      .sort((a: { count: number }, b: { count: number }) => b.count - a.count) as never[];
+  const coverage_gaps: CoverageGapBreakdown[] = Array.from(gapAgg.entries())
+    .map(([type, agg]) => ({
+      type,
+      count: agg.count,
+      topics: byDemand(agg.topics, "topic") as { topic: string; count: number }[],
+      confidences: byDemand(agg.confidences, "confidence") as { confidence: string; count: number }[],
+      last_seen: agg.lastSeen,
+    }))
     .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
   const coverage_gaps_total = coverage_gaps.reduce((s, g) => s + g.count, 0);
 
@@ -404,6 +620,27 @@ export function buildDashboard(
     .map(([command, count]) => ({ command, count }))
     .sort((a, b) => b.count - a.count || a.command.localeCompare(b.command));
 
+  // Section 5b: F1's pointer ledger. Read from the local spools, like the pull half
+  // beside it. Cheap by construction: only the turns a pointer actually fired on are
+  // scored, and pointers are capped at two per turn.
+  const pointer = readPointerOutcome();
+
+  // Section 5c (F6): the same inject/outcome rows read above, aggregated the other way
+  // round. A document offered again and again and never engaged with is either
+  // mis-ranked or not useful, and today that fact is computed per turn and thrown away.
+  // Only DECIDED windows count: a pending inject, or one that landed on the session's
+  // last turn, had no opportunity to be used and proves nothing.
+  const ignored_documents = ignoredDocuments(
+    injects.map((inj) => {
+      const o = outcomes.get(inj.inject_id);
+      return {
+        offered_source_ids: inj.offered_source_ids ?? [],
+        referenced_source_ids: o?.referenced_source_ids ?? [],
+        decided: o !== undefined && o.outcome !== "pending" && o.outcome !== "no_opportunity",
+      };
+    }),
+  );
+
   return {
     window: `${windowDays}d`,
     window_days: windowDays,
@@ -411,11 +648,20 @@ export function buildDashboard(
     evidence,
     injections: injects.length,
     enforcement,
+    pull,
+    // Computed from the SAME windowed event list as everything else, so the three
+    // channels describe one window and can be read against each other.
+    floor: computeFloorSummary(events.filter((e) => inWindow(e.created_at, startMs, nowMs))),
+    intent_split,
     coverage_gaps,
     coverage_gaps_total,
     load_bearing,
+    ignored_documents,
+    pointer,
     commands_total,
     commands_by_name,
+    // Full history on purpose, not the windowed slice above.
+    activation: computeActivation(events),
   };
 }
 
@@ -456,10 +702,137 @@ function enforcementLines(en: EnforcementSummary, verbose: boolean): string[] {
   return out;
 }
 
+/**
+ * Score F1's pointers against what the agent did next.
+ *
+ * Reads four small local spools and joins only on the turns a pointer fired. Fails to an
+ * empty ledger on any fault: a stats section is not worth breaking `mla stats` over, and
+ * "no pointers scored" is honestly what an unreadable spool means.
+ */
+function readPointerOutcome(): PointerOutcome {
+  try {
+    // 1MB of ~150-byte rows is the last ~7,000 fires, far past the 50 the verdict needs.
+    const fires = parsePointerFires(readLogJsonlTail("evidence-pointers.jsonl", 1024 * 1024));
+    if (!fires.length) return scorePointerOutcomes([], []);
+    const readsByTurn = new Map<string, string[]>();
+    for (const r of parseFileReads(readLogJsonl("file-reads.jsonl"))) {
+      const key = `${r.session_id} ${r.turn_index}`;
+      const list = readsByTurn.get(key) ?? [];
+      list.push(r.path);
+      readsByTurn.set(key, list);
+    }
+    const engagements = buildPointerEngagements(fires, {
+      mcpCalls: parseMcpCalls(readLogJsonl("mcp-calls.jsonl")),
+      citations: parseReportCitations(readLogJsonl("report-citations.jsonl")),
+      readsByTurn,
+      // The SHARED id-to-path rule, not a second copy: a private one here would let the
+      // pointer ledger and the turn recap disagree about whether a file was opened.
+      matchOpened: (offered, paths) =>
+        matchOpenedIds(
+          offered,
+          paths.map((p) => ({ session_id: "", turn_index: 0, path: p })),
+        ),
+    });
+    return scorePointerOutcomes(fires, engagements);
+  } catch {
+    return scorePointerOutcomes([], []);
+  }
+}
+
+/**
+ * Section 5b. Reported beside the injection rate and never inside it, with the verdict
+ * spelled out, because this number's whole job is to decide whether F1 stays.
+ */
+function pointerLines(p: PointerOutcome): string[] {
+  const lines: string[] = ["5b. Moment-of-need pointers (F1)"];
+  if (p.pointed === 0) {
+    lines.push("   No pointers have fired yet.");
+    return lines;
+  }
+  const rate = p.engagement_rate === null ? "n/a" : `${Math.round(p.engagement_rate * 100)}%`;
+  lines.push(`   Fired: ${p.fires} (${p.pointed} distinct document/turn opportunities)`);
+  lines.push(`   Engaged after the pointer: ${p.engaged}/${p.pointed} (${rate})`);
+  const verdict = pointerVerdict(p);
+  if (verdict === "undecided") {
+    lines.push(`   Verdict: undecided (${p.pointed}/${POINTER_KILL_MIN_FIRES} opportunities toward the kill check)`);
+  } else {
+    lines.push(`   Verdict: ${verdict.toUpperCase()}`);
+  }
+  // Said out loud, because the alternative is someone adding these two numbers together.
+  lines.push(
+    "   Scored separately from the injection rate on purpose: a pointer's success is usually an open or a",
+  );
+  lines.push(
+    "   silent read (invisible to `referenced`), and a pointer-caused pull is mla grading its own output.",
+  );
+  return lines;
+}
+
+/**
+ * Section 1's headline, shared by the local and global renders.
+ *
+ * ONE implementation on purpose: these two blocks were byte-identical copies, and the
+ * F4 change had to be made twice to land at all. A metric whose two renders can drift
+ * is a metric that will eventually report two different numbers for the same fact.
+ *
+ * F4 (2026-08-08): `unresolved` is stated, with the reason, whenever it is non-zero.
+ * The old render said "N pending" inside a parenthetical and then printed a rate that
+ * had already counted those same injects as misses. Now the rate covers DECIDED
+ * windows only and the censored count sits directly beneath it, so the sample size
+ * behind the percentage is never implicit.
+ */
+function evidenceHeadlineLines(m: MetricFamily, injections: number): string[] {
+  const lines: string[] = [
+    `   mla surfaced evidence in ${injections} injection(s) (${m.injects_offered} decided, with evidence offered).`,
+    `   ${PROACTIVE_INJECTION_UTILIZATION_LABEL}: ${pct(m.injection_utilization)} (${m.injects_referenced}/${m.injects_offered} decided injects referenced)`,
+    `   ${REFERENCE_PRECISION_V1_LABEL}:  ${pct(m.reference_precision_v1)} (${m.used}/${m.used + m.ignored} referenced / decided)`,
+    `   Unknown Coverage:         ${pct(m.unknown_coverage)} (${m.unknown}/${m.closed_windows} closed windows unclassified)`,
+    `   ${EVIDENCE_ITEM_REFERENCE_RATE_LABEL}: ${pct(m.evidence_item_utilization)} (${m.distinct_referenced}/${m.distinct_offered} distinct docs)`,
+  ];
+  if (m.unresolved > 0) {
+    // CENSORED, not counted. Spelled out because the alternative reading of a small
+    // denominator is "mla barely ran", and the true reading is "most windows have not
+    // been graded yet". Split by cause: the two are unresolved for different reasons
+    // and only one of them will ever resolve.
+    const parts: string[] = [];
+    if (m.pending > 0) parts.push(`${m.pending} still open`);
+    if (m.no_opportunity > 0) parts.push(`${m.no_opportunity} landed on a session's final turn`);
+    lines.push(
+      `   Unresolved windows:       ${m.unresolved} (${parts.join("; ")}); censored from every rate above, never scored a miss`,
+    );
+  }
+  return lines;
+}
+
 export function renderDashboard(d: StatsDashboard, verbose: boolean): string {
   const m = d.evidence;
   const lines: string[] = [];
   lines.push(`mla usefulness, last ${d.window} (workspace-local):`);
+  lines.push("");
+
+  // Activation leads, because a workspace that never activated makes every number below it a
+  // measurement of nothing. Marked lifetime so it is never read as part of the window.
+  const a = d.activation;
+  if (a.activated) {
+    const when =
+      a.minutes_to_activation === null
+        ? ""
+        : a.minutes_to_activation < 60
+          ? ` after ${a.minutes_to_activation}m`
+          : ` after ${(a.minutes_to_activation / 60).toFixed(1)}h`;
+    const cause = a.via === "evidence" ? "evidence from this repo" : "a repo-scoped rule";
+    lines.push(`0. Activated (lifetime): first turn carrying ${cause}${when} from the first command.`);
+  } else {
+    lines.push(
+      "0. NOT activated (lifetime): no turn has yet carried a repo-scoped rule or evidence from",
+    );
+    lines.push(
+      "   this repository. The always-on floor does not count: it is generic, so delivering it",
+    );
+    lines.push(
+      "   proves nothing was learned about this repo. Run the `/mla onboard` skill to index it.",
+    );
+  }
   lines.push("");
 
   // 1. Evidence followthrough (headline).
@@ -467,29 +840,100 @@ export function renderDashboard(d: StatsDashboard, verbose: boolean): string {
   if (d.injections === 0) {
     lines.push("   No evidence injections recorded in this window yet.");
   } else {
-    const pendingNote = m.pending > 0 ? `, ${m.pending} pending` : "";
-    lines.push(
-      `   mla surfaced evidence in ${d.injections} injection(s) (${m.injects_offered} offered evidence${pendingNote}).`,
-    );
-    lines.push(
-      `   Injection Utilization:    ${pct(m.injection_utilization)} (${m.injects_referenced}/${m.injects_offered} offered injects referenced)`,
-    );
-    lines.push(
-      `   ${REFERENCE_PRECISION_V1_LABEL}:  ${pct(m.reference_precision_v1)} (${m.used}/${m.used + m.ignored} referenced / decided)`,
-    );
-    lines.push(
-      `   Unknown Coverage:         ${pct(m.unknown_coverage)} (${m.unknown}/${m.closed_windows} closed windows unclassified)`,
-    );
-    lines.push(
-      `   Evidence Item Utilization: ${pct(m.evidence_item_utilization)} (${m.distinct_referenced}/${m.distinct_offered} distinct docs)`,
-    );
-    if (m.no_opportunity > 0) {
-      // The agent never got a turn to act on these, so they are excluded from every
-      // rate above; surfaced here only so the count is not silently dropped.
+    lines.push(...evidenceHeadlineLines(m, d.injections));
+    // The SAME injects, split by what the router thought the turn was about. A
+    // decomposition, not a filter: the rate above is unchanged. It exists because
+    // "the router could not classify this turn and we injected anyway" and "the
+    // ranking was wrong" produce the same ignored inject, and only this split tells
+    // them apart. Behavior on an unknown intent is deliberately unchanged until this
+    // has a week of data: suppressing those injects would raise the rate above
+    // without making one inject more useful.
+    const isp = d.intent_split;
+    if (isp.known.injects_offered + isp.unknown.injects_offered > 0) {
       lines.push(
-        `   No-opportunity injects:   ${m.no_opportunity} (landed on a session's final turn; excluded from all rates)`,
+        `     by router intent: known ${pct(isp.known.injection_utilization)} (${isp.known.injects_referenced}/${isp.known.injects_offered}), unknown ${pct(isp.unknown.injection_utilization)} (${isp.unknown.injects_referenced}/${isp.unknown.injects_offered})`,
+      );
+      if (isp.unlabelled > 0) {
+        lines.push(`     ${isp.unlabelled} inject(s) carry no router intent yet (pre-rollout rows).`);
+      }
+    } else if (isp.unlabelled > 0) {
+      // Never render "unknown 0%" for a bucket with no members: that reads as a
+      // measured failure of the router rather than as telemetry that has not
+      // reached this window yet.
+      lines.push(`     by router intent: not yet labelled (${isp.unlabelled} inject(s) predate the intent field).`);
+    }
+  }
+  lines.push("");
+
+  // 1b. The PULL path. Reported next to the push metrics and never merged into
+  // them. Every number here is already on disk (mcp-calls.jsonl +
+  // report-citations.jsonl); this section exists because nothing was reading them.
+  //
+  // Note what is NOT claimed. A non-empty pull is a RETRIEVAL result, not a help
+  // result: on this machine 93% of evidence-tool calls returned something and 1.6%
+  // of returned references were ever cited. Only the observable follow-through is
+  // reported as follow-through.
+  lines.push("1b. Pull path (evidence the agent fetched for itself)");
+  if (d.pull.pull_calls === 0) {
+    lines.push("   No agent-initiated evidence calls recorded in this window.");
+  } else {
+    const p = d.pull;
+    lines.push(
+      `   Pull calls:               ${p.pull_calls} (${p.non_empty_pull_calls} returned results, ${p.empty_pull_calls} empty)`,
+    );
+    lines.push(
+      `   Documents returned:       ${p.documents_returned} (${p.unique_documents_returned} unique)`,
+    );
+    lines.push(
+      `   Pull reference follow-through: ${pct(p.pull_reference_followthrough)} (${p.returned_references_cited}/${p.returned_references} returned references later cited)`,
+    );
+    if (verbose && p.by_tool.length > 0) {
+      lines.push(`     by tool: ${p.by_tool.map((t) => `${t.tool} ${t.count}`).join(", ")}`);
+    }
+    lines.push(
+      "   A returned result is not a used result: only citations are counted above.",
+    );
+  }
+  lines.push("");
+
+  // 1c. The floor channel (F1). Third of three, and the only one reported as pure cost.
+  lines.push("1c. Floor (governed rules delivered on every turn)");
+  if (d.floor.turns === 0) {
+    lines.push("   No rule block was delivered in this window.");
+  } else {
+    const f = d.floor;
+    const rules = f.rules_now === null ? "unknown" : `${f.rules_now}`;
+    lines.push(
+      `   Turns carrying rules:     ${f.turns} (${rules} always-on rules on the latest turn)`,
+    );
+    lines.push(
+      `   Always-on cost:           ~${f.always_on_tokens_mean ?? 0} tokens/turn, ${f.always_on_tokens_total} this window`,
+    );
+    if (f.always_on_share !== null) {
+      lines.push(
+        `   Untargeted share:         ${pct(f.always_on_share)} of delivered rule tokens rode on every turn regardless of the prompt`,
       );
     }
+    if (f.overflow_turns > 0) {
+      // A block is not an injection. Held out of the means above and named here,
+      // because a MUST that could not fit is the most actionable row on this page.
+      lines.push(
+        `   Blocked by budget:        ${f.overflow_turns} turn(s) where an applicable MUST did not fit (prompt blocked, fail-closed)`,
+      );
+    }
+    if (f.degraded_turns > 0) {
+      lines.push(
+        `   Counts unknown:           ${f.degraded_turns} turn(s) assembled from a missing or stale cache (bytes true, rule counts unknown)`,
+      );
+    }
+    // Said out loud, every render, because this is the one section on the page whose
+    // numbers a reader will otherwise take for a value claim.
+    lines.push(
+      "   This is COST, not value: delivery is observable, obedience is not. The two reference rates",
+    );
+    lines.push(
+      "   above are the only 'did it help' numbers here, and the three channels are never summed.",
+    );
   }
   lines.push("");
 
@@ -515,6 +959,14 @@ export function renderDashboard(d: StatsDashboard, verbose: boolean): string {
     for (const g of d.coverage_gaps) {
       const gap = coverageGapPresentation(g.type);
       lines.push(`     ${gap.label}: ${g.count}  (${gap.hint})`);
+      // The class of question that failed, and how close retrieval got. This is
+      // what makes the section actionable as a roadmap: a bare count names no
+      // work. The query text is not retained on this path and is not printed.
+      const topics = g.topics.map((t) => `${t.topic} x${t.count}`).join(", ");
+      if (topics) lines.push(`       topics:     ${topics}`);
+      const confs = g.confidences.map((c) => `${c.confidence} x${c.count}`).join(", ");
+      if (confs) lines.push(`       retrieval:  ${confs}`);
+      if (g.last_seen) lines.push(`       last seen:  ${g.last_seen}`);
     }
   }
   lines.push("");
@@ -527,6 +979,18 @@ export function renderDashboard(d: StatsDashboard, verbose: boolean): string {
     lines.push("   Most-referenced evidence:");
     for (const it of d.load_bearing) lines.push(`     ${it.source_id} (x${it.reference_count})`);
   }
+  if (d.ignored_documents.length > 0) {
+    // Named as an OBSERVATION, with the caveat attached, because the number invites
+    // exactly one wrong reading ("delete these notes") and one dangerous one ("penalize
+    // these notes"). Neither is supported by the signal.
+    lines.push("   Offered repeatedly, never engaged with:");
+    for (const it of d.ignored_documents.slice(0, 5)) {
+      lines.push(`     ${it.source_id} (offered x${it.offered}, engaged 0)`);
+    }
+    lines.push("     Mis-ranked or not useful; this cannot tell which. A question for a human, not a ranking signal.");
+  }
+  lines.push("");
+  lines.push(...pointerLines(d.pointer));
 
   // 6. Activity footnote (only under --verbose; never the lead).
   if (verbose) {
@@ -557,27 +1021,7 @@ export function renderGlobalDashboard(r: GlobalRollup): string {
   if (r.injections === 0) {
     lines.push("   No evidence injections recorded in this window yet.");
   } else {
-    const pendingNote = m.pending > 0 ? `, ${m.pending} pending` : "";
-    lines.push(
-      `   mla surfaced evidence in ${r.injections} injection(s) (${m.injects_offered} offered evidence${pendingNote}).`,
-    );
-    lines.push(
-      `   Injection Utilization:    ${pct(m.injection_utilization)} (${m.injects_referenced}/${m.injects_offered} offered injects referenced)`,
-    );
-    lines.push(
-      `   ${REFERENCE_PRECISION_V1_LABEL}:  ${pct(m.reference_precision_v1)} (${m.used}/${m.used + m.ignored} referenced / decided)`,
-    );
-    lines.push(
-      `   Unknown Coverage:         ${pct(m.unknown_coverage)} (${m.unknown}/${m.closed_windows} closed windows unclassified)`,
-    );
-    lines.push(
-      `   Evidence Item Utilization: ${pct(m.evidence_item_utilization)} (${m.distinct_referenced}/${m.distinct_offered} distinct docs)`,
-    );
-    if (m.no_opportunity > 0) {
-      lines.push(
-        `   No-opportunity injects:   ${m.no_opportunity} (landed on a session's final turn; excluded from all rates)`,
-      );
-    }
+    lines.push(...evidenceHeadlineLines(m, r.injections));
   }
   lines.push("");
 
@@ -780,6 +1224,64 @@ function recordStatsViewed(args: StatsArgs, deps: StatsDeps): void {
   }
 }
 
+// The hook's enrichment deadline, shown beside the latency distribution so a reader can see the
+// tail against the wall instead of having to know where the wall is.
+//
+// IMPORTED, not restated. This was "the reader's copy" of the hook's value for exactly as long
+// as it took to drift: the prior wall lives in ask-outcomes as PRIOR_ENRICH_BUDGET_MS, and the
+// only reason a reader's copy existed at all was that the hook is bash. It now reads the one
+// canonical export, which test/lib/enrich-budget-canonical.spec.ts binds to the shell literal.
+const ENRICH_BUDGET_MS = LAYER2_ENRICH_BUDGET_MS;
+
+// `mla stats ask [--window Nd]`: the enrichment-outcome report over ask-traces.jsonl.
+function runAskOutcomes(args: StatsArgs): number {
+  const rows = readLogJsonl("ask-traces.jsonl")
+    .map(toAskTraceRow)
+    .filter((r): r is NonNullable<typeof r> => r !== null);
+
+  // The section parser returns as soon as it sees the bare section token, so this section's own
+  // flags arrive unparsed in `rest`. Read them here rather than restructuring a parser three other
+  // sections depend on.
+  let days = args.windowDays;
+  let json = args.json;
+  for (let i = 0; i < args.rest.length; i++) {
+    const a = args.rest[i];
+    if (a === "--json") json = true;
+    else if (a === "--window") {
+      const v = args.rest[++i] ?? "";
+      const m = /^(\d+)d$/.exec(v);
+      if (!m) {
+        console.error(`\`mla stats ask --window\` expects Nd (e.g. 7d), got ${JSON.stringify(v)}`);
+        return 2;
+      }
+      days = Number(m[1]);
+    } else {
+      console.error(`Unknown flag for \`mla stats ask\`: ${a}`);
+      return 2;
+    }
+  }
+  const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+  const inWindow = rows.filter((r) => r.ts >= cutoff);
+
+  if (inWindow.length === 0) {
+    console.log(`mla stats ask: no enrichment attempts in the last ${days}d.`);
+    return 0;
+  }
+  const report = summarizeAskOutcomes(inWindow, { budgetMs: ENRICH_BUDGET_MS });
+  // The same rows, per day. The window headline cannot show a step (30 days of 2-6% averaged
+  // with 5 days of 20% still reads 6.7%), and that is how the 2026-08-05 regression stayed
+  // unfiled for five days with every row already on disk. No new store, schedule or flag: it
+  // rides this report.
+  const daily = summarizeDailyTimeoutSeries(inWindow);
+  if (json) {
+    console.log(JSON.stringify({ ...report, dailyTimeoutSeries: daily }, null, 2));
+    return 0;
+  }
+  for (const line of renderAskOutcomes(report, `last ${days}d`)) console.log(line);
+  for (const line of renderDailyTimeoutSeries(daily)) console.log(line);
+  return 0;
+}
+
 export async function runStats(argv: string[], deps: StatsDeps = {}): Promise<number> {
   // `mla stats --turn [N]` is an alias for the per-turn recap (`mla turn`). It is
   // intercepted before parseStatsArgs (which has no --turn flag) and delegated to
@@ -806,6 +1308,14 @@ export async function runStats(argv: string[], deps: StatsDeps = {}): Promise<nu
     return (deps.adoption ?? runAdoption)(args.rest);
   }
 
+  // `mla stats ask` reads the enrichment outcomes we already trace. It exists because a
+  // 2026-08-05 audit summed timeouts and dependency-down errors into one "11.3% hard-failure
+  // rate" and argued a latency claim off p90, and neither error needed new telemetry to catch:
+  // enrich_latency_ms and fail_open_reason were on every row. Nobody was reading them.
+  if (args.section === "ask") {
+    return runAskOutcomes(args);
+  }
+
   // `--global` reads the control rollup read-model (spec section 10.4), not PostHog.
   if (args.global) {
     return runGlobalStats(args, deps);
@@ -814,7 +1324,19 @@ export async function runStats(argv: string[], deps: StatsDeps = {}): Promise<nu
   const read = deps.read ?? readEvents;
   const nowMs = deps.nowMs ?? Date.now();
   const events = read();
-  const dashboard = buildDashboard(events, args.windowDays, nowMs);
+  // The pull join reads the two LOCAL trace files the hooks already write. Windowed
+  // by the same cutoff the event population uses, so the two halves of the dashboard
+  // describe the same span.
+  const startMs = nowMs - args.windowDays * 24 * 60 * 60 * 1000;
+  const inSpan = (r: Record<string, unknown>): boolean => {
+    const t = typeof r.ts === "string" ? Date.parse(r.ts) : NaN;
+    return !Number.isFinite(t) || (t >= startMs && t <= nowMs);
+  };
+  const pull = computePullSummary(
+    parseMcpCalls(readLogJsonl("mcp-calls.jsonl").filter(inSpan)),
+    parseReportCitations(readLogJsonl("report-citations.jsonl").filter(inSpan)),
+  );
+  const dashboard = buildDashboard(events, args.windowDays, nowMs, pull);
 
   if (args.json) {
     console.log(JSON.stringify(dashboard, null, 2));

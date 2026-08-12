@@ -99,7 +99,7 @@ describe("common.sh spawn_reconcile (detached deleted-session sweep)", () => {
     try {
       expect(recorded).toContain("session reconcile");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -110,7 +110,7 @@ describe("common.sh spawn_reconcile (detached deleted-session sweep)", () => {
     try {
       expect(recorded).toEqual([]);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

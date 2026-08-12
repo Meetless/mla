@@ -3,6 +3,7 @@ import {
   parseKbClaimsArgs,
   parseKbClaimVerdictArgs,
   runKbClaimVerdict,
+  renderGroundingCapability,
 } from "../../src/commands/kb_claims";
 
 // `accept` and `reject` now serve TWO grains under one word: a document ref gets the
@@ -149,5 +150,24 @@ describe("runKbClaimVerdict refuses --agent", () => {
   it("a usage error is exit 2, not a fault", async () => {
     expect(await runKbClaimVerdict("accept", [])).toBe(2);
     expect(errSpy.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(/a claim id is required/);
+  });
+});
+
+// --- Phase 1 closure: do not imply verification runs -------------------------
+// Ruling 2026-08-06: claim-grounding verification was never implemented, so
+// `groundingStatus: UNKNOWN` on every claim is EXPECTED behavior, not a broken
+// caller. An operator reading a claims listing must not infer that accepting a
+// claim makes it trusted-for-generation: it does not, and cannot, until a
+// verifier exists. Derived from code ownership (no verifier writes
+// groundingStatus), never from a persisted capability flag.
+describe("claim grounding capability line", () => {
+  it("states that verification is not implemented, and that verified claims are 0", () => {
+    const out = renderGroundingCapability();
+    expect(out).toContain("Claim grounding verification: not implemented");
+    expect(out).toContain("Verified claims: 0");
+  });
+
+  it("does not imply a human verdict confers generation trust", () => {
+    expect(renderGroundingCapability()).toMatch(/not.*trust|reserved|does not/i);
   });
 });

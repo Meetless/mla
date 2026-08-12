@@ -278,7 +278,7 @@ describe("env_assignment: a reference is not a value", () => {
   // still reported a hit on its own output, so an already-redacted document was
   // refused at the egress boundary for containing the proof it had been redacted.
   it("does not flag its own output", () => {
-    const once = String(redact("GH_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a"));
+    const once = String(redact("GH_TOKEN=gh" + "p_16C7e42F292c6912E7710c838347Ae178B4a"));
     expect(once).toBe(`GH_TOKEN=${REDACTED}`);
     expect(redact(once)).toBe(once);
     expect(scanForCredentials(once)).toEqual([]);

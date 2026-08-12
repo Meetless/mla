@@ -56,7 +56,7 @@ describe("runInternalEvidenceInject", () => {
     delete process.env.MEETLESS_TELEMETRY;
     delete process.env.MEETLESS_NO_TELEMETRY;
     delete process.env.CLAUDE_CODE_SESSION_ID;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const baseArgv = (over: string[] = []): string[] => [

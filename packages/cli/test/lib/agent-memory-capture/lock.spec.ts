@@ -16,7 +16,7 @@ describe("acquireBindingLock (CONCURRENCY-1)", () => {
     home = mkdtempSync(join(tmpdir(), "amlock-"));
   });
   afterEach(() => {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("acquires when free and records the holder pid", () => {

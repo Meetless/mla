@@ -41,7 +41,7 @@ describe("resolveSessionStartHook", () => {
   afterEach(() => {
     if (prevHome === undefined) delete process.env.MEETLESS_HOME;
     else process.env.MEETLESS_HOME = prevHome;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function load() {

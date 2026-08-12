@@ -159,7 +159,7 @@ describe("flush.sh stamps X-Meetless-Actor on capture writes (T1.4 transport)", 
         expect(call).toContain(`X-Meetless-Actor: ${ACTOR}`);
       }
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

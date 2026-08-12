@@ -56,7 +56,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 // True when `p` resolves inside `root` (or is `root`). Uses path arithmetic, not string

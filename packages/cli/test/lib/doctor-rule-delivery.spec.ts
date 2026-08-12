@@ -106,6 +106,75 @@ describe("doctor rule DELIVERY checks", () => {
     expect(c.detail).toContain("no floor block");
   });
 
+  // The fresh-install closed loop (notes/20260807-mla-activation-onboarding-audit.md §1.2
+  // Finding A). Three tests, because the fix is only correct if it separates the two causes of a
+  // zero floor rather than excusing all of them.
+  it("RED, still, when the workspace HAS governed rules but this checkout carries none", () => {
+    // Delivery is genuinely broken here: 12 rules exist and none of them reached this root.
+    // This is the case `mla scan` really does fix, so the remedy stays.
+    const checks = run({
+      cacheForThisRoot: cache({ floorRules: [] }),
+      governedRules: { kind: "known", count: 12 },
+    });
+    const c = byId(checks, "rules.scan-cache");
+    expect(c.ok).toBe(false);
+    expect(c.label).toContain("NO floor rules");
+    expect(c.detail).toContain("mla scan");
+  });
+
+  it("INFO, not RED, when the workspace has no governed rules to deliver yet", () => {
+    // A correctly installed brand-new workspace. Before this, doctor exited RED for every new
+    // user and prescribed `mla scan`, which cannot mint a floor rule because the floor carries
+    // only bundle-sourced human-attested directives. Running it produced an identical RED.
+    const checks = run({
+      cacheForThisRoot: cache({ floorRules: [] }),
+      governedRules: { kind: "known", count: 0 },
+    });
+    const c = byId(checks, "rules.scan-cache");
+    expect(c.ok).toBe(true);
+    expect(c.level).toBe("info");
+    expect(c.label).toContain("no governed rules to deliver yet");
+    // The remedy must point at onboarding, and must NOT send the user back into the loop.
+    expect(c.detail).toContain("/mla onboard");
+    expect(c.detail).not.toContain("run `mla scan`");
+    // A brand-new workspace that has not taken a turn yet must not be RED overall.
+    expect(doctorJson(run({
+      cacheForThisRoot: cache({ floorRules: [] }),
+      governedRules: { kind: "known", count: 0 },
+      receipt: null,
+    })).status).toBe("green");
+  });
+
+  it("INFO when no bundle has been fetched yet, and the remedy is the one that works", () => {
+    // `mla activate` binds the folder without pulling rules, so this is the ordinary state one
+    // command before the first scan. Measured in a clean room 2026-08-08: activate then doctor
+    // gave "carries NO floor rules ... run `mla scan`" and exited RED, on a brand-new workspace
+    // where nothing was wrong. Here `mla scan` genuinely IS the lever (it performs the pull), so
+    // the remedy stays, but the row must not be a hard failure.
+    const checks = run({
+      cacheForThisRoot: cache({ floorRules: [] }),
+      governedRules: { kind: "never-fetched" },
+    });
+    const c = byId(checks, "rules.scan-cache");
+    expect(c.ok).toBe(true);
+    expect(c.level).toBe("info");
+    expect(c.label).toContain("no rule bundle fetched");
+    expect(c.detail).toContain("mla scan");
+    // It must NOT claim the workspace has no rules: they may exist on the authority and simply
+    // not be on this machine, and saying otherwise would hide an undelivered rule set.
+    expect(c.detail).not.toContain("no accepted rules");
+  });
+
+  it("RED when the governed rule count is UNKNOWN, because unknown must never suppress", () => {
+    // Bundle unreadable. Suppressing on null would re-open the 2026-08-02 hole this file exists
+    // to guard: a delivery failure hidden behind a read that merely failed.
+    const checks = run({
+      cacheForThisRoot: cache({ floorRules: [] }),
+      governedRules: { kind: "unknown" },
+    });
+    expect(byId(checks, "rules.scan-cache").ok).toBe(false);
+  });
+
   it("RED when the last turn emitted a head carrying no floor rules", () => {
     const checks = run({
       receipt: receipt({ delivery: "missing", floorRules: 0, reason: "floor_empty" }),

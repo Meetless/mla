@@ -155,6 +155,10 @@ describe("the deny tile's review evidence DOES leave the machine (to your own co
         "blocked_path",
         "decision",
         "enforced_tool",
+        // The ATTESTED ceiling (D.4). A closed {OBSERVE, WARN, ASK, DENY} enum, so it belongs in the
+        // "ids and enums" class this assertion exists to protect, not the content-bearing one: it
+        // names an authority level, never a path, a statement or a person.
+        "enforcement_ceiling",
         "incident_id",
         "review_status",
         "rule_node_id",

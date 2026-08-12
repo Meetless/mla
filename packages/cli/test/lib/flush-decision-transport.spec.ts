@@ -201,7 +201,7 @@ describe("flush.sh agent-decision transport (T16 hard gate)", () => {
       // Clean drain self-cleans the spool.
       expect(fs.existsSync(queueFile)).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -231,7 +231,7 @@ describe("flush.sh agent-decision transport (T16 hard gate)", () => {
       expect(decision).toBeDefined();
       expect(decision?.eventKey).toBe("agent_decision_captured:claude_code:toolu_abc#0");
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

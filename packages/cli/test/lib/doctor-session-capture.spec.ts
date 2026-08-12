@@ -24,7 +24,7 @@ describe("sessionCaptureCheck (mla doctor, T3.3)", () => {
     fs.mkdirSync(gate, { recursive: true });
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("reports active when no <sid>.off sentinel exists", () => {

@@ -16,10 +16,11 @@ import {
   type IntelAskParams,
 } from "../lib/mcp-fetchers";
 import { makeMcpStaleCheck } from "../lib/staleness";
-import { MCP_RESTART_EXIT_CODE, isMcpChild } from "../lib/mcp-restart";
+import { MCP_RESTART_EXIT_CODE, isMcpChild, isMcpReload } from "../lib/mcp-restart";
 import { installOrphanGuard } from "../lib/orphan-guard";
 import { isPackagedBinary } from "../lib/packaged";
 import { recordMcpEvidenceUnavailable } from "../lib/failure-telemetry";
+import { emitOnboardingOffer } from "../lib/analytics/onboarding-offer";
 
 // The enum-only friction record the MCP server hands us when an evidence tool's
 // intel call fails (Item 5). Substrate is already stripped at the MCP boundary
@@ -78,6 +79,26 @@ export interface ActiveMcpServerDeps {
   // deadletter (recordMcpEvidenceUnavailable), stamped with this workspace. The
   // server owns NO fs/env, so the wiring lives here; the closure never throws.
   recordFailure: (rec: McpEvidenceFailure) => void;
+  // Onboarding-gap sink (P0-2). The server calls this exactly when a zero-candidate pull renders
+  // the ONBOARDING-GAP remedy, i.e. "this workspace has no indexed documents, run /mla onboard".
+  // It is the offer's LEVEL trigger: unlike SessionStart, which speaks before the user has felt
+  // anything, this fires at the moment the miss actually happened.
+  //
+  // Deliberately NOT called for the other two empty-pull branches. A populated corpus that simply
+  // did not match is a retriever miss, not an onboarding gap, and `captured_not_indexed` is a
+  // workspace that already onboarded and whose documents went down a non-grounding capture lane;
+  // telling either of them to onboard is the false remedy this split exists to stop.
+  //
+  // Same shape and same guarantees as recordFailure above: enum-only, side-effect only, and the
+  // closure never throws, so telemetry can never break a tool call.
+  recordOnboardingGap: () => void;
+  // M1: is this boot a self-heal RELOAD rather than the session's first worker?
+  // A reload happens behind a client that never saw a disconnect (the supervisor
+  // holds fd 0/1 on purpose), so the client still has the pre-reload tool schema
+  // cached and is feeding it to the model. When true the server emits
+  // `notifications/tools/list_changed` after connecting, which is the only
+  // mechanism measured to actually move the model-visible contract.
+  announceToolListChanged: boolean;
 }
 
 /**
@@ -98,6 +119,10 @@ export interface InactiveStatus {
 export interface InactiveMcpServerDeps {
   mode: "inactive";
   status: InactiveStatus;
+  // Same reload signal as the active deps. An inactive server that reloads after
+  // `mla activate` swaps a status-only tool list for the real one, which is
+  // exactly the change the notification exists to announce.
+  announceToolListChanged: boolean;
 }
 
 /**
@@ -250,11 +275,12 @@ async function serveInactive(
   startServer: (deps: McpServerDeps) => Promise<unknown>,
   installGuard: () => void,
   err: (msg: string) => void,
+  announceToolListChanged = false,
 ): Promise<number> {
   err(`meetless mcp: inactive (${status.reason}); run \`${status.action.command}\` to enable.`);
   installGuard();
   try {
-    await startServer({ mode: "inactive", status });
+    await startServer({ mode: "inactive", status, announceToolListChanged });
     return 0;
   } catch (e) {
     err(`meetless mcp server exited with an error: ${(e as Error).message}`);
@@ -277,6 +303,9 @@ export async function runMcp(
   const env = deps.env ?? process.env;
   const err = deps.errorLog ?? ((m: string) => console.error(m));
   const exit = deps.exit ?? ((code: number) => process.exit(code));
+  // M1: is this the session's first worker, or a self-heal respawn behind a
+  // client that still has the old tool schema cached? Only the latter announces.
+  const reloaded = isMcpReload(argv, env);
 
   let cfg: CliConfig;
   try {
@@ -290,7 +319,7 @@ export async function runMcp(
   // a status-only server so Claude Code shows a CONNECTED (not red) server that
   // can explain it needs `mla login`.
   if (cfg.auth.mode === "none") {
-    return serveInactive(notAuthenticatedStatus(), startServer, installGuard, err);
+    return serveInactive(notAuthenticatedStatus(), startServer, installGuard, err, reloaded);
   }
 
   let ctx: WorkspaceContext;
@@ -301,10 +330,10 @@ export async function runMcp(
     // red. Distinguish a missing activation (`mla activate`) from a present but
     // broken marker (`mla doctor` to repair).
     if (e instanceof NotActivatedError) {
-      return serveInactive(notActivatedStatus(), startServer, installGuard, err);
+      return serveInactive(notActivatedStatus(), startServer, installGuard, err, reloaded);
     }
     if (e instanceof MarkerMissingWorkspaceIdError) {
-      return serveInactive(invalidActivationStatus(), startServer, installGuard, err);
+      return serveInactive(invalidActivationStatus(), startServer, installGuard, err, reloaded);
     }
     // An unanticipated resolution failure stays fatal (red): we cannot truthfully
     // describe a state we did not expect.
@@ -333,6 +362,12 @@ export async function runMcp(
     onStaleRestart: isMcpChild(argv, env)
       ? () => exit(MCP_RESTART_EXIT_CODE)
       : null,
+    // The other half of the self-heal: onStaleRestart moves the HANDLER (the
+    // worker exits, the parent respawns it on the new dist), and this moves the
+    // model-visible SCHEMA (the respawned worker tells the client its tool list
+    // changed). Without it a reload swaps the code underneath a contract the
+    // client cached at spawn and will never re-request on its own.
+    announceToolListChanged: reloaded,
     // Item 5: fold every MCP evidence failure into ONE structured, sanitized
     // deadletter record, stamped with the resolved workspace. recordMcpEvidence-
     // Unavailable honors the telemetry kill switch and never throws, so this is a
@@ -346,6 +381,31 @@ export async function runMcp(
         workspaceId: ctx.workspaceId,
         surface: "mla-mcp",
       });
+    },
+    // P0-2: the offer, bound to the retrieval failure instead of to the session start.
+    //
+    // corpusState is `dark` and nothing else it could be: the server calls this only on the
+    // branch where intel resolved the corpus as having no indexed documents at all. The three
+    // seed counters are omitted rather than zeroed, because no seed runs on a pull; they emit as
+    // null and drop at control's projector (see OnboardingOfferInput).
+    //
+    // No conversion event is emitted here by design. `mla enrich <plan|ingest>` already emits its
+    // own mla_command, so acceptance is that row joined to this one within the session, computed
+    // rather than instrumented. A second event would be a second thing to keep correct for a
+    // number we can already derive.
+    recordOnboardingGap: () => {
+      try {
+        emitOnboardingOffer(
+          { surface: "retrieval_empty", corpusState: "dark" },
+          {
+            workspaceId: ctx.workspaceId,
+            sessionId: (env.CLAUDE_CODE_SESSION_ID || "").trim() || null,
+            nowMs: Date.now(),
+          },
+        );
+      } catch {
+        /* telemetry must never fail the tool call it observes */
+      }
     },
   };
 

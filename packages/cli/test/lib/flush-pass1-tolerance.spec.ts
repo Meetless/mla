@@ -29,7 +29,7 @@ function runSnippet(snippet: string): { status: number; stdout: string; stderr: 
   const scriptPath = path.join(tmp, "test.sh");
   fs.writeFileSync(scriptPath, snippet, { mode: 0o755 });
   const r = spawnSync("bash", [scriptPath], { encoding: "utf8" });
-  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   return { status: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
 }
 

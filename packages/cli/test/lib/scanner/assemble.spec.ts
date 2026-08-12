@@ -518,7 +518,12 @@ describe("assembleContext — global SHOULD overflow (droppable tail, floor surv
     );
     expect(out.overflow).toBe(false);
     expect(out.text).toContain("never push without explicit consent");
-    expect(out.text).not.toContain("sss");
+    // NOT DELIVERED: no `[SHOULD]` line, and the 3,000-character body did not ride.
+    expect(out.text).not.toContain("- [SHOULD] ");
+    expect(out.text).not.toContain("s".repeat(200));
+    // M1: but it is NAMED as withheld, bounded to one 120-character quote. Before that
+    // landed, this drop was indistinguishable from the rule having been retired.
+    expect(out.text).toMatch(/NOT retired: 1 \[SHOULD\] rule\(s\)/);
     expect(out.delivered).toEqual([{ ruleId: "fm1", tier: "floor-must" }]);
     expect(out.omitted).toContainEqual({ ruleId: "fs1", reason: "best-effort:did-not-fit" });
   });

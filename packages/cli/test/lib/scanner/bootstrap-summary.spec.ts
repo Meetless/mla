@@ -56,11 +56,10 @@ function result(over: Partial<ScanResult>): ScanResult {
   };
 }
 
-// Every case below exercises the bootstrapped-session path unless it says
-// otherwise; `injectedNow: false` (a plain `mla activate` in a shell, with no
-// session to inject into) has its own case at the bottom.
-function render(scan: ScanResult, injectedNow = true): string {
-  return renderBootstrapSummary(scan, { injectedNow });
+// The card is a pure function of the scan now: it makes no claim that depends on whether the
+// CURRENT session was bootstrapped, because measurement showed the claim was false either way.
+function render(scan: ScanResult): string {
+  return renderBootstrapSummary(scan);
 }
 
 describe("renderBootstrapSummary", () => {
@@ -74,7 +73,7 @@ describe("renderBootstrapSummary", () => {
     expect(out).toContain("8 decision/spec docs");
   });
 
-  it("lists the high-confidence directives that will guide the session now, with source", () => {
+  it("lists the high-confidence directives it found, with source", () => {
     const out = render(
       result({
         directives: [
@@ -83,7 +82,6 @@ describe("renderBootstrapSummary", () => {
         ],
       }),
     );
-    expect(out).toMatch(/guiding this session now/i);
     expect(out).toContain("Never create feature branches");
     expect(out).toContain("CLAUDE.md");
     expect(out).toContain("Use make test-db for migrations");
@@ -156,13 +154,77 @@ describe("renderBootstrapSummary", () => {
   it("never claims a live injection when the current session was not bootstrapped", () => {
     const out = render(
       result({ directives: [directive({ text: "Never create feature branches" })] }),
-      false,
     );
     expect(out).not.toMatch(/this session now/i);
     expect(out).not.toMatch(/injected/i);
-    expect(out).toMatch(/next Claude Code session/i);
-    // The rules themselves are still worth showing: they WILL apply next session.
+    // The rules themselves are still worth showing: they were found, and that is the point.
     expect(out).toContain("Never create feature branches");
+  });
+});
+
+// The SAME bug as the one above, one level deeper, and it survived that fix because both are
+// about the card's honesty but only one was about the SESSION. Measured live 2026-08-06 on a
+// fresh repo carrying CLAUDE.md, AGENTS.md, and two .claude/rules files:
+//
+//   directives: 9    floorRules: 0    scopedRules: 1
+//
+// Eight of the nine rules the card had just promised would "guide the next Claude Code session"
+// reach NEITHER delivery array. `buildStructuredRules` routes a directive to the floor only when
+// it is bundle-sourced, and to scoped only when it carries globs or a turn trigger; a plain
+// CLAUDE.md line is neither, so it is parsed, deduped, cached into `confirmedRulesXml`, and
+// dropped. `confirmedRulesXml` is the RETIRED first-run pack (targeted-rule-injection Phase 2):
+// it has no reader left in the hook.
+//
+// The exclusion itself is CORRECT and must not be "fixed" by injecting these. Claude Code loads
+// CLAUDE.md and .claude/rules natively, so re-injecting them is duplication, which is exactly
+// what 7f0f4f1cb measured at 94.7% of delivered material and removed. What was wrong is only the
+// claim. A first-run card that promises delivery it cannot perform is also how a fleet of dark
+// workspaces went unnoticed: the product told every one of them it was working.
+describe("renderBootstrapSummary: what Meetless will ACTUALLY do with what it found", () => {
+  it("does not promise to inject a plain CLAUDE.md rule, because nothing delivers it", () => {
+    const out = render(
+      result({ directives: [directive({ text: "Never create feature branches", source: "CLAUDE.md" })] }),
+    );
+    expect(out).not.toMatch(/guiding this session/i);
+    expect(out).not.toMatch(/will guide/i);
+    expect(out).not.toMatch(/injected/i);
+  });
+
+  it("says WHY it is not re-injecting them: the agent already reads these files itself", () => {
+    const out = render(
+      result({ directives: [directive({ text: "Never create feature branches", source: "CLAUDE.md" })] }),
+    );
+    expect(out).toMatch(/already read|already load|reads .* itself|does not re-?inject/i);
+  });
+
+  it("DOES report a rule that genuinely rides the delivery path, kept separate from the rest", () => {
+    // A .claude/rules entry carrying explicit globs is the one file-sourced shape that becomes a
+    // scoped rule, so it is the one the card may honestly say Meetless delivers.
+    const out = render(
+      result({
+        directives: [
+          directive({ text: "Plain repo rule", source: "CLAUDE.md" }),
+          directive({ text: "Validate at the boundary", source: ".claude/rules/db.md", globs: ["src/**"] }),
+        ],
+      }),
+    );
+    expect(out).toMatch(/Validate at the boundary/);
+    expect(out).toMatch(/1 .*(scoped|matching|targeted)/i);
+  });
+
+  // The headline sat one line above the false promise and made the same claim ("Meetless will
+  // USE high-confidence project instructions"). Fixing only the lower line would have left two
+  // headlines making opposite claims about the same files, which is how the first one survived
+  // a previous honesty fix.
+  it("does not claim in the headline that Meetless will USE the repo's rules either", () => {
+    const out = render(result({ directives: [directive({ text: "Plain repo rule", source: "CLAUDE.md" })] }));
+    expect(out).not.toMatch(/will use/i);
+    expect(out).toMatch(/index/i);
+  });
+
+  it("says nothing about scoped delivery when no rule qualifies for it", () => {
+    const out = render(result({ directives: [directive({ text: "Plain repo rule", source: "CLAUDE.md" })] }));
+    expect(out).not.toMatch(/scoped/i);
   });
 
   it("handles an empty graph without claiming any instructions guide the session", () => {

@@ -43,6 +43,97 @@ export interface ProjectionReceipt {
   path?: string; // absolute target path, for the observability receipt
 }
 
+/**
+ * What `inspectFloorProjection` found. Deliberately a superset of the write outcomes, because a
+ * reader needs to tell "stale" apart from "never written" and "someone else owns it", and the
+ * writer collapses those into "blocked".
+ */
+export type ProjectionDriftStatus =
+  | "match" // on-disk body is exactly the floor the bundle carries
+  | "drift" // owned by MLA, but carrying an older floor: the item-6 defect
+  | "absent" // nothing at the target; the root never scanned
+  | "foreign" // a file MLA does not own sits there
+  | "edited" // MLA's marker, hand-edited body: user-owned, do not touch
+  | "no_floor_rules"; // nothing to project, so nothing can be stale
+
+export interface ProjectionDrift {
+  status: ProjectionDriftStatus;
+  path: string;
+  /** The hash the live floor would render to. Null when there is no floor to render. */
+  intendedHash: string | null;
+  /** The hash the file declares in its header. Null when absent, foreign, or unstamped. */
+  declaredHash: string | null;
+  /** Kept for the human-readable report only. NEVER the drift discriminator: see below. */
+  declaredBundleId: string | null;
+}
+
+/**
+ * Read-only drift check for one scan root's floor projection (MLA issue-list item 6).
+ *
+ * Compares the PAYLOAD HASH, not the bundle revision. Two reasons, both measured:
+ *
+ *   - `bundleRevision` is scoped per (workspaceId, principalUserId). One workspace here has two
+ *     principals, at rev-126 and rev-4, so revision comparison reads every principal boundary as
+ *     drift.
+ *   - `materializeFloorProjection` returns `{projection: "unchanged", reason: "same_hash"}` BEFORE
+ *     it writes, so the header's `bundleId` only refreshes when the BODY changes. A byte-perfect
+ *     projection can sit ten revisions "behind". The revision is not provenance; it is the
+ *     revision at which the content last happened to change.
+ *
+ * Never writes, and never repairs. A governing instruction file changing under a running agent is
+ * worse than the drift it would fix, so the repair stays an explicit foreground `mla scan`.
+ */
+export function inspectFloorProjection(scanRoot: string, dirs: Directive[]): ProjectionDrift {
+  const absTarget = path.join(scanRoot, FLOOR_PROJECTION_RELPATH);
+  const base: ProjectionDrift = {
+    status: "absent",
+    path: absTarget,
+    intendedHash: null,
+    declaredHash: null,
+    declaredBundleId: null,
+  };
+  try {
+    const body = renderProjectionBody(dirs);
+    // Same carve-out the writer makes: an empty floor is the bundle-unavailable case, and must
+    // not be reported as the on-disk file being wrong.
+    if (!body) return { ...base, status: "no_floor_rules" };
+    const intendedHash = projectionBodyHash(body);
+
+    let existing: string | null = null;
+    try {
+      existing = fs.readFileSync(absTarget, "utf8");
+    } catch {
+      return { ...base, intendedHash };
+    }
+
+    const parts = splitProjection(existing);
+    const declaredHash = parts ? declaredPayloadHash(parts.header) : null;
+    if (!parts || !declaredHash) return { ...base, status: "foreign", intendedHash };
+
+    const declaredBundleId = declaredBundleIdOf(parts.header);
+    if (!isOwnedProjection(existing)) {
+      return { ...base, status: "edited", intendedHash, declaredHash, declaredBundleId };
+    }
+    return {
+      status: declaredHash === intendedHash ? "match" : "drift",
+      path: absTarget,
+      intendedHash,
+      declaredHash,
+      declaredBundleId,
+    };
+  } catch {
+    // Fail-safe, exactly as the writer does: doctor reporting nothing is better than doctor
+    // throwing on an unreadable directory.
+    return base;
+  }
+}
+
+/** The header's `bundleId`, for the human-readable line only. */
+function declaredBundleIdOf(header: string): string | null {
+  const m = /^bundleId:\s*(\S+)\s*$/m.exec(header);
+  return m ? m[1] : null;
+}
+
 export interface RemovalReceipt {
   removed: boolean;
   reason?: "absent" | "foreign_file" | "edited" | "error";

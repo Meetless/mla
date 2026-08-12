@@ -127,7 +127,7 @@ describe("mla workspace show (folder = workspace)", () => {
     writeCfg(home, BASE_CFG);
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("reports not activated when no marker is found up the tree (no probe)", async () => {
@@ -273,7 +273,7 @@ describe("mla workspace use (removed, T3.2)", () => {
     writeMarker(repo, { workspaceId: "ws_acme" });
   });
   afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("is a hard error pointing at `mla activate` (Trap 4)", async () => {

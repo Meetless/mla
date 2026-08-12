@@ -31,7 +31,7 @@ describe("mla flush --gc (reaper wiring)", () => {
   afterEach(() => {
     logSpy.mockRestore();
     delete process.env.MEETLESS_HOME;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   function seedDeadSession(sid: string, ageSec: number): string[] {
@@ -52,7 +52,9 @@ describe("mla flush --gc (reaper wiring)", () => {
     const code = await runFlush(["--gc"]);
     expect(code).toBe(0);
 
-    for (const f of files) expect(fs.existsSync(f)).toBe(false);
+    // `.turn` survives on purpose: it is the cross-hook join key and a resumed session
+    // must not restart its numbering. Everything else is reclaimable litter.
+    for (const f of files) expect(fs.existsSync(f)).toBe(f.endsWith(".turn"));
     expect(logged.some((l) => /^\[gc\] reaped 1 stale session/.test(l))).toBe(true);
   });
 
@@ -124,8 +126,8 @@ describe("mla flush --gc (reaper wiring)", () => {
       const code = await runFlush(["--reap-only"]);
       expect(code).toBe(0);
 
-      // dead litter reaped...
-      for (const f of dead) expect(fs.existsSync(f)).toBe(false);
+      // dead litter reaped, except the preserved turn counter...
+      for (const f of dead) expect(fs.existsSync(f)).toBe(f.endsWith(".turn"));
       // ...active spool preserved (reapQueue skips pending work)...
       expect(fs.existsSync(spool)).toBe(true);
       // ...drain loop never ran (no per-session flush attempt on stdout or stderr)

@@ -44,8 +44,8 @@ beforeEach(() => {
 afterEach(() => {
   if (prevHome === undefined) delete process.env.MEETLESS_HOME;
   else process.env.MEETLESS_HOME = prevHome;
-  fs.rmSync(home, { recursive: true, force: true });
-  fs.rmSync(osHome, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  fs.rmSync(osHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   jest.resetModules();
 });
 
@@ -802,7 +802,7 @@ describe("the live binary is the one that is running, not one derived from MEETL
       expect(code).toBe(0);
     } finally {
       await srv.close();
-      fs.rmSync(stage, { recursive: true, force: true });
+      fs.rmSync(stage, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
 
     // What the canary asserts, and what "Upgraded mla X -> Y" is claiming.

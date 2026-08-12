@@ -35,7 +35,7 @@ describe("resolveConsultEvidenceRuleBinding resolves the obligation triple from 
 
   afterEach(() => {
     closeCe0Store(store);
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("falls back to the frozen compile-time identity when no live version is attested (unarmed)", () => {

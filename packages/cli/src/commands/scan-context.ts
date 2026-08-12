@@ -1,6 +1,7 @@
 // src/commands/scan-context.ts
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
+import { resolve, sep } from "node:path";
 import { scanWorkspace } from "../lib/scanner/scan";
 import {
   applyVerdicts,
@@ -14,6 +15,7 @@ import {
 } from "../lib/scanner/cache";
 import { Directive, FloorMeta, ReconciliationFinding, ScanResult } from "../lib/scanner/types";
 import { findWorkspaceContext } from "../lib/workspace";
+import { findWorktreeCheckoutRoot } from "../lib/activation";
 import { resolveBundlePrincipal } from "../lib/rules/bundle-principal";
 import { readRuleBundleCache, type BundlePrincipal } from "../lib/rules/bundle-cache";
 import {
@@ -230,14 +232,51 @@ export interface ScanTarget {
 // rescan whole-workspace (all rules, root-relative + stable ids) no matter which
 // subdir the command was invoked from. Shared by every caller that rescans.
 export function resolveScanRoot(startDir: string): string {
-  return findWorkspaceContext(startDir)?.markerDir ?? startDir;
+  const ctx = findWorkspaceContext(startDir);
+  if (!ctx) return startDir;
+  // The marker dir is this scan's root only when it actually CONTAINS startDir,
+  // which is every ordinary walk-up. A linked worktree inherits its binding from
+  // a marker in a DIFFERENT checkout (D1), and adopting that dir here would scan
+  // the origin checkout's files as this one's, hand both checkouts the same
+  // per-root cache slot, and let a worktree at an old commit retire the origin's
+  // instruction snapshots. Inheritance is for the WORKSPACE binding only; the
+  // checkout keeps its own identity. Containment is the predicate rather than
+  // `ctx.via` because it states the actual requirement, and it is derived from
+  // the paths in hand rather than from a stamp any future caller could set.
+  if (containsOrIsSelf(ctx.markerDir, startDir)) return ctx.markerDir;
+  return findWorktreeCheckoutRoot(startDir) ?? startDir;
+}
+
+// Is `ancestor` the same directory as `child`, or one of its parents? Compares
+// realpaths so /var vs /private/tmp on macOS is not read as a mismatch, and
+// appends a separator so `/a/bc` is never treated as living under `/a/b`.
+function containsOrIsSelf(ancestor: string, child: string): boolean {
+  const a = realpathOrResolve(ancestor);
+  const c = realpathOrResolve(child);
+  if (a === c) return true;
+  return c.startsWith(a.endsWith(sep) ? a : a + sep);
+}
+
+function realpathOrResolve(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
 }
 
 // The canonical identity of a scan cache: the realpath of the directory a scan runs FROM
 // (the marker dir; see resolveScanRoot). This is what a cache's scanRootPath is stamped with
 // on write and compared against on read, so a reader in checkout B never renders or injects
-// checkout A's stomped cache as its own. realpath canonicalizes symlinks and worktrees to one
-// stable string (the same rule resolveActiveRuntimeScopeId uses on the enforcement plane).
+// checkout A's stomped cache as its own. realpath canonicalizes SYMLINKED paths to one stable
+// string (the same rule resolveActiveRuntimeScopeId uses on the enforcement plane).
+//
+// A linked worktree keeps its OWN identity here and is never folded onto its origin checkout.
+// This comment used to claim realpath canonicalized "symlinks and worktrees" alike, which was
+// false (a linked worktree is a different real directory), and the false claim is part of why
+// D1 went unbuilt for so long. resolveScanRoot above is what keeps the two apart now: a marker
+// inherited from another checkout does not become this checkout's scan root. Corrected
+// 2026-08-10, notes/20260810-worktree-binding-loss-and-multi-repo-shared-workspace.md.
 // Falls back to the un-canonicalized marker path if realpath throws (dir removed mid-flight),
 // which still compares equal to itself. Cheap: a filesystem walk to the marker plus one realpath,
 // no subprocess, so it is safe on the assembler hot path.

@@ -43,7 +43,7 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
       expect(insp.hooksAny).toBe(true);
       expect(insp.hooksComplete).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -55,7 +55,7 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
       expect(insp.hooksAny).toBe(true);
       expect(insp.hooksComplete).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -69,7 +69,7 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
       writeClaudeJson(tmp, { mcpServers: { [MCP_SERVER_KEY]: {} } });
       expect(inspectLegacyWiring(legacyWiringPaths(tmp)).globalMcpPresent).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -85,7 +85,7 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
       expect(insp.mcpAny).toBe(true);
       expect(insp.globalMcpPresent).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -97,7 +97,7 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
       writeClaudeJson(tmp, { projects: { "/repo": { mcpServers: {} } } });
       expect(inspectLegacyWiring(legacyWiringPaths(tmp)).mcpAny).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -118,7 +118,7 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
       insp = inspectLegacyWiring(paths);
       expect(insp.skillsComplete).toBe(true);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -146,7 +146,7 @@ describe("inspectLegacyWiring (8-field surface view)", () => {
         expect(insp.agentsComplete).toBe(i === rest.length - 1);
       }
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

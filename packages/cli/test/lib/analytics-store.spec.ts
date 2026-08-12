@@ -41,7 +41,7 @@ describe("analytics store (INV-LOCAL-STATS-1/2)", () => {
   afterEach(() => {
     delete process.env.MEETLESS_HOME;
     delete process.env.MEETLESS_LOCAL_STATS;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("eventsPath lives under MEETLESS_HOME", () => {
@@ -56,7 +56,7 @@ describe("analytics store (INV-LOCAL-STATS-1/2)", () => {
   });
 
   it("creates HOME if it does not exist", () => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     store.appendEvent(makeEvent());
     expect(fs.existsSync(store.eventsPath())).toBe(true);
   });

@@ -64,7 +64,7 @@ function inCommon(snippet: string, env: Record<string, string> = {}, home?: stri
     encoding: "utf8",
     env: { ...process.env, MEETLESS_HOME: h, MEETLESS_DEBUG: "0", ...env },
   });
-  if (!home) fs.rmSync(h, { recursive: true, force: true });
+  if (!home) fs.rmSync(h, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   return (r.stdout || "").trim();
 }
 
@@ -88,7 +88,7 @@ describe("collect_dirty_working_tree (common.sh)", () => {
     try {
       expect(collectDirtyWorkingTree(dir)).toBe("[]");
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -97,7 +97,7 @@ describe("collect_dirty_working_tree (common.sh)", () => {
     try {
       expect(collectDirtyWorkingTree(repo)).toBe("[]");
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -111,7 +111,7 @@ describe("collect_dirty_working_tree (common.sh)", () => {
       expect(arr).toContain("fresh.ts");
       expect(arr.length).toBe(2);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -124,7 +124,7 @@ describe("collect_dirty_working_tree (common.sh)", () => {
       const arr = JSON.parse(collectDirtyWorkingTree(repo)) as string[];
       expect(arr.filter((p) => p === "seed.ts").length).toBe(1);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -135,7 +135,7 @@ describe("collect_dirty_working_tree (common.sh)", () => {
       const arr = JSON.parse(collectDirtyWorkingTree(repo, { MEETLESS_TOUCHED_FILES_MAX: "2" })) as string[];
       expect(arr.length).toBe(2);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -151,7 +151,7 @@ describe("collect_dirty_working_tree (common.sh)", () => {
       expect(arr).toContain("real.ts");
       expect(arr).not.toContain("ignored.log");
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -212,8 +212,8 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       expect(mine).not.toContain("peer-b.ts");
       expect(mine).not.toContain("seed.ts");
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -224,8 +224,8 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       fs.writeFileSync(path.join(repo, "peer.ts"), "// peer\n"); // dirty, but not ours
       expect(collectTouchedFiles(home, "sess-fresh", repo)).toBe("[]");
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -237,8 +237,8 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       expect(collectTouchedFiles(home, "sess-mine", repo)).toBe("[]");
       expect(JSON.parse(collectTouchedFiles(home, "sess-other", repo))).toEqual(["theirs.ts"]);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -249,8 +249,8 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       seedLedger(home, "s", [path.join(repo, "src", "deep", "x.ts")]);
       expect(JSON.parse(collectTouchedFiles(home, "s", repo))).toEqual(["src/deep/x.ts"]);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -262,9 +262,9 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       seedLedger(home, "s", [path.join(other, "elsewhere.ts"), path.join(repo, "here.ts")]);
       expect(JSON.parse(collectTouchedFiles(home, "s", repo))).toEqual(["here.ts"]);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(other, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(other, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -280,8 +280,8 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       ]);
       expect(JSON.parse(collectTouchedFiles(home, "s", repo))).toEqual(["new.ts", "old.ts", "mid.ts"]);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -299,8 +299,8 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       ) as string[];
       expect(arr).toEqual(["e.ts", "d.ts"]);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -311,8 +311,8 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       seedLedger(home, "s", [path.join(dir, "note.md")]);
       expect(JSON.parse(collectTouchedFiles(home, "s", dir))).toEqual(["note.md"]);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -332,8 +332,143 @@ describe("collect_touched_files (common.sh): exact per-session attribution", () 
       // The blank-sid call must not have minted a phantom ledger.
       expect(fs.readdirSync(path.join(home, "queue")).sort()).toEqual(["s.touched"]);
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 (2026-08-07): EMPTY IS LEGIBLE, PARTIAL IS NOT.
+//
+// The activation-root scope above is the contract and it is not moving: a sibling
+// repo is its own activation root, runs its own hook, and reporting its files here
+// would attribute one root's edits to another. What was wrong is the SILENCE.
+//
+// Session 770058c5's ledger held 58 entries over 14 distinct paths. Two were inside
+// the activation root; twelve were not and were dropped, so the injected block read
+//
+//     touched_files: meetless-cli/packages/mcp/kb_actions.js, .../tool_manifest.js
+//
+// which is 86% of the session's work missing with no marker. A reader who sees
+// `(none)` knows to discount the field. A reader who sees two plausible source files
+// has no signal at all, and the field is named `touched_files`, not
+// `touched_files_in_this_workspace`. Worse, both survivors were touched in turn 1,
+// so by turn 4 they were the least representative pair in the ledger.
+//
+// The fix is a COUNT, never a path: no sibling path crosses the boundary the
+// contract protects, and the omission stops being silent. `count_touched_files_
+// omitted` shares its root resolution and its dedupe with `collect_touched_files`
+// (one `_touched_files_scan`), because a second copy of "is this path inside the
+// root" is exactly how the two answers drift apart.
+// ---------------------------------------------------------------------------
+function countOmitted(home: string, sid: string, dir: string): string {
+  return inCommon(`count_touched_files_omitted "${sid}" "${dir}"`, {}, home);
+}
+
+describe("count_touched_files_omitted (common.sh): the silent partial, made legible", () => {
+  it("reports 0 when every touched path is inside the activation root", () => {
+    const home = ledgerHome();
+    const repo = initRepoWithSeed();
+    try {
+      seedLedger(home, "s", [path.join(repo, "a.ts"), path.join(repo, "src", "b.ts")]);
+      expect(JSON.parse(collectTouchedFiles(home, "s", repo))).toEqual(["src/b.ts", "a.ts"]);
+      expect(countOmitted(home, "s", repo)).toBe("0");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
+  it("counts what the scope dropped, and the kept list is unchanged by it", () => {
+    const home = ledgerHome();
+    const repo = initRepoWithSeed();
+    const sibling = fs.mkdtempSync(path.join(os.tmpdir(), "mla-sibling-root-"));
+    try {
+      seedLedger(home, "s", [
+        path.join(repo, "mine.ts"),
+        path.join(sibling, "notes", "one.md"),
+        path.join(sibling, "notes", "two.md"),
+        path.join(sibling, "analyze.py"),
+      ]);
+      // The boundary still holds: not one sibling PATH is emitted.
+      const kept = JSON.parse(collectTouchedFiles(home, "s", repo)) as string[];
+      expect(kept).toEqual(["mine.ts"]);
+      expect(kept.join(" ")).not.toContain(sibling);
+      // ...and the omission is now a number instead of nothing.
+      expect(countOmitted(home, "s", repo)).toBe("3");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(sibling, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
+  it("counts DISTINCT paths, not ledger lines (58 entries, 14 paths, 12 outside)", () => {
+    const home = ledgerHome();
+    const repo = initRepoWithSeed();
+    const sibling = fs.mkdtempSync(path.join(os.tmpdir(), "mla-sibling-dupes-"));
+    try {
+      // The real shape: a handful of files touched over and over across a session.
+      const inside = ["kb_actions.js", "tool_manifest.js"].map((f) => path.join(repo, f));
+      const outside = Array.from({ length: 12 }, (_, i) => path.join(sibling, `f${i}.md`));
+      const lines: string[] = [];
+      for (let rep = 0; rep < 5; rep++) lines.push(...inside, ...outside);
+      expect(lines.length).toBe(70);
+      seedLedger(home, "s", lines);
+
+      expect((JSON.parse(collectTouchedFiles(home, "s", repo)) as string[]).length).toBe(2);
+      expect(countOmitted(home, "s", repo)).toBe("12");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(sibling, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
+  it("is 0, never blank, for an unknown session and for an empty ledger", () => {
+    const home = ledgerHome();
+    const repo = initRepoWithSeed();
+    try {
+      // Blank would render as `(+ outside this workspace root)` in the block, and a
+      // malformed marker is worse than the silence it replaces.
+      expect(countOmitted(home, "sess-nobody", repo)).toBe("0");
+      seedLedger(home, "s-empty", []);
+      expect(countOmitted(home, "s-empty", repo)).toBe("0");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
+  it("does not count a RELATIVE ledger entry as outside the root", () => {
+    const home = ledgerHome();
+    const repo = initRepoWithSeed();
+    try {
+      // Relative entries are already root-relative by construction; the scope check
+      // only ever applies to absolute paths, and counting them would inflate the
+      // marker on every ordinary session.
+      seedLedger(home, "s", ["already/relative.ts", path.join(repo, "abs.ts")]);
+      expect(JSON.parse(collectTouchedFiles(home, "s", repo))).toEqual(["abs.ts", "already/relative.ts"]);
+      expect(countOmitted(home, "s", repo)).toBe("0");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
+  it("works in a marker-only (non-git) activation root", () => {
+    const home = ledgerHome();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mla-nongit-omit-"));
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), "mla-nongit-other-"));
+    try {
+      seedLedger(home, "s", [path.join(dir, "note.md"), path.join(other, "elsewhere.md")]);
+      expect(JSON.parse(collectTouchedFiles(home, "s", dir))).toEqual(["note.md"]);
+      expect(countOmitted(home, "s", dir)).toBe("1");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(other, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -376,8 +511,8 @@ describe("post-tool-use.sh records the I1 attribution ledger", () => {
       expect(arr.sort()).toEqual(["edited.ts", "written.ts"]);
       expect(arr).not.toContain("peer.ts");
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -391,8 +526,8 @@ describe("post-tool-use.sh records the I1 attribution ledger", () => {
       runPostToolUse(home, repo, "sess-read", "Read", doc);
       expect(collectTouchedFiles(home, "sess-read", repo)).toBe("[]");
     } finally {
-      fs.rmSync(repo, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -541,7 +676,7 @@ async function runWiredHook(opts: {
       child.stdin.end();
     });
 
-    if (opts.gitRepo) fs.rmSync(workdir, { recursive: true, force: true });
+    if (opts.gitRepo) fs.rmSync(workdir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 
     return {
       classifyCount: stub.bodies.classify.length,
@@ -549,7 +684,7 @@ async function runWiredHook(opts: {
     };
   } finally {
     await stub.close();
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

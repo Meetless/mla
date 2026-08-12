@@ -77,8 +77,8 @@ describe("write_stop_review_card (the Stop hook's real review-card writer)", () 
   });
 
   afterEach(() => {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(home, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("appends a <=5-item card with id/detail/source and a total, read from the real scan cache", () => {

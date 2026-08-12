@@ -148,11 +148,11 @@ function renderMeetlessRulesBlock(): string {
     "",
     "This repo is wired to Meetless, a change-governance layer for product delivery.",
     "",
-    "Before you grep, Read, Glob, find, or WebFetch for any idea, concept,",
-    "architecture, decision, naming, or \"what is X / how does Y work / where do we",
-    "stand on Z\" question, consult Meetless's governed memory first. It is the source",
-    "of truth for anything that is not pure code. grep and Read are for pure code",
-    "shape only: file paths, function names, signatures, config keys.",
+    "Before answering project-history, decision, constraint, or rationale",
+    "questions, call `retrieve_knowledge`. For code-shape questions such as",
+    "definitions, callers, imports, regex behavior, and whether a field is read or",
+    "written, inspect the code first. If code inspection raises a historical or",
+    "rationale question, then call `retrieve_knowledge`.",
     "",
     "Use the Meetless MCP tools already in your tool list, in this order:",
     "",
@@ -964,9 +964,12 @@ export function ensureClaudeSettings(
   // Claude Code settings.json hook shape: hooks.<EventName> = [{ matcher, hooks: [{ type: "command", command, timeout? }] }]
   // UserPromptSubmit gets an explicit 30s timeout. It always injects the Layer 1
   // floor (zero network) and best-effort appends a Layer 2 retrieval_only pull.
-  // The enrich curl ceiling (MEETLESS_INTERCEPT_MAX_S, default 6) sits well below
+  // The enrich curl ceiling (MEETLESS_INTERCEPT_MAX_S, defaulted by
+  // MLA_DEFAULT_INTERCEPT_MAX_S in the hook; 10s since 2026-08-09) sits well below
   // this 30s so WE own the deadline, not a SIGKILL (two-layer plan §10;
-  // notes/20260528-...-trace-schema.md §3.6).
+  // notes/20260528-...-trace-schema.md §3.6). The number lives in the hook, not
+  // here: this comment only needs the INEQUALITY to stay true, and duplicating the
+  // literal is how it went stale the last time the budget moved.
   // Derive the wanted list from the canonical MANAGED_HOOK_SCRIPTS so install and
   // uninstall share one source of truth. --no-post-tool-use is an EVENT opt-out: it
   // drops every script registered on PostToolUse (both the load-bearing capture hook

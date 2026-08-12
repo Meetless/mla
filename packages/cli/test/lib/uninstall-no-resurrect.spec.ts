@@ -78,7 +78,7 @@ describe("uninstall teardown does not resurrect HOME (real store writer)", () =>
     if (prevHome === undefined) delete process.env.MEETLESS_HOME;
     else process.env.MEETLESS_HOME = prevHome;
     try {
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     } catch {
       /* best-effort temp cleanup */
     }
@@ -104,7 +104,7 @@ describe("uninstall teardown does not resurrect HOME (real store writer)", () =>
     expect(fs.existsSync(home)).toBe(true);
 
     // Uninstall removed the whole footprint.
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     expect(fs.existsSync(home)).toBe(false);
 
     // Unguarded post-command capture: this is exactly what runCliBootstrap used
@@ -117,7 +117,7 @@ describe("uninstall teardown does not resurrect HOME (real store writer)", () =>
   it("fix: gating the append on homeWasTornDown() leaves HOME gone", () => {
     const store = loadStore();
     fs.writeFileSync(store.eventsPath(), "{}\n", "utf8");
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     expect(fs.existsSync(home)).toBe(false);
 
     // The runCliBootstrap guard: skip every disk-writing teardown once HOME is

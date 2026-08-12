@@ -36,7 +36,7 @@ describe("readAgentMemoryFiles", () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "mla-mem-"));
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("fails open to [] when the dir is missing", () => {
     expect(readAgentMemoryFiles(join(dir, "nope"))).toEqual([]);
@@ -98,7 +98,7 @@ describe("discoverAgentMemoryDirectives", () => {
     home = mkdtempSync(join(tmpdir(), "mla-home-"));
     mkdirSync(agentMemoryDir(cwd, home), { recursive: true });
   });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   it("discovers + parses feedback memory under the encoded dir, respecting the cap", () => {
     const dir = agentMemoryDir(cwd, home);
@@ -133,7 +133,7 @@ describe("agent-memory provider adapter", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "mla-home-"));
   });
-  afterEach(() => rmSync(home, { recursive: true, force: true }));
+  afterEach(() => rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
 
   const write = (dir: string, name: string, description: string, body = "x") => {
     mkdirSync(dir, { recursive: true });

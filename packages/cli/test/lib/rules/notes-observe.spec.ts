@@ -82,7 +82,7 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       });
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -101,7 +101,7 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       });
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -126,7 +126,7 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       });
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -141,7 +141,7 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       expect(result.observation.kind).toBe("INFRA");
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -160,7 +160,7 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       });
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -175,7 +175,7 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       expect(result.observation).toEqual({ kind: "NOT_APPLICABLE" });
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -190,7 +190,7 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       expect(result.observation).toEqual({ kind: "NOT_APPLICABLE" });
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -229,8 +229,8 @@ describe("observeNotesRule: scan cache -> rule layer -> observe-only outcome", (
       });
       expectDecisionFree(result);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

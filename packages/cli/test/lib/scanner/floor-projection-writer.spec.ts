@@ -60,7 +60,7 @@ describe("materializeFloorProjection", () => {
     root = mkdtempSync(join(tmpdir(), "mla-proj-"));
   });
   afterEach(() => {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("row 'no floor rules': writes nothing and reports unchanged/no_floor_rules", () => {
@@ -197,7 +197,7 @@ describe("materializeFloorProjection", () => {
       expect(existsSync(targetPath(root))).toBe(true);
       expect(existsSync(join(sibling, ".claude"))).toBe(false);
     } finally {
-      rmSync(sibling, { recursive: true, force: true });
+      rmSync(sibling, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -248,7 +248,7 @@ describe("materializeFloorProjection", () => {
       expect(existsSync(join(wt, ".gitignore"))).toBe(false);
       expect(existsSync(join(root, ".gitignore"))).toBe(false);
     } finally {
-      rmSync(wtParent, { recursive: true, force: true });
+      rmSync(wtParent, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -259,7 +259,7 @@ describe("removeOwnedProjection (matrix: deactivation removes only owned)", () =
     root = mkdtempSync(join(tmpdir(), "mla-proj-rm-"));
   });
   afterEach(() => {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("row 'deactivation → remove owned': removes an MLA-owned projection", () => {
@@ -302,7 +302,7 @@ describe("resolveProjectionOutcome (revoked-floor vs transient-empty disambiguat
     root = mkdtempSync(join(tmpdir(), "mla-proj-outcome-"));
   });
   afterEach(() => {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const meta = (freshness: FloorMeta["freshness"]): FloorMeta => ({

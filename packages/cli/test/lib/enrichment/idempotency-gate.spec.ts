@@ -44,7 +44,7 @@ function completeState(run: OnboardingRun, counts = { documentation: 3, history:
 }
 
 afterAll(() => {
-  rmSync(HOME, { recursive: true, force: true });
+  rmSync(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 describe("findCompletedRunWithDigest", () => {
@@ -63,7 +63,7 @@ describe("findCompletedRunWithDigest", () => {
     expect(hit!.run.runId).toBe("run-a1");
     expect(hit!.state.status).toBe("complete");
     expect(hit!.state.scouts.documentation.candidateCount).toBe(7);
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("does not match when the plan digest differs", () => {
@@ -73,7 +73,7 @@ describe("findCompletedRunWithDigest", () => {
     writeState(HOME, completeState(run));
 
     expect(findCompletedRunWithDigest(HOME, WS, repo, "0".repeat(64))).toBeNull();
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("does not match a run whose state is partial (or has no state at all)", () => {
@@ -88,7 +88,7 @@ describe("findCompletedRunWithDigest", () => {
     writeRunRecord(HOME, partial);
     writeState(HOME, { ...completeState(partial), runId: "run-c-partial", status: "partial" });
     expect(findCompletedRunWithDigest(HOME, WS, repo, partial.planDigest)).toBeNull();
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("does not match a completed run of a DIFFERENT repo that shares the workspace + digest", () => {
@@ -106,8 +106,8 @@ describe("findCompletedRunWithDigest", () => {
     expect(findCompletedRunWithDigest(HOME, WS, repoY, runY.planDigest)).toBeNull();
     // And looking up repoX with runY's (different) digest must also miss.
     expect(findCompletedRunWithDigest(HOME, WS, repoX, runY.planDigest)).toBeNull();
-    rmSync(repoX, { recursive: true, force: true });
-    rmSync(repoY, { recursive: true, force: true });
+    rmSync(repoX, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(repoY, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("matches across a symlinked repo path (realpath-normalized)", () => {
@@ -123,8 +123,8 @@ describe("findCompletedRunWithDigest", () => {
     // (the gate normalizes both sides with realpath).
     const hit = findCompletedRunWithDigest(HOME, WS, link, run.planDigest);
     expect(hit?.run.runId).toBe("run-sym");
-    rmSync(real, { recursive: true, force: true });
-    rmSync(linkParent, { recursive: true, force: true });
+    rmSync(real, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    rmSync(linkParent, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("honors excludeRunId (the in-flight run never gates against itself)", () => {
@@ -136,6 +136,6 @@ describe("findCompletedRunWithDigest", () => {
     expect(findCompletedRunWithDigest(HOME, WS, repo, run.planDigest, "run-self")).toBeNull();
     // Without the exclusion it would match.
     expect(findCompletedRunWithDigest(HOME, WS, repo, run.planDigest)).not.toBeNull();
-    rmSync(repo, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 });

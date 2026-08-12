@@ -523,6 +523,70 @@ test("an intel without corpus_empty gets a hedged hint, never an assertion", asy
   assert.match(out.warnings[0], /If this workspace was never ingested/);
 });
 
+// ---------- P0-2: the onboarding OFFER fires here, and only here ---------------
+//
+// The offer used to exist only at SessionStart, which speaks before the user has felt any miss.
+// This is the LEVEL trigger: it fires at the moment retrieval actually came back empty because
+// nothing is indexed. The three tests below pin that it fires on that branch and STAYS SILENT on
+// the other three, because an offer shown to a workspace that already onboarded is the false
+// remedy the corpus-state split exists to prevent.
+
+test("the onboarding-gap branch calls the offer sink exactly once", async () => {
+  const cf = stubFetch({ candidates: [], corpus_empty: true, corpus_state: "empty" });
+  let calls = 0;
+  const out = await runRetrieveKnowledge(
+    { query: "q" },
+    { intelFetch: cf, defaultWorkspaceId: WS, recordOnboardingGap: () => { calls += 1; } },
+  );
+  assert.equal(calls, 1);
+  assert.match(out.warnings[0], /\/mla onboard/);
+});
+
+test("a populated-corpus miss and a captured_not_indexed corpus NEVER offer", async () => {
+  for (const response of [
+    { candidates: [], corpus_empty: false, corpus_state: "populated" },
+    // Already onboarded; its documents went down a non-grounding lane. Telling it to onboard
+    // again produces more unservable rows, so this must not count as an onboarding gap.
+    { candidates: [], corpus_empty: true, corpus_state: "captured_not_indexed" },
+    // An intel that predates the field. A hedge is not an established gap.
+    { candidates: [] },
+  ]) {
+    let calls = 0;
+    await runRetrieveKnowledge(
+      { query: "q" },
+      { intelFetch: stubFetch(response), defaultWorkspaceId: WS, recordOnboardingGap: () => { calls += 1; } },
+    );
+    assert.equal(calls, 0, `offered on ${JSON.stringify(response)}`);
+  }
+});
+
+test("a served pull never offers, and a throwing sink never breaks the pull", async () => {
+  // A pull that RETURNED candidates is not empty at all, so the branch is unreachable.
+  let calls = 0;
+  const served = await runRetrieveKnowledge(
+    { query: "q" },
+    {
+      intelFetch: stubFetch({ candidates: [{ citation: "NT:a.md" }], corpus_empty: false }),
+      defaultWorkspaceId: WS,
+      recordOnboardingGap: () => { calls += 1; },
+    },
+  );
+  assert.equal(calls, 0);
+  assert.equal(served.count, 1);
+
+  // Telemetry is a side effect, never a gate: a sink that throws must leave the tool result intact.
+  const out = await runRetrieveKnowledge(
+    { query: "q" },
+    {
+      intelFetch: stubFetch({ candidates: [], corpus_empty: true, corpus_state: "empty" }),
+      defaultWorkspaceId: WS,
+      recordOnboardingGap: () => { throw new Error("spool is unwritable"); },
+    },
+  );
+  assert.equal(out.count, 0);
+  assert.match(out.warnings[0], /no indexed documents/);
+});
+
 test("a non-boolean corpus_empty is ignored rather than coerced", async () => {
   const cf = stubFetch({ candidates: [], corpus_empty: null });
   const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
@@ -630,4 +694,64 @@ test("a served pull carries no corpus state either", async () => {
   const out = await runRetrieveKnowledge({ query: "q" }, { intelFetch: cf, defaultWorkspaceId: WS });
   assert.equal(out.corpus_state, undefined);
   assert.equal(out.warnings, undefined);
+});
+
+// --- served_relevance: a served pull can be as empty as an empty one -----------
+//
+// The corpus fields above only attach when `candidates.length === 0`, so a page of
+// twelve irrelevant rows and a page of twelve on-point ones were byte-identical in
+// shape: `{count: 12, candidates: [...]}`. Measured against the real dogfood
+// workspace on 2026-08-08, twelve candidates on every probe, three real queries and
+// three nonsense ones: every real query returned at least one `high` band and no
+// nonsense query returned any, while `low` appeared only in the nonsense ones. intel
+// now summarises that as `served_relevance`; this carries it through so the agent can
+// actually see it.
+
+test("a served pull carries served_relevance so a scrape is distinguishable from a hit", async () => {
+  const out = await runRetrieveKnowledge(
+    { query: "sourdough at high altitude" },
+    {
+      intelFetch: stubFetch({
+        candidates: [{ citation: "NT:a.md", relevance: "low" }],
+        served_relevance: "low",
+      }),
+      defaultWorkspaceId: WS,
+    },
+  );
+
+  assert.equal(out.count, 1);
+  assert.equal(out.served_relevance, "low");
+  // Reporting only: the candidate is still served. Abstaining is the agent's call.
+  assert.equal(out.candidates.length, 1);
+});
+
+test("an unrecognised band is dropped rather than echoed to the agent", async () => {
+  // Same rule the corpus_state allow-list follows: a word we have no meaning for
+  // must not reach the agent looking like a product term.
+  const out = await runRetrieveKnowledge(
+    { query: "q" },
+    {
+      intelFetch: stubFetch({
+        candidates: [{ citation: "NT:a.md" }],
+        served_relevance: "extremely_high",
+      }),
+      defaultWorkspaceId: WS,
+    },
+  );
+
+  assert.equal(out.served_relevance, undefined);
+});
+
+test("an empty pull reports no served_relevance, leaving corpus_state to explain it", async () => {
+  const out = await runRetrieveKnowledge(
+    { query: "q" },
+    {
+      intelFetch: stubFetch({ candidates: [], corpus_empty: false, corpus_state: "populated" }),
+      defaultWorkspaceId: WS,
+    },
+  );
+
+  assert.equal(out.count, 0);
+  assert.equal(out.served_relevance, undefined);
+  assert.equal(out.corpus_state, "populated");
 });

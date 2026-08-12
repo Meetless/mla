@@ -166,7 +166,7 @@ describe("flush.sh assistant_message transport (Bug A: narration whitelists)", (
       // Clean drain self-cleans the spool.
       expect(fs.existsSync(queueFile)).toBe(false);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -196,7 +196,7 @@ describe("flush.sh assistant_message transport (Bug A: narration whitelists)", (
       expect(narrEvent).toBeDefined();
       expect(narrEvent?.eventKey).toBe(NARRATION_KEY);
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

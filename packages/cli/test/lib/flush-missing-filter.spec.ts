@@ -108,7 +108,7 @@ function runFlush(opts: RunOpts): RunResult {
         .filter((l) => l.length > 0)
     : [];
 
-  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   return {
     status: r.status ?? -1,
     stdout: r.stdout,

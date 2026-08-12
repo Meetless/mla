@@ -1,6 +1,6 @@
 {
   "name": "@meetless/mla",
-  "version": "0.2.34",
+  "version": "0.2.36",
   "license": "Apache-2.0",
   "private": false,
   "description": "Meetless CLI (mla): governed change-control and knowledge for AI coding agents.",
@@ -33,7 +33,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-assets.js && node scripts/gen-build-info.js && node scripts/bundle-esm.js && chmod +x dist/cli.js dist/pretool-entry.js",
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.js && node scripts/gen-build-info.js && node scripts/bundle-esm.js && chmod +x dist/cli.js dist/pretool-entry.js dist/redact-entry.js dist/assemble-entry.js",
     "dev": "ts-node src/cli.ts",
     "start": "node dist/cli.js",
     "test": "jest --config jest.config.js",

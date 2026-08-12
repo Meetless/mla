@@ -193,11 +193,36 @@ describe("renderIngestSummary", () => {
   // serves relationship/agent-review packets and cannot show KB documents).
   it("points the operator to the console KB review surface, not `mla review`", () => {
     const out = renderIngestSummary([outcome({ persisted: 3 })], "ENRICHED", CONSOLE_KB);
-    expect(out).toMatch(/review 3 candidates born PENDING/i);
+    expect(out).toMatch(/3 candidates born PENDING/i);
     expect(out).toContain(CONSOLE_KB);
     expect(out).toMatch(/Needs Review/);
-    expect(out).not.toMatch(/mla review/);
+    expect(out).not.toMatch(/mla review\b/);
     expect(out).not.toMatch(/show more/i);
+  });
+
+  // P1-4. The most expensive step in the funnel used to END on a chore: "review N candidates
+  // in the console at <url>". That is a to-do list and a context switch to a different
+  // surface, printed to an operator who is standing in a terminal that can already do it.
+  // `mla enrich accept --run-id <id>` with neither --all nor --only is READ-ONLY review and
+  // already exists, so the last line is now a gesture rather than an errand. No new review
+  // surface is introduced, which was the explicit constraint.
+  it("ends on the one gesture that reviews in place, not on a URL to another surface", () => {
+    const out = renderIngestSummary([outcome({ persisted: 3 })], "ENRICHED", CONSOLE_KB, undefined, "run_abc");
+    const last = out.trimEnd().split("\n").pop() as string;
+    expect(last).toContain("mla enrich accept --run-id run_abc");
+    // The console stays reachable, just no longer as the only way through.
+    expect(out).toContain(CONSOLE_KB);
+  });
+
+  it("keeps the console-only handoff when there is no run id to offer a command for", () => {
+    const out = renderIngestSummary([outcome({ persisted: 3 })], "ENRICHED", CONSOLE_KB);
+    expect(out).not.toContain("mla enrich accept --run-id");
+    expect(out).toContain(CONSOLE_KB);
+  });
+
+  it("still refuses to claim anything was accepted", () => {
+    const out = renderIngestSummary([outcome({ persisted: 3 })], "ENRICHED", CONSOLE_KB, undefined, "run_abc");
+    expect(out).toMatch(/nothing is accepted/i);
   });
 
   // A reject DROPS the claim. By the time the operator reads this summary the scout is gone
@@ -274,7 +299,7 @@ describe("renderIngestSummary", () => {
       "ENRICHED",
       CONSOLE_KB,
     );
-    expect(out).toMatch(/review 20 candidates born PENDING/i);
+    expect(out).toMatch(/20 candidates born PENDING/i);
     expect(out).toContain(CONSOLE_KB);
     expect(out).not.toMatch(/show more/i);
     expect(out).not.toMatch(/first \d/i);
@@ -306,7 +331,7 @@ describe("renderIngestSummary", () => {
       CONSOLE_KB,
     );
     expect(out).toMatch(/documentation: 10 accepted, 0 rejected, 10 persisted \(3 new, 7 already present\) \(received 10\)/);
-    expect(out).toMatch(/review 10 candidates born PENDING \(3 new, 7 already present\)/i);
+    expect(out).toMatch(/10 candidates born PENDING \(3 new, 7 already present\)/i);
   });
 
   it("reports a full re-run of an unchanged repo as all-already-present (idempotent)", () => {
@@ -316,7 +341,7 @@ describe("renderIngestSummary", () => {
       CONSOLE_KB,
     );
     expect(out).toMatch(/documentation: 10 accepted, 0 rejected, 10 persisted \(all 10 already present\) \(received 10\)/);
-    expect(out).toMatch(/all 10 candidates were already present from a prior onboarding run/i);
+    expect(out).toMatch(/10 candidates were already present from a prior onboarding run/i);
     expect(out).toMatch(/nothing new to add/i);
     expect(out).toContain(CONSOLE_KB);
     expect(out).not.toMatch(/—/);
