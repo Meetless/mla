@@ -58,7 +58,7 @@ const SAFE_ENUM = /^[A-Z0-9_]{1,40}$/;
 // in-flight jobs (FULLY_RESERVED), or whose payer entitlement is still being
 // lazily minted (NOT_PROVISIONED), gets a 402 that the SAME call answers
 // differently once its siblings settle. Every other 402 (NO_PAYER, EXHAUSTED,
-// NO_HEADROOM, and the structural refusals) is terminal: waiting cannot help,
+// and the structural refusals) is terminal: waiting cannot help,
 // only a top-up or a config fix can. Kept as an allowlist so a reason nobody
 // mirrors here fails CLOSED to the terminal path (never a retry storm), exactly
 // like intel's frozenset does.
@@ -74,9 +74,6 @@ const TRANSIENT_BILLING_REASONS = new Set(["FULLY_RESERVED", "NOT_PROVISIONED"])
 //   NO_PAYER          bind a payer. Money changes nothing until one exists.
 //   EXHAUSTED         top up. The ONLY reason where the money is genuinely gone,
 //                     and the only one for which control sets topUpRequired.
-//   NO_HEADROOM       the WORKSPACE RUNAWAY BRAKE is at zero. control reaches
-//                     this only AFTER proving the balance positive, so a top-up
-//                     buys nothing; only an operator can raise the cap.
 //   ACCOUNT_SUSPENDED an operator suspended cost-bearing execution for the
 //                     principal that owns this payer (abuse defense Change Set B,
 //                     owner ruling 2026-07-27). Explicitly NOT a money state:
@@ -87,10 +84,18 @@ const TRANSIENT_BILLING_REASONS = new Set(["FULLY_RESERVED", "NOT_PROVISIONED"])
 // Structural refusals (PRICING_UNSUPPORTED, the delivery-key family,
 // ACTOR_NOT_IN_WORKSPACE) and any reason invented later fall through to the
 // generic terminal copy, which asserts no remedy it cannot vouch for.
+//
+// NO_HEADROOM was a fourth keyed remedy ("only an operator can raise the cap")
+// until control RETIRED it on 2026-08-14: the runaway-brake column had no writer
+// anywhere, so no operator could arm it and none ever had. Intel mirrored the
+// deletion the same day (5670080e). The key is dropped rather than kept pointing
+// at dead copy, so a control that somehow still emits it lands in the generic
+// terminal bucket, which is the CORRECT answer: a control emitting a vocabulary
+// this build does not mirror is a coordination defect, and the fail-closed
+// fallthrough is what makes it loud instead of silently well-phrased.
 const TERMINAL_BILLING_GUIDANCE_KEY = {
   NO_PAYER: "payment_required_no_payer",
   EXHAUSTED: "payment_required_exhausted",
-  NO_HEADROOM: "payment_required_no_headroom",
   ACCOUNT_SUSPENDED: "payment_required_suspended",
 };
 
@@ -243,12 +248,6 @@ const GUIDANCE = {
     "Terminal: the balance is spent. NOT an outage and NOT self-clearing. Do NOT " +
     "fall back to grep as if the evidence were absent, and do NOT retry; escalate " +
     "to top up the balance.",
-  payment_required_no_headroom:
-    "Terminal: the workspace SPEND CAP is at zero. This is NOT a money problem, " +
-    "the balance is already positive, so topping up buys nothing and a checkout " +
-    "page is the wrong destination. NOT an outage and NOT self-clearing. Do NOT " +
-    "fall back to grep as if the evidence were absent, and do NOT retry; escalate " +
-    "to an operator to raise the workspace cap.",
   payment_required_suspended:
     "Terminal: an operator has SUSPENDED cost-bearing execution for this " +
     "account. This is NOT a money problem and must not be treated as one: the " +

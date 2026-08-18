@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.37 (2026-08-18)
+
+Mostly internal correctness. The one worth a look: if you run `mla` under Codex, it can
+finally tell you when the integration is only half-installed.
+
+**Fixed**
+- `mla codex install` now detects a partial Codex setup instead of reporting a clean one. An older install that predates the Stop hook was recording your sessions but saving no knowledge from any of them, and said nothing was wrong.
+- Onboarding names each governance candidate after what it actually proposes now, instead of labeling them all "Candidate".
+
+**Heads up**
+- On Codex and nothing has been showing up? Re-run `mla codex install`. An install from before this fix was capturing activity and finalizing none of it.
+
 ## 0.2.36 (2026-08-12)
 
 Several repositories can now share one workspace. Point each checkout at the workspace

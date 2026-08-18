@@ -20,6 +20,7 @@ import {
   validateScoutResultShape,
   validateCandidateShape,
   normalizeExactSourceClaim,
+  normalizeStatement,
   RECONCILIATION_FINDING_KIND,
   SCOUT_NAMES,
   DISPATCH_SCOUT_NAMES,
@@ -656,6 +657,39 @@ export const CANDIDATE_DOC_SCHEMA_VERSION = 1 as const;
 // Every frontmatter value is a closed-vocabulary literal (a literal, the sha256 candidateId,
 // the kind enum, or the scout enum), so no user/agent-controlled string enters the YAML; the
 // free-text statement and rationale live in the body, after the closing fence.
+// The display/ranking title for a candidate note, derived from its own statement.
+//
+// P4 (session d50582e9, F6): every onboarding note used to render a literal `# Candidate`
+// H1, and the server derives a note's title from its first H1 (ldm_markdown._extract_title)
+// when no frontmatter `title:` is present. So the entire onboarding corpus was titled
+// "Candidate", which is useless for ranking and for display. The title MUST come from the
+// body, not the frontmatter: the frontmatter here is a closed-vocabulary machine header (no
+// user/agent free text) precisely so the reconciliation scanners never trip on it, so a
+// free-text `title:` key would break that invariant.
+//
+// Deterministic and semantics-free, exactly like the id and the slug: collapse the statement
+// to one line, keep the first sentence when it reads as a title on its own, otherwise cut at
+// a word boundary. NO LLM, no summarization. It does NOT touch identity: `candidateId` hashes
+// kind + statement + anchors and never the title, so a better H1 leaves the id and the relPath
+// unchanged, and only NEW renders (or a re-mint of the same identity) pick it up. An empty
+// statement (which validation forbids, but render must never throw) falls back to the kind.
+const CANDIDATE_TITLE_MAX = 72;
+
+export function candidateTitle(candidate: MergedCandidate): string {
+  const norm = normalizeStatement(candidate.statement);
+  if (norm.length === 0) return `Onboarding candidate (${candidate.kind})`;
+  const firstSentence = norm.match(/^.*?[.!?](?=\s|$)/)?.[0]?.trim();
+  const base =
+    firstSentence && firstSentence.length <= CANDIDATE_TITLE_MAX
+      ? firstSentence.replace(/[.!?]+$/, "")
+      : norm;
+  if (base.length <= CANDIDATE_TITLE_MAX) return base;
+  const cut = base.slice(0, CANDIDATE_TITLE_MAX);
+  const lastSpace = cut.lastIndexOf(" ");
+  const trimmed = (lastSpace > 0 ? cut.slice(0, lastSpace) : cut).trim();
+  return `${trimmed}…`;
+}
+
 export function renderCandidateDocument(candidate: MergedCandidate): string {
   const sourceLabel = renderSourceLabel(candidate.sourceScouts);
 
@@ -671,7 +705,10 @@ export function renderCandidateDocument(candidate: MergedCandidate): string {
   ];
 
   const body: string[] = [];
-  body.push("# Candidate");
+  // The H1 is the note's display/ranking title (the server reads it as the title when no
+  // frontmatter title exists). Derived from the statement so it is never the useless
+  // "Candidate" literal; the full statement still follows in full below.
+  body.push(`# ${candidateTitle(candidate)}`);
   body.push("");
   body.push(candidate.statement.trim());
   body.push("");

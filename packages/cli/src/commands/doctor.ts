@@ -69,7 +69,8 @@ import {
   type ReconcilePlan,
   type ReconcileIO,
 } from "../connectors/claude-code/plugin-migrate";
-import { codexHooksInstalled, isOurMlaCommand } from "../connectors/codex/wire";
+import { CODEX_MANAGED_HOOKS } from "../connectors/codex/hook-contract";
+import { codexHooksInstalled, codexInstalledEvents, isOurMlaCommand } from "../connectors/codex/wire";
 import {
   readRuleBundleCache,
   BUNDLE_CACHE_NEVER_FETCHED,
@@ -258,21 +259,51 @@ export function pluginStatusCheck(ownership: PluginOwnership): Check {
   };
 }
 
-export function codexHookDoctorCheck(installed: boolean, hooksPath: string): Check {
-  return installed
-    ? {
-        id: "codex.hooks.registered",
-        ok: true,
-        label: "Codex Meetless hooks registered",
-        detail: hooksPath,
-      }
-    : {
-        id: "codex.hooks.registered",
-        ok: true,
-        level: "info",
-        label: "Codex Meetless hooks not installed",
-        detail: "run `mla codex install` to enable Codex grounding and enforcement",
-      };
+/**
+ * THREE states, not two. `installed` is the list of managed events actually
+ * registered (`codexInstalledEvents`), because the boolean this used to take could
+ * not tell "you have no Codex connector" from "you have one that captures events and
+ * creates no knowledge", and it rendered the second as a green info line reading
+ * "Codex Meetless hooks not installed" to operators whose hooks were demonstrably
+ * firing every day.
+ *
+ * A PARTIAL install FAILS. It is not a style preference: `Stop` is the only hook that
+ * requests a finalize, finalize is the only thing that runs turn assembly, and turn
+ * assembly is the only thing that turns a session into claims. Production, 2026-08-10
+ * to 08-16: 89 Codex runs, 0 finalized, 0 turns, 0 claims, while every other hook
+ * delivered 318 tool events and 16 prompts. An operator cannot be told that is fine.
+ */
+export function codexHookDoctorCheck(installed: string[] | boolean, hooksPath: string): Check {
+  // Back-compat with the boolean callers: true means complete, false means absent.
+  const events = typeof installed === "boolean" ? (installed ? CODEX_MANAGED_HOOKS.map((h) => h.event) : []) : installed;
+  const missing = CODEX_MANAGED_HOOKS.map((h) => h.event).filter((e) => !events.includes(e));
+
+  if (events.length === 0) {
+    return {
+      id: "codex.hooks.registered",
+      ok: true,
+      level: "info",
+      label: "Codex Meetless hooks not installed",
+      detail: "run `mla codex install` to enable Codex grounding and enforcement",
+    };
+  }
+  if (missing.length === 0) {
+    return {
+      id: "codex.hooks.registered",
+      ok: true,
+      label: "Codex Meetless hooks registered",
+      detail: hooksPath,
+    };
+  }
+  return {
+    id: "codex.hooks.registered",
+    ok: false,
+    label: `Codex hooks INCOMPLETE: ${missing.join(", ")} not registered`,
+    detail:
+      missing.includes("Stop")
+        ? "without Stop this session is captured but never finalized, so no turn is assembled and no knowledge is created from it; run `mla codex install` to repair"
+        : `run \`mla codex install\` to repair (${hooksPath})`,
+  };
 }
 
 /**
@@ -281,23 +312,38 @@ export function codexHookDoctorCheck(installed: boolean, hooksPath: string): Che
  * the final assistant message directly, while Claude-only transcript replay
  * features (such as intra-turn narration reconstruction) stay disabled.
  */
-export function codexLifecycleCoverageCheck(installed: boolean): Check {
-  return installed
-    ? {
-        id: "codex.hooks.coverage",
-        ok: true,
-        level: "info",
-        label: "Codex hook coverage: full session capture lifecycle",
-        detail:
-          "SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop are registered; Codex transcript replay remains limited to stable hook fields",
-      }
-    : {
-        id: "codex.hooks.coverage",
-        ok: true,
-        level: "info",
-        label: "Codex hook coverage inactive",
-        detail: "no Meetless Codex hooks are installed",
-      };
+export function codexLifecycleCoverageCheck(installed: string[] | boolean): Check {
+  const events = typeof installed === "boolean" ? (installed ? CODEX_MANAGED_HOOKS.map((h) => h.event) : []) : installed;
+  const missing = CODEX_MANAGED_HOOKS.map((h) => h.event).filter((e) => !events.includes(e));
+
+  if (events.length === 0) {
+    return {
+      id: "codex.hooks.coverage",
+      ok: true,
+      level: "info",
+      label: "Codex hook coverage inactive",
+      detail: "no Meetless Codex hooks are installed",
+    };
+  }
+  if (missing.length === 0) {
+    return {
+      id: "codex.hooks.coverage",
+      ok: true,
+      level: "info",
+      label: "Codex hook coverage: full session capture lifecycle",
+      detail:
+        "SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop are registered; Codex transcript replay remains limited to stable hook fields",
+    };
+  }
+  // A partial install must not borrow the full-lifecycle sentence. The sibling check
+  // owns the severity; this one owns the inventory, and it says which half is live.
+  return {
+    id: "codex.hooks.coverage",
+    ok: true,
+    level: "info",
+    label: `Codex hook coverage: partial (${events.join(", ")})`,
+    detail: `${missing.join(", ")} not registered, so the lifecycle stops before ${missing.includes("Stop") ? "finalize and no turn is ever assembled" : "that event"}`,
+  };
 }
 
 export function ruleBundleDoctorChecks(read: BundleCacheRead): Check[] {
@@ -1663,17 +1709,23 @@ export async function runDoctor(argv: string[]): Promise<number> {
   // who only use Claude Code. When present, these rows make its two independent
   // halves visible: lifecycle hooks and the governed-retrieval MCP plugin.
   const liveCodexHooksPath = codexHooksPath();
+  // The EVENT LIST, not the all-or-nothing boolean: a pre-`b2486c443` install has
+  // every hook but Stop, captures normally and creates no knowledge, and the boolean
+  // reported that as "not installed".
+  const liveCodexEvents = codexInstalledEvents({
+    hooksPathOverride: liveCodexHooksPath,
+  });
   const liveCodexHooksInstalled = codexHooksInstalled({
     hooksPathOverride: liveCodexHooksPath,
   });
   const liveCodexMcpProbe = probeCodexMcp();
   checks.push(
     codexHookDoctorCheck(
-      liveCodexHooksInstalled,
+      liveCodexEvents,
       liveCodexHooksPath,
     ),
   );
-  checks.push(codexLifecycleCoverageCheck(liveCodexHooksInstalled));
+  checks.push(codexLifecycleCoverageCheck(liveCodexEvents));
   checks.push(codexMcpDoctorCheck(liveCodexMcpProbe));
   checks.push(
     codexConnectorCompleteCheck(liveCodexHooksInstalled, liveCodexMcpProbe),

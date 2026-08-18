@@ -193,6 +193,12 @@ export async function runWhoami(
   const email = me.user.email ? ` <${me.user.email}>` : "";
   const human = [
     `Logged in as ${me.user.displayName}${email}.`,
+    // Which backend answered is part of the identity, not trivia: one machine can hold
+    // several cli-configs under different HOMEs (a dev config on 127.0.0.1 and a prod
+    // one), and the same human then prints identically from both while holding different
+    // user ids and different sessions. `mla whoami` is the command you run precisely to
+    // settle "which login am I?", so it has to say.
+    `  Backend:   ${cfg.controlUrl}`,
     `  User:      ${me.user.id}`,
     `  Role:      ${me.user.role}`,
   ];

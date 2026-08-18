@@ -168,3 +168,100 @@ describe("I7: how a commit is scoped on a tree ten sessions share", () => {
     expect(git(repo, ["diff", "--cached", "--name-only"])).toBe("");
   });
 });
+
+// --------------------------------------------------------------------------
+// THE TWO FAILURE MODES THAT FIRED ON 2026-08-10 AND ARE NOT COVERED ABOVE.
+//
+// Everything above pins how a commit is SCOPED. Both of these are about the isolated
+// index being a SNAPSHOT: it is correct at the instant `read-tree` runs and wrong the
+// moment HEAD moves, and nothing in the procedure noticed.
+//
+// Incident: an isolated index was seeded with `read-tree HEAD`, a four-minute standalone
+// verification ran, three peer commits landed in that window, and `commit-tree -p HEAD`
+// then parented the STALE tree onto the NEW tip. Six peer files were reverted. The first
+// repair silently no-opped and shipped an empty fix.
+// --------------------------------------------------------------------------
+
+describe("the isolated index is a snapshot, and HEAD does not wait for it", () => {
+  it("DEFECT: a tree built from an OLD head reverts every peer commit that landed since", () => {
+    const { repo, index } = sharedTree();
+    isolate(repo, index, ["mine.txt"]);
+    const base = git(repo, ["rev-parse", "HEAD"]);
+
+    // The window. Anything slow goes here: a standalone verification run, a suite, a
+    // live replay. On this tree that is minutes, and minutes are several peer commits.
+    writeFileSync(join(repo, "peer.txt"), "base\na peer's LANDED fix\n");
+    git(repo, ["add", "peer.txt"]);
+    git(repo, ["commit", "-q", "-m", "peer: a fix that is now in HEAD"]);
+    expect(git(repo, ["rev-parse", "HEAD"])).not.toBe(base);
+
+    // The procedure as written: write the tree that was staged before the window, and
+    // parent it onto whatever HEAD is NOW.
+    const tree = git(repo, ["write-tree"], { GIT_INDEX_FILE: index });
+    const sha = git(repo, ["commit-tree", tree, "-p", "HEAD", "-m", "mine only"]);
+    git(repo, ["update-ref", "HEAD", sha]);
+
+    // The commit claims to be "mine only" and its own stat says otherwise.
+    expect(git(repo, ["show", "HEAD:peer.txt"])).not.toContain("a peer's LANDED fix");
+    expect(git(repo, ["show", "--pretty=format:", "--stat", "HEAD"])).toContain("peer.txt");
+  });
+
+  it("update-ref with the OLD value refuses the race instead of losing it", () => {
+    // The cheap half of the fix, and it is pure git: the three-arg form is a
+    // compare-and-swap. It cannot rebuild a stale tree, but it converts a silent
+    // clobber into a loud failure, which is the difference between a lost commit and
+    // a retry.
+    const { repo, index } = sharedTree();
+    isolate(repo, index, ["mine.txt"]);
+    const base = git(repo, ["rev-parse", "HEAD"]);
+
+    writeFileSync(join(repo, "peer.txt"), "base\na peer's LANDED fix\n");
+    git(repo, ["add", "peer.txt"]);
+    git(repo, ["commit", "-q", "-m", "peer: landed during my window"]);
+
+    const tree = git(repo, ["write-tree"], { GIT_INDEX_FILE: index });
+    const sha = git(repo, ["commit-tree", tree, "-p", base, "-m", "mine only"]);
+    expect(() => git(repo, ["update-ref", "HEAD", sha, base])).toThrow();
+    expect(git(repo, ["show", "HEAD:peer.txt"])).toContain("a peer's LANDED fix");
+  });
+
+  it("DEFECT: restoring a path the clobber DELETED needs --add, and without it the repair no-ops", () => {
+    // The second half of the incident. The repair loop rebuilt an index and called
+    // `update-index --cacheinfo` per path. For every path that still existed that
+    // works; for the one the clobber had REMOVED it is a hard error, and the loop took
+    // the rest of the restore with it. The resulting commit was byte-identical to the
+    // one it was meant to fix.
+    const { repo } = sharedTree();
+    const base = git(repo, ["rev-parse", "HEAD"]);
+    // A peer adds a file that did not exist before. This is the shape that breaks the
+    // repair: content reverts are restorable with plain --cacheinfo, a whole NEW path
+    // is not.
+    writeFileSync(join(repo, "peer_new.txt"), "a peer's new file\n");
+    git(repo, ["add", "peer_new.txt"]);
+    git(repo, ["commit", "-q", "-m", "peer: adds a new file"]);
+    const good = git(repo, ["rev-parse", "HEAD"]);
+
+    // The stale-tree clobber, which DELETES it.
+    const stale = join(repo, ".git", "stale-index");
+    git(repo, ["read-tree", base], { GIT_INDEX_FILE: stale });
+    const staleTree = git(repo, ["write-tree"], { GIT_INDEX_FILE: stale });
+    const bad = git(repo, ["commit-tree", staleTree, "-p", good, "-m", "clobber"]);
+    git(repo, ["update-ref", "refs/heads/main", bad, good]);
+    expect(() => git(repo, ["cat-file", "-e", "HEAD:peer_new.txt"])).toThrow();
+
+    // The repair, exactly as it was written.
+    const repair = join(repo, ".git", "repair-index");
+    git(repo, ["read-tree", "HEAD"], { GIT_INDEX_FILE: repair });
+    const blob = git(repo, ["rev-parse", `${good}:peer_new.txt`]);
+    expect(() =>
+      git(repo, ["update-index", "--cacheinfo", `100644,${blob},peer_new.txt`], { GIT_INDEX_FILE: repair }),
+    ).toThrow(/missing --add option/);
+
+    // AND THE TELL WAS ON SCREEN: nothing staged, so the "repair" commits nothing.
+    expect(git(repo, ["diff", "--cached", "--name-only", "HEAD"], { GIT_INDEX_FILE: repair })).toBe("");
+
+    // `--add` is the whole difference.
+    git(repo, ["update-index", "--add", "--cacheinfo", `100644,${blob},peer_new.txt`], { GIT_INDEX_FILE: repair });
+    expect(git(repo, ["diff", "--cached", "--name-only", "HEAD"], { GIT_INDEX_FILE: repair })).toBe("peer_new.txt");
+  });
+});

@@ -97,21 +97,38 @@ export function removeCodexHooks(opts: {
   });
 }
 
-/** True when a Codex hooks.json currently registers every managed hook. */
-export function codexHooksInstalled(opts: {
+/**
+ * WHICH managed hooks a Codex hooks.json currently registers, in contract order.
+ *
+ * THE PARTIAL STATE IS THE ONE THAT MATTERS, and collapsing it into a boolean is how
+ * it stayed invisible for a month. `Stop` joined `CODEX_MANAGED_HOOKS` in `b2486c443`
+ * (2026-07-21); an install written before that keeps capturing (SessionStart creates
+ * the run, UserPromptSubmit and PostToolUse deliver events) and never requests a
+ * finalize, and turn assembly runs ONLY inside the AGENT_RUN_FINALIZED handler. So
+ * every other hook works, events accumulate, and not one claim is ever created.
+ *
+ * Measured in production 2026-08-10..08-16: 89 Codex runs, 0 finalized, 0
+ * `agent_turns`; 82 of 84 sessions emitted no `session_stopped` at all; 0 of the 55
+ * sessions that called finalize in seven days were Codex. Against Claude Code's 319
+ * runs / 57 finalized / 144 turns on the same tree.
+ *
+ * Returns `[]` for "no file / not ours / unreadable", which is the genuinely-absent
+ * case an optional connector is allowed to be in.
+ */
+export function codexInstalledEvents(opts: {
   hooksPathOverride?: string;
   homeDeps?: HomeResolutionDeps;
-} = {}): boolean {
+} = {}): string[] {
   const hooksPath = opts.hooksPathOverride ?? codexHooksPath(opts.homeDeps);
-  if (!fs.existsSync(hooksPath)) return false;
+  if (!fs.existsSync(hooksPath)) return [];
   let doc: any;
   try {
     doc = JSON.parse(fs.readFileSync(hooksPath, "utf8"));
   } catch {
-    return false;
+    return [];
   }
   const events = doc?.hooks;
-  if (!events || typeof events !== "object") return false;
+  if (!events || typeof events !== "object") return [];
   const installed = new Set<string>();
   for (const event of Object.keys(events)) {
     const list = events[event];
@@ -129,6 +146,17 @@ export function codexHooksInstalled(opts: {
       }
     }
   }
+  // Contract order, not Set-insertion order, so a caller can print it and a test can
+  // compare it without sorting at every site.
+  return CODEX_MANAGED_HOOKS.map((hook) => hook.event).filter((event) => installed.has(event));
+}
+
+/** True when a Codex hooks.json currently registers every managed hook. */
+export function codexHooksInstalled(opts: {
+  hooksPathOverride?: string;
+  homeDeps?: HomeResolutionDeps;
+} = {}): boolean {
+  const installed = new Set(codexInstalledEvents(opts));
   return CODEX_MANAGED_HOOKS.every((hook) => installed.has(hook.event));
 }
 

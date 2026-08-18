@@ -3428,3 +3428,75 @@ maybe_refresh_ahead() {
   refresh_user_token "$skew" || true
   return 0
 }
+
+# N1 (2026-08-15). The citations carried by the governing RULES that fired this turn,
+# one per line, deduped, in head order. Printed for `rule_citations` on the enrich
+# request; empty output on ~98% of turns, which is the byte-identical path.
+#
+# THE DEFECT IT CLOSES. A `[MUST]` rule can name a governed document by citation, this
+# hook injects that rule, and no selector on intel's enrich path ever fetches the
+# document: every selector reads `probe_text or question`, and until now no field on the
+# request carried rule text at all. So the system stated a document as a requirement and
+# then ran a relevance gate that could not see the requirement it had just issued.
+# Measured on session ef697800: 17 rules live, 2 naming a citation, 31 turns delivering
+# any citation, and 0 delivering the document their own rule names.
+#
+# ONLY THE RULE BLOCKS, and this is the load-bearing part of the parse. The assembled
+# head also carries the static grounding block (which documents the citation KINDS as
+# prose, `NT:<note>`, and would mine as a citation) and, later in the turn, the evidence
+# block (which names the ids intel just served us). Feeding either back would report our
+# own delivery as a governance obligation and pin the payload to whatever was served
+# once, which is a self-echo loop wearing a governance label.
+#
+# NO CAP HERE, DELIBERATELY. Intel caps at `RULE_CITATION_CAP` and reports the overflow
+# as `rule_citations_dropped_for_cap`. Capping on this side would truncate the
+# denominator before intel ever saw it, so the drop counter would read 0 while documents
+# went missing: the silent-cap failure this workstream has now found three times.
+#
+# ALL THREE KINDS ARE EMITTED, not just the one intel resolves. `NT:` is a governed KB
+# document and is the only kind any live rule cites today (7 of 90 rule versions on
+# control-dev carry a citation, all three distinct ones `NT:`). `CC:` and `DE:` are sent
+# so intel can COUNT them as `rule_citations_unsupported`; filtering them here would make
+# the day a rule starts citing a case indistinguishable from the day none does.
+#
+# Rule bodies are operator-authored prose and reach this function as DATA: `$1`, never
+# eval, never a here-doc, so a body carrying backticks or `$VAR` cannot execute. MUST
+# exit 0 so `RULE_CITATIONS_RAW="$(extract_rule_citations ...)"` can never abort a turn.
+extract_rule_citations() {
+  local head="${1:-}"
+  [[ -n "$head" ]] || return 0
+  # ONE awk pass: isolate the rule blocks, scan them for citations, strip prose
+  # punctuation, dedupe in first-seen order. A pipeline of grep and sed was the first
+  # cut and it needed a `|| true` on the grep, because a turn whose rules cite nothing
+  # is the COMMON case (~98%) and a no-match grep exits 1, which under `pipefail` makes
+  # the naive spelling print its fallback TWICE. That defect is already recorded on this
+  # tree; not building a pipeline is a cheaper way to not have it.
+  #
+  # BLOCK MATCHED ON THE `kind=` ATTRIBUTE with `index()`, not on the whole header:
+  # `floor-rules` carries `trust="must-follow"` and `scoped-rules` carries nothing
+  # today, so a header-equality test would silently stop matching the day either grows
+  # an attribute. `index()` over a regex for the same reason the two patterns are not
+  # one alternation: this runs under whichever awk the operator's machine ships, and
+  # BSD awk is the floor here, not gawk.
+  printf '%s\n' "$head" \
+    | awk '
+        index($0, "kind=\"floor-rules\"")  > 0 { inblk = 1; next }
+        index($0, "kind=\"scoped-rules\"") > 0 { inblk = 1; next }
+        inblk && index($0, "</meetless-context>") > 0 { inblk = 0; next }
+        inblk {
+          s = $0
+          while (match(s, /(NT|CC|DE):[A-Za-z0-9_][A-Za-z0-9_.\/-]*/)) {
+            tok = substr(s, RSTART, RLENGTH)
+            s = substr(s, RSTART + RLENGTH)
+            # Trailing prose punctuation is not part of the id. A real citation ends in
+            # its extension or its opaque id, so stripping these can never shorten a
+            # well-formed one, and leaving them on would ship an unresolvable id that
+            # degrades to silence and says nothing about why.
+            sub(/[.,;:!?)\]}>"'"'"'`]+$/, "", tok)
+            if (tok != "" && !(tok in seen)) { seen[tok] = 1; out[++n] = tok }
+          }
+        }
+        END { for (i = 1; i <= n; i++) print out[i] }
+      ' 2>/dev/null || true
+  return 0
+}

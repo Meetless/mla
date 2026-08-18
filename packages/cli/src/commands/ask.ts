@@ -12,7 +12,7 @@ import {
 import { parseAsOf } from "../lib/temporal";
 import { isPackagedBinary } from "../lib/packaged";
 import { findWorkspaceContext } from "../lib/workspace";
-import { readScanCacheForRoot } from "./scan-context";
+import { readScanCacheForRoot, resolveScanRootIdentity } from "./scan-context";
 
 // `mla ask`: the CLI front-end over the shared @meetless/ask-core ask
 // implementation (proposal 20260529 T5 / D-D). It reuses the SAME mode routing
@@ -207,7 +207,16 @@ function isUngroundedAnswer(result: Record<string, unknown>): boolean {
 // a throw anywhere in the chain costs one optional line, never the answer.
 function attachDocumentationImpact(result: Record<string, unknown>, workspaceId: string): void {
   try {
-    const repoRoot = findWorkspaceContext()?.markerDir;
+    // The bytes must come from the SAME checkout whose scan produced the
+    // findings. `readScanCacheForRoot` below is this checkout's slot, so pairing
+    // it with the marker dir was only ever the same directory by accident: a
+    // linked worktree inherits its binding from the origin checkout (D1), so the
+    // marker dir is a DIFFERENT tree, possibly at a different commit. Re-hashing
+    // a finding against another checkout's bytes defeats the point of the gate,
+    // which is that a finding is true only if the cited file still says what was
+    // evaluated. `assemble-context` already reads through resolveScanRoot; this
+    // is the same rule, and it is the only site that had drifted from it.
+    const repoRoot = resolveScanRootIdentity();
     const cache = readScanCacheForRoot(undefined, workspaceId);
     if (!cache) return;
     const live = liveReconciliationFindings(

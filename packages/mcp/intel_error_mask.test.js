@@ -204,15 +204,22 @@ test("ACCOUNT_SUSPENDED is not described as a billing denial or an outage", () =
   assert.match(c.guidance, /support/i);
 });
 
-test("NO_HEADROOM does not advise a top-up either (same defect class)", () => {
-  // control reaches NO_HEADROOM only AFTER proving the balance positive: it is the
-  // workspace runaway brake at zero, and only an operator can raise it. control's
-  // own constants call sending the customer to a checkout page here "the dark
-  // pattern this flag exists to avoid"; the mask must not undo that downstream.
+test("the RETIRED NO_HEADROOM falls through to the generic terminal copy", () => {
+  // KEPT rather than deleted when control retired the reason on 2026-08-14, and
+  // repointed rather than repurposed, mirroring intel's ruling on the same
+  // deletion (5670080e): deleting this case would delete the only test that uses
+  // a REAL string control once emitted to prove what happens when control answers
+  // a reason this build has never heard of.
+  //
+  // The answer must be the generic terminal bucket. It stays terminal, and it must
+  // not guess a remedy: the retired copy sent the reader "to an operator to raise
+  // the workspace cap", advice for a brake that no longer exists and that no
+  // operator could ever arm.
   const c = classifyIntelError(denyErr("NO_HEADROOM"));
   assert.equal(c.transient, false);
   assert.equal(advisesBuyingCredit(`${c.message}\n${c.guidance}`), false, c.guidance);
-  assert.match(c.guidance, /raise the workspace cap/i);
+  assert.doesNotMatch(c.guidance, /raise the workspace cap/i);
+  assert.equal(c.guidance, classifyIntelError(denyErr("PRICING_UNSUPPORTED")).guidance);
 });
 
 test("EXHAUSTED DOES advise a top-up (the one reason where money is the answer)", () => {
@@ -231,8 +238,8 @@ test("NO_PAYER advises binding a payer, not funding one", () => {
   assert.equal(advisesBuyingCredit(c.guidance), false, c.guidance);
 });
 
-test("the four terminal remedies never share a guidance line", () => {
-  const reasons = ["NO_PAYER", "EXHAUSTED", "NO_HEADROOM", "ACCOUNT_SUSPENDED"];
+test("the three terminal remedies never share a guidance line", () => {
+  const reasons = ["NO_PAYER", "EXHAUSTED", "ACCOUNT_SUSPENDED"];
   const seen = new Map();
   for (const r of reasons) {
     const g = classifyIntelError(denyErr(r)).guidance;
@@ -283,9 +290,12 @@ test("every AdmissionDenyReason control can emit is classified, and only the all
     }
   }
 
-  // The four we key a specific remedy on must still EXIST upstream. A rename on
+  // The three we key a specific remedy on must still EXIST upstream. A rename on
   // control's side would otherwise silently demote that reason to the generic copy.
-  for (const keyed of ["NO_PAYER", "EXHAUSTED", "NO_HEADROOM", "ACCOUNT_SUSPENDED"]) {
+  // NO_HEADROOM was a fourth until control retired it on 2026-08-14; this loop is
+  // exactly the guard that caught the drift, two days late only because mla-ci is
+  // path-filtered to meetless-cli/** and the deletion landed in apps/control.
+  for (const keyed of ["NO_PAYER", "EXHAUSTED", "ACCOUNT_SUSPENDED"]) {
     assert.ok(reasons.includes(keyed), `control no longer emits ${keyed}; update TERMINAL_BILLING_GUIDANCE_KEY`);
   }
 });

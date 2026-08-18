@@ -6,6 +6,7 @@ import {
   loadState,
   writeState,
   renderCandidateDocument,
+  candidateTitle,
   CANDIDATE_DOC_SCHEMA_VERSION,
   verifyCandidate,
   defaultProbe,
@@ -1252,7 +1253,7 @@ describe("ingestRun: batched persistence (progress must survive a failure)", () 
 });
 
 describe("renderCandidateDocument", () => {
-  it("emits versioned onboarding-candidate frontmatter and a # Candidate / ## Evidence / ## Status body", () => {
+  it("emits versioned onboarding-candidate frontmatter and a statement-titled / ## Evidence / ## Status body", () => {
     const md = renderCandidateDocument(
       asMerged(docCandidate({ evidence: [{ type: "file", path: "CLAUDE.md", startLine: 3, endLine: 9 }] })),
     );
@@ -1263,12 +1264,42 @@ describe("renderCandidateDocument", () => {
     expect(md).toContain("kind: convention");
     expect(md).toContain("sourceScouts: [documentation]");
     expect(md).toContain("reviewHint: provisional");
-    // Body skeleton.
-    expect(md).toContain("# Candidate");
+    // Body skeleton. P4 (F6): the H1 is the statement-derived title the server reads, never
+    // the useless "# Candidate" literal that titled the whole onboarding corpus.
+    expect(md).toContain("# Use 127.0.0.1 not localhost on macOS");
+    expect(md).not.toContain("# Candidate");
     expect(md).toContain("127.0.0.1");
     expect(md).toContain("## Evidence");
     expect(md).toContain("`CLAUDE.md` lines 3-9");
     expect(md).toContain("## Status");
+  });
+
+  // P4 (F6): the title comes from the candidate's own statement, deterministically.
+  it("titles the note from its statement, not the literal 'Candidate'", () => {
+    expect(candidateTitle(asMerged(docCandidate({ statement: "Prefer 127.0.0.1 over localhost." })))).toBe(
+      "Prefer 127.0.0.1 over localhost",
+    );
+  });
+
+  it("keeps the title on one line and within the length bound, cutting at a word boundary", () => {
+    const long =
+      "Served RelationAssertion graph edges must re-resolve each endpoint's own governed ACL before the edge is served to a caller";
+    const title = candidateTitle(asMerged(docCandidate({ statement: long })));
+    expect(title.length).toBeLessThanOrEqual(73); // 72 chars + the single-character ellipsis
+    expect(title).not.toContain("\n");
+    expect(title.endsWith("…")).toBe(true);
+    expect(long.startsWith(title.replace(/…$/, ""))).toBe(true);
+  });
+
+  it("falls back to the kind when the statement is empty, and never throws", () => {
+    expect(candidateTitle(asMerged(docCandidate({ statement: "   " })))).toBe("Onboarding candidate (convention)");
+  });
+
+  it("changing the title does NOT change the candidate identity (id hashes statement, not title)", () => {
+    const c = asMerged(docCandidate());
+    // The H1 is derived, but the persisted candidateId (and thus the relPath) is unchanged.
+    expect(renderCandidateDocument(c)).toContain(`candidateId: ${candidateId(c)}`);
+    expect(renderCandidateDocument(c)).toContain(`# ${candidateTitle(c)}`);
   });
 
   it("carries a frontmatter candidateId equal to the candidate's identity (the same id its relPath uses)", () => {
@@ -1370,8 +1401,10 @@ describe("renderCandidateDocument", () => {
     expect(candidateId(c)).toMatch(/^[0-9a-f]{64}$/);
 
     // Body skeleton: blank, heading, blank, statement, blank, the sentinel that bounds it.
+    // The heading is the statement-derived title (P4, F6), never the "# Candidate" literal.
     expect(lines[8]).toBe("");
-    expect(lines[9]).toBe("# Candidate");
+    expect(lines[9]).toBe(`# ${candidateTitle(c)}`);
+    expect(lines[9]).not.toBe("# Candidate");
     expect(lines[10]).toBe("");
     expect(lines[11]).toBe(c.statement);
     expect(lines[12]).toBe("");

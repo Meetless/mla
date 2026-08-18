@@ -162,11 +162,23 @@ function formatRemaining(iso: string): string | null {
 
 // The shared "you're still logged in" message. Pulled out so the fast path, the
 // verify-confirmed path, and the offline-fallback path all print identically.
-function printAlreadyLoggedIn(auth: Extract<CliAuth, { mode: "user-token" }>): void {
+//
+// `controlUrl` is not decoration. One machine can hold several cli-configs under
+// different HOMEs (a dev config on 127.0.0.1 and a prod one, which is exactly how
+// tools/mla-demo isolates its box), and MEETLESS_BACKEND_URL can repoint a third.
+// Without the backend on this line, all of them print an identical "Already logged
+// in as <same human> <same email>" while answering for different servers, different
+// sessions and different user ids. On 2026-08-17 that cost a live debugging detour:
+// a prod session had expired, and `mla login` in the operator's own shell reported
+// the healthy DEV session as proof it had not.
+function printAlreadyLoggedIn(
+  auth: Extract<CliAuth, { mode: "user-token" }>,
+  controlUrl: string,
+): void {
   const who = auth.user.displayName || auth.user.id;
   const email = auth.user.email ? ` <${auth.user.email}>` : "";
   const runway = formatRemaining(auth.refreshExpiresAt);
-  console.log(`Already logged in as ${who}${email}.`);
+  console.log(`Already logged in as ${who}${email} at ${controlUrl}.`);
   console.log(
     `  Session expires ${runway ?? "soon"} (run \`mla login --force\` to re-login).`,
   );
@@ -312,7 +324,7 @@ export async function runLogin(argv: string[], deps: LoginDeps = {}): Promise<nu
       // next to the all-day dead loop a blind no-op can hide.
       try {
         await verifySession(cfg);
-        printAlreadyLoggedIn(auth);
+        printAlreadyLoggedIn(auth, cfg.controlUrl);
         return 0;
       } catch (e) {
         if (classifyProbeFailure(e as HttpError) === "keep") {
@@ -321,7 +333,7 @@ export async function runLogin(argv: string[], deps: LoginDeps = {}): Promise<nu
           // but erroring on a concrete non-auth status (e.g. 500 on /auth/me).
           // Keep the cached session; opening a browser flow whose token exchange
           // would hit the same wall helps no one.
-          printAlreadyLoggedIn(auth);
+          printAlreadyLoggedIn(auth, cfg.controlUrl);
           console.log(
             "  (could not verify with control; keeping cached session for now.)",
           );
@@ -374,7 +386,9 @@ export async function runLogin(argv: string[], deps: LoginDeps = {}): Promise<nu
   const email = bundle.user.email ? ` <${bundle.user.email}>` : "";
   const accessRunway = formatRemaining(bundle.accessExpiresAt);
   const refreshRunway = formatRemaining(bundle.refreshExpiresAt);
-  console.log(`Logged in as ${bundle.user.displayName}${email}.`);
+  // Backend on this line for the same reason printAlreadyLoggedIn carries it: which
+  // server this session belongs to is the one fact that distinguishes two configs.
+  console.log(`Logged in as ${bundle.user.displayName}${email} at ${cfg.controlUrl}.`);
   // An account-only login (no workspace yet) is the NORMAL first-run outcome, not
   // a failure: login creates an Account and nothing else (INV-ACC-3). Say so, and
   // point at the one command that resolves it. `mla whoami` would be a dead end

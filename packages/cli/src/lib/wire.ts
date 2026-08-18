@@ -137,6 +137,21 @@ export interface McpRegisterResult {
 // rules file is necessary and not sufficient (this very repo, which carried a
 // query-first rule in CLAUDE.md yet still saw agents grep for concepts, proves
 // it). Evidence-adoption measurement is what actually changes behavior over time.
+//
+// THE WRITE-SIDE PARAGRAPH (added 2026-08-15) IS DELIBERATELY CONDITIONAL. Its
+// ancestor lived in the hook's static block as "Before you WRITE or MODIFY code,
+// call retrieve_knowledge", an unconditional gate on an ACTION, inside a block
+// whose own first line declares its contents untrusted. The owner ruling on G2 of
+// notes/20260814-did-mla-help-session-42cae8a5-*.md removed it from there and
+// refused to instrument it, because a rate over "did a pull precede this edit" is
+// turned green by one reflex pull that reads nothing.
+//
+// So the gap it covered is kept and the trigger is inverted: the condition is
+// MISSING OR INSUFFICIENT governed context, never the fact that a write is about
+// to happen. Do not re-tighten this into "always retrieve before writing" in
+// either surface; test/hooks/steering-surface-parity.spec.ts fails on that shape
+// here AND in the hook, and on any steering sentence the untrusted block carries
+// that this trusted one does not.
 export const PROJECT_RULES_FILENAME = "CLAUDE.md";
 export const MEETLESS_RULES_BEGIN = "<!-- BEGIN MEETLESS RULES (managed by `mla init`) -->";
 export const MEETLESS_RULES_END = "<!-- END MEETLESS RULES -->";
@@ -153,6 +168,13 @@ function renderMeetlessRulesBlock(): string {
     "definitions, callers, imports, regex behavior, and whether a field is read or",
     "written, inspect the code first. If code inspection raises a historical or",
     "rationale question, then call `retrieve_knowledge`.",
+    "",
+    "When a task depends on governed knowledge that has not already been supplied,",
+    "or on what was supplied being more than it is, retrieve it rather than",
+    "guessing. Team conventions (error handling, logging, migrations, auth, naming,",
+    "rollout) live in governed memory: the codebase shows you what EXISTS, not what",
+    "is REQUIRED. This is conditioned on the gap, not on the kind of work; when the",
+    "context you already hold settles the question, proceed.",
     "",
     "Use the Meetless MCP tools already in your tool list, in this order:",
     "",
