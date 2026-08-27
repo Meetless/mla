@@ -18,6 +18,7 @@ import { runKbPromote } from "./kb_promote";
 import { runKbDemote } from "./kb_demote";
 import { runKbRetime } from "./kb_retime";
 import { runKbClaims, runKbClaimVerdict, looksLikeDocumentRef } from "./kb_claims";
+import { runKbTensions } from "./kb_tensions";
 
 // `mla kb`: Knowledge Base subcommand router (T40, kb curation v2.3).
 //
@@ -73,6 +74,9 @@ interface SubstrateCounts {
   ops_relationship_candidates: number;
   ops_workflow_audit: number;
   outbox_pending: number;
+  // Documents harmed by a stranded serving ingest (optional: older servers omit them).
+  missing_serving_head?: number;
+  behind_serving_head?: number;
 }
 
 interface IngestedSource {
@@ -136,11 +140,21 @@ function n(v: unknown): number {
 // under an "accepted/live, promoted from sources" label is what made the old
 // output look broken.
 function bucketLines(c: SubstrateCounts): { sources: string[]; graph: string[]; ops: string[] } {
+  const sources = [
+    `chunks (Weaviate):        ${n(c.chunks)}`,
+    `chunk_fts (lexical):      ${n(c.chunk_fts)}`,
+  ];
+  // Stranded-ingest defects, when the server reports them: documents that a failed or
+  // hung serving ingest left with no head, or serving content the source has replaced.
+  // A control projection carrier (head-less by design) is never counted here.
+  if (typeof c.missing_serving_head === "number") {
+    sources.push(`missing serving head:     ${n(c.missing_serving_head)}`);
+  }
+  if (typeof c.behind_serving_head === "number") {
+    sources.push(`behind serving head:      ${n(c.behind_serving_head)}`);
+  }
   return {
-    sources: [
-      `chunks (Weaviate):        ${n(c.chunks)}`,
-      `chunk_fts (lexical):      ${n(c.chunk_fts)}`,
-    ],
+    sources,
     graph: [
       `entities (nodes):         ${n(c.graph_nodes)}`,
       `knowledge_relations:      ${n(c.graph_edges)}`,
@@ -378,7 +392,11 @@ Usage:
 
   inspect
     mla kb summary [--json]                substrate counts for this workspace
-    mla kb dump [--markdown] [--json]      counts + one row per ingested source`;
+    mla kb dump [--markdown] [--json]      counts + one row per ingested source
+    mla kb tensions <kbdoc:<id>|note:<path>|<path>> [--json]
+                                           the CONTRADICTS / SUPERSEDES edges touching this
+                                           document's claims + the counterpart, banded
+                                           DETECTED (machine-detected, pre-verdict)`;
 
 // Overload boundary for the `review` verb: a leading candidate id means "record a
 // verdict on this one"; anything else (no args, or a leading flag) means "list the
@@ -431,6 +449,8 @@ export async function runKb(argv: string[]): Promise<number> {
       return runKbAdd(rest);
     case "show":
       return runKbShow(rest);
+    case "tensions":
+      return runKbTensions(rest);
     case "reingest":
       return runKbReingest(rest);
     case "forget":

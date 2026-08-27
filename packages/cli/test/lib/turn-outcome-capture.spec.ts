@@ -33,14 +33,24 @@ interface WireTurn {
   low_trust: boolean;
 }
 
-function collect(opts: { turns: { seq: number; goal: string }[]; spool?: string[]; touched?: string[] }): WireTurn[] {
+function collect(opts: { turns: { seq: number; goal: string; outcome?: string }[]; spool?: string[]; touched?: string[] }): WireTurn[] {
   const home = mkdtempSync(join(tmpdir(), "mla-outcome-"));
   const queue = join(home, "queue");
   mkdirSync(queue, { recursive: true });
   const sid = "outcome_probe";
   writeFileSync(
     join(queue, `${sid}.turns`),
-    opts.turns.map((t) => JSON.stringify({ turn_id: `${sid}:${t.seq}`, sequence: t.seq, user_goal: t.goal })).join("\n") + "\n",
+    opts.turns
+      .map((t) => {
+        // An explicit `outcome` on the ledger row is the ONLY blocked signal the
+        // producer honors: `blocked` is never derived, only preserved when something
+        // upstream recorded it (review 2026-08-20). Absent it, the row is the ordinary
+        // {turn_id, sequence, user_goal} shape record_session_turn writes today.
+        const row: Record<string, unknown> = { turn_id: `${sid}:${t.seq}`, sequence: t.seq, user_goal: t.goal };
+        if (t.outcome !== undefined) row.outcome = t.outcome;
+        return JSON.stringify(row);
+      })
+      .join("\n") + "\n",
   );
   if (opts.spool) writeFileSync(join(queue, `${sid}.jsonl`), opts.spool.join("\n") + "\n");
   const touched = JSON.stringify(opts.touched ?? []);
@@ -61,14 +71,121 @@ const said = (narration: string) => JSON.stringify({ event: "assistant_message",
 const GOAL = [{ seq: 1, goal: "suppress goal-only observations" }];
 
 describe("deterministic turn outcome", () => {
-  it("a turn that changed files is APPLIED, not unknown", () => {
-    const [t] = collect({ turns: GOAL, touched: ["src/a.ts"] });
+  // ------------------------------------------------------------------------------------
+  // An's review (2026-08-20) REJECTED the loose "touched a file => applied" rule and the
+  // proposal's inference machinery (no-commit=>blocked, restore-to-HEAD proof, goal/path
+  // matching, HEAD comparison). `applied` means an UNAMBIGUOUS TURN-OWNED COMMIT with no
+  // revert ambiguity; a mixed commit/revert, a research-only turn, or an uncommitted edit
+  // is `unknown`; a pure revert is `reverted`; `blocked` is honored only from an explicit
+  // recorded signal, never derived. The conservative table, driven only by the
+  // session-owned commands the turn ran (plus the explicit row signal), is below.
+  // ------------------------------------------------------------------------------------
+
+  it("SEAM-3 SHAPE: a turn that committed one sub-task AND reverted its goal-work is UNKNOWN, goal omitted", () => {
+    // The exact defect F1 exists for: goal names the reverted seam-3 work, the commit
+    // landed a DIFFERENT sub-task's files. Pairing them as `applied` is the false
+    // attribution. Mixed commit/revert => unknown, and the misleading goal is dropped so
+    // it is never associated with the unrelated committed files.
+    const [t] = collect({
+      turns: [{ seq: 4, goal: "Make active seeding resolve through the stable lineage" }],
+      spool: [bash("GIT_INDEX_FILE=$IDX git commit -F .git/COMMIT_EDITMSG"), bash("git checkout -- seed_claims_live.py")],
+      touched: ["tools/mla-helpfulness/analyze.py"],
+    });
+    expect(t.outcome).toBe("unknown");
+    expect(t.user_goal).toBe(""); // dropped: never pair a goal with files that do not implement it
+    // The files are still described (as committed-this-turn), only the goal pairing is gone.
+    expect(t.touched_files).toEqual(["tools/mla-helpfulness/analyze.py"]);
+  });
+
+  it("PURE COMMIT: an unambiguous turn-owned commit with no revert is APPLIED, goal kept", () => {
+    const [t] = collect({ turns: GOAL, spool: [bash("GIT_INDEX_FILE=$IDX git commit -F .git/COMMIT_EDITMSG")] });
+    expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("suppress goal-only observations");
+  });
+
+  it("PURE COMMIT (plain git commit, no isolated index) is also APPLIED", () => {
+    // Outcome asks whether a commit LANDED, not whether it was isolated-index compliant
+    // (that is the tier-2b observer's job, a separate concern).
+    const [t] = collect({ turns: GOAL, spool: [bash("git commit -m 'fix the thing'")] });
     expect(t.outcome).toBe("applied");
   });
 
-  it("a turn that ran a mutating command is APPLIED", () => {
-    const [t] = collect({ turns: GOAL, spool: [bash("git commit -m 'fix the thing'")] });
+  it("PURE REVERT (discard): a turn that only DISCARDED uncommitted work and committed nothing is REVERTED", () => {
+    // Discard = git restore / checkout -- path / reset --hard: threw away uncommitted work.
+    const [t] = collect({ turns: GOAL, spool: [bash("git checkout -- src/a.ts"), bash("git restore src/b.ts")] });
+    expect(t.outcome).toBe("reverted");
+  });
+
+  // An's follow-up ruling (2026-08-20): `outcome` is whether the GOAL succeeded, while a
+  // shell command is a repository MUTATION. `git revert` COMMITS a rollback (forward,
+  // successful work), so a user-requested rollback run with `git revert` must NOT read as
+  // `reverted`. We cannot prove from the command that the rollback WAS the goal, so the
+  // honest floor is `unknown` with the goal dropped, never `reverted`.
+  it("REQUESTED ROLLBACK: `git revert` of a named commit is NOT falsely reverted (unknown, goal dropped)", () => {
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "revert commit abc123def, it broke prod checkout" }],
+      spool: [bash("git revert abc123def --no-edit")],
+    });
+    expect(t.outcome).not.toBe("reverted"); // the ruling's hard requirement
+    expect(t.outcome).toBe("unknown"); // the conservative floor the ruling names
+    expect(t.user_goal).toBe(""); // goal dropped: a git-revert command must not be paired as the goal
+  });
+
+  it("REQUESTED ROLLBACK: `git revert` with no touched files still drops the goal", () => {
+    // git revert runs via Bash, so it never populates TOUCHED_FILES_JSON. The goal must
+    // still drop on the git-action signal, not only on a non-empty touched set.
+    const [t] = collect({ turns: [{ seq: 1, goal: "roll back the bad migration" }], spool: [bash("git revert HEAD")] });
+    expect(t.outcome).toBe("unknown");
+    expect(t.user_goal).toBe("");
+    expect(t.touched_files).toEqual([]);
+  });
+
+  it("MENTION NOT USE: a normal commit whose MESSAGE contains revert/restore is still APPLIED", () => {
+    // The subcommand anchor (`git <sub>`) means a word inside a -m message is a mention,
+    // not a use: `git commit -m 'revert the flaky skip'` is a commit, not a git-revert.
+    const [t] = collect({ turns: GOAL, spool: [bash("git commit -m 'revert the flaky skip and restore the config'")] });
     expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("suppress goal-only observations"); // a clean applied keeps its goal
+  });
+
+  it("NO COMMIT, NO BLOCK: a turn that only edited files (no commit) is UNKNOWN, not applied", () => {
+    // The review's correction of the loose rule: an uncommitted edit's outcome is
+    // genuinely unknown (it may be reverted, abandoned, or committed next turn). Omission
+    // beats false attribution, so the goal is dropped rather than paired with the files.
+    const [t] = collect({ turns: GOAL, touched: ["src/a.ts"] });
+    expect(t.outcome).toBe("unknown");
+    expect(t.user_goal).toBe("");
+    expect(t.touched_files).toEqual(["src/a.ts"]);
+  });
+
+  it("NO COMMIT, NO BLOCK: a build-only turn (no commit) is UNKNOWN, not applied", () => {
+    // `npm run build` / `rm` / `mv` are activity, not a landed commit. The old rule read
+    // them as applied; the review's table says only a commit is applied.
+    const [t] = collect({ turns: GOAL, spool: [bash("npm run build"), bash("rm -rf dist")] });
+    expect(t.outcome).toBe("unknown");
+  });
+
+  it("EXPLICIT BLOCK: a turn with a recorded blocked signal is BLOCKED, never derived", () => {
+    // `blocked` is honored ONLY from an explicit recorded outcome on the row. It is never
+    // synthesized from "no commit" (the proposal's rejected rule).
+    const [t] = collect({ turns: [{ seq: 1, goal: "ship the gated change", outcome: "blocked" }] });
+    expect(t.outcome).toBe("blocked");
+  });
+
+  it("PEER MOVES HEAD: classification is a pure function of session-owned inputs, unchanged", () => {
+    // The producer never reads the git log, diffs against HEAD, or uses a time window, so a
+    // peer moving HEAD mid-turn cannot change any classification. Same inputs => same output,
+    // twice, and the mixed shape stays `unknown` regardless of the ambient repo state.
+    const input = {
+      turns: [{ seq: 2, goal: "land the slice" }],
+      spool: [bash("GIT_INDEX_FILE=$IDX git commit -F .git/COMMIT_EDITMSG"), bash("git checkout -- other.py")],
+      touched: ["a.ts"],
+    };
+    const first = collect(input)[0];
+    const second = collect(input)[0];
+    expect(first.outcome).toBe("unknown");
+    expect(second.outcome).toBe(first.outcome);
+    expect(second.user_goal).toBe(first.user_goal);
   });
 
   it("a turn that only READ is not applied: reading is not doing", () => {
@@ -96,19 +213,22 @@ describe("deterministic turn outcome", () => {
   it("never invents an outcome for a turn it has no evidence about", () => {
     // Only the freshest turn carries spool evidence (the spool is not turn-indexed,
     // documented in collect_recent_turns). Older turns must NOT inherit it: that
-    // would be exactly the false attribution the shared tree makes so easy.
+    // would be exactly the false attribution the shared tree makes so easy. The freshest
+    // turn OWNS a commit (=> applied, goal kept); the older turn has nothing (=> unknown).
     const turns = collect({
       turns: [
         { seq: 1, goal: "older turn" },
         { seq: 2, goal: "newer turn" },
       ],
-      touched: ["src/a.ts"],
+      spool: [bash("GIT_INDEX_FILE=$IDX git commit -F .git/COMMIT_EDITMSG")],
     });
-    const older = turns.find((t) => t.user_goal === "older turn")!;
-    const newer = turns.find((t) => t.user_goal === "newer turn")!;
+    const older = turns.find((t) => t.sequence === 1)!;
+    const newer = turns.find((t) => t.sequence === 2)!;
     expect(newer.outcome).toBe("applied");
+    expect(newer.user_goal).toBe("newer turn"); // a clean applied commit keeps its goal
     expect(older.outcome).toBe("unknown");
     expect(older.touched_files).toEqual([]);
+    expect(older.commands_run).toEqual([]);
   });
 
   it("only ever emits values from intel's enum", () => {

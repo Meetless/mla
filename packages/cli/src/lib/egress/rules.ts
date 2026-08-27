@@ -118,6 +118,63 @@ export const EGRESS_RULES: readonly EgressRule[] = [
     },
   },
   {
+    // D0 SHADOW. The canonical `POST /v1/query` on the platform tier, run beside the
+    // legacy Ask so the two can be compared on governed evidence. Registered as
+    // `service: "control"` because that is the first-party host class this rule table
+    // knows; the tier is first-party the same way control is, and inventing a fourth
+    // service value for one shadow route would be vocabulary for its own sake.
+    //
+    // Same field policy as `/v1/ask` for the one field they share: the question is
+    // REDACTED. A shadow must not become the reason an unredacted question reaches a
+    // second system, and the comparison is about citations, which redaction does not
+    // touch.
+    service: "control",
+    method: "POST",
+    match: /^\/v1\/query$/,
+    note: "D0 shadow: canonical query beside the legacy ask",
+    mode: "redact",
+    profile: "retrieval",
+    fields: {
+      question: "redact",
+      surface: "preserve",
+      conversationId: "preserve",
+      language: "preserve",
+    },
+  },
+  {
+    // D3 SHADOW. The canonical `POST /v1/coordination/pull` on the platform tier, run beside
+    // the legacy session-steer pull so the two can be compared on the SET of delivered steer
+    // ids. The body is one structural id (the session), so passthrough with `sessionId` named;
+    // there is no content to redact. Same first-party `service: "control"` host class as the D0
+    // shadow above (the tier is first-party the way control is).
+    service: "control",
+    method: "POST",
+    match: /^\/v1\/coordination\/pull$/,
+    note: "D3 shadow: canonical coordination pull beside the legacy steer pull",
+    mode: "passthrough",
+    why: "one session id",
+    fields: ["sessionId"],
+  },
+  {
+    // E1 SHADOW. The canonical `POST /v1/turns/prepare` on the platform tier, run beside the
+    // legacy turn-preparation decision. Same `retrieval` posture as `/v1/query`: the `task` IS
+    // the prompt, and the server MUST see its text to match turn triggers (a hard redact would
+    // break the comparison it exists to make), so the retrieval bar strips secrets while keeping
+    // the retrieval-relevant text. sessionId and the local-fact signals (explicit paths, working
+    // set, rehash digests) are preserved: they are the legitimate E1 inputs the decision needs.
+    service: "control",
+    method: "POST",
+    match: /^\/v1\/turns\/prepare$/,
+    note: "E1 shadow: canonical turns/prepare beside the legacy turn decision",
+    mode: "redact",
+    profile: "retrieval",
+    fields: {
+      task: "redact",
+      sessionId: "preserve",
+      signals: "preserve",
+    },
+  },
+  {
     service: "intel",
     method: "POST",
     match: /^\/v1\/ask\/retrieve$/,

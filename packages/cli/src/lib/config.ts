@@ -107,6 +107,18 @@ export interface CliConfig {
   // override via cli-config.json or the MEETLESS_CONSOLE_URL env var to point
   // at your own console deployment.
   consoleUrl?: string;
+  // The parent context `mla activate` attaches a NEWLY PROVISIONED workspace to
+  // (notes/20260816-scoped-truth-hierarchy-roadmap.md, E1.4).
+  //
+  // Per-machine and per-human by design: it lives here rather than in the
+  // committed `.meetless.json` marker, so one developer's choice of root never
+  // decides where a teammate's repo lands. It is a REMEMBERED CHOICE, not a
+  // guess: nothing infers a root from workspace `kind`, because since the P4
+  // account cutover most accounts have no PERSONAL workspace at all.
+  //
+  // Read ONLY on the activate provisioning path, and only when `--parent` was
+  // not passed. It never affects an existing binding.
+  defaultParentWorkspaceId?: string;
   // Workspace user id this CLI invocation acts as. Required for KB curation
   // commands (§9.1) so every outbox event carries an audited actor. Optional
   // on this interface for backwards compatibility with pre-curation
@@ -379,6 +391,7 @@ interface RawDiskConfig {
   mlaPath?: string;
   intelRoot?: string;
   consoleUrl?: string;
+  defaultParentWorkspaceId?: string;
   actorUserId?: string;
   update?: unknown;
   auth?: unknown;
@@ -569,6 +582,7 @@ export function readConfig(): CliConfig {
     mlaPath: cfg.mlaPath || "",
     intelRoot: cfg.intelRoot,
     consoleUrl: cfg.consoleUrl,
+    defaultParentWorkspaceId: cfg.defaultParentWorkspaceId,
     actorUserId,
     update: normalizeUpdate(cfg.update),
     auth,
@@ -637,6 +651,7 @@ interface OnDiskConfig {
   mlaPath: string;
   intelRoot?: string;
   consoleUrl?: string;
+  defaultParentWorkspaceId?: string;
   actorUserId?: string;
   update?: UpdateConfig;
   auth: CliAuth;
@@ -662,6 +677,9 @@ export function writeConfig(cfg: CliConfig): void {
     mlaPath: cfg.mlaPath,
     ...(cfg.intelRoot ? { intelRoot: cfg.intelRoot } : {}),
     ...(cfg.consoleUrl ? { consoleUrl: cfg.consoleUrl } : {}),
+    ...(cfg.defaultParentWorkspaceId
+      ? { defaultParentWorkspaceId: cfg.defaultParentWorkspaceId }
+      : {}),
     ...(actorUserId ? { actorUserId } : {}),
     ...(cfg.update ? { update: cfg.update } : {}),
     auth: cfg.auth,

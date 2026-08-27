@@ -18,6 +18,7 @@ import {
   reactivateWorkspace,
   type WorkspaceLifecycleClientHttp,
 } from "../lib/control-workspace-lifecycle-client";
+import { runWorkspaceParent } from "./workspace_parent";
 import { extractWorkspaceOverride } from "./rules-backend";
 import { staleCommandHint } from "../lib/update-notifier";
 import {
@@ -587,9 +588,12 @@ export async function runWorkspace(argv: string[]): Promise<number> {
   if (sub === "reactivate") {
     return runWorkspaceReactivate(argv.slice(1));
   }
+  if (sub === "parent") {
+    return runWorkspaceParent(argv.slice(1));
+  }
   console.error(
     `Unknown workspace subcommand: ${sub}. Usage: mla workspace ` +
-      `[show | list | invite <email> | members | remove <email> | reactivate] ` +
+      `[show | list | parent | invite <email> | members | remove <email> | reactivate] ` +
       `(use 'mla activate' / 'mla deactivate' to change the folder binding).` +
       staleCommandHint(),
   );

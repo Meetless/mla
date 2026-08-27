@@ -24,14 +24,18 @@ When Codex tries to `Write` its design note under `notes/`, the PreToolUse hook
 The decision rides the body, never the exit code:
 
 ```json
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Blocked by Meetless rule <ruleNodeId>. Writing notes/<your-note>.md under the forbidden \"notes/\" root is prohibited. design notes, decision records, and working Markdown belong in the reviewed docs/decisions/ tree, never in an unreviewed notes/ scratch directory.\n\nRun `mla enforcement` to confirm or dismiss this block."}}
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Blocked by Meetless rule <ruleNodeId>. Writing notes/<your-note>.md under the forbidden \"notes/\" root is prohibited. design notes, decision records, and working Markdown belong in the reviewed docs/decisions/ tree, never in an unreviewed notes/ scratch directory.\nAttested <YYYY-MM-DD>, ceiling DENY, version <ruleVersionId>.\n\nIf this block is wrong for THIS action, authorize one retry:\n  mla enforcement allow <incidentId>\nThat permits this exact action once, in this session only. The rule stays in force.\n\nRun `mla enforcement` to confirm or dismiss this block."}}
 ```
 
-The `permissionDecisionReason` is assembled by the enforcement seam: a fixed lead
-sentence (`Blocked by Meetless rule <id>. Writing <path> under the forbidden
-"notes/" root is prohibited.`), then the active rule's own text, then a blank line
-and the `mla enforcement` hint. The rule id and the note path vary with your
-workspace and run; the shape is fixed.
+The `permissionDecisionReason` is assembled by the enforcement seam in four parts:
+(1) a fixed lead sentence (`Blocked by Meetless rule <id>. Writing <path> under the
+forbidden "notes/" root is prohibited.`) followed by the active rule's own text;
+(2) a SOURCE line naming when the rule was attested, the attested ceiling, and the
+version that fired (`Attested <YYYY-MM-DD>, ceiling DENY, version <id>.`); (3) a
+single-use override CTA the operator can copy to authorize exactly this one write
+(`mla enforcement allow <incidentId>`) without turning the rule off; and (4) the
+`mla enforcement` adjudicate hint. The rule id, note path, date, version, and
+incident id vary with your workspace and run; the shape is fixed.
 
 Codex sees the deny, does not write the file, and writes to `docs/decisions/`
 instead (step 6). A write under `docs/decisions/` returns the empty pass-through

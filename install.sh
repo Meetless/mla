@@ -184,7 +184,7 @@ download_failed() {
   printf 'mla: error: could not download a prebuilt binary for %s\n' "$_t" >&2
   printf '  tried: %s\n' "$_u" >&2
   printf '  There may be no prebuilt binary for %s yet, or the download failed.\n' "$_t" >&2
-  printf '  Install via npm instead (works on every platform Node 18+ supports):\n' >&2
+  printf '  Install via npm instead (works on every platform Node 22+ supports):\n' >&2
   printf '    npm i -g @meetless/mla\n' >&2
   exit 1
 }

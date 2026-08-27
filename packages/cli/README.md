@@ -33,7 +33,7 @@ already require this:
 brew trust meetless/tap
 ```
 
-**npm (Node 18.18+):**
+**npm (Node 22+):**
 
 ```sh
 npm install -g @meetless/mla

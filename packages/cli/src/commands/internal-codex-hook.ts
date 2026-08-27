@@ -16,6 +16,7 @@ import * as path from "path";
 import { spawnSync } from "child_process";
 
 import { ensureCodexRuntimeHooks } from "../connectors/codex/runtime-hooks";
+import { codexIntegrationDiagnostic } from "../connectors/codex/wire";
 
 interface ScriptStep {
   script: string;
@@ -40,6 +41,11 @@ export interface CodexHookDeps {
   hooksDir?: string;
   resolveHooksDir?: () => string;
   runScript?: (scriptPath: string, input: string) => string;
+  /** Test seam: which hooks.json to inspect for the partial-install warning. */
+  codexHooksPath?: string;
+  /** Where the partial-install warning goes. Defaults to stderr, which is where
+   *  Codex surfaces hook output to the operator. */
+  warn?: (line: string) => void;
 }
 
 function readStdinReal(): Promise<string> {
@@ -90,6 +96,34 @@ export async function runInternalCodexHook(
     const hooksDir =
       deps.hooksDir ??
       (deps.resolveHooksDir ?? ensureCodexRuntimeHooks)();
+
+    // A PARTIAL install is announced ONCE, at the start of the session it will
+    // silently fail to capture into knowledge. Codex fires SessionStart,
+    // UserPromptSubmit and PostToolUse normally when `Stop` is missing, so events
+    // accumulate, no finalize is ever requested, turn assembly never runs, and the
+    // session produces zero claims while looking healthy from every angle an
+    // operator can see.
+    //
+    // SESSION-START ONLY, because this is the per-event hot path: on post-tool-use
+    // the same line would land in the operator's editor on every tool call.
+    //
+    // AND CAPTURE STILL RUNS. Refusing the bootstrap would delete the events too,
+    // which buys nothing (they are cheap, and they are the evidence that the
+    // integration is half-installed) and risks the Codex lifecycle this wrapper
+    // documents itself as never breaking. What is refused is the silent pretence
+    // that the session is being captured into knowledge.
+    if (event === "session-start") {
+      try {
+        const diagnostic = codexIntegrationDiagnostic(
+          deps.codexHooksPath ? { hooksPathOverride: deps.codexHooksPath } : {},
+        );
+        if (diagnostic.state === "partial" && diagnostic.message) {
+          (deps.warn ?? ((l: string) => process.stderr.write(l + "\n")))(diagnostic.message);
+        }
+      } catch {
+        /* fail open: a diagnostic must never be what breaks capture */
+      }
+    }
 
     const input = await readStdin();
     for (const step of steps) {

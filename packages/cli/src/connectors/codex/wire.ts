@@ -151,6 +151,68 @@ export function codexInstalledEvents(opts: {
   return CODEX_MANAGED_HOOKS.map((hook) => hook.event).filter((event) => installed.has(event));
 }
 
+/**
+ * THE ONE INSPECTOR. Three readers, one sentence, and zero writes.
+ *
+ * `mla doctor` names it, ordinary `mla` warns with it, and the Codex hook wrapper
+ * repeats it where the operator actually is. They used to be able to drift, and the
+ * sentence is the whole product here: "hooks not installed" is what an operator got
+ * for a month while their Codex hooks fired every day and produced no knowledge.
+ *
+ * IT NEVER WRITES, and that is an ownership decision rather than an oversight. The
+ * obvious fix for a stale `hooks.json` is to reconcile it from whatever MLA path runs
+ * first. That is refused:
+ *
+ *   - startup would mutate a config file another tool owns;
+ *   - a user could not tell installation from ordinary execution;
+ *   - the next Codex schema change would turn a runtime path into a migration engine;
+ *   - simply starting MLA would change the evidence you are debugging with.
+ *
+ * `ensureCodexHooks` is the only reconciler, `mla codex install` is the only command
+ * that calls it on purpose, and `autoWireCodex` reuses that same function from the
+ * explicit install/rewire path. No second implementation, anywhere.
+ *
+ * Total: any unreadable or malformed file reads as `absent`, because an inspector on a
+ * command's startup path must never throw and must never nag about a file it could not
+ * parse.
+ */
+export interface CodexIntegrationDiagnostic {
+  /** `absent` = no Codex integration configured (optional connector, silence is right). */
+  state: "absent" | "partial" | "complete";
+  /** Managed events registered right now, contract order. */
+  installed: string[];
+  /** Managed events missing. Empty unless `state` is `partial`. */
+  missing: string[];
+  /** The operator-facing line, or `null` when there is nothing to say. */
+  message: string | null;
+}
+
+export function codexIntegrationDiagnostic(opts: {
+  hooksPathOverride?: string;
+  homeDeps?: HomeResolutionDeps;
+} = {}): CodexIntegrationDiagnostic {
+  const installed = codexInstalledEvents(opts);
+  const missing = CODEX_MANAGED_HOOKS.map((h) => h.event).filter((e) => !installed.includes(e));
+
+  if (installed.length === 0) return { state: "absent", installed, missing: [], message: null };
+  if (missing.length === 0) return { state: "complete", installed, missing: [], message: null };
+
+  // Consequence before instruction. "Some hooks are missing" tells an operator to
+  // reinstall without telling them what it cost, and the cost is the entire point:
+  // Stop is the only hook that requests a finalize, finalize is the only thing that
+  // runs turn assembly, and turn assembly is the only thing that turns a session into
+  // durable knowledge.
+  const consequence = missing.includes("Stop")
+    ? "Codex events will be captured, but turns and knowledge will not be finalized."
+    : `The ${missing.join(", ")} half of the Codex lifecycle is not running.`;
+  return {
+    state: "partial",
+    installed,
+    missing,
+    message: `Codex integration incomplete: missing ${missing.join(", ")} hook${missing.length > 1 ? "s" : ""}. ${consequence} Run: mla codex install`,
+  };
+}
+
 /** True when a Codex hooks.json currently registers every managed hook. */
 export function codexHooksInstalled(opts: {
   hooksPathOverride?: string;

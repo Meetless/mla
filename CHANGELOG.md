@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.38 (2026-08-27)
+
+If your Codex sessions have not been turning into knowledge, this release makes the condition impossible to miss and names the one command that fixes it. Plus two additions to `mla kb`.
+
+**New**
+- `mla kb tensions <doc>` shows the unresolved tensions recorded against a document in your governed knowledge, straight from the terminal.
+- `mla kb` now reports documents that were captured but never finished indexing, so a stuck ingest shows up instead of staying silent.
+
+**Fixed**
+- A half-installed Codex integration now says so on every ordinary `mla` command and once at the start of each Codex session, naming the missing hook and the consequence. It was visible only to someone who ran `mla doctor` before, and earlier reported itself as "not installed" while firing on every event.
+
+**Heads up**
+- **If you installed the Codex integration before 2026-07-21, it can record everything and produce no durable knowledge at all.** In production, most active Codex workspaces that did real work finalized nothing. The repair is one command: upgrade, then `mla codex install` (upgrade first, because the install provisions the hook scripts from the binary that runs it).
+- `mla` now requires Node 22 or newer. Upgrade Node before updating.
+
 ## 0.2.37 (2026-08-18)
 
 Mostly internal correctness. The one worth a look: if you run `mla` under Codex, it can
@@ -11,6 +26,7 @@ finally tell you when the integration is only half-installed.
 
 **Heads up**
 - On Codex and nothing has been showing up? Re-run `mla codex install`. An install from before this fix was capturing activity and finalizing none of it.
+- Corrected 2026-08-19: `mla doctor` is not sufficient to verify this. It checks whether the hooks are REGISTERED, and measurement since found that most affected installs pass that check and still finalize nothing. Verify by finishing a session and confirming it produced a turn (`mla session show <session-id>`), not by a green doctor line.
 
 ## 0.2.36 (2026-08-12)
 

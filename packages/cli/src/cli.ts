@@ -99,6 +99,8 @@ import {
   runInternalEvidenceStop,
 } from "./commands/internal-evidence-hooks";
 import { runInternalSteerSync } from "./commands/internal-steer-sync";
+import { runInternalTurnPrepareShadow } from "./commands/internal-turn-prepare-shadow";
+import { runInternalTurnPrepareShadowSummary } from "./commands/internal-turn-prepare-shadow-summary";
 import { runCaptureDecisions } from "./commands/internal-capture-decisions";
 import { runInternalPretoolObserve } from "./commands/internal-pretool-observe";
 import { runInternalCodexHook } from "./commands/internal-codex-hook";
@@ -120,6 +122,7 @@ import {
   staleCommandHint,
 } from "./lib/update-notifier";
 import { runUpgrade, maybePromoteStagedAndReExec } from "./lib/upgrade-apply";
+import { warnIfCodexPartial } from "./lib/codex-startup-warning";
 import { maybeResyncHooks, maybeHealMcpCommand } from "./lib/wire";
 import { runScanContext } from "./commands/scan-context";
 import { runAssembleContext } from "./commands/assemble-context";
@@ -1034,6 +1037,8 @@ export const COMMANDS: CommandSpec[] = [
       if (sub === "evidence-capture") return runInternalEvidenceCapture(rest);
       if (sub === "evidence-stop") return runInternalEvidenceStop(rest);
       if (sub === "steer-sync") return runInternalSteerSync(rest);
+      if (sub === "turn-prepare-shadow") return runInternalTurnPrepareShadow();
+      if (sub === "turn-prepare-shadow-summary") return runInternalTurnPrepareShadowSummary(rest);
       if (sub === "capture-decisions") return runCaptureDecisions(rest);
       if (sub === "pretool-observe") return runInternalPretoolObserve(rest);
       // Codex UserPromptSubmit wrapper: translate Codex's hook I/O envelope and
@@ -1141,6 +1146,14 @@ export async function dispatch(argv: string[]): Promise<number> {
   // it prints the full screen plus the stale-command hint exactly as before.
   const spec = resolveCommand(COMMANDS, cmd);
   if (spec) {
+    // A partial Codex install records events all day and produces zero durable
+    // knowledge, and from the outside it looks exactly like a working one. `mla
+    // doctor` fails it, which only reaches an operator who runs doctor, so ordinary
+    // commands carry the same sentence. INSPECTION ONLY: nothing here writes to
+    // `hooks.json`; `mla codex install` is the reconciler and the only one. The hook
+    // hot paths and the commands that already say it better are excluded inside
+    // `shouldWarnCodexPartial`.
+    warnIfCodexPartial(spec.name);
     // `mla <command> --help` is answered from the registry, so EVERY command has
     // a --help without every command having to parse one (T11). The four commands
     // that render a richer catalog of their own (kb, graph, enrich, review) opt

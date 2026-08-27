@@ -310,12 +310,70 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
   // may still fit). Mandatory content is never revisited, so nothing can push it out; and since the
   // budget already covers the required set, the first trial is `requiredBytes + one SHOULD line`,
   // never a comparison that could evict a MUST.
-  const acceptedFloorShould: FloorRuleEntry[] = [];
-  const acceptedScopedLines: ScopedLine[] = [...mandatoryLines];
-  const delivered: DeliveredRule[] = [
+  // The required delivered set (floor MUST + every applicable scoped MUST). Passed to the shared
+  // renderer, which appends the best-effort tier as it accepts each candidate.
+  const requiredDelivered: DeliveredRule[] = [
     ...floorMust.map((f) => ({ ruleId: f.ruleId, tier: "floor-must" as const })),
     ...mandatoryScoped.map((s) => ({ ruleId: s.ruleId, tier: "scoped-required" as const })),
   ];
+
+  return renderDecision({
+    base,
+    floorMust,
+    floorShould,
+    mandatoryLines,
+    candidates,
+    requiredDelivered,
+    budget,
+    baseBytes,
+    allScopedBytes,
+    scopedConfigured: scopedRules.length,
+  });
+}
+
+/** The render + budget inputs, whether the decision was computed locally or came from the tier. */
+export interface RenderDecisionInput {
+  base: string;
+  floorMust: FloorRuleEntry[];
+  floorShould: FloorRuleEntry[];
+  /** The required scoped lines (always delivered whole). */
+  mandatoryLines: ScopedLine[];
+  /** Best-effort candidates in rank order; the budget decides which ride. */
+  candidates: Candidate[];
+  /** floor-must + scoped-required delivered entries, before best-effort is appended. */
+  requiredDelivered: DeliveredRule[];
+  /** max(safeTotal, requiredBytes): the tail budget above the required floor. */
+  budget: number;
+  baseBytes: number;
+  /** Bytes of the full configured scoped set, for the meter's avoidedBytes. */
+  allScopedBytes: number;
+  scopedConfigured: number;
+}
+
+/**
+ * The RENDER + BUDGET half of assembleContext, extracted (E2). Given a decision (required floor +
+ * scoped set, plus best-effort candidates in rank order), it runs the identical greedy budget fill
+ * and byte accounting and returns the envelope. `assembleContext` computes the decision LOCALLY and
+ * calls this; `assembleFromCanonicalDecision` maps the SERVER's decision onto the same inputs and
+ * calls this, so both paths render byte-for-byte the same way. PURE.
+ */
+export function renderDecision(input: RenderDecisionInput): AssembleOutput {
+  const {
+    base,
+    floorMust,
+    floorShould,
+    mandatoryLines,
+    candidates,
+    requiredDelivered,
+    budget,
+    baseBytes,
+    allScopedBytes,
+    scopedConfigured,
+  } = input;
+
+  const acceptedFloorShould: FloorRuleEntry[] = [];
+  const acceptedScopedLines: ScopedLine[] = [...mandatoryLines];
+  const delivered: DeliveredRule[] = [...requiredDelivered];
   const omitted: OmittedRule[] = [];
 
   for (const c of candidates) {
@@ -353,7 +411,7 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
       ambientRules: floorMust.length + acceptedFloorShould.length,
       scopedBytes,
       scopedRules: acceptedScopedLines.length,
-      scopedConfigured: scopedRules.length,
+      scopedConfigured,
       // What scoping SAVED this turn: the configured scoped rules that did not match. Clamped at
       // 0 because the delivered set is a subset of the configured set, so the difference cannot go
       // negative unless a future caller feeds the assembler a delivered rule it never configured.
@@ -362,4 +420,85 @@ export function assembleContext(input: AssembleInput): AssembleOutput {
       headBytes: byteLength(text),
     },
   };
+}
+
+/**
+ * The tier's `POST /v1/turns/prepare` decision, as the CLI consumes it (E2). Structural, so the
+ * CLI needs no dependency on the platform tier's types: it names exactly the fields the renderer
+ * reads off the response context.
+ */
+export interface CanonicalTurnContext {
+  floorMust: Array<{ ruleId: string; versionId?: string; text: string; strength: "MUST" | "SHOULD" }>;
+  floorShould: Array<{ ruleId: string; versionId?: string; text: string; strength: "MUST" | "SHOULD" }>;
+  scopedRequired: Array<{ ruleId: string; versionId?: string; text: string; strength: "MUST" | "SHOULD" }>;
+  bestEffort: Array<{ ruleId: string; text: string; strength: "MUST" | "SHOULD"; source: "floor" | "scoped" }>;
+}
+
+/**
+ * E2 render-from-canonical: build the injection envelope from the SERVER's turn decision instead of
+ * a locally computed one. It maps the canonical context onto the exact `renderDecision` inputs the
+ * local path uses, so the rendered head is byte-for-byte what the local assembler would have
+ * produced for the same decision. Rendering and budgeting stay entirely client-side, which is the
+ * whole point of E1: the server decided WHICH rules govern; the client decides how they fit its
+ * surface.
+ *
+ * THE METER IS APPROXIMATE ON THIS PATH, deliberately and only in `avoidedBytes`/`scopedConfigured`:
+ * the canonical decision does not carry the bytes of the scoped rules the server EXCLUDED this turn
+ * (it carries an excluded COUNT, not their text), so the counterfactual saving cannot be exact. The
+ * rendered head, the delivered/omitted lists, and every other meter field ARE exact; only the
+ * scoping-ROI analytics field is a floor. Callers that need an exact ROI keep using the local path.
+ */
+export function assembleFromCanonicalDecision(
+  base: string,
+  ctx: CanonicalTurnContext,
+  safeTotal: number,
+): AssembleOutput {
+  const toFloor = (r: { ruleId: string; versionId?: string; text: string }, strength: "MUST" | "SHOULD"): FloorRuleEntry => ({
+    ruleId: r.ruleId,
+    versionId: r.versionId ?? r.ruleId,
+    text: r.text,
+    strength,
+  });
+
+  const floorMust = ctx.floorMust.map((r) => toFloor(r, "MUST"));
+  const floorShould = ctx.floorShould.map((r) => toFloor(r, "SHOULD"));
+  const mandatoryLines: ScopedLine[] = ctx.scopedRequired.map((r) => ({ text: r.text, strength: r.strength }));
+
+  const requiredDelivered: DeliveredRule[] = [
+    ...floorMust.map((f) => ({ ruleId: f.ruleId, tier: "floor-must" as const })),
+    ...ctx.scopedRequired.map((s) => ({ ruleId: s.ruleId, tier: "scoped-required" as const })),
+  ];
+
+  const candidates: Candidate[] = ctx.bestEffort.map((c) =>
+    c.source === "floor"
+      ? { channel: "floor-should" as const, ruleId: c.ruleId, entry: toFloor(c, "SHOULD") }
+      : { channel: "scoped" as const, ruleId: c.ruleId, line: { text: c.text, strength: c.strength } },
+  );
+
+  // The same budget the local path computes: max(safeTotal, the required floor's own byte size).
+  const floorBlock = renderFloorBlock(floorMust, [], floorShould);
+  const requiredBytes = byteLength(joinSegments([base, floorBlock, renderScopedBlock(mandatoryLines)]));
+  const budget = Math.max(safeTotal, requiredBytes);
+
+  // avoidedBytes is a floor here (see the doc above): we only know the required + candidate scoped
+  // bytes, not the excluded rules' bytes, so this undercounts the saving rather than inventing it.
+  const scopedLinesKnown = [
+    ...mandatoryLines,
+    ...ctx.bestEffort.filter((c) => c.source === "scoped").map((c) => ({ text: c.text, strength: c.strength })),
+  ];
+  const allScopedBytes = byteLength(renderScopedBlock(scopedLinesKnown));
+  const scopedConfigured = ctx.scopedRequired.length + ctx.bestEffort.filter((c) => c.source === "scoped").length;
+
+  return renderDecision({
+    base,
+    floorMust,
+    floorShould,
+    mandatoryLines,
+    candidates,
+    requiredDelivered,
+    budget,
+    baseBytes: byteLength(base),
+    allScopedBytes,
+    scopedConfigured,
+  });
 }

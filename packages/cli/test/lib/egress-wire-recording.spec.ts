@@ -198,6 +198,16 @@ describe("the generated route samples are honest", () => {
     );
     expect(actual).toEqual([
       "redact intel POST ^\\/v1\\/ask$",
+      // D0 shadow: the canonical query run beside the legacy ask. Same redact posture
+      // as `/v1/ask`, because a shadow must not be the reason an unredacted question
+      // reaches a second system.
+      "redact control POST ^\\/v1\\/query$",
+      // D3 shadow: the canonical coordination pull run beside the legacy steer pull. One
+      // structural session id, so passthrough (there is no content to redact).
+      "passthrough control POST ^\\/v1\\/coordination\\/pull$",
+      // E1 shadow: the canonical turns/prepare. The task is the prompt, so it takes the
+      // retrieval redact posture (text kept for trigger matching, secrets stripped).
+      "redact control POST ^\\/v1\\/turns\\/prepare$",
       "redact intel POST ^\\/v1\\/ask\\/retrieve$",
       "passthrough control POST ^\\/internal\\/v1\\/auth\\/token\\/refresh$",
       "passthrough control POST ^\\/internal\\/v1\\/auth\\/sessions\\/revoke$",
@@ -289,6 +299,13 @@ const PRESERVED_BY_ROW: ReadonlyArray<readonly [string, readonly string[]]> = [
       "workspace_id",
     ],
   ],
+  // D0 shadow. Deliberately SHORTER than the ask row above it: the canonical request
+  // carries no workspace_id and no user_id, because the tier derives both from the
+  // credential. Fewer preserved fields here is the contract improving, not a gap.
+  ["control POST ^\\/v1\\/query$", ["conversationId", "language", "surface"]],
+  // E1 shadow. The task (prompt) is redacted at the retrieval bar; the session and the
+  // local-fact signals object pass through, because they are the decision inputs the server needs.
+  ["control POST ^\\/v1\\/turns\\/prepare$", ["sessionId", "signals"]],
   ["intel POST ^\\/v1\\/ask\\/retrieve$", ["limit", "source_context", "workspace_id"]],
   ["control POST ^\\/internal\\/v1\\/analytics\\/events$", ["workspaceId"]],
   [

@@ -136,9 +136,22 @@ interface ActivateFlags {
   repair?: boolean;
   bootstrap?: BootstrapTier;
   workspace?: string;
+  /**
+   * The parent context to place a NEWLY PROVISIONED workspace under
+   * (notes/20260816-scoped-truth-hierarchy-roadmap.md, E1.4).
+   *
+   * `--parent none` opts this repo out of the remembered default. Absent, the
+   * default from cli-config applies; absent both, the workspace is born with no
+   * parent, which is exactly what happened before the hierarchy existed.
+   *
+   * Only ever consulted on the PROVISION path: activate never repoints an
+   * existing binding's parent, because that would change what a workspace's
+   * agents are told is true as a side effect of running activate in a folder.
+   */
+  parent?: string;
 }
 
-const VALUE_FLAGS = new Set(["--name", "--note", "--bootstrap", "--workspace"]);
+const VALUE_FLAGS = new Set(["--name", "--note", "--bootstrap", "--workspace", "--parent"]);
 const BOOLEAN_FLAGS = new Set(["--here", "--create", "--repair"]);
 
 export function parseActivateArgs(argv: string[]): ActivateFlags {
@@ -153,6 +166,7 @@ export function parseActivateArgs(argv: string[]): ActivateFlags {
       if (a === "--name") out.name = v;
       else if (a === "--note") out.note = v;
       else if (a === "--workspace") out.workspace = v;
+      else if (a === "--parent") out.parent = v;
       else if (a === "--bootstrap") {
         // The removed `full` tier gets a migration message, never a silent fallback
         // to a shallower tier (Phase 2: "never silently fall back from a named-but-
@@ -1047,6 +1061,14 @@ async function runProvision(
     note: flags.note,
   });
 
+  // Place the new workspace inside a broader context, if the human has said
+  // once where new work belongs. Only on a genuinely NEW workspace: re-activating
+  // a folder must not silently reparent a workspace that already has history and
+  // may already sit somewhere deliberate.
+  const parentAttached = resp.isNew
+    ? await attachParentContext(cfg, resp.id, flags.parent)
+    : null;
+
   if (!isMachineMode()) {
     // isNew === false means control matched `repoPath` and handed back the
     // workspace this folder was activated under before (`mla deactivate` removes
@@ -1062,6 +1084,15 @@ async function runProvision(
     console.log(`  marker:      ${markerPath}`);
     console.log(`  workspaceId: ${resp.id}`);
     if (healed) console.log("  identity:    signed-in session bound to this workspace as OWNER.");
+    if (parentAttached?.ok) {
+      console.log(`  parent:      ${parentAttached.parentWorkspaceId}`);
+      console.log("               agents here also ground from that workspace's knowledge.");
+    } else if (parentAttached?.error) {
+      // A failed attach must never fail the activation: the workspace exists and
+      // is usable, it just has no inherited context yet. Say so and name the fix.
+      console.log(`  parent:      not attached (${parentAttached.error})`);
+      console.log(`               retry with: mla workspace parent set <id>`);
+    }
     console.log("");
     for (const line of activateExplainerLines()) console.log(line);
     console.log("");
@@ -2211,4 +2242,42 @@ export async function runDeactivate(
     );
   }
   return 0;
+}
+
+/**
+ * Attach a freshly provisioned workspace to its parent context.
+ *
+ * Resolution order, most explicit first:
+ *   `--parent none`  -> deliberately no parent, ignoring the remembered default
+ *   `--parent <id>`  -> that id, for this activation only
+ *   cli-config       -> the remembered default from `mla workspace parent default`
+ *   nothing          -> no parent, the pre-hierarchy behaviour
+ *
+ * NEVER fails the activation. A workspace with no parent is a completely valid
+ * workspace; refusing to finish activating one because a link could not be made
+ * would trade a missing nicety for a broken setup.
+ */
+async function attachParentContext(
+  cfg: CliConfig,
+  workspaceId: string,
+  flagValue: string | undefined,
+): Promise<{ ok: boolean; parentWorkspaceId?: string; error?: string } | null> {
+  const explicit = (flagValue ?? "").trim();
+  if (explicit.toLowerCase() === "none") return null;
+  const target = explicit || (cfg.defaultParentWorkspaceId ?? "").trim();
+  if (!target) return null;
+  if (target === workspaceId) {
+    return { ok: false, error: "a workspace cannot be its own parent" };
+  }
+  try {
+    await post(
+      cfg,
+      "/internal/v1/workspace-hierarchy/parent",
+      { workspaceId, parentWorkspaceId: target },
+      15000,
+    );
+    return { ok: true, parentWorkspaceId: target };
+  } catch (e) {
+    return { ok: false, error: serverMessageOrRaw(e as HttpError) ?? "attach failed" };
+  }
 }

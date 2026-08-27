@@ -10,6 +10,7 @@ import {
   readInjectedIds,
 } from "../lib/steer-cache";
 import { homedir } from "node:os";
+import { runCoordinationShadow, formatCoordinationShadow } from "../lib/coordination-shadow";
 import { getBundle, type RuleBundle } from "../lib/rules/control-rule-client";
 import { writeRuleBundleCache } from "../lib/rules/bundle-cache";
 import { recordBundlePrincipal } from "../lib/rules/bundle-principal";
@@ -160,13 +161,31 @@ export async function runInternalSteerSync(argv: string[]): Promise<number> {
 
   try {
     const stub = process.env.MEETLESS_STEER_SYNC_STUB_PULL;
-    const transport =
-      stub && stub.length > 0 ? stubTransport(stub) : realTransport(loadWorkspaceConfig());
+    // Load the config once in the real path, so the D3 shadow below can read the same auth the
+    // transport uses. Under a pull stub (test path) there is no config and no shadow.
+    const cfg = stub && stub.length > 0 ? null : loadWorkspaceConfig();
+    const transport = cfg ? realTransport(cfg) : stubTransport(stub as string);
 
     // 1) Pull and cache the authoritative deliverable set (overwrite: the server
     //    returns the full not-yet-injected set, so the cache is never a stale delta).
     const steers = await transport.pull(sessionId);
     writeSteerCache(sessionId, steers);
+
+    // D3 SHADOW (off by default, MEETLESS_D3_SHADOW=1). Fire the canonical
+    // `POST /v1/coordination/pull` beside the legacy pull and compare the set of steer ids. The
+    // legacy pull above is authoritative and already cached, the shadow NEVER throws, and it
+    // stays inside the flush drain's best-effort try so it can never break a drain. Only in the
+    // real path, where a cfg and a user token exist.
+    if (cfg) {
+      const shadow = await runCoordinationShadow({
+        enabled: process.env.MEETLESS_D3_SHADOW === "1",
+        platformUrl: process.env.MEETLESS_PLATFORM_URL,
+        accessToken: cfg.auth?.mode === "user-token" ? cfg.auth.accessToken : undefined,
+        sessionId,
+        legacySteers: steers,
+      });
+      if (shadow.ran || shadow.error) console.error(formatCoordinationShadow(shadow));
+    }
 
     // 2) Mark-injected what the hook already surfaced. The hook dedups injection
     //    via its own inject-state, so a one-turn overlap (a just-injected steer

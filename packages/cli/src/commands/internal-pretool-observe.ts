@@ -678,7 +678,7 @@ type DenyIncidentSource = {
 /** One-line CTA appended to every fired deny so the operator can adjudicate the block at the moment they
  * see it (the capture-time verdict path). The interactive PreToolUse hook cannot prompt y/n (it returns
  * JSON, no TTY), so the verdict is deferred to `mla enforcement`, which reuses control's adjudicate path. */
-const ENFORCEMENT_ADJUDICATE_HINT =
+export const ENFORCEMENT_ADJUDICATE_HINT =
   "Run `mla enforcement` to confirm or dismiss this block.";
 
 /**
@@ -689,7 +689,7 @@ const ENFORCEMENT_ADJUDICATE_HINT =
  * exact copyable command has to be in it, naming this incident, and it has to say what it grants so
  * nobody reads it as "turn the rule off".
  */
-function buildOverrideHint(incidentId: string): string {
+export function buildOverrideHint(incidentId: string): string {
   return (
     "If this block is wrong for THIS action, authorize one retry:\n" +
     `  mla enforcement allow ${incidentId}\n` +

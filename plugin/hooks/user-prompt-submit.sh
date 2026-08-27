@@ -3226,6 +3226,24 @@ $AR_TEXT
     spool_injection_trace
     spawn_flush "$SESSION_ID"
   fi
+
+  # E1 SHADOW (off unless MEETLESS_E1_SHADOW=1). Fired HERE, after the injection is already on
+  # stdout, and fully detached, so it never touches the turn's latency. It recomputes the legacy
+  # decision from the local scan cache and compares it against the canonical POST /v1/turns/prepare
+  # on DECISION SEMANTICS (rule ids, warning paths), never rendered text. Legacy stays
+  # authoritative: this only observes. Threads exactly the legitimate E1 inputs the hook already
+  # holds (prompt, session, the working set, the repo root); the command derives explicit paths
+  # itself. `${_asm_ws:-[]}`/`${_asm_root:-}` default cleanly on a turn where the assembler branch
+  # did not run.
+  if [[ "${MEETLESS_E1_SHADOW:-0}" == "1" && "$INJECTED" == "true" ]]; then
+    spawn_e1_shadow "$(jq -cn \
+      --arg prompt "$PROMPT_HUMAN" \
+      --argjson workingSet "${_asm_ws:-[]}" \
+      --arg repoRoot "${_asm_root:-}" \
+      --arg sessionId "$SESSION_ID" \
+      '{prompt:$prompt, workingSet:$workingSet, sessionId:$sessionId}
+        + (if $repoRoot == "" then {} else {repoRoot:$repoRoot} end)' 2>/dev/null || true)"
+  fi
   return 0
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // bundle-esm.js: compile the workspace packages the CLI loads at runtime
-// (@meetless/ask-core, @meetless/mcp, @meetless/trace-core) into self-contained
-// CommonJS bundles under dist/bundles/.
+// (@meetless/ask-core, @meetless/mcp, @meetless/trace-core, @meetless/native-auth)
+// into self-contained CommonJS bundles under dist/bundles/.
 //
 // Why (ESM packages): the @yao-pkg/pkg standalone binary runs a V8 snapshot
 // that has NO ESM dynamic-import callback registered, so a true runtime import()
@@ -99,11 +99,35 @@ async function main() {
     path.join(outDir, "trace-core.js"),
   );
 
+  // native-auth: the loopback-PKCE login flow, extracted for reuse by non-CLI
+  // first-party clients (B4). Same reason as trace-core, and the same trap: it is
+  // private and not on the registry, so a real runtime dep would make
+  // `npm i -g @meetless/mla` fail to resolve it. It pulls in only node builtins
+  // (http, crypto, child_process, os), so the bundle is fully self-contained.
+  await bundleFromSpecifiers(
+    "native-auth",
+    'export { consoleUrlFromControl, exchangeGrant, generatePkce, generateState, ' +
+      'openBrowser, openLoopbackServer, runBrowserLogin } from "@meetless/native-auth";\n',
+    path.join(outDir, "native-auth.js"),
+  );
+
   // Verify each bundle is a requirable CJS module exposing its sentinel symbol.
   const checks = [
     ["ask-core.js", ["makeIntelAsk", "makeAskModes", "statusFallback", "makeMatchCanonical"]],
     ["mcp.js", ["runStdioServer"]],
     ["trace-core.js", ["makeTracer", "makeNoopTracer"]],
+    [
+      "native-auth.js",
+      [
+        "consoleUrlFromControl",
+        "exchangeGrant",
+        "generatePkce",
+        "generateState",
+        "openBrowser",
+        "openLoopbackServer",
+        "runBrowserLogin",
+      ],
+    ],
   ];
   for (const [name, syms] of checks) {
     const p = path.join(outDir, name);
@@ -116,7 +140,7 @@ async function main() {
     }
   }
 
-  console.log(`bundle-esm: wrote ${path.relative(cliDir, outDir)}/{ask-core,mcp,trace-core}.js`);
+  console.log(`bundle-esm: wrote ${path.relative(cliDir, outDir)}/{ask-core,mcp,trace-core,native-auth}.js`);
 }
 
 main().catch((e) => {

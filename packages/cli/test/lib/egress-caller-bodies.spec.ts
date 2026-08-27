@@ -63,6 +63,49 @@ interface Witness {
 
 /** Keyed by `${service} ${method} ${match.source}`. */
 const WITNESSES: Record<string, Witness> = {
+  // ------------------------------------------------------- D0 shadow query
+  // The canonical `/v1/query` run beside the legacy Ask. The maximal body is the
+  // whole public request schema, not just the field the shadow sends today: this
+  // boundary fails closed on an undeclared key, so declaring only `question` would
+  // break the moment the shadow threaded a language through.
+  [`control POST ${/^\/v1\/query$/.source}`]: {
+    caller: "lib/query-shadow.ts runQueryShadow",
+    path: "/v1/query",
+    body: {
+      question: "why did we deprecate the decision diff",
+      surface: "mcp",
+      conversationId: "conv_1",
+      language: "en",
+    },
+  },
+  // ------------------------------------------------------- D3 shadow coordination pull
+  // The canonical `/v1/coordination/pull` run beside the legacy session-steer pull. The tier's
+  // pull schema is strict and accepts exactly one field, so `sessionId` is the whole maximal
+  // body (lib/coordination-shadow.ts runCoordinationShadow).
+  [`control POST ${/^\/v1\/coordination\/pull$/.source}`]: {
+    caller: "lib/coordination-shadow.ts runCoordinationShadow",
+    path: "/v1/coordination/pull",
+    body: {
+      sessionId: "sess_1",
+    },
+  },
+  // ------------------------------------------------------- E1 shadow turns/prepare
+  // The canonical `/v1/turns/prepare` run beside the legacy turn decision. The maximal body is
+  // the whole request: the prompt task, the session, and the local-fact signals
+  // (lib/turn-prepare-shadow.ts runTurnPrepareShadow).
+  [`control POST ${/^\/v1\/turns\/prepare$/.source}`]: {
+    caller: "lib/turn-prepare-shadow.ts runTurnPrepareShadow",
+    path: "/v1/turns/prepare",
+    body: {
+      task: "please write a design doc",
+      sessionId: "sess_1",
+      signals: {
+        explicitPaths: ["apps/x.ts"],
+        workingSet: ["b.ts"],
+        reconcileDigests: [{ path: "CLAUDE.md", digest: "abc" }],
+      },
+    },
+  },
   // ---------------------------------------------------------------- intel ask
   [`intel POST ${/^\/v1\/ask$/.source}`]: {
     caller:

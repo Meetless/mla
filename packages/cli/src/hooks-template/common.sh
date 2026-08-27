@@ -1937,41 +1937,67 @@ collect_recent_turns() {
       ( . | map(select(type == "object")) | reverse ) as $rows
       | [ $rows | to_entries[]
           | .key as $i | .value as $r
+          # F1 (An review 2026-08-20): resolve the outcome CONSERVATIVELY, from the
+          # session-owned commands THIS turn ran, and NOTHING ELSE. No git log, no HEAD
+          # diff, no time window (ten-plus sessions share this tree, so a peer moving HEAD
+          # mid-turn must not change any classification), and no matching of goal text to
+          # file paths. The prior rule read a touched file OR any mutating command as
+          # `applied`; that is what served a REVERTED goal as done.
+          #
+          # THE CAVEAT (An, 2026-08-20 follow-up): `outcome` is whether the GOAL succeeded,
+          # while these commands describe REPOSITORY MUTATIONS, and the two are not always
+          # the same. Two mutations look like "revert" but are opposite kinds of work:
+          #   - DISCARD (git restore / reset --hard / checkout -- path): throws away
+          #     UNCOMMITTED work without a commit. A turn that only discards, and commits
+          #     nothing, undid its own work -> `reverted`.
+          #   - COMMIT A REVERT (git revert): creates a NEW commit that undoes an earlier
+          #     one. This is forward, committing work. A user-requested rollback run with
+          #     `git revert` is SUCCESSFUL work, never "the goal was reverted". But we
+          #     cannot prove from the command alone that the rollback WAS the goal, so the
+          #     honest floor is `unknown` with the goal dropped, NOT `reverted`.
+          #
+          #   applied  : an unambiguous turn-owned COMMIT, no discard and no git-revert.
+          #   reverted : the turn DISCARDED uncommitted work and committed nothing.
+          #   unknown  : commit AND discard together (seam-3 mixed); OR a `git revert`
+          #              (ambiguous rollback, per the caveat); OR neither (an uncommitted
+          #              edit, a build, research). A false `applied`/`reverted` is worse
+          #              than a conservative `unknown`.
+          #   blocked  : ONLY when the row carries an explicit recorded blocked signal;
+          #              NEVER derived from "no commit".
+          #
+          # `commit-tree` alone writes an object without landing it and is not counted.
+          # Each signal is anchored at `git <subcommand>` (a bare space between), so a
+          # subcommand word inside a `-m` message ("revert the skip") is a MENTION, not a
+          # use, and does not fire. Only the freshest turn ($i==0) carries spool commands;
+          # older turns stay unknown unless they carry an explicit signal. (No apostrophes
+          # below: single-quoted in bash.)
+          | ($cmds | .[-5:]) as $recent
+          | (($r.outcome // "") | ascii_downcase) as $recorded
+          | ($i == 0 and ($recent | map(select(test("((^|[;&| ])git +commit($|[^-]))|scoped-commit\\.sh"; "i"))) | length > 0)) as $committed
+          | ($i == 0 and ($recent | map(select(test("(^|[;&| ])git +(restore\\b|reset\\b[^;|&]*--hard|checkout\\b[^;|&]* -- )"; "i"))) | length > 0)) as $discarded
+          | ($i == 0 and ($recent | map(select(test("(^|[;&| ])git +revert\\b"; "i"))) | length > 0)) as $git_revert
+          | (if $recorded == "blocked" then "blocked"
+             elif $git_revert then "unknown"
+             elif $committed and $discarded then "unknown"
+             elif $committed then "applied"
+             elif $discarded then "reverted"
+             else "unknown" end) as $oc
+          | ($committed or $discarded or $git_revert) as $git_action
           | {
               turn_id: ($r.turn_id // "unknown"),
               sequence: ($r.sequence // 0),
-              user_goal: ($r.user_goal // ""),
+              # Drop the goal on `unknown` when the turn shows a concrete git action (files
+              # committed/touched, OR a commit/discard/git-revert command): keeping it would
+              # assert a goal<->action pairing we cannot prove (the seam-3 false attribution,
+              # or a `git revert` read as the goal). The action still travels in
+              # touched_files / commands_run, just never bound to the goal. A goal-only
+              # unknown turn keeps its goal (nothing to be falsely paired with, and the
+              # intel self-echo guard drops it anyway).
+              user_goal: (if $oc == "unknown" and $i == 0 and (($tf | length) > 0 or $git_action) then "" else ($r.user_goal // "") end),
               assistant_summary: (if $i == 0 then ($narr | last // "") else "" end),
               touched_files: (if $i == 0 then $tf else [] end),
-              commands_run: (if $i == 0 then ($cmds | .[-5:]) else [] end),
-              # Phase 5B: resolve the outcome from DETERMINISTIC, SESSION-OWNED
-              # evidence instead of the hardcoded "unknown" every observation
-              # used to carry. A turn is `applied` when it demonstrably CHANGED
-              # something: it touched a file, or it ran a mutating command.
-              #
-              # Mutation, not activity, is the discriminator. Reading (grep, ls,
-              # cat) is not doing, and neither is narration: an assistant saying
-              # "I fixed it" is the least reliable signal available and is
-              # deliberately not accepted as proof.
-              #
-              # Attribution is structural. Both inputs are keyed by THIS session
-              # id, so nothing here reads the git log, diffs "commits since
-              # session start", or uses a time window. Ten or more sessions share
-              # this tree; a commit in any window belongs to whoever made it.
-              # A turn with no session-owned evidence stays `unknown` and stays
-              # suppressed by the intel self-echo guard. Omission beats false
-              # attribution.
-              #
-              # `reverted` and `blocked` are in the intel enum and are NOT derived:
-              # no deterministic session-owned signal distinguishes them today,
-              # and guessing would be the same defect in a new coat.
-              # (No apostrophes below: the whole program is single-quoted in bash.)
-              outcome: (
-                if ($i == 0)
-                   and ( ($tf | length) > 0
-                         or ( ($cmds | .[-5:] | map(select(test("(^|[;&|] *)(git (commit|add|push|mv|rm|checkout -b)|npm run build|pnpm (run )?build|make |mv |rm |cp |sed -i|tee )"; "i"))) | length) > 0 ) )
-                then "applied" else "unknown" end
-              ),
+              commands_run: (if $i == 0 then $recent else [] end),
+              outcome: $oc,
               low_trust: true
             } ]' 2>/dev/null || printf '[]')"
   case "$out" in '['*']') printf '%s' "$out" ;; *) printf '[]' ;; esac
@@ -2867,6 +2893,19 @@ spawn_flush() {
   else
     (nohup "$MEETLESS_HOOK_SCRIPT_DIR/flush.sh" "$session_id" >>"$LOG_DIR/flush-$session_id.log" 2>&1 &) >/dev/null 2>&1 || true
   fi
+}
+
+# E1 SHADOW spawn. Fires the canonical turns/prepare comparison in a fully detached process, so
+# it can never add latency to the injection that already went out on stdout. Reads its one JSON
+# argument on stdin. Off unless MEETLESS_E1_SHADOW=1 (the caller gates on that). The comparison
+# line the command writes to stderr lands in e1-shadow.log for later analysis, which is the raw
+# data the E1-specific comparator is derived from (proposal §11 row 5).
+spawn_e1_shadow() {
+  local input="$1"
+  [[ -z "$input" || -z "${MLA_PATH:-}" ]] && return 0
+  local target="/dev/null"
+  [[ -n "${LOG_DIR:-}" ]] && target="$LOG_DIR/e1-shadow.log"
+  ( printf '%s' "$input" | nohup "$MLA_PATH" _internal turn-prepare-shadow >>"$target" 2>&1 & ) >/dev/null 2>&1 || true
 }
 
 # F3-B throttled mid-turn liveness heartbeat. PostToolUse spools tool events but

@@ -639,7 +639,13 @@ test("a workspace that captured plenty is never told it has nothing", async () =
   // The lie that shipped. 170 documents, told it had none.
   assert.ok(!/no indexed documents/.test(out.warnings[0]));
   assert.match(out.warnings[0], /captured/);
-  assert.match(out.warnings[0], /never indexed/);
+  // Current cohort semantics (2026-08-20): agent-session decisions now serve to their
+  // OWNER as exact-span claim evidence, so the message no longer claims "never indexed"
+  // outright nor "nothing for EVERY query"; it says nothing is in the FULL-TEXT index and
+  // that a reworded query may still find a claim.
+  assert.match(out.warnings[0], /full-text/);
+  assert.match(out.warnings[0], /claim evidence/);
+  assert.ok(!/for EVERY query/.test(out.warnings[0]));
 });
 
 test("the captured-not-indexed remedy names the indexing lane, not a repeat of onboarding", async () => {

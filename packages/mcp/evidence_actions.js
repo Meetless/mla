@@ -183,12 +183,14 @@ export function isOnboardingGapPull(corpusEmpty, corpusState) {
 function explainEmptyPull(corpusEmpty, corpusState) {
   if (corpusState === "captured_not_indexed") {
     return (
-      "This workspace has captured content, but none of it is in the searchable index, " +
-      "so retrieval returns nothing for EVERY query, not just this one. Agent session " +
-      "memory is kept for review and is never indexed, and anything added in the last " +
-      "few minutes may still be processing. Index a document to make it answerable " +
-      "(`mla kb add <path>`, or the /mla onboard skill for this repository). Do NOT " +
-      "report the absence of evidence as an absence of the fact."
+      "This workspace has captured content, but none of it is in the full-text search " +
+      "index, so no chunk-grounded document matched this query. Captured agent-session " +
+      "decisions DO serve to their owner as exact-span claim evidence, so a differently " +
+      "worded query may still find one; they are never chunked into the full-text index, " +
+      "and anything added in the last few minutes may still be processing. To make a " +
+      "document full-text answerable, index it (`mla kb add <path>`, or the /mla onboard " +
+      "skill for this repository). Do NOT report the absence of evidence as an absence of " +
+      "the fact."
     );
   }
   if (isOnboardingGapPull(corpusEmpty, corpusState)) {

@@ -195,6 +195,75 @@ describe("scoped-commit.sh: what it commits", () => {
   });
 });
 
+describe("scoped-commit.sh: run from a subdirectory, the way an agent actually works", () => {
+  // Agents `cd` into a package and pass paths from there. Git's own convention for
+  // `git add -- <path>` is CWD-RELATIVE, so the tool has to match it, and the first cut
+  // only half did: `update-index -- "$p"` is cwd-relative, but the `[[ -e "$p" ]]` shape
+  // test and the `ls-tree` mode lookup were reading two different roots. The failure was
+  // loud rather than silent, which is the one mercy, but the message said "nothing to
+  // commit" for a path whose only problem was which directory it was named from.
+  function nested(): string {
+    const repo = tree();
+    mkdirSync(join(repo, "pkg", "sub"), { recursive: true });
+    writeFileSync(join(repo, "pkg", "sub", "a.txt"), "base\n");
+    writeFileSync(join(repo, "pkg", "sub", "run.sh"), "#!/bin/sh\necho base\n", { mode: 0o755 });
+    git(repo, ["add", "pkg"]);
+    git(repo, ["commit", "-q", "-m", "nested"]);
+    return repo;
+  }
+
+  it("takes a cwd-relative path, which is what git itself takes", () => {
+    const repo = nested();
+    writeFileSync(join(repo, "pkg", "sub", "a.txt"), "base\nmy change\n");
+
+    execFileSync("bash", ["-c", `bash "$0" "$@" 2>&1`, SCRIPT, "-m", "from subdir", "--", "sub/a.txt"], {
+      cwd: join(repo, "pkg"),
+      encoding: "utf8",
+      env: { ...process.env, ...ENV },
+    });
+
+    expect(filesIn(repo)).toEqual(["pkg/sub/a.txt"]);
+  });
+
+  it("keeps the mode when run from a subdirectory, where the ls-tree lookup used to read the wrong root", () => {
+    const repo = nested();
+    writeFileSync(join(repo, "pkg", "sub", "run.sh"), "#!/bin/sh\necho mine\necho peer\n", { mode: 0o755 });
+    const intended = join(repo, ".git", "intended.sh");
+    writeFileSync(intended, "#!/bin/sh\necho mine\n");
+
+    execFileSync(
+      "bash",
+      ["-c", `bash "$0" "$@" 2>&1`, SCRIPT, "-m", "blob from subdir", "--blob", `sub/run.sh=${intended}`, "--", "sub/run.sh"],
+      { cwd: join(repo, "pkg"), encoding: "utf8", env: { ...process.env, ...ENV } },
+    );
+
+    expect(git(repo, ["ls-tree", "HEAD", "--", "pkg/sub/run.sh"]).split(" ")[0]).toBe("100755");
+    expect(git(repo, ["show", "HEAD:pkg/sub/run.sh"])).not.toContain("peer");
+  });
+
+  it("says WHERE it looked when a path does not resolve, instead of blaming the file", () => {
+    // The misleading half. A repo-relative path passed from a subdirectory used to come
+    // back "nothing to commit", which reads as "your edit is not there" and sends the
+    // operator looking for a lost change.
+    const repo = nested();
+    writeFileSync(join(repo, "pkg", "sub", "a.txt"), "base\nmy change\n");
+
+    let out = "";
+    try {
+      execFileSync("bash", ["-c", `bash "$0" "$@" 2>&1`, SCRIPT, "-m", "x", "--", "pkg/sub/a.txt"], {
+        cwd: join(repo, "pkg"),
+        encoding: "utf8",
+        env: { ...process.env, ...ENV },
+      });
+    } catch (e) {
+      out = String((e as { stdout?: string }).stdout ?? "");
+    }
+    expect(out).toMatch(/pkg\/sub\/a\.txt/);
+    expect(out).toMatch(/relative to/i);
+    expect(git(repo, ["log", "--format=%s", "-1"])).toBe("nested");
+  });
+});
+
 describe("scoped-commit.sh: the mixed file a peer is editing too", () => {
   it("stages MY content and leaves the peer's hunk in the working tree", () => {
     // The hardest case on this tree and the one no pathspec can solve. Both of us are
@@ -212,6 +281,44 @@ describe("scoped-commit.sh: the mixed file a peer is editing too", () => {
     expect(git(repo, ["show", "HEAD:mine.txt"])).not.toContain("a peer's uncommitted hunk");
     // ...and the peer still has their line, on disk, uncommitted.
     expect(readFileSync(join(repo, "mine.txt"), "utf8")).toContain("a peer's uncommitted hunk");
+  });
+
+  it("keeps the file MODE, because a blob that silently drops +x breaks the thing it committed", () => {
+    // Found 2026-08-19 by running the tool against its own shape. `--cacheinfo` takes a
+    // mode and the first cut hardcoded 100644, so an executable file came back 100644
+    // with correct content and no diff anyone would notice in a review.
+    //
+    // The tool itself is 100755. A mixed-file edit to `scoped-commit.sh` committed with
+    // `--blob` would have un-executabled the script that prevents peer clobbers, which
+    // is as quiet a failure as this repo has produced.
+    const repo = tree();
+    writeFileSync(join(repo, "run.sh"), "#!/bin/sh\necho base\n", { mode: 0o755 });
+    git(repo, ["add", "run.sh"]);
+    git(repo, ["commit", "-q", "-m", "an executable"]);
+    expect(git(repo, ["ls-tree", "HEAD", "--", "run.sh"]).split(" ")[0]).toBe("100755");
+
+    writeFileSync(join(repo, "run.sh"), "#!/bin/sh\necho mine\necho a peer hunk\n", { mode: 0o755 });
+    const intended = join(repo, ".git", "intended-run.sh");
+    writeFileSync(intended, "#!/bin/sh\necho mine\n");
+
+    scoped(repo, ["-m", "blob an executable", "--blob", `run.sh=${intended}`, "--", "run.sh"]);
+
+    expect(git(repo, ["ls-tree", "HEAD", "--", "run.sh"]).split(" ")[0]).toBe("100755");
+    expect(git(repo, ["show", "HEAD:run.sh"])).not.toContain("a peer hunk");
+  });
+
+  it("gives a NEW blob path the mode of the file on disk", () => {
+    // The other half: a path with no HEAD entry has no mode to inherit, so the working
+    // tree is the only source. Non-executable here, and the +x case is above.
+    const repo = tree();
+    writeFileSync(join(repo, "fresh.txt"), "peer hunk too\n");
+    const intended = join(repo, ".git", "intended-fresh.txt");
+    writeFileSync(intended, "mine only\n");
+
+    scoped(repo, ["-m", "new via blob", "--blob", `fresh.txt=${intended}`, "--", "fresh.txt"]);
+
+    expect(git(repo, ["ls-tree", "HEAD", "--", "fresh.txt"]).split(" ")[0]).toBe("100644");
+    expect(git(repo, ["show", "HEAD:fresh.txt"])).toBe("mine only");
   });
 
   it("refuses a --blob whose content file does not exist rather than staging the worktree", () => {

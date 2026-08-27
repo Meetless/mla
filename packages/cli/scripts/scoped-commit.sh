@@ -91,6 +91,24 @@ BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
 INDEX="$(git rev-parse --git-dir)/scoped-commit-index.$$"
 trap 'rm -f "$INDEX"' EXIT
 
+# PATHS ARE CWD-RELATIVE, exactly as `git add -- <path>` takes them, and this loop is
+# here because getting that wrong used to report the wrong cause. An agent that has cd'd
+# into a package and passes a REPO-relative path resolved to nothing, took the
+# deleted-from-worktree branch, staged nothing, and came back "nothing to commit" -- a
+# message that reads as "your edit is not there" and sends the operator looking for a
+# change that is sitting safely on disk one directory up.
+#
+# `HEAD:./<p>` is git's own cwd-relative revision syntax, so a path that is missing from
+# disk but present in the commit (a deletion you mean to stage) still passes.
+for p in "${PATHS[@]}"; do
+  if [[ ! -e "$p" ]] && ! git cat-file -e "HEAD:./$p" 2>/dev/null; then
+    echo "scoped-commit: no such path, relative to $(pwd): $p" >&2
+    echo "  paths are CWD-RELATIVE, the same as \`git add -- <path>\`. From a" >&2
+    echo "  subdirectory, name the file from HERE, not from the repository root." >&2
+    exit 2
+  fi
+done
+
 # Stage the named paths into an index seeded from $1. Each path is handled by its shape,
 # because the three shapes need three different commands and the second defect was
 # exactly one of them reaching for the wrong one.
@@ -107,9 +125,26 @@ stage_from() {
       [[ "${BLOB_PATHS[$i]}" == "$p" ]] && blob="${BLOB_FILES[$i]}"
     done
     if [[ -n "$blob" ]]; then
-      local sha
+      # THE MODE IS NOT A CONSTANT, and hardcoding 100644 here silently un-executabled
+      # any script committed this way: correct content, no diff a review would catch,
+      # and the file no longer runs. This tool is itself 100755, so the first mixed-file
+      # edit to it committed with --blob would have broken the thing that prevents peer
+      # clobbers. Found 2026-08-19 by running the tool against its own shape.
+      #
+      # The working tree is the authority (it is the same file, just with a peer's hunks
+      # in it), HEAD is the fallback for a path deleted on disk, and 100644 is the
+      # default for a path that is new in both.
+      local sha mode
       sha="$(git hash-object -w "$blob")"
-      GIT_INDEX_FILE="$INDEX" git update-index --add --cacheinfo "100644,$sha,$p"
+      if [[ -x "$p" ]]; then
+        mode=100755
+      elif [[ -e "$p" ]]; then
+        mode=100644
+      else
+        mode="$(git ls-tree "$base" -- "$p" | awk '{print $1}')"
+        mode="${mode:-100644}"
+      fi
+      GIT_INDEX_FILE="$INDEX" git update-index --add --cacheinfo "$mode,$sha,$p"
     elif [[ -e "$p" ]]; then
       # `--add` covers BOTH the modified and the newly-added shape. Without it a path
       # absent from the base tree is a hard error, which is defect 2.

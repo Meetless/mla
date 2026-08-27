@@ -1,6 +1,6 @@
 {
   "name": "@meetless/mla",
-  "version": "0.2.37",
+  "version": "0.2.38",
   "license": "Apache-2.0",
   "private": false,
   "description": "Meetless CLI (mla): governed change-control and knowledge for AI coding agents.",
@@ -61,6 +61,7 @@
   "devDependencies": {
     "@meetless/ask-core": "workspace:*",
     "@meetless/mcp": "workspace:*",
+    "@meetless/native-auth": "workspace:*",
     "@meetless/trace-core": "workspace:*",
     "@types/better-sqlite3": "^7.6.11",
     "@types/jest": "^29.5.12",

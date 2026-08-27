@@ -1,6 +1,7 @@
 import * as path from "path";
 import { pathToFileURL } from "url";
 import { renderPlain } from "../lib/ask-render";
+import { formatShadow, runQueryShadow } from "../lib/query-shadow";
 import { documentationImpact } from "../lib/ask-documentation-impact";
 import { loadWorkspaceConfig } from "../lib/config";
 import { DEFAULT_INTEL_URL } from "../lib/http";
@@ -116,7 +117,7 @@ export function parseArgs(argv: string[]): AskArgs {
 // ask-core is plain ESM; `mla` compiles to CommonJS. A literal dynamic import()
 // would be downleveled by tsc to require(), which cannot load an ESM-only
 // package on Node < 22. The Function constructor preserves a TRUE runtime
-// import() so it works on every supported Node (>=18.18). Used only by the dev
+// import() so it works on every supported Node (>=22). Used only by the dev
 // fallback below (ts-node, no built dist). Resolve ask-core as a sibling package
 // directory (packages/ask-core), three levels up from the compiled commands dir
 // (dist/commands -> dist -> cli -> packages).
@@ -355,5 +356,20 @@ export async function runAsk(
   if (isUngroundedAnswer(result)) {
     console.error('Asking about mla itself? Try: mla docs ask "..."');
   }
+
+  // D0 SHADOW. AFTER the answer is rendered, so the legacy path is authoritative in the
+  // strongest sense available: the operator already has their answer and nothing below can
+  // change it. Compares GOVERNED EVIDENCE only, because the prose is non-deterministic and
+  // diffing it would produce a permanent stream of false alarms nobody reads. Off unless
+  // MEETLESS_D0_SHADOW=1, because it costs a second Ask.
+  const shadow = await runQueryShadow({
+    enabled: process.env.MEETLESS_D0_SHADOW === "1",
+    platformUrl: process.env.MEETLESS_PLATFORM_URL,
+    accessToken: cfg.auth?.mode === "user-token" ? cfg.auth.accessToken : undefined,
+    question: args.query,
+    legacyResult: result,
+  });
+  if (shadow.ran || shadow.error) console.error(formatShadow(shadow));
+
   return 0;
 }
