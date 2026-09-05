@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.41 (2026-09-05)
+
+Small honesty fixes to the private notes you capture with "remember".
+
+**Fixed**
+- A remembered note is now recalled as something captured through your assistant, not as if you had typed it yourself, so the record reflects what actually happened.
+- Re-remembering a note you had already forgotten now tells you plainly that it stays withdrawn, instead of an unhelpful hint to reword it.
+- Each person's private captures are kept separate, so your notes cannot collide with someone else's identical text.
+
 ## 0.2.40 (2026-09-05)
 
 **New**

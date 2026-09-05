@@ -96,12 +96,16 @@ test("remember: owner (actor) comes from the trusted config, never from args (#1
   assert.ok(!("scope" in body.envelope), "no scope in the envelope");
 });
 
-test("remember: builds an UPSERT agent/human/authenticated-authoring envelope", () => {
+test("remember: builds an UPSERT agent-produced authenticated-authoring envelope (truthful provenance)", () => {
   const env = buildRememberEnvelope("hello world", { workspaceId: WS });
   assert.equal(env.operation, "UPSERT");
   assert.equal(env.sourceSystem, "agent");
-  assert.equal(env.producerActorType, "human");
+  // producer=agent -> server derives provenance agent_distilled (NOT human_authored):
+  // the only evidence here is the agent's tool submission (An review 2026-09-05).
+  assert.equal(env.producerActorType, "agent");
   assert.equal(env.captureMethod, "authenticated_authoring_surface");
+  // born-ACCEPTED needs producer=human + authenticatedProducerId; both absent, so PENDING.
+  assert.equal(env.authenticatedProducerId, null);
   assert.equal(env.sourceOrderingKind, "SERVER_RECEIVE_SEQUENCE");
   assert.equal(env.rawContent, "hello world");
   assert.equal(env.rawContentHash, createHash("sha256").update("hello world", "utf8").digest("hex"));
@@ -113,6 +117,16 @@ test("remember: externalObjectId is content-addressed (idempotent on identical t
   const c = buildRememberEnvelope("different fact", { workspaceId: WS });
   assert.equal(a.externalObjectId, b.externalObjectId, "identical text -> identical identity");
   assert.notEqual(a.externalObjectId, c.externalObjectId, "different text -> different identity");
+});
+
+test("remember: identity is per-user (two users, same text -> distinct captures)", () => {
+  const an = buildRememberEnvelope("same fact", { workspaceId: WS, actorUserId: "wu_an" });
+  const other = buildRememberEnvelope("same fact", { workspaceId: WS, actorUserId: "wu_other" });
+  assert.equal(an.sourceTenantId, `memory:${WS}:wu_an`);
+  assert.notEqual(an.sourceTenantId, other.sourceTenantId, "different owners -> different identity keyspace");
+  // Same content hash, but the full identity (tenant + extObj) differs, so the two
+  // are distinct documents and one owner's handle is not derivable from text alone.
+  assert.equal(an.externalObjectId, other.externalObjectId);
 });
 
 test("remember: rejects empty text", async () => {
@@ -143,13 +157,32 @@ test("remember: confirmation is derived from the receipt, not fabricated (persis
   );
 });
 
+test("remember: a DEDUPLICATED (re-capture of a withdrawn identity) is NEVER reported recall-ready", async () => {
+  // Live-verified 2026-09-05: remember(A)->forget(A)->remember(A) returns
+  // outcome=DEDUPLICATED and the doc stays TOMBSTONED. The tool must not claim it
+  // is retrievable, and must say plainly it was not re-saved.
+  const { fetchImpl } = recordingFetch({
+    outcome: "DEDUPLICATED",
+    documentId: "doc_dup",
+    revisionId: null,
+    revisionStatus: null,
+    publicationMode: null,
+    deduplicated: true,
+  });
+  const res = await runRemember({ text: "prior text" }, { intelFetch: fetchImpl, defaultWorkspaceId: WS, operatorUserId: OPERATOR });
+  assert.equal(res.retrievalReady, false, "a deduped/withdrawn identity is never recall-ready");
+  assert.equal(res.captured, false, "nothing new was captured");
+  assert.equal(res.outcome, "DEDUPLICATED");
+  assert.match(res.note, /remains withdrawn; it was not restored/i, "the note explains the no-op honestly, without a hash-manipulation workaround");
+});
+
 test("remember: returns a withdraw handle matching the envelope identity", async () => {
   const { fetchImpl } = recordingFetch(OK_RECEIPT);
   const res = await runRemember(
     { text: "handle test" },
     { intelFetch: fetchImpl, defaultWorkspaceId: WS, operatorUserId: OPERATOR },
   );
-  const env = buildRememberEnvelope("handle test", { workspaceId: WS });
+  const env = buildRememberEnvelope("handle test", { workspaceId: WS, actorUserId: OPERATOR });
   assert.equal(res.scope, "person");
   assert.equal(res.captureId, "doc_123");
   assert.deepEqual(res.withdraw, {

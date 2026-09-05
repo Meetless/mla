@@ -6,7 +6,7 @@
 #      detached flush. Fast and non-blocking; must never be at risk from the
 #      interception path below.
 #   2. INTERCEPTION (Push, two-layer): Claude (the coding agent) is in the
-#      driver seat (an internal design note §9-§12).
+#      driver seat (internal notes §9-§12).
 #        Layer 1 (the FLOOR, zero network, ALWAYS injected): a static grounding
 #          block carrying the workspace hint (display only, never a scope), the
 #          touched-file set, the read-only evidence-tool manifest, and the
@@ -25,8 +25,8 @@
 # remains reachable via MEETLESS_INTERCEPT_STRATEGY for non-frontier-agent
 # surfaces (Slack/console) and A/B; `pull_only` stays a true no-inject control.
 #
-# Source: an internal design note §9-§12,
-#         an internal design note §3.
+# Source: internal notes §9-§12,
+#         internal notes §3.
 source "$(dirname "$0")/common.sh"
 
 # THE LAYER-2 DEADLINE, in one place, because three places is how a budget drifts.
@@ -569,7 +569,7 @@ _gov_silent() {
   spawn_governance_count_refresh "$WORKSPACE_ID"
 
   # STATE A NUMBER OR SAY NOTHING (D4,
-  # an internal design note).
+  # internal notes).
   #
   # Three of the four unavailable states have no number to report, and the block they
   # produced spent 429-447 bytes saying so and pointing at a command no agent runs
@@ -1024,9 +1024,9 @@ write_trace() {
 }
 
 # InjectionTrace keystone (governed-story v2, spec
-# an internal design note
+# internal notes
 # §4.3-§4.6; supersedes the relationship-only v1 from
-# an internal design note §7.2). Ship ONE
+# internal notes §7.2). Ship ONE
 # immutable trace of WHAT this turn injected so the session-detail page can honestly
 # answer "what did Meetless inject?" (question 2). Distinct from write_trace, which
 # is a LOCAL analytics line (ask-traces.jsonl, never networked); this is the
@@ -1273,7 +1273,7 @@ arbitrate_layer2() {
 }
 
 # --- governed-story block capture (spec §4.3) -----------------------------------
-# an internal design note
+# internal notes
 # ONE producer feeds BOTH the delivered prompt and the captured structure, so the
 # stored blocks can never drift from the bytes the agent actually saw.
 #
@@ -1470,7 +1470,7 @@ intercept_main() {
   # delivered Layer 2, how many still died), so the trade is priced on the new cohort
   # rather than on counterfactuals about requests that already died. If a 10s budget
   # recovers little, revert to 6 here: that is the whole rollback.
-  # NT:an internal design note
+  # internal notes
   INTERCEPT_MAX_S="${MEETLESS_INTERCEPT_MAX_S:-${MLA_DEFAULT_INTERCEPT_MAX_S}}"
   SURFACE="${MEETLESS_INTERCEPT_SURFACE:-cli_intercept}"
   # retrieval_only is the NEW default: raw evidence, no synthesis, agent drives.
@@ -1595,7 +1595,7 @@ intercept_main() {
   INJECTED_CHARS="0"
   INJECTED_BYTES="0"
   TRUNCATED="false"
-  # H4 (an internal design note).
+  # H4 (internal notes).
   # The citations this turn actually EMITTED, read back off the budgeted block. `null`
   # rather than `[]` on every turn that rendered no evidence block at all, so "no
   # evidence this turn" stays distinguishable from "evidence rendered, nothing survived".
@@ -1919,7 +1919,7 @@ intercept_main() {
   # --- Layer 2 best-effort: needs the intel token; otherwise floor stands alone ---
   local INTEL_URL INTEL_TOKEN
   # ENRICH targets `intelEnrichUrl` when set: the dedicated stable `serve` instance (P2 of
-  # an internal design note...). Enriching through the `--reload` dev
+  # internal notes...). Enriching through the `--reload` dev
   # server lets a peer's file save on this shared checkout replace the worker mid-request, and
   # the call hangs past the deadline with zero bytes, indistinguishable from a slow retrieval.
   # Falls back to `intelUrl`, then to the dev default, so an unconfigured box is unchanged. The
@@ -2127,7 +2127,7 @@ ${ENRICH_Q:$((PLEN - 500))}"
       # G1: HOW WIDE THE PIPE IS, computed here and sent, so the composer can size its
       # projection to the transport instead of composing ten times it.
       #
-      # THE DEFECT (an internal design note
+      # THE DEFECT (internal notes
       # I1). This number already existed; it was just computed 400 lines below, AFTER the
       # response had arrived, so intel had never seen it. Measured over 64 turns carrying
       # both figures: intel composed a median of 12,193 bytes into a median transport of
@@ -2520,7 +2520,7 @@ ${ENRICH_Q:$((PLEN - 500))}"
     fi
   fi
 
-  # F2 (an internal design note,
+  # F2 (internal notes,
   # I2). WHY nothing was offered, read off the trace THIS turn already parsed. Empty on a
   # failed enrich (parse_enrich resets GOVERNED_KB_TRACE_JSON to null) and on any pre-trace
   # response, so the decline arm below is unreachable unless intel actually classified it.
@@ -2831,7 +2831,7 @@ $MD
     # injection-trace contract): historical traces carry it and must keep rendering.
     # Nothing new emits it.
   elif [[ -n "${FAIL_OPEN_REASON:-}" ]]; then
-    # F4: SAY IT THIS TURN (an internal design note §3.1 D4).
+    # F4: SAY IT THIS TURN (internal notes §3.1 D4).
     #
     # On 2026-08-04 intel sat wedged for most of a session and the agent found out hours
     # in, by running `mla doctor` by hand. The hook knew on the FIRST degraded turn: it
@@ -2883,7 +2883,7 @@ $MD
         _deg_detail="a stop guard held the retrieval back"
         _deg_recovery="The guard is local to this hook: call meetless__retrieve_knowledge by hand if this turn needs governed memory." ;;
       *)
-        # F1 (An review of an internal design note, §1).
+        # F1 (An review of internal notes, §1).
         # The generic error arm used to emit "the evidence service returned an error"
         # plus an UNCONDITIONAL "call meetless__retrieve_knowledge by hand" recovery.
         # On the measured 503 (session 8751d447: control down, intel answering "Auth
@@ -2958,7 +2958,7 @@ governed evidence not auto-offered: router low confidence (the router declined t
     append_context_block "$DECLINED_BLOCK"
   fi
 
-  # F1 (an internal design note D1): another
+  # F1 (internal notes D1): another
   # session on this machine wrote a file this session also wrote. A DISTINCT block that never
   # merges into `touched_files` (which stays exact self-attribution, the 2026-07-27 fix) and
   # never gates anything.
@@ -3169,7 +3169,7 @@ $AR_TEXT
   fi
 
   # ---- Layer C-lite: previous-turn assist recap (Phase 2) ------------------
-  # an internal design note. Passively inject the PREVIOUS
+  # internal notes. Passively inject the PREVIOUS
   # turn's recap ("did mla run + help last turn?") so the agent sees its own assist
   # signal with ZERO model cost. Rides at the very END of $CTX -- it is meta, the
   # lowest-priority block, and must never displace the turn's grounding. Gated by
