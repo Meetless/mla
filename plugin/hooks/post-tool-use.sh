@@ -14,11 +14,11 @@
 #                                 says what the agent pulled on the same turn.
 #                                 relationship_verdict is an ACTION, never an
 #                                 evidence Pull (evidence_tool=false). See
-#                                 notes/20260603-mla-kb-agent-proxy-and-evidence-adoption.md
+#                                 an internal design note
 #                                 §7.1 P1 / §7.4 A1.
 # Any other tool is ignored.
 #
-# Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
+# Source: an internal design note §5.2.
 source "$(dirname "$0")/common.sh"
 
 # Per-folder activation gate (opt-in). Exit before any work unless a
@@ -285,7 +285,7 @@ fi
 # eventKeys already queued this session (the Stop transcript-scan backstop writes
 # the same keys), so a re-fired PostToolUse never double-spools the same decision.
 # Capture is assistive: every failure is swallowed and never breaks the session.
-# See notes/20260608-agent-decision-capture-design.md section 5.
+# See an internal design note section 5.
 if [[ "$TOOL" == "AskUserQuestion" || "$TOOL" == "request_user_input" ]]; then
   if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
     DECISION_LINES="$(printf '%s' "$INPUT" | "$MLA_PATH" _internal capture-decisions \
@@ -372,7 +372,7 @@ if [[ "$TOOL" == "Edit" || "$TOOL" == "Write" || "$TOOL" == "MultiEdit" || "$TOO
     record_touched_file "$SESSION_ID" "$FILE_TRACE_PATH"
 
     # ---- Evidence material-incorporation P1: stage the changed hunk(s) --------
-    # notes/20260716-evidence-material-incorporation-correlator.md (§5, §8, §10.6, §11).
+    # an internal design note (§5, §8, §10.6, §11).
     # UNLIKE the metadata-only tool_used_file event above, this stages the actual
     # changed CODE (a diff-shaped hunk) so the seal-on-window-close builder has the
     # agent's OWN work product before auto-compaction can drop it from the transcript.
@@ -401,7 +401,7 @@ if [[ "$TOOL" == "Edit" || "$TOOL" == "Write" || "$TOOL" == "MultiEdit" || "$TOO
 fi
 
 # ---- Read-side knowledge trace: tool_used_file with access:"read" ---------
-# Session Files rail Phase 2 (notes/20260616-session-files-rail-design.md). The
+# Session Files rail Phase 2 (an internal design note). The
 # rail's "read by the agent" lane needs to know which PROSE files the agent
 # opened; Read/Grep/Glob otherwise emit nothing. Spool ONE metadata-only
 # tool_used_file per markdown Read, tagged access:"read" so the console routes it

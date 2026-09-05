@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { parseArgs } from "../../src/commands/internal-steer-sync";
+import { parseArgs, commandsToCachedSteers } from "../../src/commands/internal-steer-sync";
 import {
   RULE_BUNDLE_SCHEMA_VERSION,
   ruleBundleCachePath,
@@ -19,6 +19,52 @@ import type { RuleBundle } from "../../src/lib/rules/control-rule-client";
 // parseArgs). A full pull -> cache -> markInjected run needs a live control and is
 // exercised by the manual end-to-end task; the stubbed transport seam keeps the
 // command itself offline-runnable but is not asserted here.
+
+// Row 2 of the platform migration: coordination delivery moves to the tier's
+// `/v1/coordination/pull`, whose neutral `commands` list must map losslessly back to the
+// `CachedSteer[]` the zero-network cache and the hook read. The tier/legacy transport choice and
+// its idempotent replay are live-verified against a running tier (the manual e2e); these pin the
+// pure adapter, where the authoritative-set-not-delta and rename semantics live.
+describe("commandsToCachedSteers (tier delivery adapter)", () => {
+  it("renames the neutral command fields to CachedSteer with no loss", () => {
+    const out = commandsToCachedSteers({
+      commands: [
+        {
+          commandId: "st_1",
+          directive: "Do not ship without the migration",
+          coordinationCaseId: "cc_9",
+          createdAt: "2026-09-01T00:00:00Z",
+        },
+      ],
+    });
+    expect(out).toEqual([
+      { id: "st_1", directive: "Do not ship without the migration", caseId: "cc_9", createdAt: "2026-09-01T00:00:00Z" },
+    ]);
+  });
+
+  it("preserves the FULL authoritative set in order (a pull is never a delta)", () => {
+    const out = commandsToCachedSteers({
+      commands: [
+        { commandId: "a", directive: "one", coordinationCaseId: null, createdAt: "t1" },
+        { commandId: "b", directive: "two", coordinationCaseId: "cc_2", createdAt: "t2" },
+        { commandId: "c", directive: "three", coordinationCaseId: null, createdAt: "t3" },
+      ],
+    });
+    expect(out.map((s) => s.id)).toEqual(["a", "b", "c"]);
+    expect(out[0].caseId).toBeNull();
+    expect(out[1].caseId).toBe("cc_2");
+  });
+
+  it("maps an empty command set to an empty cache, which CLEARS a resolved steer", () => {
+    expect(commandsToCachedSteers({ commands: [] })).toEqual([]);
+  });
+
+  it("never throws on a malformed or missing body (best-effort per-turn path)", () => {
+    expect(commandsToCachedSteers({})).toEqual([]);
+    expect(commandsToCachedSteers(null)).toEqual([]);
+    expect(commandsToCachedSteers({ commands: "nope" })).toEqual([]);
+  });
+});
 
 describe("internal steer-sync parseArgs", () => {
   it("parses --session", () => {

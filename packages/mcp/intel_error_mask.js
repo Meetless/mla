@@ -145,8 +145,12 @@ function categoryOf(err) {
   if (typeof status === "number") {
     return status >= 500 && status <= 599 ? "unavailable" : "error";
   }
-  // No numeric status: the transport failed (connection refused mid-restart,
-  // DNS, an aborted/timed-out request). Always transient.
+  // No numeric status: no HTTP response was classified. That is USUALLY a transport
+  // failure (connection refused mid-restart, DNS, an aborted/timed-out request), but a
+  // status-free throw can also be a local parse error or a cancellation, so we do not
+  // assert which. Treated as transient (retryable) because the common case is, and the
+  // retry contract is what this category encodes; the copy stays neutral (see
+  // shapeOfUnavailable / classifyIntelError).
   return "unavailable";
 }
 
@@ -154,21 +158,30 @@ function categoryOf(err) {
  * Which of the three `unavailable` failures this is. Same category, same retry
  * contract, three MUTUALLY EXCLUSIVE facts about the world:
  *
- *   unreachable   no numeric status: the connection never completed (refused
- *                 mid-restart, DNS, abort). Intel really is out of contact.
+ *   no_status     no numeric status reached us. We CANNOT say which service failed,
+ *                 or even that the transport (rather than a local parse/cancel) did.
+ *                 The copy names neither intel nor a connection failure.
  *   rate_limited  429: intel answered. It is up, healthy, and shedding load.
  *   server_error  5xx: intel answered. It is up and faulted on this request.
  *
- * Collapsing these into one "intel unreachable" line (as this module did until
- * now) is not a cosmetic sloppiness: it sends an operator to check DNS, ingress
- * and the deploy when intel is plainly answering, and it hides a rate limit,
- * which is the one shape where retrying WITHOUT backoff makes things worse. The
- * status is already returned in the result's `status` field, so naming it in the
- * message discloses nothing new (SEC-3.2 is about the body, host and stack).
+ * WHY THE no_status COPY IS NEUTRAL (An review of 20260812-...-8751d447 §2). The old
+ * name for this shape was "unreachable", and it emitted "intel is unreachable (the
+ * connection failed)". Session 8751d447 recorded that line while intel was answering
+ * /health in 4.5ms: a status-free error is EXACTLY the case where the module has no
+ * evidence about which service failed, or whether a connection failed at all. Naming
+ * intel there is the same class of overclaim this module was written to remove, just
+ * pointed at itself. So the no_status branch says only what it can stand behind.
+ *
+ * The two status-bearing shapes stay specific: with a status the module DOES know intel
+ * answered, and naming it (and the code) discloses nothing new, since `status` is already
+ * a field of the result (SEC-3.2 is about the body, host and stack). Collapsing all three
+ * into one line is the defect: it sends an operator to check DNS, ingress and the deploy
+ * when intel is plainly answering, and it hides a rate limit, the one shape where retrying
+ * WITHOUT backoff makes things worse.
  */
 function shapeOfUnavailable(err) {
   const status = err && err.status;
-  if (typeof status !== "number") return "unreachable";
+  if (typeof status !== "number") return "no_status";
   return status === 429 ? "rate_limited" : "server_error";
 }
 
@@ -263,9 +276,10 @@ const GUIDANCE = {
     "to grep as if the evidence were absent, and do NOT escalate to bind a payer; " +
     "one is already bound.",
   unavailable:
-    "Intel is temporarily unreachable (an infra blip), not a permanent " +
-    "failure. Retry shortly. For pure code-shape questions, grep is an " +
-    "acceptable stopgap.",
+    "The request did not complete, and no HTTP response was classified, so which " +
+    "service failed is unknown. This is usually transient; retry shortly. For pure " +
+    "code-shape questions, grep is an acceptable stopgap. Do not treat missing " +
+    "evidence as absent.",
   unavailable_rate_limited:
     "Intel is UP and answering; it is shedding load (rate limit), not down. " +
     "This is not an outage and the evidence is not absent. Back off before " +
@@ -341,7 +355,12 @@ export function classifyIntelError(err, opts = {}) {
       guidanceKey = "unavailable_server_error";
       message = `${noun} temporarily unavailable: intel answered with a server error (HTTP ${status}). Intel is reachable; this is not a connectivity fault. Retry shortly.`;
     } else {
-      message = `${noun} temporarily unavailable: intel is unreachable (the connection failed); retry shortly`;
+      // No numeric status: we do not know which service failed, or even that the
+      // transport did (a local parse error, an abort, or a non-HTTP throw lands here
+      // too). Say only what we can stand behind (An review §2). NOT "intel is
+      // unreachable (the connection failed)": that named a service on no evidence, and
+      // session 8751d447 emitted it while intel was answering /health in 4.5ms.
+      message = `${noun} temporarily unavailable: the request did not complete; retry shortly`;
     }
   } else {
     message = `${noun} unavailable`;

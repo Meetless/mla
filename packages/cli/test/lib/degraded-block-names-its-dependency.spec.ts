@@ -3,47 +3,59 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { spawnSync, spawn, ChildProcess } from "child_process";
 
-// DEFECT PIN (G1, notes/20260812-did-mla-help-session-8751d447-both-clients-blamed-the-wrong-service.md).
+// REGRESSION PIN (G1, notes/20260812-did-mla-help-session-8751d447-both-clients-blamed-the-wrong-service.md).
 //
-// This file records CURRENT behaviour, so it is GREEN today. Turning it red is the
-// acceptance test for the fix. It cannot fail a deploy and it costs one test run to
-// rediscover the finding.
+// This started as a defect pin recording CURRENT (broken) behaviour. It now asserts the
+// SHIPPED, CORRECTED behaviour (An review §1) and finishes GREEN. Turning THESE
+// assertions red is a real regression.
 //
 // THE MEASURED CASE, session 8751d447, 2026-08-12T13:18:05Z.
 //
 // `control` was not running. intel therefore could not validate the CLI user token and
 // answered `503 {"detail":"Auth backend unavailable"}` in 23ms. That refusal is CORRECT
 // and deliberate: falling back to the shared key would turn a control outage into a
-// silent auth bypass (intel app/core/auth.py:213-220, proposal T15). Nothing below asks
+// silent auth bypass (intel app/core/auth.py:213-220, proposal T15). Nothing here asks
 // for that to change.
 //
-// What the hook then told the agent is the defect. `FAIL_OPEN_REASON` is derived by a
-// three-arm case (user-prompt-submit.sh, "timeout | stop_guard | *"), so every HTTP
-// status lands on `error`, and the degraded-block builder falls to ITS default arm:
+// What the hook told the agent was the defect. `FAIL_OPEN_REASON` is derived by a case
+// (user-prompt-submit.sh, "timeout | stop_guard | *"), so every HTTP status landed on
+// `error`, and the degraded-block builder fell to ITS default arm:
 //
 //     "the evidence service returned an error ...
 //      Call meetless__retrieve_knowledge by hand once before treating any absence as
 //      settled."
 //
-// THE HARM: that instruction CANNOT BE FOLLOWED. The MCP shares the same control-backed
-// auth, so the one recovery the block names is the one recovery guaranteed to fail while
-// the auth backend is down. The audited agent followed it and the call failed. The arm
-// set already knows how to say this honestly: the `intel_down` arm reads "A direct
-// meetless__retrieve_knowledge may fail for the same reason, but it is the only
-// recovery". The 503 case gets the naive line instead, purely because no arm looks at
-// the status the hook already holds.
+// THE HARM: that instruction could NOT be followed. The MCP shares the same
+// control-backed auth, so the one recovery the block named is the one recovery
+// guaranteed to fail while the auth backend is down. The audited agent followed it and
+// the call failed.
 //
 // Not a one-off: 43 turns in the local trace carry `hook.http_status: 503`, five of them
 // in the 13 hours before the audit.
 //
-// THE EDIT THAT CLOSES THIS: give the auth-backend outage its own reason
-// (`backend_unavailable`, selected when the recorded status is 503) and its own arm,
-// whose recovery line says the hand-pull shares the dead dependency and that the turn is
-// UNGOVERNED rather than "nothing was found". The last distinction is load-bearing:
-// conflating "we could not look" with "there is nothing there" is the defect class this
-// whole family of notes exists to prevent.
+// THE FIX THAT SHIPPED (An review §1, NOT the proposal's original draft):
+//   - The generic error arm consults the status the hook already holds
+//     ($ENRICH_HTTP_STATUS). On an HTTP error status (4xx/5xx) it REPORTS THE STATUS
+//     ("the retrieval request failed (HTTP 503)") and stops.
+//   - It does NOT invent an auth diagnosis: a 503 does not prove the auth dependency is
+//     down; it can be any 5xx, a proxy, a gateway.
+//   - It does NOT prescribe an unconditional hand-pull, because the MCP shares this
+//     backend and is no more likely to survive a server-side failure.
+//   - It does NOT call the turn "ungoverned" (Layer 1 operated) and names no port.
+//   - It adds NO new FAIL_OPEN_REASON enum: the arbitration reason stays
+//     `enrichment_error`, so no emitted vocabulary grew for a wording fix.
 const HOOK = join(__dirname, "../../src/hooks-template/user-prompt-submit.sh");
 const DEGRADED = 'kind="evidence-unavailable"';
+
+// The always-present static grounding block lists meetless__retrieve_knowledge as a
+// tool, so a whole-context grep for that name is meaningless. Scope recovery-prose
+// assertions to the degraded block itself.
+function degradedBlock(additionalContext: string): string {
+  const m = /<meetless-context kind="evidence-unavailable"[\s\S]*?<\/meetless-context>/.exec(
+    additionalContext,
+  );
+  return m ? m[0] : "";
+}
 
 const scratch: string[] = [];
 
@@ -137,7 +149,7 @@ async function runAgainst(status: number, body: string) {
   }
 }
 
-describe("G1 defect pin: an auth-backend 503 is described as a generic error", () => {
+describe("G1: an auth-backend 503 reports its status and prescribes no shared-dependency recovery", () => {
   afterAll(() => {
     for (const d of scratch) rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     scratch.length = 0;
@@ -149,34 +161,59 @@ describe("G1 defect pin: an auth-backend 503 is described as a generic error", (
     // what it knows, and separating those is the whole point of the finding.
     expect(r.trace.hook.http_status).toBe(503);
     expect(r.trace.hook.layer2_injected).toBe(false);
+    // No new enum: the arbitration reason stays enrichment_error (fail_open_reason
+    // "error"). The wording fix rides on $ENRICH_HTTP_STATUS, not on a new reason.
+    expect(r.trace.hook.fail_open_reason).toBe("error");
     expect(r.trace.arbitration.reason).toBe("enrichment_error");
   }, 40000);
 
-  it("TODAY: 503 collapses onto the generic `error` arm", async () => {
+  it("reports the HTTP status and does NOT invent an auth diagnosis", async () => {
     const r = await runAgainst(503, JSON.stringify({ detail: "Auth backend unavailable" }));
-    // PIN. When the fix lands this becomes `backend_unavailable` and this line fails.
-    expect(r.trace.hook.fail_open_reason).toBe("error");
     expect(r.additionalContext).toContain(DEGRADED);
-    expect(r.additionalContext).toContain("the evidence service returned an error");
+    const block = degradedBlock(r.additionalContext);
+    // Reports the status the hook already holds ...
+    expect(block).toMatch(/HTTP 503/);
+    // ... and drops the old generic "returned an error" line for a status-bearing failure.
+    expect(block).not.toContain("the evidence service returned an error");
+    // Invents no diagnosis: a 503 does not prove WHICH dependency is down. No claim about
+    // the auth backend, no laptop-specific port, and it does not echo intel's body.
+    expect(block).not.toMatch(/auth (backend|dependency)/i);
+    expect(block).not.toMatch(/3006/);
+    expect(block).not.toMatch(/ungoverned/i);
+    expect(block).not.toContain("Auth backend unavailable");
   }, 40000);
 
-  it("TODAY: it prescribes a hand-pull that shares the dead dependency", async () => {
+  it("does NOT prescribe a hand-pull that shares the dead dependency", async () => {
     const r = await runAgainst(503, JSON.stringify({ detail: "Auth backend unavailable" }));
-    // THE HARM, pinned as an assertion rather than as a comment. The audited agent
-    // followed exactly this line and the MCP call failed for the same reason.
-    expect(r.additionalContext).toMatch(/Call meetless__retrieve_knowledge by hand once/);
-    // And it does NOT warn that the recovery shares the failure, which the `intel_down`
-    // arm does say. That missing sentence is the deliverable.
-    expect(r.additionalContext).not.toMatch(/same reason/i);
-    expect(r.additionalContext).not.toMatch(/ungoverned/i);
+    // THE HARM, closed. The audited agent followed exactly the removed line and the MCP
+    // call failed for the same reason; on a server-side status the degraded block now
+    // names no meetless__retrieve_knowledge recovery at all. Scoped to the block, because
+    // the static grounding block always lists the tool.
+    const block = degradedBlock(r.additionalContext);
+    expect(block).not.toBe("");
+    expect(block).not.toMatch(/Call meetless__retrieve_knowledge by hand/i);
+    expect(block).not.toMatch(/retrieve_knowledge/i);
   }, 40000);
 
-  it("the arm set is not broken in general: a timeout still gets its own honest arm", async () => {
-    // VACUITY GUARD. Without this, deleting the whole case statement would leave the
-    // three pins above green (they assert the DEFAULT arm), and the suite would report
-    // health while the feature was gone.
+  it("is status-driven, not 503-hardcoded: a 500 reports HTTP 500 the same way", async () => {
+    // Guards against a fix that special-cased the one measured status. Any HTTP error
+    // status the hook received is reported, and none of them prescribe the shared-backend
+    // hand-pull.
+    const r = await runAgainst(500, JSON.stringify({ detail: "boom" }));
+    expect(r.additionalContext).toContain(DEGRADED);
+    expect(r.additionalContext).toMatch(/HTTP 500/);
+    expect(r.additionalContext).not.toMatch(/Call meetless__retrieve_knowledge by hand/i);
+  }, 40000);
+
+  it("the arm set is not broken in general: the degraded block still frames absence honestly", async () => {
+    // VACUITY GUARD (retained per An review §4). Without this, deleting the whole case
+    // statement would leave the pins above green (they assert absence of strings), and
+    // the suite would report health while the feature was gone.
     const r = await runAgainst(503, JSON.stringify({ detail: "Auth backend unavailable" }));
     expect(r.additionalContext).toContain("MLA evidence is unavailable THIS TURN");
     expect(r.additionalContext).toContain("Governed memory was NOT consulted");
+    // And the "absence is unknown, not settled" framing (the review's "missing evidence
+    // does not mean governed memory contains nothing") survives.
+    expect(r.additionalContext).toMatch(/an absence here is unknown, not settled/);
   }, 40000);
 });

@@ -379,11 +379,26 @@ test("5xx says intel is REACHABLE and faulted, never 'unreachable'", () => {
   }
 });
 
-test("only a transport failure claims 'unreachable'", () => {
+test("a status-free failure names NO service and asserts NO connection failure (An review §2)", () => {
   const e = new TypeError("fetch failed");
   const c = classifyIntelError(e);
-  assert.match(c.message, /unreachable/i);
-  assert.match(c.message, /connection failed/i);
+  // Neutral: it does not know which service failed, or even that the transport did.
+  assert.match(c.message, /did not complete/i);
+  assert.doesNotMatch(c.message, /\bintel\b/i);
+  assert.doesNotMatch(c.message, /unreachable/i);
+  assert.doesNotMatch(c.message, /connection failed/i);
+});
+
+test("a status-free NON-transport throw (parse/local) is also neutral, not 'intel unreachable'", () => {
+  // The review's point: no numeric status does not prove a transport failure. A plain
+  // Error thrown by local code (a JSON parse, a cancellation) must get the same neutral
+  // copy, never a service name. Extends this file's coverage rather than adding another.
+  const c = classifyIntelError(new Error("Unexpected token < in JSON at position 0"));
+  assert.equal(c.category, "unavailable");
+  assert.equal(c.status, undefined);
+  assert.match(c.message, /did not complete/i);
+  assert.doesNotMatch(c.message, /\bintel\b/i);
+  assert.doesNotMatch(c.message, /connection failed/i);
 });
 
 test("the three shapes never share a message or a guidance line", () => {
@@ -506,32 +521,39 @@ test("a plain validation error is NOT an intel transport error (passes through)"
 // expensive: with a status the copy is careful and correct, without one it names a
 // service it has no evidence about.
 //
-// THE EDIT THAT CLOSES THIS (G2a): the no-status branch must describe the failure without
-// asserting WHICH service failed, because a status-free transport error is exactly the
-// case where the module does not know. G2b (find the leg that drops `.status`) is blocked
-// on an unproven premise and is deliberately not pinned here.
+// THE FIX THAT SHIPPED (G2a): the no-status branch describes the failure without
+// asserting WHICH service failed, because a status-free error is exactly the case where
+// the module does not know. G2b (a leg that drops `.status`) was investigated and
+// REFUTED on current code: the retrieve path preserves intel's HTTP status end-to-end
+// (a 503 arrives as server_error, not no_status) -- see evidence_actions.test.js and
+// mcp-fetchers.spec.ts. So there is no producer change; the no_status copy is the fix.
 
-test("G2 pin: WITH a status the copy is careful, and says intel is reachable", () => {
+test("G2: WITH a status the copy is careful, and says intel is reachable", () => {
   const c = classifyIntelError(httpErr(503, { detail: "Auth backend unavailable" }), { noun: "retrieval" });
   assert.equal(c.category, "unavailable");
   assert.equal(c.status, 503);
   assert.equal(c.transient, true);
-  // The correct half. This is what the production turn SHOULD have rendered.
+  // The status-bearing half stays specific: intel DID answer, so naming it is honest.
   assert.match(c.message, /server error \(HTTP 503\)/);
   assert.match(c.message, /Intel is reachable; this is not a connectivity fault/);
   assert.doesNotMatch(c.message, /the connection failed/);
 });
 
-test("G2 pin: WITHOUT a status it names intel specifically, on no evidence", () => {
+test("G2: WITHOUT a status it names NO service and asserts NO connection failure", () => {
   // The shape a transport failure arrives in: undici's TypeError, no .status.
   const e = new TypeError("fetch failed");
   const c = classifyIntelError(e, { noun: "retrieval" });
   assert.equal(c.category, "unavailable");
   assert.equal(c.status, undefined);
   assert.equal(c.transient, true);
-  // PIN. When G2a lands, the message stops naming intel and these two flip.
-  assert.match(c.message, /intel is unreachable \(the connection failed\)/);
-  assert.doesNotMatch(c.message, /governed-memory backend/);
+  // SHIPPED: neutral. It no longer names intel or asserts a connection failure on no
+  // evidence, which is exactly what session 8751d447 recorded it doing while intel was up.
+  assert.match(c.message, /did not complete/i);
+  assert.doesNotMatch(c.message, /\bintel\b/i);
+  assert.doesNotMatch(c.message, /unreachable/i);
+  assert.doesNotMatch(c.message, /connection failed/i);
+  // The guidance carried the same overclaim; it too is neutral now.
+  assert.doesNotMatch(c.guidance, /\bintel\b.*unreachable/i);
 });
 
 test("G2 pin: the two branches must never converge, in either direction", () => {

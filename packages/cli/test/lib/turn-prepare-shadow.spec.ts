@@ -1,5 +1,6 @@
 import {
   compareTurnDecisions,
+  compareRuleVersions,
   formatTurnPrepareShadow,
   runTurnPrepareShadow,
   type LegacyTurnDecision,
@@ -87,6 +88,34 @@ describe("runTurnPrepareShadow never affects the (already-delivered) injection",
   });
 });
 
+describe("order (sequence) comparison for the required tiers", () => {
+  it("same set but different order -> orderFloorMust false (isolates a pure ordering difference)", () => {
+    const cmp = compareTurnDecisions(
+      legacy({ floorMust: ["f2", "f1"] }),
+      canonical({ floorMust: [{ ruleId: "f1" }, { ruleId: "f2" }] }),
+    );
+    expect(cmp.floorMust?.same).toBe(true); // the SET agrees
+    expect(cmp.orderFloorMust).toBe(false); // the ORDER does not
+  });
+
+  it("same set and same order -> orderScopedRequired true", () => {
+    const cmp = compareTurnDecisions(
+      legacy({ scopedRequired: ["s1", "s2"] }),
+      canonical({ scopedRequired: [{ ruleId: "s1" }, { ruleId: "s2" }] }),
+    );
+    expect(cmp.scopedRequired?.same).toBe(true);
+    expect(cmp.orderScopedRequired).toBe(true);
+  });
+
+  it("emits an order[...] token before the excluded end anchor", () => {
+    const line = formatTurnPrepareShadow(
+      compareTurnDecisions(legacy({ floorMust: ["f1"] }), canonical({ floorMust: [{ ruleId: "f1" }] })),
+    );
+    expect(line).toContain("order[floor_must=true scoped_required=true]");
+    expect(line).toContain("excluded=not_comparable");
+  });
+});
+
 describe("formatTurnPrepareShadow", () => {
   it("is one greppable line, per-dimension, and marks excluded not_comparable", () => {
     const line = formatTurnPrepareShadow(
@@ -107,5 +136,45 @@ describe("formatTurnPrepareShadow", () => {
 
   it("reports a skip as a skip", () => {
     expect(formatTurnPrepareShadow({ ran: false, skipped: "disabled" })).toBe("e1_shadow skipped=disabled");
+  });
+});
+
+// Step 1 of the cutover gate: the rule-VERSION identity comparison. Matching rule ids/order can
+// hide a different rule version/content; this proves the comparator catches that using the
+// versionId both sides already carry. Not wired into per-turn telemetry.
+describe("compareRuleVersions", () => {
+  it("flags a rule selected by both paths at a DIFFERENT version (same id, drifted content)", () => {
+    const cmp = compareRuleVersions(
+      { r1: "v1" },
+      canonical({ floorMust: [{ ruleId: "r1", versionId: "v2" }] }),
+    );
+    expect(cmp.comparedRuleIds).toBe(1);
+    expect(cmp.mismatches).toEqual([{ ruleId: "r1", legacyVersionId: "v1", canonicalVersionId: "v2" }]);
+  });
+
+  it("is clean when the shared rules carry the SAME version on both sides", () => {
+    const cmp = compareRuleVersions(
+      { r1: "v1", r2: "v9" },
+      canonical({ floorMust: [{ ruleId: "r1", versionId: "v1" }], scopedRequired: [{ ruleId: "r2", versionId: "v9" }] }),
+    );
+    expect(cmp.mismatches).toEqual([]);
+    expect(cmp.comparedRuleIds).toBe(2);
+  });
+
+  it("ignores a rule present on only one side (that is an id-set diff, not a version diff)", () => {
+    const cmp = compareRuleVersions(
+      { onlyLegacy: "v1" },
+      canonical({ floorMust: [{ ruleId: "onlyCanonical", versionId: "v1" }] }),
+    );
+    expect(cmp.comparedRuleIds).toBe(0);
+    expect(cmp.mismatches).toEqual([]);
+  });
+
+  it("compares across BOTH required tiers, not just the floor", () => {
+    const cmp = compareRuleVersions(
+      { scoped1: "v1" },
+      canonical({ scopedRequired: [{ ruleId: "scoped1", versionId: "v2" }] }),
+    );
+    expect(cmp.mismatches.map((m) => m.ruleId)).toEqual(["scoped1"]);
   });
 });

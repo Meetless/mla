@@ -1,5 +1,6 @@
 import { loadWorkspaceConfig, WorkspaceCliConfig } from "../lib/config";
 import { get, post } from "../lib/http";
+import { egressFetch } from "../lib/egress/fetch";
 import {
   ActiveConflict,
   writeActiveConflictCache,
@@ -68,9 +69,72 @@ interface ActiveConflictResponse {
   conflicts?: ActiveConflict[];
 }
 
+/**
+ * Row 2 of the platform migration: coordination DELIVERY moves to the tier's
+ * `/v1/coordination/pull` + `/:id/ack`, the smallest adapter over the SAME session-steers
+ * substrate the legacy control routes wrap. It is authority ONLY when a platform URL and a
+ * user token are both present (the same gate the D3 shadow uses); everywhere else, and on any
+ * tier error, the legacy control call remains, so the per-turn steer injection never regresses
+ * where the tier is not deployed. The other jobs (conflict snapshot, rule-bundle refresh with
+ * its DENY -> ASK lease guard) are untouched.
+ */
+function tierAuthority(cfg: WorkspaceCliConfig): { base: string; token: string } | null {
+  const base = process.env.MEETLESS_PLATFORM_URL;
+  const token = cfg.auth?.mode === "user-token" ? cfg.auth.accessToken : undefined;
+  if (!base || base.length === 0 || !token) return null;
+  return { base: base.replace(/\/+$/, ""), token };
+}
+
+/** One tier `CoordinationDelivery` shape. A field-for-field rename of `CachedSteer`. */
+interface CoordinationDelivery {
+  commandId?: unknown;
+  directive?: unknown;
+  coordinationCaseId?: unknown;
+  createdAt?: unknown;
+}
+
+/**
+ * Map the tier's `{ commands: CoordinationDelivery[] }` back to the `CachedSteer[]` the
+ * zero-network cache and the hook read. Pure rename, no field loss: the tier derived this list
+ * from the same internal `DeliverableSteer` the legacy pull returns. The full set is the
+ * authoritative deliverable set (never a delta), so an empty `commands` maps to `[]` and
+ * clears the cache exactly as an empty legacy pull would.
+ */
+export function commandsToCachedSteers(body: unknown): CachedSteer[] {
+  const commands = (body as { commands?: unknown })?.commands;
+  if (!Array.isArray(commands)) return [];
+  return commands.map((c) => {
+    const cmd = c as CoordinationDelivery;
+    return {
+      id: String(cmd.commandId ?? ""),
+      directive: String(cmd.directive ?? ""),
+      caseId: (cmd.coordinationCaseId as string | null) ?? null,
+      createdAt: String(cmd.createdAt ?? ""),
+    };
+  });
+}
+
 function realTransport(cfg: WorkspaceCliConfig): SteerTransport {
   return {
     pull: async (sessionId) => {
+      const tier = tierAuthority(cfg);
+      if (tier) {
+        // When the platform URL is CONFIGURED the tier is authoritative: a timeout, connection
+        // failure, or non-2xx must FAIL, never silently fall back to the legacy control route.
+        // A fallback would bypass the canonical authorization/ACL/billing boundary on a tier
+        // outage. The outer best-effort guard turns a throw into an empty set for this one turn
+        // (advise-never-block); it does NOT reach legacy. Legacy is chosen only when the URL is
+        // absent (pre-deployment), which is `tier === null` below.
+        console.error("coordination_authority source=tier");
+        const res = await egressFetch("control", `${tier.base}/v1/coordination/pull`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${tier.token}` },
+          body: { sessionId },
+        });
+        if (!res.ok) throw new Error(`coordination pull: tier returned ${res.status}`);
+        return commandsToCachedSteers(JSON.parse(await res.text()));
+      }
+      console.error("coordination_authority source=legacy");
       const res = await post<PullResponse>(
         cfg,
         `/internal/v1/session-steers/by-session/${encodeURIComponent(sessionId)}/pull`,
@@ -80,6 +144,20 @@ function realTransport(cfg: WorkspaceCliConfig): SteerTransport {
       return res.steers ?? [];
     },
     markInjected: async (id) => {
+      const tier = tierAuthority(cfg);
+      if (tier) {
+        // Authoritative when configured: a tier failure THROWS (the caller's per-id guard retries
+        // next flush, still via the tier), never a legacy bypass. The id is in the path and the
+        // workspace in the token, so the ack body is empty; a bodyless POST needs no egress body
+        // rule. The flip PULLED -> INJECTED is idempotent.
+        const res = await egressFetch(
+          "control",
+          `${tier.base}/v1/coordination/${encodeURIComponent(id)}/ack`,
+          { method: "POST", headers: { Authorization: `Bearer ${tier.token}` } },
+        );
+        if (!res.ok) throw new Error(`coordination ack: tier returned ${res.status}`);
+        return;
+      }
       await post<unknown>(
         cfg,
         `/internal/v1/session-steers/${encodeURIComponent(id)}/injected`,

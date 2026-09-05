@@ -3,7 +3,7 @@
 # spool and spawns the flusher. Stop must return in <1s. Claude's final message
 # is read from its transcript; Codex supplies it directly on the hook payload.
 #
-# Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
+# Source: an internal design note §5.2.
 source "$(dirname "$0")/common.sh"
 
 # Per-folder activation gate (opt-in). Exit before any work unless a
@@ -184,7 +184,7 @@ SESSION_TITLE="$(resolve_session_title "$TRANSCRIPT")"
 # the counter still holds N. An empty array is recorded too: "this turn's report
 # cited nothing" is a real A1b denominator signal. extract_source_ids (common.sh)
 # is the single shared grammar with the pull side.
-# notes/20260603-mla-kb-agent-proxy-and-evidence-adoption.md §7.1 P3 / §7.4 A1.
+# an internal design note §7.1 P3 / §7.4 A1.
 mkdir -p "$QUEUE_DIR" "$LOG_DIR"
 REPORT_TURN="$(current_turn_index "$SESSION_ID")"
 REPORT_SIDS="$(extract_source_ids "$FINAL_MSG")"
@@ -200,7 +200,7 @@ REPORT_LINE="$(jq -c -n \
 )
 
 # ---- F1b echo scan ---------------------------------------------------------
-# notes/20260808-mla-in-this-session-measured-and-a-fix-proposal.md §4 (F1b).
+# an internal design note §4 (F1b).
 # The citation capture above answers "did the report CITE an id we injected". It cannot see
 # the push path's actual success mode, which is the agent reading the injected snippet inline
 # and acting on it with no pull and no marker: that is what turns 7 and 8 of session
@@ -227,7 +227,7 @@ if [[ -n "${MLA_PATH:-}" && -x "$MLA_PATH" ]]; then
 fi
 
 # ---- Evidence material-incorporation P1: stage the closing assistant output ----
-# notes/20260716-evidence-material-incorporation-correlator.md (§5, §8, §10.6, §11).
+# an internal design note (§5, §8, §10.6, §11).
 # The agent's CLOSING message (FINAL_MSG above, already end_turn-extracted and
 # flush-settled) is part of the judged work product: the seal-on-window-close builder
 # pairs it with the PostToolUse hunks so materiality is judged over what the agent
@@ -296,7 +296,7 @@ spool_append "$SESSION_ID" "$LINE_FINALIZE"
 # Spooled BEFORE spawn_flush so the decisions ride this same flush cycle.
 # Fail-soft: a missing mla binary, an unreadable transcript, or a command error
 # is swallowed and never delays or fails Stop (<1s budget).
-# See notes/20260608-agent-decision-capture-design.md section 5.
+# See an internal design note section 5.
 if [[ "${MEETLESS_CONNECTOR:-}" != "codex" && -n "${MLA_PATH:-}" && -x "$MLA_PATH" && -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] \
   && grep -q "AskUserQuestion" "$TRANSCRIPT" 2>/dev/null; then
   DECISION_LINES="$("$MLA_PATH" _internal capture-decisions \
@@ -374,7 +374,7 @@ fi
 # fail-soft, and kill-switchable via MEETLESS_TURN_RECAP_LANGFUSE=off (its OWN flag,
 # independent of the C-lite injection's MEETLESS_TURN_RECAP), so it never blocks
 # Stop. Rides the same end-of-Stop tail as the kickoffs above.
-# See notes/20260609-mla-per-turn-assist-recap-plan.md §4.4.
+# See an internal design note §4.4.
 spawn_turn_recap_emit "$SESSION_ID" "$REPORT_TURN"
 
 # Stop returns in <1s. Worker runs review async.

@@ -75,4 +75,37 @@ describe("assembleFromCanonicalDecision renders the server decision like the loc
     expect(out.text).toContain("scoped best effort body");
     expect(out.text).toContain("floor should body");
   });
+
+  // Step 3 of the cutover gate: deterministic client rendering under TOKEN PRESSURE.
+  it("fills best-effort in RANK ORDER under pressure: delivered is a rank prefix, the rest drop", () => {
+    const ctx: CanonicalTurnContext = {
+      floorMust: [{ ruleId: "f1", text: "req", strength: "MUST" }],
+      floorShould: [],
+      scopedRequired: [],
+      bestEffort: [
+        { ruleId: "be1", text: "a", strength: "SHOULD", source: "floor" },
+        { ruleId: "be2", text: "b", strength: "SHOULD", source: "floor" },
+        { ruleId: "be3", text: "x".repeat(4000), strength: "SHOULD", source: "floor" }, // cannot fit
+      ],
+    };
+    // Budget fits the required floor block + the two tiny candidates, never the 4000-byte one.
+    const out = assembleFromCanonicalDecision("", ctx, 400);
+    const be = out.delivered.filter((d) => d.tier === "best-effort").map((d) => d.ruleId);
+    // Rank order preserved (a prefix of the input order), and the oversized lowest-rank one dropped.
+    expect(be).toEqual(["be1", "be2"]);
+    expect(out.omitted.map((o) => o.ruleId)).toContain("be3");
+  });
+
+  it("delivers a SCOPED-REQUIRED rule whole even under a tiny budget (required never drops)", () => {
+    const ctx: CanonicalTurnContext = {
+      floorMust: [],
+      floorShould: [],
+      scopedRequired: [{ ruleId: "sr1", versionId: "sr1v", text: "scoped required body that must ride whole", strength: "MUST" }],
+      bestEffort: [{ ruleId: "be1", text: "y".repeat(500), strength: "SHOULD", source: "scoped" }],
+    };
+    const out = assembleFromCanonicalDecision("", ctx, 30);
+    expect(out.delivered.map((d) => [d.ruleId, d.tier])).toEqual([["sr1", "scoped-required"]]);
+    expect(out.text).toContain("scoped required body that must ride whole");
+    expect(out.omitted.map((o) => o.ruleId)).toEqual(["be1"]);
+  });
 });

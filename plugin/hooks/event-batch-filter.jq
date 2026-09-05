@@ -22,7 +22,7 @@
 # string; `split("\n")` re-splits to lines. `fromjson?` per-line tolerates
 # garbage.
 #
-# Whitelist gate (notes/20260608-agent-decision-capture-design.md section 5):
+# Whitelist gate (an internal design note section 5):
 # an event type NOT named here is silently dropped with NO error. So
 # `agent_decision_captured` MUST appear in the select() below or every captured
 # agent-human decision vanishes between the spool and control, looking healthy.

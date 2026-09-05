@@ -3,7 +3,7 @@
 # Claude calls it directly on SessionStart. Codex calls it internally on
 # UserPromptSubmit; a marker makes that path once-per-session.
 #
-# Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
+# Source: an internal design note §5.2.
 source "$(dirname "$0")/common.sh"
 
 # Per-folder activation gate (opt-in). In an ACTIVATED repo we fall through to

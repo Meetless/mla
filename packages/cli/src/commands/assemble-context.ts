@@ -34,7 +34,8 @@ import {
   makeArtifactByteReader,
 } from "../lib/scanner/reconciliation-live";
 import { readScanCacheForRoot, resolveScanRoot } from "./scan-context";
-import { assembleContext } from "../lib/scanner/assemble";
+import { prepareTurn } from "../lib/turn-prepare-authority";
+import { loadWorkspaceConfig } from "../lib/config";
 import { floorDelta, type FloorRuleRef } from "../lib/scanner/floor-delta";
 import { extractExplicitPaths } from "../lib/scanner/prompt-paths";
 import {
@@ -103,6 +104,12 @@ export interface AssembleContextDeps {
   now?: () => string;
   log?: (out: string) => void;
   logErr?: (out: string) => void;
+  // Cutover wiring (Decision A). When a platform URL is present the command serves the canonical
+  // `/v1/turns/prepare` decision (fail-closed on refusal, legacy fallback on outage); absent, the
+  // command is byte-identical to the pre-cutover local assembler. Injected for tests; production
+  // resolves platformUrl from MEETLESS_PLATFORM_URL and accessToken from the logged-in session.
+  platformUrl?: string;
+  accessToken?: string;
 }
 
 interface AssembleStdin {
@@ -209,6 +216,9 @@ function normalizeWorkingSet(entries: string[]): string[] {
 interface AssembleCtx {
   // undefined = the cache module resolves the state root (it honors MEETLESS_HOME).
   home: string | undefined;
+  // Cutover (Decision A): platform URL present => serve the canonical decision; absent => legacy.
+  platformUrl?: string;
+  accessToken?: string;
   now: () => string;
   readCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
   readGlobalCache: (home: string | undefined, workspaceId: string) => ScanResult | null;
@@ -262,7 +272,7 @@ interface AssembleResult {
  * boundary with each rule's durable RuleVersion identity (§7.4) and dedup represent-edge (§7.3);
  * the pure assembler stays minimal so its tests do not churn on identity plumbing.
  */
-function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
+async function assemble(input: AssembleStdin, ctx: AssembleCtx): Promise<AssembleResult> {
   const cache = ctx.readCache(ctx.home, input.workspaceId);
   const explicitPaths = extractExplicitPaths(input.prompt, { repoRoot: input.repoRoot });
   const workingSetPaths = normalizeWorkingSet(input.workingSet);
@@ -540,7 +550,12 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
   // throws for budget: required content is always delivered whole. Any UNEXPECTED throw here (a
   // genuine bug) propagates to the fail-soft catch in runAssembleContext, which yields to the bash
   // fallback rather than crashing the hook.
-  const out = assembleContext({
+  // Decision A: one command, one renderer. Select exactly one decision source through prepareTurn
+  // and render it. cutover = a platform URL is present; when absent this is byte-identical to the
+  // pre-cutover local assembler (prepareTurn renders the legacy decision). On a Platform refusal
+  // (4xx / missing credential while configured) it fails CLOSED (no governed rules), never legacy.
+  // The one e1_authority line is emitted by prepareTurn; audit/meter below fire ONCE on `out`.
+  const legacyInput = {
     base: input.base,
     prompt: input.prompt,
     floorRules,
@@ -548,7 +563,17 @@ function assemble(input: AssembleStdin, ctx: AssembleCtx): AssembleResult {
     explicitPaths,
     workingSetPaths,
     safeTotal: input.safeTotal,
+  };
+  const authority = await prepareTurn({
+    cutover: Boolean(ctx.platformUrl),
+    legacyInput,
+    platformUrl: ctx.platformUrl,
+    accessToken: ctx.accessToken,
+    task: input.prompt,
+    sessionId: input.sessionId ?? "",
+    signals: { explicitPaths, workingSet: workingSetPaths },
   });
+  const out = authority.output;
   // `out.overflow` is permanently false (see assemble.ts). The overflow-conditional plumbing below
   // (state "overflow", blockedVersions, the rc==3 path in runAssembleContext) is a DORMANT, typed
   // safety net: it never fires today, but it stays valid so a future real byte ceiling could re-arm
@@ -632,8 +657,23 @@ export async function runAssembleContext(
     const readStdin = deps.readStdin ?? (() => readFileSync(0, "utf8"));
     const input = parseInput(readStdin());
     if (!input) return 0; // fail-soft: bash fallback emits LAYER1 + floor
+    // Cutover creds (Decision A). Resolve ONLY when a platform URL is configured, so the pre-cutover
+    // path reads no config and stays byte-identical. A configured URL with no user token is an auth
+    // state prepareTurn fails CLOSED on (per the authority matrix), not a silent legacy bypass.
+    const platformUrl = deps.platformUrl ?? process.env.MEETLESS_PLATFORM_URL ?? undefined;
+    let accessToken = deps.accessToken;
+    if (platformUrl && accessToken === undefined) {
+      try {
+        const cfg = loadWorkspaceConfig();
+        accessToken = cfg.auth?.mode === "user-token" ? cfg.auth.accessToken : undefined;
+      } catch {
+        /* no resolvable config: leave undefined; prepareTurn fails closed when configured */
+      }
+    }
     const ctx: AssembleCtx = {
       home: deps.home, // undefined = the cache module's state root (it honors MEETLESS_HOME)
+      platformUrl,
+      accessToken,
       now: deps.now ?? (() => new Date().toISOString()),
       // Contained byte reader for the rehash gate, rooted at the SCAN ROOT rather than at this
       // turn's repoRoot. A finding's `path` was recorded by the scan, which enumerates via
@@ -667,7 +707,7 @@ export async function runAssembleContext(
     const log = deps.log ?? ((out: string) => process.stdout.write(out));
     const logErr = deps.logErr ?? ((out: string) => process.stderr.write(out));
 
-    const result = assemble(input, ctx);
+    const result = await assemble(input, ctx);
     if (result.head) log(result.head);
     // Drop the rule-cost meter (audit 6.G) where the caller asked for it. STRICTLY best-effort and
     // deliberately not in the `try` that guards delivery: a full disk or a vanished temp dir must

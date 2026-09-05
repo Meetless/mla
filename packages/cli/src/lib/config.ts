@@ -89,6 +89,13 @@ export interface CliConfig {
   // unchanged through the auth.* migration. New code branches on `auth`.
   controlToken: string;
   intelUrl?: string;
+  // The intel endpoint the PROMPT-ENRICHMENT hook targets, when it should differ from
+  // `intelUrl`. P2 of notes/20260820-...: the dogfood hook enriches every turn, and enriching
+  // through a `--reload` intel lets a peer's file save wedge the call past the deadline. Point
+  // this at a dedicated stable `serve` instance so `intelUrl` (and the MCP tools) stay on the
+  // dev server for people editing intel. The hook reads `intelEnrichUrl // intelUrl`; unset is
+  // the ordinary case (enrichment uses intelUrl).
+  intelEnrichUrl?: string;
   // DEPRECATED as a workspace source (folder = workspace, T1.1). cli-config no
   // longer carries the per-folder workspace binding; the workspaceId is resolved
   // from the nearest `.meetless.json` marker via the shared resolver. Kept
@@ -387,6 +394,7 @@ export function telemetryDisabled(env: NodeJS.ProcessEnv = process.env): boolean
 interface RawDiskConfig {
   controlUrl?: string;
   intelUrl?: string;
+  intelEnrichUrl?: string;
   workspaceId?: string;
   mlaPath?: string;
   intelRoot?: string;
@@ -538,6 +546,11 @@ export function readConfig(): CliConfig {
     process.env.MEETLESS_BACKEND_URL || cfg.controlUrl || DEFAULT_CONTROL_URL;
   const intelUrl =
     process.env.MEETLESS_INTEL_URL || cfg.intelUrl || DEFAULT_INTEL_URL;
+  // The enrichment endpoint (P2). Env alias selects WHICH box the hook enriches through,
+  // like MEETLESS_INTEL_URL above. Undefined when unset: the hook falls back to intelUrl,
+  // so an unconfigured box is unchanged.
+  const intelEnrichUrl =
+    process.env.MEETLESS_INTEL_ENRICH_URL || cfg.intelEnrichUrl || undefined;
 
   const diskAuth = normalizeAuthFromDisk(cfg);
 
@@ -579,6 +592,7 @@ export function readConfig(): CliConfig {
     controlUrl,
     controlToken,
     intelUrl,
+    intelEnrichUrl,
     mlaPath: cfg.mlaPath || "",
     intelRoot: cfg.intelRoot,
     consoleUrl: cfg.consoleUrl,
@@ -647,6 +661,7 @@ export function readKbConfig(override?: string): KbCliConfig {
 interface OnDiskConfig {
   controlUrl: string;
   intelUrl?: string;
+  intelEnrichUrl?: string;
   workspaceId?: string;
   mlaPath: string;
   intelRoot?: string;
@@ -673,6 +688,7 @@ export function writeConfig(cfg: CliConfig): void {
   const onDisk: OnDiskConfig = {
     controlUrl: cfg.controlUrl,
     ...(cfg.intelUrl ? { intelUrl: cfg.intelUrl } : {}),
+    ...(cfg.intelEnrichUrl ? { intelEnrichUrl: cfg.intelEnrichUrl } : {}),
     ...(cfg.workspaceId ? { workspaceId: cfg.workspaceId } : {}),
     mlaPath: cfg.mlaPath,
     ...(cfg.intelRoot ? { intelRoot: cfg.intelRoot } : {}),

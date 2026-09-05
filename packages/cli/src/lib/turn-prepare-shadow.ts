@@ -52,7 +52,21 @@ export interface TurnShadowComparison {
   scopedRequired?: DimensionDiff;
   bestEffort?: DimensionDiff;
   warnings?: DimensionDiff;
+  /**
+   * SEQUENCE agreement (not just set) for the required tiers, where injection ORDER is
+   * governance-meaningful and neither path drops for budget. `true` means identical id sequence;
+   * combined with the set `same`, a `same=true order=false` isolates a pure ordering difference.
+   * best_effort is deliberately excluded: the canonical candidate set is unbudgeted and unordered
+   * against the legacy budget order, so an order compare there would be a fake equivalence.
+   */
+  orderFloorMust?: boolean;
+  orderScopedRequired?: boolean;
   error?: string;
+}
+
+/** Identical id SEQUENCE (order-sensitive), the order counterpart to the set compare in `diff`. */
+function sameOrder(legacy: string[], canonical: string[]): boolean {
+  return legacy.length === canonical.length && legacy.every((x, i) => x === canonical[i]);
 }
 
 function diff(legacy: string[], canonical: string[]): DimensionDiff {
@@ -81,13 +95,70 @@ function ids(list: unknown, key: string): string[] {
 export function compareTurnDecisions(legacy: LegacyTurnDecision, canonicalBody: unknown): TurnShadowComparison {
   const ctx = (canonicalBody as { context?: Record<string, unknown> } | null)?.context ?? {};
   const warnings = (canonicalBody as { warnings?: unknown } | null)?.warnings;
+  const canonFloor = ids(ctx.floorMust, "ruleId");
+  const canonScoped = ids(ctx.scopedRequired, "ruleId");
   return {
     ran: true,
-    floorMust: diff(legacy.floorMust, ids(ctx.floorMust, "ruleId")),
-    scopedRequired: diff(legacy.scopedRequired, ids(ctx.scopedRequired, "ruleId")),
+    floorMust: diff(legacy.floorMust, canonFloor),
+    scopedRequired: diff(legacy.scopedRequired, canonScoped),
     bestEffort: diff(legacy.bestEffort, ids(ctx.bestEffort, "ruleId")),
     warnings: diff(legacy.warnings, ids(warnings, "path")),
+    orderFloorMust: sameOrder(legacy.floorMust, canonFloor),
+    orderScopedRequired: sameOrder(legacy.scopedRequired, canonScoped),
   };
+}
+
+/** One rule that both paths selected but at a DIFFERENT version: a same-id, different-content hit. */
+export interface RuleVersionMismatch {
+  ruleId: string;
+  legacyVersionId: string;
+  canonicalVersionId: string;
+}
+
+export interface RuleVersionComparison {
+  /** ruleIds present in BOTH required tiers whose versionId disagrees. Empty => version parity. */
+  mismatches: RuleVersionMismatch[];
+  /** How many shared ruleIds carried a versionId on both sides and were actually compared. */
+  comparedRuleIds: number;
+}
+
+/**
+ * The rule-VERSION identity comparison An required before cutover (step 1): matching rule ids and
+ * order can still hide a different rule VERSION or content. This uses the `versionId` both sides
+ * ALREADY carry (legacy `FloorRuleEntry.versionId` / `ScopedRuleEntry.versionId`; canonical
+ * `ContextRule.versionId`), so it invents no new fingerprint, adds no persistence, and is NOT
+ * wired into the per-turn e1_shadow line. It is a pure comparator the pre-cutover proof calls.
+ *
+ * A ruleId present on only one side is an id-SET divergence that `compareTurnDecisions` already
+ * reports; it is not a version question, so it is skipped here (only the intersection is compared).
+ */
+export function compareRuleVersions(
+  legacyVersions: Record<string, string>,
+  canonicalBody: unknown,
+): RuleVersionComparison {
+  const ctx = (canonicalBody as { context?: Record<string, unknown> } | null)?.context ?? {};
+  const canonical: Record<string, string> = {};
+  for (const tier of ["floorMust", "scopedRequired"] as const) {
+    const list = ctx[tier];
+    if (!Array.isArray(list)) continue;
+    for (const r of list) {
+      const rr = r as { ruleId?: unknown; versionId?: unknown };
+      if (typeof rr.ruleId === "string" && typeof rr.versionId === "string") {
+        canonical[rr.ruleId] = rr.versionId;
+      }
+    }
+  }
+  const mismatches: RuleVersionMismatch[] = [];
+  let comparedRuleIds = 0;
+  for (const [ruleId, legacyVersionId] of Object.entries(legacyVersions)) {
+    const canonicalVersionId = canonical[ruleId];
+    if (canonicalVersionId === undefined) continue; // not in both required tiers: an id-set diff, not a version diff
+    comparedRuleIds++;
+    if (canonicalVersionId !== legacyVersionId) {
+      mismatches.push({ ruleId, legacyVersionId, canonicalVersionId });
+    }
+  }
+  return { mismatches, comparedRuleIds };
 }
 
 export interface TurnShadowOptions {
@@ -136,7 +207,9 @@ export function formatTurnPrepareShadow(cmp: TurnShadowComparison): string {
   if (!cmp.ran) return `e1_shadow skipped=${cmp.skipped ?? "error"}${cmp.error ? ` error=${cmp.error}` : ""}`;
   return (
     `e1_shadow ${dim("floor_must", cmp.floorMust)} ${dim("scoped_required", cmp.scopedRequired)} ` +
-    `${dim("best_effort", cmp.bestEffort)} ${dim("warnings", cmp.warnings)} excluded=not_comparable`
+    `${dim("best_effort", cmp.bestEffort)} ${dim("warnings", cmp.warnings)} ` +
+    `order[floor_must=${cmp.orderFloorMust ?? "?"} scoped_required=${cmp.orderScopedRequired ?? "?"}] ` +
+    `excluded=not_comparable`
   );
 }
 

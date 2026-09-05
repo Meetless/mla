@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.40 (2026-09-05)
+
+**New**
+- Coordination driver tools in the `mla` MCP. From your session, acting as your authenticated self, you can submit a coordination goal, read its state, list the proposals waiting for review, review one, and propose closing the goal.
+
+**Fixed**
+- `mla` no longer treats a git subcommand written inside a quoted, multi-line string as a real command, so what it flags matches what actually ran.
+
+## 0.2.39 (2026-08-29)
+
+Mostly internal correctness. If you are already on 0.2.38, there is nothing here you need.
+
+**Fixed**
+- When the Meetless backend has trouble mid-session, `mla` now reports the actual error status instead of guessing at a diagnosis, so a degraded run is easier to tell apart from a real problem in your own code.
+
 ## 0.2.38 (2026-08-27)
 
 If your Codex sessions have not been turning into knowledge, this release makes the condition impossible to miss and names the one command that fixes it. Plus two additions to `mla kb`.

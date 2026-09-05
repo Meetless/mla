@@ -44,9 +44,19 @@ import {
 } from "./relationship_actions.js";
 import { runDismissConflict } from "./dismiss_conflict_action.js";
 import { runDecisionRecord } from "./decision_record_action.js";
+import {
+  runCoordinationSubmitGoal,
+  runCoordinationGetState,
+  runCoordinationListProposals,
+  runCoordinationReviewProposal,
+  runCoordinationProposeClose,
+} from "./coordination_actions.js";
 import { randomUUID } from "node:crypto";
 import { makeIntelFetch, runKbDocDetail } from "./kb_actions.js";
 import { runRetrieveKnowledge } from "./evidence_actions.js";
+import { runRemember } from "./remember_action.js";
+import { runForget } from "./forget_action.js";
+import { runPublish } from "./publish_action.js";
 import { TOOLS, assertReadOnlyManifest } from "./tool_manifest.js";
 // Shared ask implementation (proposal 20260529 T5). The mode routing, the
 // status-fallback rule, and the INDEX.md matcher all live in @meetless/ask-core
@@ -278,6 +288,135 @@ export async function dispatchTool(name, args, deps) {
             type: "text",
             text: JSON.stringify({
               tool: "meetless__dismiss_conflict",
+              error: String(err.message || err),
+              status: err && err.status ? err.status : undefined,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // Conversational governed capture. remember writes a private (person-scoped)
+  // fact into the governed KB via intel's ingest-governed front door; forget
+  // withdraws it. Both are mutating and route through intelFetch. The owner and
+  // provenance are derived server-side (the tool exposes only text), so nothing
+  // here trusts an actor/scope/provenance from the model.
+  if (name === "meetless__remember") {
+    try {
+      const result = await runRemember(args || {}, {
+        intelFetch,
+        defaultWorkspaceId,
+        operatorUserId,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              tool: "meetless__remember",
+              error: String(err.message || err),
+              status: err && err.status ? err.status : undefined,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === "meetless__forget") {
+    try {
+      const result = await runForget(args || {}, {
+        intelFetch,
+        defaultWorkspaceId,
+        operatorUserId,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              tool: "meetless__forget",
+              error: String(err.message || err),
+              status: err && err.status ? err.status : undefined,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // Conversational governed PUBLICATION (Slice C6): the deliberate widening step
+  // that remember never performs. Promotes a captured KB doc PERSON -> WORKSPACE
+  // via intel's existing scope route. Scope is server-fixed to WORKSPACE
+  // (publish-only); the model passes only a fact_ref (+ optional reason).
+  if (name === "meetless__publish") {
+    try {
+      const result = await runPublish(args || {}, {
+        intelFetch,
+        controlFetch,
+        defaultWorkspaceId,
+        operatorUserId,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              tool: "meetless__publish",
+              error: String(err.message || err),
+              status: err && err.status ? err.status : undefined,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // Emily coordination DRIVER tools. All share the same deps (controlFetch,
+  // defaultWorkspaceId, operatorUserId). Each returns the raw control result so
+  // the agent reads the native contract (notably: propose_close's `not_ready`
+  // guardrail is DATA, not an error).
+  const coordinationHandlers = {
+    meetless__coordination_submit_goal: runCoordinationSubmitGoal,
+    meetless__coordination_get_state: runCoordinationGetState,
+    meetless__coordination_list_proposals: runCoordinationListProposals,
+    meetless__coordination_review_proposal: runCoordinationReviewProposal,
+    meetless__coordination_propose_close: runCoordinationProposeClose,
+  };
+  if (coordinationHandlers[name]) {
+    try {
+      const result = await coordinationHandlers[name](args || {}, {
+        controlFetch,
+        defaultWorkspaceId,
+        operatorUserId,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              tool: name,
               error: String(err.message || err),
               status: err && err.status ? err.status : undefined,
             }),

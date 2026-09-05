@@ -249,4 +249,168 @@ describe("deterministic turn outcome", () => {
     const [t] = collect({ turns: GOAL });
     expect(t.outcome).toBe("unknown");
   });
+
+  // ------------------------------------------------------------------------------------
+  // F1 (An review 2026-08-20, note 20260820-...-fc038453): the signals matched raw command
+  // text with a BARE-SPACE anchor `(^|[;&| ])`, so a git subcommand MENTIONED inside a
+  // heredoc body or mid-line prose (a commit message, a doc, an example) fired as a USE.
+  // A committing turn whose message says "git revert" was served `unknown`, goal dropped;
+  // and a pure-documentation turn that only WROTE "git commit" read `applied`.
+  //
+  // The fix ports analyze.py's discipline: strip heredoc BODIES (data, not commands), then
+  // anchor every signal at a statement head (start, or after ; && || | or a NEWLINE, since
+  // heredoc bodies are gone), with an env-assignment prefix allowance for the commit signal
+  // only (`GIT_INDEX_FILE=$IDX git commit`). A mid-line prose "git" is no longer a head.
+  // ------------------------------------------------------------------------------------
+
+  it("F1 CHARACTERIZATION (verbatim from session fc038453): a commit whose heredoc message says 'git revert' is APPLIED, goal kept", () => {
+    // The self-referential defect: turn 2 of fc038453 committed the git-revert follow-up via
+    // scoped-commit.sh, and its OWN commit message contained the prose "git revert". It was
+    // served back as outcome=unknown with the goal dropped. The honest outcome is `applied`.
+    const [t] = collect({
+      turns: [{ seq: 2, goal: "make git revert its own signal" }],
+      spool: [bash("cat > msg.txt <<EOF\nfix: git revert is its own signal now\nEOF\nbash scoped-commit.sh -F msg.txt -- common.sh")],
+    });
+    expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("make git revert its own signal"); // goal retained: a clean turn-owned commit
+  });
+
+  it("F1 SAFE DIRECTION: a heredoc body with line-start `git revert HEAD` must NOT set the revert signal (still applied via the real commit)", () => {
+    // Statement-head anchoring is necessary but not sufficient: inside a heredoc EVERY line is
+    // a statement head. The body line `git revert HEAD` is a documentation example, not a run.
+    // The turn also runs a real scoped-commit, so it is `applied` -- and would be `unknown`
+    // (goal dropped) if the body-line git revert leaked into the revert signal.
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "document the git revert recipe" }],
+      spool: [bash("cat > note.md <<EOF\ngit revert HEAD\nEOF\nbash scoped-commit.sh -F note.md -- x.md")],
+    });
+    expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("document the git revert recipe");
+  });
+
+  it("F1 DANGEROUS DIRECTION: a heredoc body with line-start `git commit` and NO executed commit must NOT read APPLIED", () => {
+    // The false-`applied` the bare-space anchor caused in the other direction: a pure-docs turn
+    // that only WRITES a `git commit` example never committed anything. The reviewer's hard
+    // requirement is "must not report applied"; the honest outcome is unknown. The goal SURVIVES
+    // here (unlike the git-action cases) precisely because no git action was detected, so there
+    // is nothing to falsely pair it with -- the intel self-echo guard drops the empty turn.
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "write a commit example for the runbook" }],
+      spool: [bash("cat > ex.md <<EOF\ngit commit -m fix\nEOF")],
+    });
+    expect(t.outcome).not.toBe("applied"); // the reviewer's hard requirement
+    expect(t.outcome).toBe("unknown");
+  });
+
+  it("F1 DANGEROUS DIRECTION: prose `git commit` mid-line inside a heredoc body is not a commit", () => {
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "explain when a git commit counts" }],
+      spool: [bash("cat > doc.md <<EOF\nThe git commit outcome should only count when executed.\nEOF")],
+    });
+    expect(t.outcome).toBe("unknown");
+  });
+
+  it("MULTILINE BOUNDARY: an actual multiline `git revert HEAD` statement is UNKNOWN with the goal dropped", () => {
+    // The reviewer's bounded syntax must cover multiline command boundaries. A real `git revert`
+    // on the second line of a compound command is a USE (heredoc bodies are already stripped, so
+    // a newline is now a safe statement boundary), so the goal must drop, exactly as it does for
+    // a `git revert` at the head. On main this stayed `unknown` but WRONGLY kept the goal.
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "revert HEAD, it broke prod checkout" }],
+      spool: [bash("git add -A\ngit revert HEAD --no-edit")],
+    });
+    expect(t.outcome).toBe("unknown");
+    expect(t.user_goal).toBe("");
+  });
+
+  it("MULTILINE BOUNDARY: a real commit on the second line of a compound command is APPLIED", () => {
+    const [t] = collect({ turns: GOAL, spool: [bash("cd packages/cli\nGIT_INDEX_FILE=$IDX git commit -F .git/COMMIT_EDITMSG")] });
+    expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("suppress goal-only observations");
+  });
+
+  it("HEREDOC-FED COMMIT: `git commit -F - <<EOF` (message via heredoc) is a real commit and is APPLIED", () => {
+    // Heredoc stripping keeps the OPENER line, so a commit that reads its message from a heredoc
+    // still fires the commit signal; only the message BODY is treated as data.
+    const [t] = collect({ turns: GOAL, spool: [bash("git commit -F - <<EOF\nrevert the flaky skip; restore the config\nEOF")] });
+    expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("suppress goal-only observations");
+  });
+
+  it("MENTION NOT USE: prose `scoped-commit.sh` inside an echo (no invocation) is not a commit", () => {
+    // scoped-commit.sh is anchored at a statement head too, so a mention inside a quoted echo
+    // argument is prose, not a run. (Previously the bare `scoped-commit\\.sh` match fired anywhere.)
+    const [t] = collect({ turns: GOAL, spool: [bash('echo "remember to run scoped-commit.sh later"')] });
+    expect(t.outcome).toBe("unknown");
+  });
+
+  it("SINGLE-QUOTED HEREDOC DELIM: `<<'EOF'` body prose is stripped too", () => {
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "quote-delimited heredoc" }],
+      spool: [bash("cat > m <<'EOF'\nfix: git revert now\nEOF\nbash scoped-commit.sh -F m -- a")],
+    });
+    expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("quote-delimited heredoc");
+  });
+
+  it("SCRIPT-WRITING TURN: scoped-commit written INTO a heredoc body is not an invocation", () => {
+    // A turn that WRITES a script containing scoped-commit.sh (heredoc body) did not commit.
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "generate a helper script" }],
+      spool: [bash("cat <<EOF > s.sh\nbash scoped-commit.sh -m x -- y\nEOF")],
+    });
+    expect(t.outcome).toBe("unknown");
+  });
+
+  it("PRECEDENCE UNCHANGED: heredoc-message commit that ALSO really discards is still mixed => unknown", () => {
+    // The commit reads its message via heredoc (prose ignored), and a real discard runs after.
+    // commit AND discard => unknown, goal dropped -- the seam-3 precedence, unaffected by the fix.
+    const [t] = collect({
+      turns: [{ seq: 3, goal: "land the slice" }],
+      spool: [bash("git commit -F - <<EOF\ndone\nEOF\ngit checkout -- other.py")],
+      touched: ["a.ts"],
+    });
+    expect(t.outcome).toBe("unknown");
+    expect(t.user_goal).toBe("");
+  });
+
+  // ------------------------------------------------------------------------------------
+  // F1 second ambiguity (An review 2026-08-26): MULTILINE QUOTED STRINGS. Heredoc stripping
+  // does not touch a `-m "..."` message or any other quoted argument, so a git subcommand on
+  // a line-start INSIDE a multiline quoted span recreates the mention-vs-use defect through
+  // another representation. The fix masks quoted spans (analyze.py `_mask_quoted` semantics,
+  // single-quote-first) to `Q` AFTER heredoc stripping and BEFORE the statement-head match,
+  // so a newline inside a quote is neither a boundary nor a place a signal can hide.
+  // ------------------------------------------------------------------------------------
+
+  it("MULTILINE QUOTED MESSAGE: a real `git commit -m` whose quoted message has a line-start `git revert` stays APPLIED, goal kept", () => {
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "fix classifier mention-vs-use" }],
+      spool: [bash('git commit -m "fix classifier\ngit revert remains conservative"')],
+    });
+    expect(t.outcome).toBe("applied");
+    expect(t.user_goal).toBe("fix classifier mention-vs-use"); // goal retained: the executed command is a commit
+  });
+
+  it("MULTILINE QUOTED MENTION: a non-git command whose quoted argument has a line-start `git commit` must NOT read APPLIED", () => {
+    // printf writes a two-line doc string; nothing was committed. The quoted `git commit`
+    // line must not fire the commit signal.
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "document the commit rule" }],
+      spool: [bash(`printf '%s\\n' "documentation:\ngit commit is only an example"`)],
+    });
+    expect(t.outcome).not.toBe("applied"); // the reviewer's hard requirement
+    expect(t.outcome).toBe("unknown");
+  });
+
+  it("QUOTED SEPARATOR PRESERVED: a real `; git revert` OUTSIDE quotes still fires (commit then revert => mixed unknown)", () => {
+    // Masking must only remove quoted content, never a real statement separator. A commit
+    // followed by a genuine `git revert` is a mixed action, so the conservative floor holds.
+    const [t] = collect({
+      turns: [{ seq: 1, goal: "commit then roll back" }],
+      spool: [bash('git commit -m "wip" ; git revert HEAD --no-edit')],
+    });
+    expect(t.outcome).toBe("unknown");
+    expect(t.user_goal).toBe("");
+  });
 });

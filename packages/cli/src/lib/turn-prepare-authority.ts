@@ -32,7 +32,17 @@ export interface CanonicalFetchOptions {
   task: string;
   sessionId: string;
   signals?: TurnPrepareSignals;
+  /**
+   * Hard ceiling on the canonical fetch, in ms. The injection path is per-turn and latency
+   * sensitive, so a slow or hung tier must fail FAST to the legacy fallback INSIDE this wrapper,
+   * never stall the turn waiting on the hook's outer kill. Defaults to a few seconds; the legacy
+   * render is instant, so a healthy tier is well under it.
+   */
+  timeoutMs?: number;
 }
+
+/** Default hard ceiling for the per-turn canonical fetch. */
+export const CANONICAL_FETCH_TIMEOUT_MS = 3500;
 
 function asRuleArray(v: unknown): Array<Record<string, unknown>> {
   return Array.isArray(v) ? (v as Array<Record<string, unknown>>) : [];
@@ -70,29 +80,60 @@ export function normalizeCanonicalContext(body: unknown): CanonicalTurnContext |
  * reader can tell "the tier was down" from "the tier answered but its decision was unusable".
  */
 export type FallbackReason = "canonical_unavailable" | "canonical_invalid";
+/** The Platform explicitly refused the request (auth/scope/billing/rate/policy), or a credential was missing while configured. */
+export type RefusalReason = "canonical_refused";
 
 export type CanonicalFetchResult =
   | { ok: true; ctx: CanonicalTurnContext }
-  | { ok: false; reason: FallbackReason };
+  /** The tier could not serve for an availability reason: legacy fallback is SAFE (read/decision path). */
+  | { ok: false; disposition: "fallback"; reason: FallbackReason }
+  /** The tier (or the credential state) explicitly refused: fail CLOSED, never legacy, or Platform policy is bypassed. */
+  | { ok: false; disposition: "fail_closed"; reason: RefusalReason; status?: number };
 
 /**
- * Fetch the canonical turn decision. NEVER throws. Returns the reason it could not serve one:
- * `canonical_unavailable` for a missing credential, a non-2xx, or a network failure;
- * `canonical_invalid` for a 2xx whose body carried no usable decision.
+ * Fetch the canonical turn decision. NEVER throws. The disposition decides the caller's behavior:
+ *   `fallback`     an AVAILABILITY problem (timeout, network, 5xx, or a 2xx whose body was unusable):
+ *                  legacy may serve, because turn preparation is a read/decision path.
+ *   `fail_closed`  an explicit REFUSAL (4xx: 400/401/402/403/429/other, or a missing/invalid credential
+ *                  while configured): legacy must NOT serve, or the request would bypass Platform
+ *                  auth/scope/billing/rate policy.
  */
 export async function fetchCanonicalTurnContext(opts: CanonicalFetchOptions): Promise<CanonicalFetchResult> {
-  if (!opts.platformUrl || !opts.accessToken) return { ok: false, reason: "canonical_unavailable" };
+  // Configured (a platform URL is set) but no usable credential is an AUTH failure, not an outage:
+  // fail closed, never legacy. When no URL is set the caller is not in cutover, so treat a missing
+  // credential there as a plain availability fallback.
+  if (!opts.accessToken) {
+    return opts.platformUrl
+      ? { ok: false, disposition: "fail_closed", reason: "canonical_refused" }
+      : { ok: false, disposition: "fallback", reason: "canonical_unavailable" };
+  }
+  if (!opts.platformUrl) return { ok: false, disposition: "fallback", reason: "canonical_unavailable" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? CANONICAL_FETCH_TIMEOUT_MS);
   try {
     const res = await egressFetch("control", `${opts.platformUrl.replace(/\/+$/, "")}/v1/turns/prepare`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${opts.accessToken}` },
       body: { task: opts.task, sessionId: opts.sessionId, ...(opts.signals ? { signals: opts.signals } : {}) },
+      signal: controller.signal,
     });
-    if (!res.ok) return { ok: false, reason: "canonical_unavailable" };
+    if (!res.ok) {
+      // A 4xx is an explicit policy/auth/scope/billing/rate rejection: falling back to the stale local
+      // matcher would bypass the Platform's decision, so fail CLOSED. A 5xx is a server outage, which
+      // is an availability problem the legacy path may safely cover.
+      if (res.status >= 400 && res.status < 500) {
+        return { ok: false, disposition: "fail_closed", reason: "canonical_refused", status: res.status };
+      }
+      return { ok: false, disposition: "fallback", reason: "canonical_unavailable" };
+    }
     const ctx = normalizeCanonicalContext(JSON.parse(await res.text()) as unknown);
-    return ctx ? { ok: true, ctx } : { ok: false, reason: "canonical_invalid" };
+    return ctx ? { ok: true, ctx } : { ok: false, disposition: "fallback", reason: "canonical_invalid" };
   } catch {
-    return { ok: false, reason: "canonical_unavailable" };
+    // A timeout aborts the fetch (AbortError) and lands here exactly like a network failure: an
+    // availability problem, so the turn falls back to legacy fast rather than stalling on a hung tier.
+    return { ok: false, disposition: "fallback", reason: "canonical_unavailable" };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -112,14 +153,24 @@ export interface PrepareTurnOptions extends CanonicalFetchOptions {
  * The distinction is the whole point of this telemetry: `legacy_fallback` is the only state that
  * blocks deleting the local matcher, and `legacy_pre_cutover` must never be mistaken for it.
  */
-export type AuthoritySource = "canonical" | "legacy_pre_cutover" | "legacy_fallback";
+export type AuthoritySource = "canonical" | "legacy_pre_cutover" | "legacy_fallback" | "refused";
 
 export interface PrepareTurnResult {
   output: AssembleOutput;
   authority: AuthoritySource;
-  /** Set only on `legacy_fallback`: why the canonical decision could not serve. */
-  reason?: FallbackReason;
+  /** Set on `legacy_fallback` (why legacy served) or `refused` (why the tier refused). */
+  reason?: FallbackReason | RefusalReason;
+  /** On `refused` from a response: the HTTP status the tier returned. */
+  status?: number;
 }
+
+/** The empty governed decision rendered on `refused`: base only, no floor/scoped/best-effort rules. */
+const EMPTY_DECISION: CanonicalTurnContext = {
+  floorMust: [],
+  floorShould: [],
+  scopedRequired: [],
+  bestEffort: [],
+};
 
 /**
  * One line, reusing the E1 stderr convention (the shadow's `e1_shadow ...`). The hook redirects it
@@ -147,11 +198,23 @@ export async function prepareTurn(opts: PrepareTurnOptions): Promise<PrepareTurn
         output: assembleFromCanonicalDecision(opts.legacyInput.base, fetched.ctx, opts.legacyInput.safeTotal),
         authority: "canonical",
       };
-    } else {
+    } else if (fetched.disposition === "fallback") {
       result = {
         output: assembleContext(opts.legacyInput),
         authority: "legacy_fallback",
         reason: fetched.reason,
+      };
+    } else {
+      // FAIL CLOSED. The Platform explicitly refused (4xx auth/scope/billing/rate/policy) or a
+      // credential was missing while configured. Falling back to the local matcher would bypass that
+      // decision, so inject NOTHING governed: render the EMPTY decision through the SAME renderer, and
+      // record the refusal on the authority line. The turn is not blocked; it simply carries no
+      // governed rules this turn.
+      result = {
+        output: assembleFromCanonicalDecision(opts.legacyInput.base, EMPTY_DECISION, opts.legacyInput.safeTotal),
+        authority: "refused",
+        reason: fetched.reason,
+        status: fetched.status,
       };
     }
   }

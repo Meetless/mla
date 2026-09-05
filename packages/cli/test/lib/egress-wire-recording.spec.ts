@@ -221,6 +221,9 @@ describe("the generated route samples are honest", () => {
       "redact control POST ^\\/internal\\/v1\\/docs\\/ask$",
       "redact control POST ^\\/internal\\/v1\\/session-conflicts\\/[^/]+\\/resolve$",
       "redact control POST ^\\/internal\\/v1\\/session-conflicts\\/[^/]+\\/agent-dismiss$",
+      "redact control POST ^\\/internal\\/v1\\/cases\\/start-goal$",
+      "redact control POST ^\\/internal\\/v1\\/coordination\\/proposals\\/review$",
+      "passthrough control POST ^\\/internal\\/v1\\/cases\\/resolve-goal$",
       "redact control POST ^\\/internal\\/v1\\/analytics\\/enforcement\\/incidents\\/[^/]+\\/adjudicate$",
       "block_on_detect control POST ^\\/internal\\/v1\\/repo-instruction-snapshots$",
       "block_on_detect control POST ^\\/internal\\/v1\\/repo-instruction-snapshots\\/sweep$",
@@ -302,7 +305,7 @@ const PRESERVED_BY_ROW: ReadonlyArray<readonly [string, readonly string[]]> = [
   // D0 shadow. Deliberately SHORTER than the ask row above it: the canonical request
   // carries no workspace_id and no user_id, because the tier derives both from the
   // credential. Fewer preserved fields here is the contract improving, not a gap.
-  ["control POST ^\\/v1\\/query$", ["conversationId", "language", "surface"]],
+  ["control POST ^\\/v1\\/query$", ["asOf", "conversationId", "idempotencyKey", "language", "surface"]],
   // E1 shadow. The task (prompt) is redacted at the retrieval bar; the session and the
   // local-fact signals object pass through, because they are the decision inputs the server needs.
   ["control POST ^\\/v1\\/turns\\/prepare$", ["sessionId", "signals"]],
@@ -345,6 +348,17 @@ const PRESERVED_BY_ROW: ReadonlyArray<readonly [string, readonly string[]]> = [
   [
     "control POST ^\\/internal\\/v1\\/session-conflicts\\/[^/]+\\/agent-dismiss$",
     ["runtimeHint"],
+  ],
+  // Coordination driver: the objective (start-goal) and rejectionReason (review) are
+  // operator prose and redact; every other top-level key is a structural id/enum and
+  // passes through untouched.
+  [
+    "control POST ^\\/internal\\/v1\\/cases\\/start-goal$",
+    ["canonicalFingerprint", "context", "evidenceRefs", "stakeholders", "workspaceId"],
+  ],
+  [
+    "control POST ^\\/internal\\/v1\\/coordination\\/proposals\\/review$",
+    ["action", "caseId", "proposalId", "reviewerId"],
   ],
   // No workspaceId: the incident id is in the path and the workspace is resolved
   // server-side. The caller sends the verdict enum and an optional note.

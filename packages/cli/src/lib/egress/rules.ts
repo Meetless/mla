@@ -136,9 +136,11 @@ export const EGRESS_RULES: readonly EgressRule[] = [
     profile: "retrieval",
     fields: {
       question: "redact",
+      idempotencyKey: "preserve",
       surface: "preserve",
       conversationId: "preserve",
       language: "preserve",
+      asOf: "preserve",
     },
   },
   {
@@ -433,6 +435,56 @@ export const EGRESS_RULES: readonly EgressRule[] = [
       // "claude-code" and friends. An enum of runtime names, or null.
       runtimeHint: "preserve",
     },
+  },
+  // Coordination DRIVER plane (the `mla mcp` coordination_* tools, packages/mcp/
+  // coordination_actions.js). These three POSTs carry a body and so must resolve an
+  // egress rule; the two GET reads (goal state, pending proposals) carry no body and
+  // need none. Modeled on the session-conflicts writes above: structural ids
+  // preserve, operator free text redacts. Every top-level key the tool actually
+  // sends is listed (an unknown key fails closed by design).
+  {
+    service: "control",
+    method: "POST",
+    match: /^\/internal\/v1\/cases\/start-goal$/,
+    note: "coordination driver: submit a goal (objective is operator prose)",
+    mode: "redact",
+    profile: "full",
+    fields: {
+      workspaceId: "preserve",
+      // The change the goal governs, written by a human: redact secrets, keep prose.
+      objective: "redact",
+      canonicalFingerprint: "preserve",
+      // Structured provenance (kind + opaque ref + label); preserved whole.
+      evidenceRefs: "preserve",
+      stakeholders: "preserve",
+      // CoordinationContext: ids + surface/directness enums, no free text.
+      context: "preserve",
+    },
+  },
+  {
+    service: "control",
+    method: "POST",
+    match: /^\/internal\/v1\/coordination\/proposals\/review$/,
+    note: "coordination driver: review a kernel proposal (rejection reason is operator prose)",
+    mode: "redact",
+    profile: "full",
+    fields: {
+      caseId: "preserve",
+      proposalId: "preserve",
+      action: "preserve",
+      // Ignored server-side for a cli-session (the reviewer is the token holder); an id.
+      reviewerId: "preserve",
+      rejectionReason: "redact",
+    },
+  },
+  {
+    service: "control",
+    method: "POST",
+    match: /^\/internal\/v1\/cases\/resolve-goal$/,
+    note: "coordination driver: propose closing a goal",
+    mode: "passthrough",
+    why: "workspace + goal ids only, no content",
+    fields: ["workspaceId", "goalCaseId"],
   },
   {
     service: "control",

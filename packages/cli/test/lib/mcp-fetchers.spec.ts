@@ -202,6 +202,45 @@ describe("mcp-fetchers — intel fetch adapter (reactive refresh)", () => {
     expect(attempt).toBe(1);
   });
 
+  it("on a 401 where refresh is 'busy' (control down), rethrows the ORIGINAL 401 with status intact, in order", async () => {
+    // An review §3 / G2b: when the auth backend (control) is down, refreshUserToken does
+    // NOT throw -- it returns "busy"/"expired". So the intel call runs FIRST and produces
+    // its status, the refresh is attempted, and because it did not rotate the original
+    // error is rethrown UNTOUCHED. The transport never manufactures a status-free
+    // "intel unreachable": whatever status intel returned is preserved for the caller.
+    const order: string[] = [];
+    let attempt = 0;
+    const verbs: HttpVerbs = {
+      get: async () => ({}),
+      // The retrieve path is a POST, so the throw lives here (dispatch routes by method).
+      post: async () => {
+        order.push("fetch");
+        attempt += 1;
+        throw http401();
+      },
+      patch: async () => ({}),
+    };
+    const refresh = jest.fn(async () => {
+      order.push("refresh");
+      return "busy" as const;
+    });
+    const cfg = userTokenConfig();
+    const intelFetch = makeIntelFetchFromCli(cfg, verbs, refresh);
+
+    const thrown = await intelFetch("/v1/ask/retrieve", {
+      method: "POST",
+      body: JSON.stringify({ q: "x" }),
+    }).catch((e) => e);
+
+    // The original 401 survives, with its status: no fabricated intel-unreachable.
+    expect((thrown as HttpError).status).toBe(401);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    // Ordering the implementation confirms: fetch (which yielded the status) BEFORE
+    // refresh, and no second fetch once refresh could not rotate.
+    expect(order).toEqual(["fetch", "refresh"]);
+    expect(attempt).toBe(1);
+  });
+
   it("does NOT attempt refresh on a 401 in shared-key mode (no user session to rotate)", async () => {
     let attempt = 0;
     const verbs: HttpVerbs = {

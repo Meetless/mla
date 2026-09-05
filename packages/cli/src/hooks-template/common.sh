@@ -3,7 +3,7 @@
 # Sourced by every Meetless hook. Sets QUEUE_DIR, CFG, MLA_PATH; exposes
 # gen_event_key + spool_append (locked) + spawn_flush.
 #
-# Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
+# Source: an internal design note §5.2.
 set -euo pipefail
 
 # home.sh FIRST, before any path is built. It repairs a poisoned $HOME (empty, a
@@ -63,7 +63,7 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
 # (Windows) and on stock macOS (An's box only has it via `brew install flock`),
 # so under `set -euo pipefail` a missing flock is `command not found` (127) and
 # ABORTS the hook -- capture silently dies (Windows prod incident 2026-07-10,
-# notes/20260710-windows-hook-wiring-and-portable-lock-fix.md).
+# an internal design note).
 #
 # ml_lock/ml_trylock/ml_unlock take the SAME (fd, lockfile) the old flock idiom
 # used, so call sites convert mechanically:
@@ -231,7 +231,7 @@ capture_auth_warn_file() {
   printf '%s/capture-auth-%s.warn' "$LOG_DIR" "$1"
 }
 
-# T1.5 fail-soft (folder = workspace, notes/20260604-folder-equals-workspace-
+# T1.5 fail-soft (folder = workspace, an internal design note
 # binding-design.md "Hook failure behavior (fail soft)"): a capture write got an
 # auth/visibility rejection (401 / 403 / 404). Capture is assistive and must
 # NEVER break the session, so the detached flusher records a THROTTLED, human-
@@ -343,7 +343,7 @@ fi
 #   $@  the fat fallback argv                          (e.g. _internal redact-capture)
 #
 # WHY (measured 2026-08-09, D1 of
-# notes/20260809-did-mla-help-session-0e61cbd5-the-doctrine-loses-to-its-own-quotations.md).
+# an internal design note).
 # The pre-enrich window holds exactly two synchronous `mla` spawns and the cost is process
 # STARTUP, not work. Interleaved, median of 9:
 #
@@ -355,7 +355,7 @@ fi
 # `dist/cli.js` eagerly imports 30+ command modules plus Sentry/analytics top-level init;
 # a sibling entry pays only its own closure. Against a live `pre_enrich_ms` of median 928ms
 # / p90 1,745ms that is ~470ms/turn of pure registry. This is lever A from
-# notes/20260621-pretool-hook-latency-levers-a-b-results.md (355.9ms -> 56.1ms on the
+# an internal design note (355.9ms -> 56.1ms on the
 # PreToolUse path), extended to the hook it was never applied to.
 #
 # ONE ENTRY PER SUBCOMMAND, NOT ONE SHARED DISPATCHER. A shared entry drags
@@ -543,7 +543,7 @@ record_touched_file() {
 # ledger record_touched_file appends to (spec §I1: enrich must seed retrieval
 # from the touched-file SET, not from the prompt's phrasing).
 #
-# 2026-07-27 dogfood finding (notes/20260514-dogfood-friction.md): this used to
+# 2026-07-27 dogfood finding (an internal design note): this used to
 # be the git working-tree delta, which is a REPOSITORY fact. In a shared checkout
 # it injected a concurrent peer's uncommitted work as "the surfaces the agent is
 # actually modifying" (verified live: four paths, none of them ours). The failure
@@ -714,7 +714,7 @@ utf8_cut_bytes() {
 # Cut $1 to at most $2 UTF-8 BYTES, landing on a boundary a READER can use. Prints the
 # result; a no-op when it already fits.
 #
-# F3 (notes/20260807-did-mla-help-this-session-measured-and-a-fix-proposal.md §4.3).
+# F3 (an internal design note §4.3).
 # `utf8_cut_bytes` guarantees the cut does not split a CHARACTER. Nothing guaranteed it
 # did not split a SENTENCE, and it routinely did. Session 6ab21c5e turn 2 delivered:
 #
@@ -933,7 +933,7 @@ inline_ceiling() {
 #
 # ONE FORMULA, TWO READERS, and that is the entire reason this is a function. G1 sends
 # the budget to intel BEFORE the request so the composer can size its projection to the
-# pipe (notes/20260811-did-mla-help-session-5e8a7182-the-composer-writes-12kb-into-a-1-2kb-pipe.md:
+# pipe (an internal design note:
 # median composed 12,193B into a median transport of 1,209B, 85.9% of turns unable to
 # carry half). The same number then bounds the post-response cut. Two copies of this
 # arithmetic would agree on the day they were written and drift silently afterwards,
@@ -1032,7 +1032,7 @@ budget_evidence_markdown() {
   # item reading as a list entry to the model and to every `^- \[` scanner downstream.
   local marker=$'\n[...truncated by Meetless...]\n'
   # The smallest share worth reserving: an item line's own chrome
-  # (`- [accepted][NT:notes/20260807-x.md] `) is ~40 bytes, so this leaves ~200 for
+  # (`- [accepted][NT:an internal design note] `) is ~40 bytes, so this leaves ~200 for
   # the snippet. Below it the reservation buys a citation with no evidence attached.
   local -i min_share=240
 
@@ -1924,6 +1924,46 @@ collect_recent_turns() {
   out="$(tail -n "$max" "$ledger" 2>/dev/null \
     | jq -s -c --argjson narr "$narration" --argjson cmds "$commands" \
         --argjson tf "${TOUCHED_FILES_JSON:-[]}" '
+      # A HEREDOC BODY IS DATA, NOT COMMANDS. Every signal below matches raw command
+      # text, so a git subcommand written INSIDE a heredoc body (a commit message, a
+      # doc, an example) would read as a USE of that subcommand (F1, An review
+      # 2026-08-20). Strip heredoc bodies first, keeping the opener line (a real
+      # `git commit -F - <<EOF` still counts) and every later command. This is the
+      # bash/jq twin of analyze.py `_strip_heredocs`; an UNTERMINATED heredoc drops
+      # everything after the opener, because the command was cut and what follows is
+      # unknowable. Delimiter: `<<` / `<<-`, and an optional opening quote is matched
+      # as a single non-word char (`[^ \tA-Za-z0-9_]?`) so `<<EOF`, `<<-EOF`, `<<"EOF"`
+      # and `<<QUOTE EOF QUOTE` all resolve to the bare `EOF`, with no apostrophe
+      # written into a program that is itself single-quoted in bash.
+      def strip_heredocs:
+        (. // "")
+        | (. | split("\n")) as $lines
+        | reduce $lines[] as $line (
+            {out: [], delim: null};
+            if .delim != null then
+              (if (($line | sub("^[ \t]+"; "")) | sub("[ \t]+$"; "")) == .delim
+               then .delim = null else . end)
+            else
+              (.out += [$line])
+              | ([ $line | match("<<-?[ \t]*[^ \tA-Za-z0-9_]?([A-Za-z_][A-Za-z0-9_]*)"; "g") ]) as $m
+              | (if ($m | length) > 0 then .delim = ($m[0].captures[0].string) else . end)
+            end
+          )
+        | (.out | join("\n"));
+      # A QUOTED ARGUMENT IS DATA TOO. Heredoc stripping does not touch a `-m "..."` message
+      # or any other quoted span, so a git subcommand on a line-start INSIDE a multiline
+      # quoted string is the same mention-vs-use defect in another representation (F1 second
+      # ambiguity, An review 2026-08-26). Collapse every quoted span to `Q`, the jq twin of
+      # analyze.py `_mask_quoted` (`_QUOTED_SPAN_RE`, single-quote-first); the class `[^X]*`
+      # matches newlines, so a multiline span collapses whole -- a newline inside a quote is
+      # then neither a statement boundary nor a place a signal can hide. Run AFTER
+      # strip_heredocs (which needs the unmasked `<<QUOTE EOF QUOTE` delimiter). The quote
+      # chars are built from codepoints (39=apostrophe, 34=double) so no literal quote is
+      # written into this program, which is itself single-quoted in bash.
+      def mask_quoted:
+        ([39] | implode) as $sq
+        | ([34] | implode) as $dq
+        | gsub($sq + "[^" + $sq + "]*" + $sq + "|" + $dq + "[^" + $dq + "]*" + $dq; "Q");
       # freshest first, so the max-items trim downstream keeps the latest turns.
       #
       # A row is kept regardless of whether it carries a goal. It used to require
@@ -1966,16 +2006,25 @@ collect_recent_turns() {
           #              NEVER derived from "no commit".
           #
           # `commit-tree` alone writes an object without landing it and is not counted.
-          # Each signal is anchored at `git <subcommand>` (a bare space between), so a
-          # subcommand word inside a `-m` message ("revert the skip") is a MENTION, not a
-          # use, and does not fire. Only the freshest turn ($i==0) carries spool commands;
-          # older turns stay unknown unless they carry an explicit signal. (No apostrophes
-          # below: single-quoted in bash.)
+          # Each signal is anchored at a STATEMENT HEAD: the start of the command, or right
+          # after `;` `&&` `||` `|` or a NEWLINE, with optional leading whitespace. This is
+          # matched against $recent_exec, where heredoc BODIES are stripped and quoted spans
+          # are masked to `Q`, so a newline is a safe boundary and no subcommand word can hide
+          # inside a message or heredoc. A subcommand word mid-line -- inside a `-m` message
+          # ("revert the skip"), a comment, or any quoted argument (even a multiline one) --
+          # is a MENTION, not a use, and does not fire (F1, An review 2026-08-20 + 2026-08-26). The commit signal additionally allows an ENVIRONMENT-ASSIGNMENT
+          # prefix (`GIT_INDEX_FILE=$IDX git commit`, the canonical isolated-index recipe);
+          # a discard/revert never runs against an isolated index, so they get no prefix.
+          # scoped-commit.sh is anchored the same way (optional bash/sh/zsh + path, then an
+          # argument), so a prose mention is not a run. Only the freshest turn ($i==0)
+          # carries spool commands; older turns stay unknown unless they carry an explicit
+          # signal. (No apostrophes below: this program is single-quoted in bash.)
           | ($cmds | .[-5:]) as $recent
+          | ($recent | map(strip_heredocs | mask_quoted)) as $recent_exec
           | (($r.outcome // "") | ascii_downcase) as $recorded
-          | ($i == 0 and ($recent | map(select(test("((^|[;&| ])git +commit($|[^-]))|scoped-commit\\.sh"; "i"))) | length > 0)) as $committed
-          | ($i == 0 and ($recent | map(select(test("(^|[;&| ])git +(restore\\b|reset\\b[^;|&]*--hard|checkout\\b[^;|&]* -- )"; "i"))) | length > 0)) as $discarded
-          | ($i == 0 and ($recent | map(select(test("(^|[;&| ])git +revert\\b"; "i"))) | length > 0)) as $git_revert
+          | ($i == 0 and ($recent_exec | map(select(test("(^|[;&|\n])[ \t]*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+)*git +commit($|[^-])"; "i") or test("(^|[;&|\n])[ \t]*(bash|sh|zsh)?[ \t]*[^ \t;&|<>]*scoped-commit\\.sh([ \t]|$)"; "i"))) | length > 0)) as $committed
+          | ($i == 0 and ($recent_exec | map(select(test("(^|[;&|\n])[ \t]*git +(restore\\b|reset\\b[^;|&\n]*--hard|checkout\\b[^;|&\n]* -- )"; "i"))) | length > 0)) as $discarded
+          | ($i == 0 and ($recent_exec | map(select(test("(^|[;&|\n])[ \t]*git +revert\\b"; "i"))) | length > 0)) as $git_revert
           | (if $recorded == "blocked" then "blocked"
              elif $git_revert then "unknown"
              elif $committed and $discarded then "unknown"
@@ -2775,7 +2824,7 @@ steer_inject_file() { printf '%s/steer/inject-%s.json' "$LOG_DIR" "$1"; }
 # under pipefail); `|| true` keeps that from aborting the caller's `set -e`.
 #
 # `/` is IN the character class on purpose: a note id is a PATH
-# (NT:notes/20260617-foo.md), which is the form the injector offers. Without the
+# (NT:an internal design note), which is the form the injector offers. Without the
 # slash the token stopped at the first separator and every full-path citation was
 # harvested as the useless stem `NT:notes`, so it could never overlap the offered
 # id and report_cited / citation_precision were dead by construction.
@@ -3349,7 +3398,7 @@ spawn_enforcement_correlate() {
 # injection in user-prompt-submit.sh): the two surfaces are independent, so you can
 # keep the free Langfuse observability on while silencing the context injection, or
 # vice versa. Pure predicate so the gate is unit-testable without spawning anything.
-# See notes/20260609-mla-per-turn-assist-recap-plan.md §4.4.
+# See an internal design note §4.4.
 turn_recap_langfuse_enabled() {
   [[ "${MEETLESS_TURN_RECAP_LANGFUSE:-on}" != "off" ]]
 }
@@ -3379,7 +3428,7 @@ spawn_turn_recap_emit() {
 }
 
 # ---- Reactive/proactive user-token refresh (Part 3) ----------------------
-# See notes/20260611-mla-hook-token-autorefresh-proposal.md. Hook-triggered token
+# See an internal design note. Hook-triggered token
 # refresh is UNCONDITIONAL: there is no kill switch. A logged-in user always wants
 # an expired access token to self-heal, so gating it behind an env var only added
 # branches and a way to silently break the feature. (The legacy

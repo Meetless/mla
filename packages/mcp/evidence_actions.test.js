@@ -261,6 +261,84 @@ test("403 is masked like 401", async () => {
   );
 });
 
+// ---------- G2b: the retrieve path preserves intel's HTTP status end-to-end ---
+//
+// notes/20260812-did-mla-help-session-8751d447-both-clients-blamed-the-wrong-service.md
+//
+// The proposal HYPOTHESIZED that "some leg of the retrieve path throws a status-free
+// transport error and the mask then blames intel by name" (G2b: a leg that drops
+// `.status`). The An review sent that back to be reproduced, not assumed.
+//
+// TRACED (source): runRetrieveKnowledge -> fetchOnce -> intelFetch. In `mla mcp` the
+// intelFetch is makeIntelFetchFromCli -> intelPost (http.ts), which sets `.status` from
+// `res.status` on any non-2xx (buildError). With control down, intel answers 503, so the
+// error reaching this handler carries `.status = 503`. withIntelRefresh refreshes only on
+// a 401 (intel returns 503, not 401, when control is down), and refreshUserToken returns
+// "busy"/"expired" rather than throwing, so no control-side ECONNREFUSED is manufactured
+// into this path. There is no status-dropping leg on current code.
+//
+// These two tests REPRODUCE the boundary with the exact error SHAPES intel produces and
+// pin the conclusion: a real 503 arrives as `server_error` with the status intact, and
+// only a genuinely status-free failure (a real transport throw) yields the neutral
+// no-status copy. The proposal's "unreachable while intel answered" symptom therefore
+// does not reproduce from an intel 503; the fix is the neutral no-status copy (G2a), not
+// a producer change.
+
+test("G2b: a persistent 503 arrives as server_error with the status intact (no status is dropped)", async () => {
+  // The shape makeIntelFetch/intelPost build for a non-ok response: message + .status.
+  const e = new Error("intel POST /v1/ask/retrieve 503: Auth backend unavailable");
+  e.status = 503;
+  e.body = JSON.stringify({ detail: "Auth backend unavailable" });
+  const cf = throwingFetch(e);
+  await assert.rejects(
+    () =>
+      runRetrieveKnowledge(
+        { query: "did MLA help this session" },
+        { intelFetch: cf, defaultWorkspaceId: WS, sleep: noSleep },
+      ),
+    (thrown) => {
+      // The status reaches the classifier and the message reflects an HTTP failure ...
+      assert.equal(thrown.status, 503);
+      assert.equal(thrown.category, "unavailable");
+      assert.match(thrown.message, /server error \(HTTP 503\)/);
+      assert.match(thrown.message, /reachable/i);
+      // ... and NOT the "unreachable / connection failed" no-status copy the proposal saw.
+      assert.doesNotMatch(thrown.message, /unreachable/i);
+      assert.doesNotMatch(thrown.message, /connection failed/i);
+      // Body still never leaks (SEC-3.2).
+      assert.ok(!thrown.message.includes("Auth backend unavailable"));
+      return true;
+    },
+  );
+  // A 5xx is transient, so it exhausts the retry budget before surfacing.
+  assert.equal(cf.calls.length, 3);
+});
+
+test("G2b: a persistent transport failure reports neutrally, with NO fabricated status", async () => {
+  // The genuinely status-free case (a real connection refusal / undici 'fetch failed').
+  // This is the ONLY shape that reaches the no-status branch, and its copy must not
+  // invent a status or name a service.
+  const netErr = new TypeError("fetch failed");
+  const cf = throwingFetch(netErr);
+  await assert.rejects(
+    () =>
+      runRetrieveKnowledge(
+        { query: "q" },
+        { intelFetch: cf, defaultWorkspaceId: WS, sleep: noSleep },
+      ),
+    (thrown) => {
+      assert.equal(thrown.status, undefined); // no fabricated HTTP status
+      assert.equal(thrown.category, "unavailable");
+      assert.equal(thrown.transient, true);
+      assert.match(thrown.message, /did not complete/i);
+      assert.doesNotMatch(thrown.message, /\bintel\b/i);
+      assert.doesNotMatch(thrown.message, /connection failed/i);
+      return true;
+    },
+  );
+  assert.equal(cf.calls.length, 3);
+});
+
 // ---------- Item 1: a 402 billing denial is NOT a generic outage ------------
 //
 // The keystone case. When a workspace has no payer bound, intel answers 402 with
@@ -336,8 +414,9 @@ test("402 with an unparseable body still masks (no reason, no leak, no retry)", 
 // ---------- resilience: transient retry (intel restart / 5xx blip) -----------
 
 test("retries a transient network error (ECONNREFUSED) then succeeds", async () => {
-  // a fetch that throws with NO .status is a transport error: intel was
-  // unreachable, e.g. mid-restart by another agent. Must be retried.
+  // a fetch that throws with NO .status did not complete (usually a transport failure,
+  // e.g. intel mid-restart by another agent; a status-free throw could also be local).
+  // Either way the retry contract treats it as transient. Must be retried.
   const netErr = new Error("fetch failed");
   const cf = flakyFetch(2, netErr, { candidates: [DTO] });
   const out = await runRetrieveKnowledge(

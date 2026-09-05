@@ -12,7 +12,7 @@
 #   - finalize-session takes ONLY sessionId (Correction 6); finalMessage is
 #     persisted on the session_stopped event
 #
-# Source: notes/20260527-bare-bones-mvp-codebase-evaluation-and-plan.md §5.2.
+# Source: an internal design note §5.2.
 source "$(dirname "$0")/common.sh"
 shopt -s nullglob 2>/dev/null || true
 
@@ -249,10 +249,14 @@ control_capture_curl() {
   # verbatim off-argv, so body size is bounded only by control's 10mb body
   # limit, never by ARG_MAX. -binary (not plain --data) so curl does not strip
   # newlines/CRs from the file.
-  local method="$1" url="$2" body_file="$3"
+  # Optional 4th arg: a file to capture the RESPONSE BODY into (default: discard). The
+  # legacy PATCH discards it (a non-2xx is the only failure signal, caught by curl -f). The
+  # Row 3 tier POST to /v1/events needs it, because the tier answers 200 with a per-event
+  # {accepted,duplicates,rejected} envelope and a partial rejection must NOT advance the spool.
+  local method="$1" url="$2" body_file="$3" out_file="${4:-/dev/null}"
   HTTP_CODE=000
   CURL_RC=0
-  HTTP_CODE="$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' \
+  HTTP_CODE="$(curl -fsS --max-time 5 -o "$out_file" -w '%{http_code}' \
     -X "$method" "$url" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     "${ACTOR_HEADER[@]+"${ACTOR_HEADER[@]}"}" \
@@ -265,7 +269,7 @@ control_capture_curl() {
       log "flush: control 401 on $method; refreshed access token, retrying once"
       HTTP_CODE=000
       CURL_RC=0
-      HTTP_CODE="$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' \
+      HTTP_CODE="$(curl -fsS --max-time 5 -o "$out_file" -w '%{http_code}' \
         -X "$method" "$url" \
         -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         "${ACTOR_HEADER[@]+"${ACTOR_HEADER[@]}"}" \
@@ -403,26 +407,80 @@ else
 fi
 
 if [[ "${EVENT_COUNT:-0}" -gt 0 ]]; then
-  # --slurpfile wraps the file's single JSON array value as $evs[0]. No argv
-  # carries the payload, so this is overflow-proof regardless of batch size.
-  PATCH_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/mla-body.XXXXXX")"
-  jq -c -n --arg ws "$WORKSPACE_ID" --slurpfile evs "$EVENTS_FILE" \
-    '{workspaceId: $ws, events: $evs[0]}' > "$PATCH_BODY_FILE" 2>/dev/null
-  control_capture_curl PATCH \
-    "$CONTROL_URL/internal/v1/agent-runs/by-session/$SESSION_ID/events" "$PATCH_BODY_FILE"
-  rm -f "$PATCH_BODY_FILE"
-  if [[ "$CURL_RC" -eq 0 ]]; then
-    log "Pass 2: PATCHed $EVENT_COUNT event(s) -> /by-session/$SESSION_ID/events"
-    DELIVERED=$((DELIVERED + EVENT_COUNT))
+  # Row 3 (platform migration): when MEETLESS_PLATFORM_URL is configured AND this is a
+  # user-token session, the platform tier is AUTHORITATIVE and the batch publishes through
+  # POST /v1/events (agent grain). A shared-key/none session (no user identity for the edge
+  # audience) or an absent URL uses the legacy direct PATCH. When the tier is authoritative
+  # there is NO legacy fallback on failure: a tier error re-spools (eventKey dedupes
+  # server-side) and redelivers next flush, so a tier outage never bypasses the canonical
+  # authorization/ACL/billing boundary.
+  if [[ -n "${MEETLESS_PLATFORM_URL:-}" && "$AUTH_MODE" == "user-token" && -n "${TOKEN:-}" ]]; then
+    log "Pass 2: coordination_events_authority source=tier"
+    # Translate the redacted Nest-flavored batch to the /v1/events agent-grain envelope with jq
+    # (JSON-native, never awk). eventKey -> eventId preserves the (runId, eventKey) identity;
+    # the grain rides the `agent.` namespace; order is the array's order. source/provider/adapter
+    # are intentionally NOT sent: the tier stamps source="platform" and control materializes
+    # provider/providerSource from the payload (the DTO's canonical source; envelope is optional).
+    EVENTS_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/mla-v1events.XXXXXX")"
+    jq -c --arg sid "$SESSION_ID" \
+      '{events: [ .[] | {
+          eventId: .eventKey,
+          occurredAt: .occurredAt,
+          surface: "cli",
+          semanticType: ("agent." + .eventType),
+          sessionId: $sid,
+          payload: (.payload // {})
+        } ]}' < "$EVENTS_FILE" > "$EVENTS_BODY_FILE" 2>/dev/null
+    TIER_RESP_FILE="$(mktemp "${TMPDIR:-/tmp}/mla-v1events-resp.XXXXXX")"
+    control_capture_curl POST "${MEETLESS_PLATFORM_URL%/}/v1/events" "$EVENTS_BODY_FILE" "$TIER_RESP_FILE"
+    rm -f "$EVENTS_BODY_FILE"
+    if [[ "$CURL_RC" -eq 0 ]]; then
+      # 200, but the tier answers 200 EVEN on per-event rejection. Advance the spool ONLY when
+      # every event was accepted or was an idempotent duplicate (a crashed-after-commit replay);
+      # ANY rejected event, or a malformed/unparseable response, re-spools the whole batch. This
+      # is what keeps "nothing silently discarded" true across the 200-with-rejections envelope
+      # the raw curl -f cannot see.
+      TIER_REJECTED="$(jq -r '.rejected // 999' < "$TIER_RESP_FILE" 2>/dev/null || echo 999)"
+      TIER_ACCEPTED="$(jq -r '.accepted // 0' < "$TIER_RESP_FILE" 2>/dev/null || echo 0)"
+      TIER_DUPS="$(jq -r '.duplicates // 0' < "$TIER_RESP_FILE" 2>/dev/null || echo 0)"
+      if [[ "$TIER_REJECTED" == "0" && $((TIER_ACCEPTED + TIER_DUPS)) -eq "$EVENT_COUNT" ]]; then
+        log "Pass 2: POSTed $EVENT_COUNT event(s) -> tier /v1/events (accepted=$TIER_ACCEPTED duplicate=$TIER_DUPS)"
+        DELIVERED=$((DELIVERED + EVENT_COUNT))
+      else
+        EVENTS_OK=0
+        log "Pass 2: tier /v1/events PARTIAL/REJECTED (accepted=$TIER_ACCEPTED duplicate=$TIER_DUPS rejected=$TIER_REJECTED of $EVENT_COUNT); will re-spool"
+      fi
+    else
+      case "$HTTP_CODE" in
+        401|403|404) warn_capture_auth "$SESSION_ID" "$HTTP_CODE" "POST /v1/events"; LAST_AUTH_CODE="$HTTP_CODE" ;;
+      esac
+      EVENTS_OK=0
+      log "Pass 2: POST /v1/events FAILED (HTTP $HTTP_CODE; tier unreachable or 4xx/5xx); will re-spool $EVENT_COUNT event(s)"
+    fi
+    rm -f "$TIER_RESP_FILE"
   else
-    # Non-2xx (control down, transient network, HTTP 4xx/5xx). Server dedupes on
-    # eventKey, so the re-spool block below replays the lot. 401/403/404 also fire
-    # a throttled local warning (fail soft); other codes just re-spool silently.
-    case "$HTTP_CODE" in
-      401|403|404) warn_capture_auth "$SESSION_ID" "$HTTP_CODE" "PATCH /internal/v1/agent-runs/by-session/$SESSION_ID/events"; LAST_AUTH_CODE="$HTTP_CODE" ;;
-    esac
-    EVENTS_OK=0
-    log "Pass 2: PATCH events FAILED (HTTP $HTTP_CODE; control unreachable or 4xx/5xx); will re-spool $EVENT_COUNT event(s)"
+    log "Pass 2: coordination_events_authority source=legacy"
+    # --slurpfile wraps the file's single JSON array value as $evs[0]. No argv
+    # carries the payload, so this is overflow-proof regardless of batch size.
+    PATCH_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/mla-body.XXXXXX")"
+    jq -c -n --arg ws "$WORKSPACE_ID" --slurpfile evs "$EVENTS_FILE" \
+      '{workspaceId: $ws, events: $evs[0]}' > "$PATCH_BODY_FILE" 2>/dev/null
+    control_capture_curl PATCH \
+      "$CONTROL_URL/internal/v1/agent-runs/by-session/$SESSION_ID/events" "$PATCH_BODY_FILE"
+    rm -f "$PATCH_BODY_FILE"
+    if [[ "$CURL_RC" -eq 0 ]]; then
+      log "Pass 2: PATCHed $EVENT_COUNT event(s) -> /by-session/$SESSION_ID/events"
+      DELIVERED=$((DELIVERED + EVENT_COUNT))
+    else
+      # Non-2xx (control down, transient network, HTTP 4xx/5xx). Server dedupes on
+      # eventKey, so the re-spool block below replays the lot. 401/403/404 also fire
+      # a throttled local warning (fail soft); other codes just re-spool silently.
+      case "$HTTP_CODE" in
+        401|403|404) warn_capture_auth "$SESSION_ID" "$HTTP_CODE" "PATCH /internal/v1/agent-runs/by-session/$SESSION_ID/events"; LAST_AUTH_CODE="$HTTP_CODE" ;;
+      esac
+      EVENTS_OK=0
+      log "Pass 2: PATCH events FAILED (HTTP $HTTP_CODE; control unreachable or 4xx/5xx); will re-spool $EVENT_COUNT event(s)"
+    fi
   fi
 fi
 

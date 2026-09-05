@@ -73,9 +73,11 @@ const WITNESSES: Record<string, Witness> = {
     path: "/v1/query",
     body: {
       question: "why did we deprecate the decision diff",
+      idempotencyKey: "sub_shadow_1",
       surface: "mcp",
       conversationId: "conv_1",
       language: "en",
+      asOf: "2026-08-01T00:00:00Z",
     },
   },
   // ------------------------------------------------------- D3 shadow coordination pull
@@ -590,6 +592,53 @@ const WITNESSES: Record<string, Witness> = {
     caller: "lib/rules/control-rule-client.ts revokeRule",
     path: "/internal/v1/rules/rule_1/revoke",
     body: { workspaceId: "ws_1", expectedCurrentVersionId: "ver_1" },
+  },
+
+  // ------------------------------------------------- coordination driver (Emily)
+  // The three coordination driver POSTs (packages/mcp/coordination_actions.js).
+  // The two GET reads (goal state, pending proposals) carry no body and need no
+  // rule. Each maximal body includes its optional fields: start-goal attaches
+  // `context` when an operator identity is configured; proposals/review attaches
+  // `rejectionReason` when a rationale is given.
+  [`control POST ${/^\/internal\/v1\/cases\/start-goal$/.source}`]: {
+    caller: "packages/mcp/coordination_actions.js runCoordinationSubmitGoal",
+    path: "/internal/v1/cases/start-goal",
+    body: {
+      workspaceId: "ws_1",
+      objective: "get the checkout pilot ready for monday",
+      canonicalFingerprint: "emily-agent:abc123def456",
+      evidenceRefs: [
+        {
+          kind: "slack_thread",
+          ref: { source: "emily-agent", objective: "get the checkout pilot ready" },
+          label: "Operator instruction (chat)",
+        },
+      ],
+      stakeholders: [{ workspaceUserId: "user_1", role: "DECISION_OWNER" }],
+      context: {
+        workspaceId: "ws_1",
+        initiatorId: "user_1",
+        requesterId: "user_1",
+        surface: "system",
+        directness: "EXPLICIT_REQUEST",
+      },
+    },
+  },
+  [`control POST ${/^\/internal\/v1\/coordination\/proposals\/review$/.source}`]: {
+    caller: "packages/mcp/coordination_actions.js runCoordinationReviewProposal",
+    path: "/internal/v1/coordination/proposals/review",
+    body: {
+      caseId: "case_1",
+      proposalId: "prop_1",
+      action: "reject",
+      reviewerId: "user_1",
+      rejectionReason: "the rollout note is missing the migration step",
+    },
+  },
+  [`control POST ${/^\/internal\/v1\/cases\/resolve-goal$/.source}`]: {
+    caller: "packages/mcp/coordination_actions.js runCoordinationProposeClose",
+    path: "/internal/v1/cases/resolve-goal",
+    body: { workspaceId: "ws_1", goalCaseId: "case_1" },
   },
 };
 

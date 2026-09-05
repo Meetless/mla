@@ -24,6 +24,7 @@
 // deliberate, human-initiated `mla ask` and NOT on the per-prompt enrich path, which is
 // orders of magnitude higher volume. Off by default is not the same as unmeasured: set
 // MEETLESS_D0_SHADOW=1 to turn it on, and the dogfood machine does.
+import { randomUUID } from "node:crypto";
 import { egressFetch } from "./egress/fetch";
 
 /**
@@ -131,7 +132,10 @@ export async function runQueryShadow(opts: ShadowOptions): Promise<ShadowCompari
     const res = await egressFetch("control", `${opts.platformUrl.replace(/\/+$/, "")}/v1/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${opts.accessToken}` },
-      body: { question: opts.question },
+      // A fresh per-call key: the shadow is an independent canonical run beside the legacy Ask
+      // (the comparison needs its own answer, not a dedup onto the legacy submission), which is
+      // exactly what happened before idempotencyKey was required and intel minted the id itself.
+      body: { question: opts.question, idempotencyKey: randomUUID() },
     });
     const text = await res.text();
     if (!res.ok) return { ran: false, skipped: `canonical HTTP ${res.status}`, status: res.status };

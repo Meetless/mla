@@ -97,13 +97,21 @@ describe("A5 carry-forward is removed and stays removed", () => {
     expect(hook).not.toMatch(/MEETLESS_CARRY_FORWARD/);
   });
 
-  it("the plugin copy of both hooks matches the source template", () => {
+  it("the plugin copy of both hooks matches the source template (modulo the note-slug strip)", () => {
     // The plugin ships its own copy (sync-plugin.mjs). A removal that lands in one and
     // not the other leaves the feature alive for every plugin user, which is the worst
     // of both outcomes: gone from the tests, present in the payload.
+    //
+    // sync-plugin.mjs deliberately strips internal note-filename references from the
+    // GENERATED artifact's comments (to keep the ~14 slugs out of the public mirror's
+    // scrub gate) while the source template keeps them for dev traceability. Apply the
+    // SAME comment-only transform here so this still guards real (code) drift between the
+    // two copies, not the intended comment difference.
+    const stripSlugs = (s: string) =>
+      s.replace(/notes\/\d{8}-[a-z0-9-]+(?:\.md)?/g, "an internal design note");
     const plugin = (f: string) => fs.readFileSync(path.join(__dirname, "..", "..", "..", "..", "plugin", "hooks", f), "utf8");
 
-    expect(plugin("user-prompt-submit.sh")).toEqual(read("user-prompt-submit.sh"));
-    expect(plugin("common.sh")).toEqual(read("common.sh"));
+    expect(plugin("user-prompt-submit.sh")).toEqual(stripSlugs(read("user-prompt-submit.sh")));
+    expect(plugin("common.sh")).toEqual(stripSlugs(read("common.sh")));
   });
 });

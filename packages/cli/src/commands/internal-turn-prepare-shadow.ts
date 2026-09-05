@@ -56,8 +56,11 @@ function parseInput(raw: string): ShadowInput | null {
 const NO_BUDGET_CEILING = 100_000_000;
 
 export async function runInternalTurnPrepareShadow(): Promise<number> {
-  // Enable is the same env switch shape as the D0/D3 shadows; off by default.
-  if (process.env.MEETLESS_E1_SHADOW !== "1") return 0;
+  // Wired into the REAL turn path (An 2026-09-01): the shadow runs whenever the platform tier is
+  // configured, gated on MEETLESS_PLATFORM_URL and NOT on a dedicated switch (MEETLESS_E1_SHADOW no
+  // longer controls the production path; no new switch replaces it). No URL means there is nothing
+  // to compare against, so skip. Legacy assemble-context stays authoritative; this only observes.
+  if (!process.env.MEETLESS_PLATFORM_URL) return 0;
 
   const input = parseInput(await readStdin());
   if (!input) return 0;

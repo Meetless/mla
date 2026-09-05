@@ -140,10 +140,18 @@ function desiredFiles() {
     const base = PLUGIN_SURFACE.scoutAgentName[role];
     put(path.join("agents", `${base}.md`), renderScoutAgent(role, PLUGIN_SURFACE));
   }
-  // Hooks: the generated manifest + every template file copied verbatim.
+  // Hooks: the generated manifest + every template file copied verbatim, EXCEPT that the
+  // GENERATED artifact has internal note-filename references stripped from its comments.
+  // The source template keeps `# (see notes/YYYYMMDD-...md)` rationale for dev traceability,
+  // but shipping ~14 distinct internal note slugs in one file reads as a harvest, not a
+  // reference, and trips the public-mirror scrub gate (deny_bulk, limit 12). Replacing the
+  // slug token with a generic phrase keeps the comment readable, keeps the source authoritative,
+  // and ends the recurring per-release whack-a-mole. Only comment text is touched (slugs only
+  // ever appear in `#` rationale), so hook behavior is byte-for-byte unaffected.
   put(path.join("hooks", "hooks.json"), renderHookManifest());
   for (const f of HOOK_TEMPLATE_FILES) {
-    const content = fs.readFileSync(path.join(hooksTemplateDir, f), "utf8");
+    const raw = fs.readFileSync(path.join(hooksTemplateDir, f), "utf8");
+    const content = raw.replace(/notes\/\d{8}-[a-z0-9-]+(?:\.md)?/g, "an internal design note");
     const mode = f.endsWith(".sh") ? 0o755 : 0o644;
     put(path.join("hooks", f), content, mode);
   }
