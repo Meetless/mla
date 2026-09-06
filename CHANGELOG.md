@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.42 (2026-09-05)
+
+**Fixed**
+- "remember" and "forget" now actually work through the assistant. In 0.2.41 they were blocked before the request left your machine, so nothing was saved or withdrawn; captures now save and withdraw correctly.
+
 ## 0.2.41 (2026-09-05)
 
 Small honesty fixes to the private notes you capture with "remember".

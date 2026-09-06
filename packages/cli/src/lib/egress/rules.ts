@@ -601,10 +601,24 @@ export const EGRESS_RULES: readonly EgressRule[] = [
     service: "intel",
     method: "POST",
     match: /^\/internal\/v1\/kb\/withdraw$/,
-    note: "KB withdraw-by-path (intel)",
+    note: "KB withdraw by relPath OR source tuple (intel)",
     mode: "block_on_detect",
     why: "withdraw carries no document body; a credential in a path or reason is refused rather than rewritten, so the withdraw target can never be silently altered",
-    fields: ["workspaceId", "actor", "captureMethod", "relPath", "reason"],
+    // `meetless__forget` (conversational governed capture) withdraws by the
+    // SOURCE TUPLE (sourceSystem/sourceTenantId/externalObjectId), the other
+    // identity handle the route accepts (kb_withdraw.py KbWithdrawRequest); the
+    // agent-memory pipeline withdraws by relPath. Both handles are allowlisted
+    // here or the tool that uses the other one is refused `unknown_field`.
+    fields: [
+      "workspaceId",
+      "actor",
+      "captureMethod",
+      "relPath",
+      "sourceSystem",
+      "sourceTenantId",
+      "externalObjectId",
+      "reason",
+    ],
   },
   {
     service: "intel",
@@ -626,6 +640,24 @@ export const EGRESS_RULES: readonly EgressRule[] = [
       "corpusName",
       "documents",
     ],
+  },
+  {
+    service: "intel",
+    method: "POST",
+    match: /^\/internal\/v1\/kb\/ingest-governed$/,
+    note: "KB governed ingest / conversational capture (intel)",
+    mode: "block_on_detect",
+    // `meetless__remember` (conversational governed capture, remember_action.js)
+    // POSTs a §5.1 connector envelope here. The capture text rides in
+    // `envelope.rawContent`; like kb/add's `documents`, a redacted memory would be
+    // silently wrong forever, so this body is block-on-detect (refused, never
+    // rewritten). Top-level keys the tool sends: workspaceId, actor, envelope.
+    // Server model: kb_ingest_governed.py GovernedIngestRequest (this row narrows
+    // it, never exceeds it). Without this row every remember was refused
+    // `no egress rule` through the real `mla mcp` binary (found by driving the
+    // installed MCP server, not by a unit test, 2026-09-05).
+    why: "the capture text in envelope.rawContent would be silently wrong if rewritten, so the body is refused on a credential hit rather than altered",
+    fields: ["workspaceId", "actor", "envelope"],
   },
   // There is no `control POST /internal/v1/kb/add` row. One used to sit here,
   // labelled "control relay", and nothing could reach it: all three producers
