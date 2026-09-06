@@ -353,11 +353,16 @@ describe("the real registry", () => {
     // The pin is a list, not a rule, because "cannot be rewritten" is a
     // judgement. A future row reaching for this mode to dodge classifying its
     // fields fails here and has to argue for itself in a diff.
+    // kb/ingest-governed joins under reason 1 (the conversational-capture text in
+    // envelope.rawContent is stored verbatim and read back; a redacted memory is a
+    // wrong memory, permanently). kb/withdraw now also accepts the source-tuple
+    // handle, still reason 3 (target identity of a destructive action).
     const rows = EGRESS_RULES.filter((r) => r.mode === "block_on_detect");
     expect(rows.map((r) => r.note).sort()).toEqual([
+      "KB governed ingest / conversational capture (intel)",
       "KB ingest (intel)",
       "KB reingest: re-deliver an existing document's CURRENT on-disk bytes",
-      "KB withdraw-by-path (intel)",
+      "KB withdraw by relPath OR source tuple (intel)",
       "amend governing rule (mint-next)",
       "bulk rule import (G2 one-time importer)",
       "mint governing rule v1",

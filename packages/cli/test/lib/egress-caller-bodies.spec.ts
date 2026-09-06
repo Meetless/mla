@@ -321,15 +321,43 @@ const WITNESSES: Record<string, Witness> = {
   // the retry loop meant it failed silently and repeatedly rather than once
   // loudly. The body below is READ FROM upsert-client.ts:withdraw, not written
   // from the rule (that inversion is what made kb/add dead for months).
+  // TWO callers now: the agent-memory pipeline withdraws by relPath, and
+  // meetless__forget (conversational governed capture) withdraws by the source
+  // tuple (sourceSystem/sourceTenantId/externalObjectId). The rule allowlists
+  // both handles, so this maximal witness carries the union of what both send.
   [`intel POST ${/^\/internal\/v1\/kb\/withdraw$/.source}`]: {
-    caller: "agent-memory-capture/upsert-client.ts:withdraw",
+    caller:
+      "agent-memory-capture/upsert-client.ts:withdraw (relPath) + meetless-cli/packages/mcp/forget_action.js:runForget (source tuple)",
     path: "/internal/v1/kb/withdraw",
     body: {
       workspaceId: "ws_1",
       actor: "user_1",
       captureMethod: "agent_auto_memory",
       relPath: "agent-memory/bind_1/reference_x.md",
+      sourceSystem: "agent",
+      sourceTenantId: "memory:ws_1:user_1",
+      externalObjectId: "mem-abc",
       reason: "reclassified",
+    },
+  },
+  [`intel POST ${/^\/internal\/v1\/kb\/ingest-governed$/.source}`]: {
+    caller: "meetless-cli/packages/mcp/remember_action.js:runRemember",
+    path: "/internal/v1/kb/ingest-governed",
+    body: {
+      workspaceId: "ws_1",
+      actor: "user_1",
+      // The §5.1 connector envelope; capture text rides in envelope.rawContent.
+      envelope: {
+        operation: "UPSERT",
+        sourceSystem: "agent",
+        sourceTenantId: "memory:ws_1:user_1",
+        externalObjectId: "mem-abc",
+        producerActorType: "agent",
+        captureMethod: "authenticated_authoring_surface",
+        sourceOrderingKind: "SERVER_RECEIVE_SEQUENCE",
+        rawContent: "meeting with Kevin Wednesday",
+        rawContentHash: "a".repeat(64),
+      },
     },
   },
   [`intel POST ${/^\/internal\/v1\/kb\/add$/.source}`]: {
